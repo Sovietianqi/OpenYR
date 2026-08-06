@@ -1,0 +1,554 @@
+#include <Abstract/TechnoClass.h>
+
+#include <Core/Memory.h>
+#include <Core/Macros.h>
+#include <Combat/WeaponTypeClass.h>
+#include <Combat/WarheadTypeClass.h>
+#include <Combat/BulletClass.h>
+#include <Game/Game.h>
+
+// ============================================================================
+// TechnoClass.cpp
+//
+//  TechnoClass is the base for every "technical" object - anything that can
+//  be owned by a house, take damage, fire a weapon, gain veterancy, cloak,
+//  or be repaired.  Infantry, vehicles, aircraft and buildings all derive
+//  from TechnoClass.  This file expands the .cpp with:
+//    * Static Array management
+//    * Update loop (AI, combat, cloaking)
+//    * Fire weapon implementation
+//    * TakeDamage implementation
+//    * Repair logic
+//    * Cloak / Uncloak
+//    * Veteran / Promote
+//    * Is_Ally / Is_Enemy
+//    * Get_Threat_Pos
+// ============================================================================
+
+// ============================================================================
+// Static member definitions
+// ============================================================================
+DynamicVectorClass<TechnoClass*>* TechnoClass::Array = nullptr;
+
+// ============================================================================
+// Init_Array / Delete_Array
+// ============================================================================
+void TechnoClass::Init_Array()
+{
+    if (Array != nullptr)
+        return;
+
+    Array = static_cast<DynamicVectorClass<TechnoClass*>*>(
+        YRMemory::Allocate(sizeof(DynamicVectorClass<TechnoClass*>)));
+
+    if (Array != nullptr)
+    {
+        new (Array) DynamicVectorClass<TechnoClass*>();
+    }
+}
+
+void TechnoClass::Delete_Array()
+{
+    if (Array == nullptr)
+        return;
+
+    Array->~DynamicVectorClass<TechnoClass*>();
+    YRMemory::Deallocate(Array);
+    Array = nullptr;
+}
+
+// ============================================================================
+// Add_To_Array / Remove_From_Array
+// ============================================================================
+int32 TechnoClass::Add_To_Array(TechnoClass* pInstance)
+{
+    if (Array == nullptr || pInstance == nullptr)
+        return -1;
+
+    if (!Array->Add(pInstance))
+        return -1;
+
+    return Array->Count - 1;
+}
+
+bool TechnoClass::Remove_From_Array(TechnoClass* pInstance)
+{
+    if (Array == nullptr || pInstance == nullptr)
+        return false;
+
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        if (Array->Items[i] == pInstance)
+        {
+            return Array->Remove(i);
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Get_Total_Count / Get_Instance / Find_Index
+// ============================================================================
+int32 TechnoClass::Get_Total_Count()
+{
+    if (Array == nullptr)
+        return 0;
+    return Array->Count;
+}
+
+TechnoClass* TechnoClass::Get_Instance(int32 index)
+{
+    if (Array == nullptr)
+        return nullptr;
+    if (index < 0 || index >= Array->Count)
+        return nullptr;
+    return Array->Items[index];
+}
+
+int32 TechnoClass::Find_Index(TechnoClass* pInstance)
+{
+    if (Array == nullptr || pInstance == nullptr)
+        return -1;
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        if (Array->Items[i] == pInstance)
+            return i;
+    }
+    return -1;
+}
+
+// ============================================================================
+// Update loop (AI, combat, cloaking)
+//
+//  Drives the per-frame work for every TechnoClass instance.  The order
+//  matters: cloaking must run before combat so a freshly-decloaked unit can
+//  still fire this frame; repair / veterancy updates run last so they can
+//  react to the combat results.
+// ============================================================================
+void TechnoClass::Update()
+{
+    // Chain parent (ObjectClass) - in the standalone build the parent has
+    // no per-frame work, but the original binary uses this slot to update
+    // the attachment list and the radar blip.
+
+    Update_Cloak();
+    Update_AI();
+    Update_Combat();
+    Update_Repair();
+    Update_Veterancy();
+}
+
+// ============================================================================
+// Update_AI
+//
+//  Runs the mission state machine.  The concrete subclass owns the actual
+//  mission handlers; the base class only ensures the cloak / weapon-recharge
+//  timers tick down.
+// ============================================================================
+void TechnoClass::Update_AI()
+{
+    // Decrement the firing timer if it is running.
+    if (FireRechargeTimer > 0)
+        --FireRechargeTimer;
+
+    // Decrement the cloak timer if it is running.
+    if (CloakTimer > 0)
+        --CloakTimer;
+
+    // Decrement the Iron Curtain / Force Shield invulnerability timers.
+    if (IronCurtainTimer > 0)
+        --IronCurtainTimer;
+    if (ForceShieldTimer > 0)
+        --ForceShieldTimer;
+
+    // Tick the secondary warhead-effect timers. The full binary also applies
+    // per-frame residual damage for fire / radiation here; the standalone
+    // build only ages the timers so the IsXxx() accessors reflect the
+    // current state.
+    if (FireDamageTimer > 0)
+        --FireDamageTimer;
+    if (SparkyCounter > 0)
+        --SparkyCounter;
+    if (TemporalTimer > 0)
+        --TemporalTimer;
+    if (GasTimer > 0)
+        --GasTimer;
+    if (RadiationTimer > 0)
+        --RadiationTimer;
+}
+
+// ============================================================================
+// Update_Combat
+//
+//  Per-frame combat update for the base TechnoClass.  Handles the common
+//  combat logic shared by all techno types:
+//
+//    1. If the techno is dead, in limbo, or frozen (temporal), skip.
+//    2. Decrement the fire recharge timer (also done in Update_AI, but
+//       repeated here so combat state stays consistent if Update_AI is
+//       overridden without chaining).
+//    3. If the techno is shielded (Iron Curtain / Force Shield), it is
+//       invulnerable but can still fight - no early return.
+//    4. If the techno is cloaked and has a pending fire action, force a
+//       decloak.  Firing breaks cloak in the standard rules.
+//    5. If the techno is armed and its weapon is ready, the derived class's
+//       Combat_AI override handles target selection and firing.  The base
+//       only ensures the shared combat state is up to date.
+//
+//  Concrete subclasses (InfantryClass, UnitClass, BuildingClass) override
+//  Combat_AI() with type-specific targeting and fire logic.
+// ============================================================================
+void TechnoClass::Update_Combat()
+{
+    // Dead, limboed, or temporally frozen technos do not process combat.
+    if (Health <= 0)
+        return;
+    if (IsInLimbo)
+        return;
+    if (TemporalTimer > 0)
+        return;
+
+    // Tick the fire recharge timer.  Update_AI also does this, but
+    // repeating it here keeps combat state consistent if a subclass
+    // overrides Update_AI without chaining the base.
+    if (FireRechargeTimer > 0)
+        --FireRechargeTimer;
+
+    // Shielded technos (Iron Curtain / Force Shield) are invulnerable but
+    // retain full combat capability.  No early return needed.
+
+    // If the techno is currently cloaked or cloaking, any combat action
+    // forces a decloak.  The full binary calls Uncloak() here when a fire
+    // command is issued; the base checks the state so derived classes can
+    // consult it before firing.
+    if (CloakState == CloakStateEnum::Cloaked ||
+        CloakState == CloakStateEnum::Cloaking)
+    {
+        // Combat activity breaks cloaking.  The derived class calls
+        // Uncloak() when it actually fires; the base does not auto-decloak
+        // to avoid interfering with passive cloak decay.
+    }
+
+    // Secondary warhead effects that influence combat capability:
+    //   - Burning technos (FireDamageTimer > 0) take residual damage
+    //     applied by the damage system, not here.
+    //   - Gassed / irradiated technos have reduced combat effectiveness
+    //     but can still fight.
+    // These timers are aged by Update_AI; Update_Combat only reads them.
+}
+
+// ============================================================================
+// Update_Cloak
+//
+//  Advances the cloak state machine.  When CloakState is "cloaking" the
+//  alpha value fades toward zero; when "uncloaking" it fades toward 255.
+// ============================================================================
+void TechnoClass::Update_Cloak()
+{
+    if (CloakState == CloakStateEnum::Idle)
+        return;
+
+    if (CloakState == CloakStateEnum::Cloaking)
+    {
+        if (CloakAlpha > 0)
+        {
+            --CloakAlpha;
+            if (CloakAlpha == 0)
+                CloakState = CloakStateEnum::Cloaked;
+        }
+    }
+    else if (CloakState == CloakStateEnum::Uncloaking)
+    {
+        if (CloakAlpha < 255)
+        {
+            ++CloakAlpha;
+            if (CloakAlpha == 255)
+                CloakState = CloakStateEnum::Idle;
+        }
+    }
+}
+
+// ============================================================================
+// Update_Repair
+//
+//  If the unit is being repaired (by a service depot or the repair-infantry),
+//  tick its HP up by the per-frame repair rate.
+// ============================================================================
+void TechnoClass::Update_Repair()
+{
+    if (!RepairActive)
+        return;
+    if (Health >= MaxHealth)
+    {
+        RepairActive = false;
+        return;
+    }
+    Health += RepairRate;
+    if (Health > MaxHealth)
+        Health = MaxHealth;
+}
+
+// ============================================================================
+// Update_Veterancy
+//
+//  Promotes the unit when its accumulated experience crosses the next
+//  threshold.  The thresholds are 100 (Veteran) and 200 (Elite) in the
+//  original binary.
+// ============================================================================
+void TechnoClass::Update_Veterancy()
+{
+    if (VeterancyLevel >= 2) // Elite
+        return;
+
+    int32 nextThreshold = (VeterancyLevel == 0) ? 100 : 200;
+    if (Experience >= nextThreshold)
+    {
+        ++VeterancyLevel;
+        // The original binary clamps the experience and applies the
+        // veterancy bonuses (firepower / armor / ROF) here.
+    }
+}
+
+// ============================================================================
+// Fire weapon implementation
+//
+//  Spawns a BulletClass aimed at pTarget.  The bullet inherits the weapon's
+//  speed, warhead and damage.  The original binary is much more involved -
+//  it computes the lead, picks the right firing offset, plays the fire-anim
+//  and the muzzle flash, and pushes the firing timer.  The standalone build
+//  preserves the entry-point signature so subclasses can call into it.
+// ============================================================================
+BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
+{
+    if (pTarget == nullptr)
+        return nullptr;
+
+    // Look up the weapon.  The full binary indexes into the TechnoType's
+    // weapon list; here we just check the index is in range.
+    if (nWeaponIndex < 0 || nWeaponIndex >= 18)
+        return nullptr;
+
+    // Gate firing on the weapon's rate of fire.  The original binary reads
+    // ROF from the WeaponTypeClass referenced by the TechnoType's weapon
+    // slot and applies the veteran / elite reload multipliers.  We resolve
+    // the WeaponTypeClass through the TechnoType's weapon array and read
+    // its ROF member directly, applying the same veterancy scaling used by
+    // WeaponTypeClass::CalculateROF.  The gate is expressed in terms of
+    // Game::CurrentFrame so it stays correct even if Update_AI is not run
+    // every frame.
+    int32 baseROF = 15;  // fallback default if the weapon slot is unset
+    if (TechnoType != nullptr) {
+        WeaponStruct* ws = TechnoType->GetWeapon(nWeaponIndex);
+        if (ws != nullptr && ws->WeaponType != nullptr) {
+            baseROF = ws->WeaponType->ROF;
+        }
+    }
+    double rofMultiplier = 1.0;
+    if (VeterancyLevel >= 2)
+        rofMultiplier = 0.8;   // elite: -20% reload time
+    else if (VeterancyLevel == 1)
+        rofMultiplier = 0.9;   // veteran: -10% reload time
+    int32 effectiveROF = static_cast<int32>(baseROF * rofMultiplier + 0.5);
+    if (effectiveROF < 1)
+        effectiveROF = 1;
+
+    int32 currentFrame = Game::CurrentFrame;
+    if (currentFrame - LastFireFrame < effectiveROF)
+        return nullptr;
+
+    // Arm the recharge timer (mirrored by Update_AI) and stamp the frame so
+    // the next shot is gated on the same ROF window.
+    FireRechargeTimer = effectiveROF;
+    LastFireFrame = currentFrame;
+
+    // In the full binary this would allocate a BulletClass, set its
+    // target / source / weapon pointers, and add it to the global bullet
+    // array.  The standalone build has no bullet pool yet.
+    return nullptr;
+}
+
+// ============================================================================
+// TakeDamage implementation
+//
+//  Applies damage to this TechnoClass.  The warhead's Verses table modulates
+//  the raw damage based on this unit's armor.  Returns true if the unit died
+//  as a result of the damage.
+// ============================================================================
+bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
+                                  WarheadTypeClass* pWarhead)
+{
+    if (damage <= 0)
+        return false;
+
+    // The full binary looks up the warhead's Verses[Armor] entry and
+    // scales the damage.  The standalone build applies the raw damage.
+    Health -= damage;
+
+    // Award experience to the attacker if one was supplied.
+    if (pSource != nullptr)
+    {
+        // The full binary dispatches through HouseClass::GainExperience.
+    }
+
+    if (Health <= 0)
+    {
+        Health = 0;
+        Destroyed(pSource);
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Repair logic
+//
+//  Begins / ends the repair state.  The full binary also deducts credits
+//  from the owning house and sparks a repair-anim.
+// ============================================================================
+void TechnoClass::Repair_Start(int32 rate)
+{
+    if (Health >= MaxHealth)
+        return;
+    RepairActive = true;
+    RepairRate = rate;
+}
+
+void TechnoClass::Repair_Stop()
+{
+    RepairActive = false;
+    RepairRate = 0;
+}
+
+// ============================================================================
+// Cloak / Uncloak
+//
+//  Triggers the cloak state machine.  Cloak fades the unit out over a few
+//  frames; Uncloak fades it back in.  The original binary also plays a
+//  sound and notifies the owning house's radar.
+// ============================================================================
+void TechnoClass::Cloak(bool bPlaySound)
+{
+    (void)bPlaySound;
+    if (CloakState == CloakStateEnum::Cloaked ||
+        CloakState == CloakStateEnum::Cloaking)
+        return;
+
+    CloakState = CloakStateEnum::Cloaking;
+    CloakTimer = 30;
+}
+
+void TechnoClass::Uncloak(bool bPlaySound)
+{
+    (void)bPlaySound;
+    if (CloakState == CloakStateEnum::Idle ||
+        CloakState == CloakStateEnum::Uncloaking)
+        return;
+
+    CloakState = CloakStateEnum::Uncloaking;
+    CloakTimer = 30;
+}
+
+bool TechnoClass::Is_Cloaked() const
+{
+    return CloakState == CloakStateEnum::Cloaked;
+}
+
+bool TechnoClass::Is_Cloaking() const
+{
+    return CloakState == CloakStateEnum::Cloaking ||
+           CloakState == CloakStateEnum::Cloaked;
+}
+
+// ============================================================================
+// Veteran / Promote
+//
+//  Adds experience and (if the threshold is crossed) bumps the veterancy
+//  level.  The full binary applies the veterancy multipliers here.
+// ============================================================================
+void TechnoClass::Promote(int32 experience)
+{
+    Experience += experience;
+    Update_Veterancy();
+}
+
+int32 TechnoClass::GetVeterancy() const
+{
+    return VeterancyLevel;
+}
+
+int32 TechnoClass::Get_Experience() const
+{
+    return Experience;
+}
+
+// ============================================================================
+// Is_Ally / Is_Enemy
+//
+//  Returns true if the supplied house is on the same team as this unit's
+//  owner.  The full binary walks the HouseClass alliance table; the
+//  standalone build treats "same owner" as "ally".
+// ============================================================================
+bool TechnoClass::Is_Ally(HouseClass* pHouse) const
+{
+    if (pHouse == nullptr)
+        return false;
+    return (pHouse == Owner);
+}
+
+bool TechnoClass::Is_Enemy(HouseClass* pHouse) const
+{
+    if (pHouse == nullptr)
+        return false;
+    return (pHouse != Owner);
+}
+
+bool TechnoClass::Is_Ally(TechnoClass* pTechno) const
+{
+    if (pTechno == nullptr)
+        return false;
+    return Is_Ally(pTechno->Owner);
+}
+
+bool TechnoClass::Is_Enemy(TechnoClass* pTechno) const
+{
+    if (pTechno == nullptr)
+        return false;
+    return Is_Enemy(pTechno->Owner);
+}
+
+// ============================================================================
+// Get_Threat_Pos
+//
+//  Returns the position the AI should aim at when attacking this unit.  For
+//  most units this is the center of the voxel / shape; for buildings the
+//  original binary picks the closest cell.
+// ============================================================================
+CoordStruct TechnoClass::Get_Threat_Pos() const
+{
+    return Location;
+}
+
+// ============================================================================
+// ComputeCRC
+//
+//  Chains the parent CRC and then adds the TechnoClass-specific state.
+// ============================================================================
+void TechnoClass::ComputeCRC(CRCEngine& crc) const
+{
+    Compute_CRC_Abstract(crc);
+
+    crc.AddData(&Health,           sizeof(Health));
+    crc.AddData(&MaxHealth,        sizeof(MaxHealth));
+    crc.AddData(&VeterancyLevel,   sizeof(VeterancyLevel));
+    crc.AddData(&Experience,       sizeof(Experience));
+    crc.AddData(&CloakState,       sizeof(CloakState));
+    crc.AddData(&CloakAlpha,       sizeof(CloakAlpha));
+    crc.AddData(&FireRechargeTimer, sizeof(FireRechargeTimer));
+    crc.AddData(&RepairActive,      sizeof(RepairActive));
+    crc.AddData(&RepairRate,        sizeof(RepairRate));
+    crc.AddData(&IronCurtainTimer,  sizeof(IronCurtainTimer));
+    crc.AddData(&ForceShieldTimer,  sizeof(ForceShieldTimer));
+    crc.AddData(&FireDamageTimer,   sizeof(FireDamageTimer));
+    crc.AddData(&TemporalTimer,     sizeof(TemporalTimer));
+    crc.AddData(&RadiationTimer,    sizeof(RadiationTimer));
+}
