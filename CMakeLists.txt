@@ -36,16 +36,17 @@ else()
     add_compile_options(-fno-rtti -fno-exceptions)
 endif()
 
-# Source files
+# Source files - 扫描整个项目目录（因为 src 已移出）
 file(GLOB_RECURSE GAMERECON_SOURCES
-    "src/*.cpp"
-    "src/*.h"
+    "${CMAKE_SOURCE_DIR}/*.cpp"
+    "${CMAKE_SOURCE_DIR}/*.h"
 )
 
 add_executable(gamerecon ${GAMERECON_SOURCES})
 
+# 根目录本身作为包含目录（不再依赖 src 子目录）
 target_include_directories(gamerecon PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}
 )
 
 # Platform-specific libraries
