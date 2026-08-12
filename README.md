@@ -1,5 +1,5 @@
 # OpenYR
-
+[![GPL v3](https://www.gnu.org/graphics/gplv3-127x51.png)](https://opensource.org/license/GPL-3.0)
 ## 概述
 
 **OpenYR** 是由 **sovietianqi** 发起并维护的《命令与征服：尤里的复仇》开源引擎实现项目。项目基于对原版 `gamemd.exe` 可执行文件的二进制逆向分析，结合 **YRpp**（https://github.com/Phobos-developers/YRpp） 库的接口定义与数据结构研究成果，对原版引擎的核心逻辑进行独立重建与重新实现。OpenYR 旨在摆脱原版二进制文件的封闭性约束，为社区提供一个开放、可扩展、可移植的引擎替代方案，同时为 MOD 开发、工具链集成及跨平台适配提供更广阔的技术空间。
