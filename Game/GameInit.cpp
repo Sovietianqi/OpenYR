@@ -1067,65 +1067,9 @@ void Init_EVAMessages()
 }
 
 // ============================================================================
-// Main_Game - Main game loop entry point
-// ============================================================================
-
-void Main_Game()
-{
-    // Ensure the game is initialized
-    if (!GameInitDone) {
-        Init_Game();
-    }
-
-    MainLoopActive = true;
-    GameIsQuitting = false;
-
-    while (MainLoopActive && !GameIsQuitting) {
-        Main_Loop();
-
-        if (GameIsQuitting) {
-            Shutdown_Game();
-            break;
-        }
-    }
-}
-
-// ============================================================================
-// Main_Loop - Per-frame game loop iteration
-// ============================================================================
-
-void Main_Loop()
-{
-    // Process input events (keyboard, mouse, network)
-    Main_Game_ProcessInput();
-
-    // Skip game logic updates if the game is paused
-    if (GamePaused > 0) {
-        return;
-    }
-
-    // Update game logic
-    Main_Game_Update();
-
-    // Process network messages
-    Main_Game_Network();
-
-    // Update AI decision-making
-    Main_Game_AI();
-
-    // Render the frame
-    Main_Game_Render();
-
-    // Check for end-game conditions
-    Main_Game_CheckEndGame();
-
-    // Increment frame counters
-    ++CurrentFrame;
-    ++FrameCounter;
-}
-
-// ============================================================================
-// Main_Game_Update - Update all game subsystems
+// NOTE: Main_Game() / Main_Loop() are defined in MainLoop.cpp
+// (the single canonical definition, matching the original binary layout).
+// The Main_Game_* per-phase helpers below remain available for reuse.
 // ============================================================================
 
 void Main_Game_Update()

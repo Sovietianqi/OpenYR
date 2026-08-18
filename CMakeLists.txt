@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # x86 target (original game is 32-bit)
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(FALSE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m32")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m32")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m32")
@@ -36,15 +36,17 @@ else()
     add_compile_options(-fno-rtti -fno-exceptions)
 endif()
 
-# Source files - 扫描整个项目目录（因为 src 已移出）
-file(GLOB_RECURSE GAMERECON_SOURCES
-    "${CMAKE_SOURCE_DIR}/*.cpp"
-    "${CMAKE_SOURCE_DIR}/*.h"
+# Source files
+file(GLOB_RECURSE GAMERECON_SOURCES CONFIGURE_DEPENDS
+    "*.cpp"
+    "*.h"
 )
+
+# Never pull in files from the build directory itself.
+list(FILTER GAMERECON_SOURCES EXCLUDE REGEX "${CMAKE_BINARY_DIR}/")
 
 add_executable(gamerecon ${GAMERECON_SOURCES})
 
-# 根目录本身作为包含目录（不再依赖 src 子目录）
 target_include_directories(gamerecon PRIVATE
     ${CMAKE_SOURCE_DIR}
 )

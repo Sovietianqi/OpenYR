@@ -13,6 +13,7 @@
 
 #include "Rendering/TacticalClass.h"
 #include "Rendering/DisplayClass.h"
+#include "Game/Externs.h"
 #include "Rendering/Surface.h"
 #include "Rendering/ConvertClass.h"
 #include "Rendering/Blitter.h"
@@ -376,20 +377,50 @@ void TacticalClass::Draw_Objects()
 
     YSortObjects();
 
-    // Draw each visible object.
+    // View rectangle used by the object draw routines (original passes the
+    // tactical viewport).  The full view is used until the viewport logic
+    // is wired to the sidebar/radar insets.
+    RectangleStruct viewRect(0, 0, (TheDisplay != nullptr) ? TheDisplay->ScreenWidth  : 640,
+                                   (TheDisplay != nullptr) ? TheDisplay->ScreenHeight : 480);
+
+    // Draw each visible object, dispatched by its concrete type.  The
+    // original draws via ObjectClass virtuals; here we use the concrete
+    // Draw(Point2D&, RectangleStruct&) entry points that exist on the
+    // Techno hierarchy, converting the object's world coords to screen.
     DynamicVectorClass<ObjectClass*> visibleObjects = GetVisibleObjects();
     for (int32 i = 0; i < visibleObjects.Count; ++i) {
         ObjectClass* pObj = visibleObjects[i];
         if (!pObj) continue;
         if (pObj->IsInLimbo) continue;
 
-        // The actual drawing is handled by the object's Draw method,
-        // which uses the display class to blit sprites to the surface.
+        CoordStruct crd;
+        pObj->GetCoords(&crd);
+        Point2D screen = CoordsToScreen(crd);
+
+        // Dispatch to the concrete draw routine.  BuildingClass::Draw takes
+        // const refs, the Techno hierarchy takes non-const refs.
+        switch (pObj->WhatAmI()) {
+            case AbstractType::Unit:
+                static_cast<UnitClass*>(pObj)->Draw(screen, viewRect);
+                break;
+            case AbstractType::Infantry:
+                static_cast<InfantryClass*>(pObj)->Draw(screen, viewRect);
+                break;
+            case AbstractType::Aircraft:
+                static_cast<AircraftClass*>(pObj)->Draw(screen, viewRect);
+                break;
+            case AbstractType::Building:
+                static_cast<BuildingClass*>(pObj)->Draw(screen, viewRect);
+                break;
+            default:
+                break;
+        }
     }
 
     // Draw health bars for selected or damaged objects.
     for (int32 i = 0; i < SelectableCount; ++i) {
-        // Draw health bars for selected objects.
+        // Health-bar rendering is stubbed until the status-bar overlay is
+        // wired to the display surface.
     }
 }
 

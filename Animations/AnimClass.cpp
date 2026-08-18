@@ -32,6 +32,65 @@ DynamicVectorClass<AnimClass*>* AnimClass::Array = nullptr;
 // Construction / Destruction
 // ============================================================================
 
+// Default construction used by the object factory / array preallocation.
+// Mirrors the original binary's AnimClass::AnimClass() default ctor.
+AnimClass::AnimClass() noexcept :
+    ObjectClass(),
+    Type(nullptr),
+    OwnerObject(nullptr),
+    unknown_D0(0),
+    LightConvert(nullptr),
+    LightConvertIndex(-1),
+    TintColor(0),
+    ZAdjust(0),
+    YSortAdjust(0),
+    FlamingGuyCoords(0, 0, 0),
+    FlamingGuyRetries(0),
+    IsBuildingAnim(false),
+    UnderTemporal(false),
+    Paused(false),
+    Unpaused(false),
+    PausedAnimFrame(0),
+    Reverse(false),
+    unknown_124(0),
+    TranslucencyLevel(0),
+    TimeToDie(false),
+    AttachedBullet(nullptr),
+    Owner(nullptr),
+    LoopDelay(0),
+    Accum(1.0),
+    AnimFlags(BlitterFlags::None),
+    HasExtras(false),
+    RemainingIterations(0),
+    unknown_196(0),
+    unknown_197(0),
+    IsPlaying_(false),
+    IsFogged(false),
+    FlamingGuyExpire(false),
+    UnableToContinue(false),
+    SkipProcessOnce(true),
+    Invisible(false),
+    PowerOff(false),
+    unused_19F(0),
+    IsFlaming(false),
+    IsNuke(false),
+    IsIonCannon(false),
+    IsLooping_(false),
+    TrailerCount(0),
+    TrailerTimer(0),
+    LightTimer(0),
+    SoundTimer(0),
+    ScorchCreated(false),
+    CraterCreated(false),
+    InfantryCreated(false),
+    TiberiumCreated(false),
+    ChainAnimCreated(false)
+{
+    Location = CoordStruct(0, 0, 0);
+    std::memset(PaletteName, 0, sizeof(PaletteName));
+    std::memset(&Animation, 0, sizeof(Animation));
+}
+
 AnimClass::AnimClass(AnimTypeClass* pAnimType, const CoordStruct& loc,
     int32 loopDelay, int32 loopCount,
     uint32 flags, int32 forceZAdjust, bool reverse) noexcept :

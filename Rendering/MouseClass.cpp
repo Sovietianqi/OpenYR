@@ -753,3 +753,49 @@ MouseCursorType MouseClass::GetLastMouseCursor()
 {
     return MouseCursorLastIndex;
 }
+
+// ============================================================================
+// ScrollClass - scrolling notification base (part of the MouseClass
+// hierarchy in the original binary: MouseClass -> ScrollClass -> TabClass)
+// ============================================================================
+
+ScrollClass* ScrollClass::Instance = nullptr;
+
+ScrollClass::ScrollClass()
+    : unknown_int_5548(0)
+    , unknown_byte_554C(0)
+    , unknown_int_5550(0)
+    , unknown_int_5554(0)
+    , unknown_byte_5548_2(0)
+    , unknown_byte_5549(0)
+    , unknown_byte_554A(0)
+{
+    Instance = this;
+}
+
+ScrollClass::~ScrollClass()
+{
+    if (Instance == this)
+        Instance = nullptr;
+}
+
+// ============================================================================
+// TabClass - tab notification base (credits display).  Part of the original
+// MouseClass hierarchy: MouseClass -> ScrollClass -> TabClass -> SidebarClass.
+// ============================================================================
+
+TabClass* TabClass::Instance = nullptr;
+
+TabClass::TabClass()
+    : unknown_byte_5544(0)
+    , MissionTimerPinged(false)
+    , unknown_byte_5546(0)
+{
+    Instance = this;
+}
+
+TabClass::~TabClass()
+{
+    if (Instance == this)
+        Instance = nullptr;
+}

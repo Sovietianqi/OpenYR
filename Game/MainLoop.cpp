@@ -1,7 +1,11 @@
 #include "Game/MainLoop.h"
 #include "Game/Game.h"
+#include "Game/GameInit.h"
 #include "Game/Externs.h"
 #include "Game/CopyProtection.h"
+#include "Rendering/GScreenClass.h"
+#include "Rendering/TacticalClass.h"
+#include "Rendering/DisplayClass.h"
 
 #include "Core/Definitions.h"
 #include "Core/Macros.h"
@@ -44,6 +48,13 @@ static const int    COPYPROT_CHECK_INTERVAL = 300;  // check every 300 frames (~
 
 void Main_Game()
 {
+    // Original binary: Main_Game() calls InitGame() first, then enters
+    // the frame loop.  Mirror that contract here.
+    if (!GameInitDone)
+    {
+        Init_Game();
+    }
+
     Game::GameInProgress = true;
 
     s_FrameStartTime    = Game::GetTickCount();
@@ -439,38 +450,52 @@ void Render_Frame()
     if (TheDisplay == nullptr)
         return;
 
-    // In the original engine, the rendering pipeline is:
-    //
-    // 1. Clear back buffer
-    // 2. Render terrain layer (isometric tiles)
-    //    - Determine visible cells based on scroll position
-    //    - Render terrain tiles (theater-specific)
-    //    - Render cell overlays (ore, craters, etc.)
-    // 3. Render object layer
-    //    - Render buildings (sorted by position)
-    //    - Render infantry (sorted by position)
-    //    - Render vehicles (sorted by position)
-    //    - Render aircraft (sorted by altitude)
-    // 4. Render effect layer
-    //    - Render animations
-    //    - Render particles
-    //    - Render superweapon effects
-    // 5. Render UI layer
-    //    - Render sidebar
-    //    - Render radar/minimap
-    //    - Render bottom bar
-    //    - Render tooltips
-    //    - Render cursor
-    // 6. Render overlay layer
-    //    - Render fog of war
-    //    - Render shroud
-    //    - Render selection boxes
-    //    - Render health bars
-    //    - Render waypoint lines
-    // 7. Flip / present back buffer to screen
-    //
-    // The rendering is done in a specific order to ensure correct
-    // z-ordering and blending.
+    // Back buffer for this frame (original: DSurface_CreatePrimary -> back
+    // buffer, blitted to screen at the end of the frame).
+    DSurface* pBack = (TheGScreen != nullptr) ? TheGScreen->Get_Back_Buffer() : nullptr;
+
+    // ── Phase 1: Clear back buffer ──────────────────────────────────────
+    if (pBack != nullptr)
+    {
+        pBack->Fill(0);   // black (original clears to the palette index 0)
+    }
+
+    // ── Phase 2: Terrain layer (isometric tiles) ────────────────────────
+    if (TheTactical != nullptr)
+    {
+        TheTactical->Render(pBack, false, TacticalRenderMode::Terrain);
+    }
+
+    // ── Phase 3: Object layer (buildings/infantry/vehicles/aircraft) ────
+    if (TheTactical != nullptr)
+    {
+        TheTactical->Render(pBack, false, TacticalRenderMode::MovingAnimating);
+    }
+
+    // ── Phase 4: Effect layer (animations / particles / superweapons) ───
+    if (TheTactical != nullptr)
+    {
+        TheTactical->Render(pBack, false, TacticalRenderMode::AllAlt);
+    }
+
+    // ── Phase 5: Shroud / fog overlay ───────────────────────────────────
+    if (TheTactical != nullptr)
+    {
+        TheTactical->Draw_Shroud();
+        TheTactical->Draw_Fog();
+    }
+
+    // ── Phase 6: UI layer (radar / sidebar / cursor) ────────────────────
+    if (TheDisplay != nullptr)
+    {
+        TheDisplay->Draw(true);
+    }
+
+    // ── Phase 7: Present back buffer to screen ──────────────────────────
+    if (TheGScreen != nullptr)
+    {
+        TheGScreen->BlitToScreen();
+    }
 
     s_LastRenderTime = Game::GetTickCount();
 }

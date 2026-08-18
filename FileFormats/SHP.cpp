@@ -770,3 +770,28 @@ void SHPClass::ReleaseCache()
     std::free(m_pFrameCache);
     m_pFrameCache = nullptr;
 }
+// ============================================================================
+// Type-casting helpers: the original binary resolves SHP file/reference by
+// casting the SHPStruct base pointer. SHPReference derives from SHPStruct and
+// stores the resolved file data in Data; SHPFile is the concrete file layout.
+// ============================================================================
+
+SHPReference* SHPStruct::AsReference()
+{
+    return IsReference() ? reinterpret_cast<SHPReference*>(this) : nullptr;
+}
+
+const SHPReference* SHPStruct::AsReference() const
+{
+    return IsReference() ? reinterpret_cast<const SHPReference*>(this) : nullptr;
+}
+
+SHPFile* SHPStruct::AsFile()
+{
+    return IsReference() ? nullptr : reinterpret_cast<SHPFile*>(this);
+}
+
+const SHPFile* SHPStruct::AsFile() const
+{
+    return IsReference() ? nullptr : reinterpret_cast<const SHPFile*>(this);
+}

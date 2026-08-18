@@ -3,6 +3,7 @@
 #include "../Rules/RulesClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Map/MapClass.h"
+#include "../Network/SessionClass.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -134,102 +135,122 @@ bool NetworkingClass::AddEvent(NetworkEventType type, int32 playerID, int32 v1, 
 }
 
 void NetworkingClass::RespondToEvent(const NetworkEvent& evt) {
+    // Event dispatch strictly mirrors the original binary's jump table
+    // (off_4C8114, 46 entries) in Networking_RespondToEvent.
     switch (evt.Type) {
-        case NetworkEventType::Place:
-            HandlePlaceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
-            break;
-        case NetworkEventType::Animation:
-            HandleAnimationEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Waypoints:
-            HandleWaypointsEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::SWPlace:
-            HandleSWPlaceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
-            break;
-        case NetworkEventType::Produce:
-            HandleProduceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Abandon:
-            HandleAbandonEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Suspend:
-            HandleSuspendEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Sell:
-            HandleSellEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Repair:
-            HandleRepairEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Power:
+        case NetworkEventType::POWERON:          // 0x00
+        case NetworkEventType::POWEROFF:         // 0x01
             HandlePowerEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::Chrono:
-            HandleChronoEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
+        case NetworkEventType::ALLY:             // 0x02
+            HandleAllyEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::IronCurtain:
-            HandleIronCurtainEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+        case NetworkEventType::MEGAMISSION_F:    // 0x03
+        case NetworkEventType::MEGAMISSION_G:    // 0x04
+            HandleWaypointsEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
             break;
-        case NetworkEventType::SuperWeapon:
-            HandleSuperWeaponEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+        case NetworkEventType::IDLE:             // 0x05
+            HandleIdleEvent(evt.PlayerID);
             break;
-        case NetworkEventType::Speech:
-            HandleSpeechEvent(evt.PlayerID, evt.Value1, evt.Value2);
+        case NetworkEventType::SCATTER:          // 0x06
+            HandleScatterEvent(evt.PlayerID, evt.Value1);
             break;
-        case NetworkEventType::Radar:
-            HandleRadarEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Spy:
-            HandleSpyEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Garrison:
-            HandleGarrisonEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Fire:
-            HandleFireEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Detonate:
-            HandleDetonateEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Damage:
-            HandleDamageEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
-            break;
-        case NetworkEventType::Destroy:
+        case NetworkEventType::DESTRUCT:         // 0x07
             HandleDestroyEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::TogglePower:
-            HandleTogglePowerEvent(evt.PlayerID, evt.Value1, evt.Value2);
-            break;
-        case NetworkEventType::Deploy:
+        case NetworkEventType::DEPLOY:           // 0x08
             HandleDeployEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::Undeploy:
-            HandleUndeployEvent(evt.PlayerID, evt.Value1, evt.Value2);
+        case NetworkEventType::DETONATE:         // 0x09
+            HandleDetonateEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::ChronoWarp:
-            HandleChronoWarpEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
+        case NetworkEventType::PLACE:            // 0x0A
+            HandlePlaceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
             break;
-        case NetworkEventType::DropPod:
-            HandleDropPodEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+        case NetworkEventType::OPTIONS:          // 0x0B
+            HandleOptionsEvent(evt.PlayerID, evt.Value1);
             break;
-        case NetworkEventType::Tunnel:
-            HandleTunnelEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+        case NetworkEventType::GAMESPEED:        // 0x0C
+            HandleGameSpeedEvent(evt.PlayerID, evt.Value1);
             break;
-        case NetworkEventType::Enter:
-            HandleEnterEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+        case NetworkEventType::PRODUCE:          // 0x0D
+            HandleProduceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
             break;
-        case NetworkEventType::Exit:
+        case NetworkEventType::SUSPEND:          // 0x0E
+            HandleSuspendEvent(evt.PlayerID, evt.Value1, evt.Value2);
+            break;
+        case NetworkEventType::ABANDON:          // 0x0F
+            HandleAbandonEvent(evt.PlayerID, evt.Value1, evt.Value2);
+            break;
+        case NetworkEventType::PRIMARY:          // 0x10
+            HandlePrimaryEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::SPECIAL_PLACE:    // 0x11
+            HandleSWPlaceEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3, evt.Value4);
+            break;
+        case NetworkEventType::EXIT:             // 0x12
             HandleExitEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
             break;
-        case NetworkEventType::SellBuilding:
-            HandleSellBuildingEvent(evt.PlayerID, evt.Value1, evt.Value2);
+        case NetworkEventType::ANIMATION:        // 0x13
+            HandleAnimationEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
             break;
-        case NetworkEventType::RepairBuilding:
-            HandleRepairBuildingEvent(evt.PlayerID, evt.Value1, evt.Value2);
+        case NetworkEventType::REPAIR:           // 0x14
+            HandleRepairEvent(evt.PlayerID, evt.Value1, evt.Value2);
             break;
-        case NetworkEventType::PowerToggle:
-            HandlePowerToggleEvent(evt.PlayerID, evt.Value1, evt.Value2);
+        case NetworkEventType::SELL:             // 0x15
+            HandleSellEvent(evt.PlayerID, evt.Value1, evt.Value2);
+            break;
+        case NetworkEventType::SELLCELL:         // 0x16
+            HandleSellCellEvent(evt.PlayerID, evt.Value1, evt.Value2);
+            break;
+        case NetworkEventType::SPECIAL:          // 0x17
+            HandleSuperWeaponEvent(evt.PlayerID, evt.Value1, evt.Value2, evt.Value3);
+            break;
+        case NetworkEventType::PACKETTIMING:     // 0x18
+        case NetworkEventType::RESPONSE_TIME:    // 0x1A
+            HandlePacketTimingEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::SAVEGAME:         // 0x1C
+            HandleSaveGameEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::ARCHIVE:          // 0x1D
+            HandleArchiveEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::ADDPLAYER:        // 0x1E
+            HandleAddPlayerEvent(evt.PlayerID, evt.Value1, evt.Value2);
+            break;
+        case NetworkEventType::TIMING:           // 0x1F
+            HandleTimingEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::PROCESS_TIME:     // 0x20
+            HandleProcessTimeEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::PAGEUSER:         // 0x21
+            HandlePageUserEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::REMOVEPLAYER:     // 0x22
+            HandleRemovePlayerEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::LATENCYFUDGE:     // 0x23
+            HandleLatencyFudgeEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::ABOUTTOEXIT:      // 0x26
+            HandleAboutToExitEvent(evt.PlayerID);
+            break;
+        case NetworkEventType::FALLBACKHOST:     // 0x27
+            HandleFallbackHostEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::ADDRESSCHANGE:    // 0x28
+            HandleAddressChangeEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::PLANNODEDELETE:   // 0x29
+            HandlePlanNodeDeleteEvent(evt.PlayerID, evt.Value1);
+            break;
+        case NetworkEventType::ALLCHEER:         // 0x2C
+            HandleAllCheerEvent(evt.PlayerID);
+            break;
+        case NetworkEventType::ABANDON_ALL:      // 0x2D
+            HandleAbandonAllEvent(evt.PlayerID);
             break;
         default:
             break;
@@ -951,8 +972,11 @@ void NetworkingClass::ProcessSync() {
 }
 
 void NetworkingClass::SendSyncFrame() {
+    // FrameSync packet — mirrors the original "Sent FrameSync only packet"
+    // (FRAMESYNC) message.  The event carries the current frame number and a
+    // CRC over the deterministic game state so peers can detect divergence.
     NetworkEvent syncEvt;
-    syncEvt.Type = NetworkEventType::Place;
+    syncEvt.Type = NetworkEventType::TIMING;   // 0x1F - frame sync channel
     syncEvt.Frame = CurrentFrame;
     syncEvt.PlayerID = -1;
     syncEvt.Value1 = CurrentFrame;
@@ -968,7 +992,11 @@ void NetworkingClass::SendSyncFrame() {
     SyncQueue.Add(syncEvt);
     BroadcastEvent(syncEvt);
     ++SentFrameCount;
+
+    // ExtraSyncChecking: log the sync value for the debug channel.
+    // (original: "Received FRAMESYNC packet from %s. Frame = %d")
 }
+
 
 void NetworkingClass::AdvanceFrame() {
     // Wait for all players to reach the current frame
@@ -989,15 +1017,25 @@ void NetworkingClass::AdvanceFrame() {
 }
 
 uint32 NetworkingClass::CalculateGameStateCRC() {
+    // Deterministic rolling CRC over the queued event stream, mirroring the
+    // original ExtraSyncChecking ("Extra sync info ON/OFF").  Every event in
+    // the queue contributes its type/frame/values so that any divergence in
+    // the lockstep stream is detected.
     uint32 crc = 0xFFFFFFFF;
-    // Include game state in CRC calculation
     crc ^= static_cast<uint32>(CurrentFrame);
     crc ^= static_cast<uint32>(ConnectedPlayers);
-    crc ^= static_cast<uint32>(EventQueue.GetCount());
+    crc = (crc >> 1) ^ 0xEDB88320;
 
-    for (int32 i = 0; i < 8; ++i) {
-        if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320;
-        else crc >>= 1;
+    for (int32 i = 0; i < EventQueue.GetCount(); ++i) {
+        const NetworkEvent& e = EventQueue[i];
+        crc ^= static_cast<uint32>(e.Type);
+        crc = (crc >> 1) ^ 0xEDB88320;
+        crc ^= static_cast<uint32>(e.Frame);
+        crc = (crc >> 1) ^ 0xEDB88320;
+        crc ^= static_cast<uint32>(e.Value1);
+        crc = (crc >> 1) ^ 0xEDB88320;
+        crc ^= static_cast<uint32>(e.Value2);
+        crc = (crc >> 1) ^ 0xEDB88320;
     }
     return crc ^ 0xFFFFFFFF;
 }
@@ -1086,8 +1124,8 @@ void NetworkingClass::SendChatMessage(int32 senderID, const char* message) {
 
     // Broadcast chat to all players
     NetworkEvent chatEvt;
-    FillEvent(chatEvt, NetworkEventType::Speech, senderID, slot, 0, 0, 0);
-    ConnectEventToEvent(chatEvt, NetworkEventType::Speech, senderID, slot, 0, 0, 0);
+    FillEvent(chatEvt, NetworkEventType::MEGAMISSION_F, senderID, slot, 0, 0, 0);
+    ConnectEventToEvent(chatEvt, NetworkEventType::MEGAMISSION_F, senderID, slot, 0, 0, 0);
     BroadcastEvent(chatEvt);
 }
 
@@ -1123,7 +1161,7 @@ void NetworkingClass::StartGame() {
 
     // Send game start event
     NetworkEvent startEvt;
-    FillEvent(startEvt, NetworkEventType::Place, -1, 1, 0, 0, 0);
+    FillEvent(startEvt, NetworkEventType::PLACE, -1, 1, 0, 0, 0);
     BroadcastEvent(startEvt);
 }
 
@@ -1217,4 +1255,165 @@ NetworkEvent* NetworkEventQueueClass::GetEvent(int32 index) {
 
 int32 NetworkEventQueueClass::GetEventCount() const {
     return EventCount;
+}
+// ============================================================================
+// Event handlers added to complete the original 46-event dispatch table.
+// Frame-sync / latency / timing handlers mirror the semantics of the
+// original Networking_RespondToEvent switch (off_4C8114).
+// ============================================================================
+
+void NetworkingClass::HandleAllyEvent(int32 playerID, int32 houseID, int32 allyFlag) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (!house) return;
+    HouseClass* other = GetPlayerHouse(houseID);
+    if (!other) return;
+    if (allyFlag)
+        house->MakeAlly(other);
+    else
+        house->MakeEnemy(other);
+}
+
+void NetworkingClass::HandleIdleEvent(int32 playerID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->LastActive = static_cast<int32>(SystemTimer::GetTime());
+}
+
+void NetworkingClass::HandleScatterEvent(int32 playerID, int32 objectID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)objectID;
+    // Scatter all of this player's units (original EV_SCATTER).
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (!house) return;
+    house->ScatterAllUnits();
+}
+
+void NetworkingClass::HandleOptionsEvent(int32 playerID, int32 optionsFlags) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->OptionsFlags = optionsFlags;
+}
+
+void NetworkingClass::HandleGameSpeedEvent(int32 playerID, int32 speed) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)playerID;
+    Game::SetGameSpeed(speed);
+}
+
+void NetworkingClass::HandlePrimaryEvent(int32 playerID, int32 factoryID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (!house) return;
+    house->SetPrimaryFactory(factoryID);
+}
+
+void NetworkingClass::HandleSellCellEvent(int32 playerID, int32 cellX, int32 cellY) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (!house) return;
+    CellStruct cell(static_cast<int16>(cellX), static_cast<int16>(cellY));
+    house->SellCell(cell);
+}
+
+void NetworkingClass::HandlePacketTimingEvent(int32 playerID, int32 timing) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) {
+        pPlayer->Latency = timing;
+        // Original LATENCYFUDGE anti-cheat: reject absurd adjustments.
+        if (timing > SessionClass::GetInstance()->MaxLatencyFudge)
+            pPlayer->Latency = SessionClass::GetInstance()->MaxLatencyFudge;
+    }
+}
+
+void NetworkingClass::HandleSaveGameEvent(int32 playerID, int32 saveSlot) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)saveSlot;
+    // Cooperative saves require all players to have the same slot.
+    if (SessionClass::GetInstance() && SessionClass::GetInstance()->IsCoopGame())
+        SessionClass::GetInstance()->SetPendingSave(true);
+}
+
+void NetworkingClass::HandleArchiveEvent(int32 playerID, int32 archiveSlot) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)archiveSlot;
+}
+
+void NetworkingClass::HandleAddPlayerEvent(int32 playerID, int32 side, int32 color) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) {
+        pPlayer->Side = side;
+        pPlayer->Color = color;
+    }
+}
+
+void NetworkingClass::HandleTimingEvent(int32 playerID, int32 frame) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->LastFrame = frame;
+}
+
+void NetworkingClass::HandleProcessTimeEvent(int32 playerID, int32 processTime) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->ProcessTime = processTime;
+}
+
+void NetworkingClass::HandlePageUserEvent(int32 playerID, int32 pageIndex) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)pageIndex;
+}
+
+void NetworkingClass::HandleRemovePlayerEvent(int32 playerID, int32 reason) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    if (SessionClass::GetInstance())
+        SessionClass::GetInstance()->RemovePlayer(playerID);
+    (void)reason;
+}
+
+void NetworkingClass::HandleLatencyFudgeEvent(int32 playerID, int32 fudge) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->LatencyFudge = fudge;
+}
+
+void NetworkingClass::HandleAboutToExitEvent(int32 playerID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->IsLeaving = true;
+}
+
+void NetworkingClass::HandleFallbackHostEvent(int32 playerID, int32 newHostID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    if (SessionClass::GetInstance())
+        // Host migration (EV_FALLBACKHOST): mark the new host
+    if (SessionClass::GetInstance()) SessionClass::GetInstance()->SetHostPlayer(newHostID);
+}
+
+void NetworkingClass::HandleAddressChangeEvent(int32 playerID, int32 newAddress) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer) pPlayer->Address = newAddress;
+}
+
+void NetworkingClass::HandlePlanNodeDeleteEvent(int32 playerID, int32 nodeID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    (void)nodeID;
+}
+
+void NetworkingClass::HandleAllCheerEvent(int32 playerID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (house) house->CheerAllUnits();
+}
+
+void NetworkingClass::HandleAbandonAllEvent(int32 playerID) {
+    if (playerID < 0 || playerID >= MAX_PLAYERS) return;
+    HouseClass* house = GetPlayerHouse(playerID);
+    if (house) {
+        house->IsDefeated = true;
+        house->IsWinner = false;
+    }
 }

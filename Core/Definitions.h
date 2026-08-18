@@ -155,16 +155,56 @@ struct ScriptActionNode {
     int32 Argument;
 };
 
+// NetworkEventType — 事件编号严格对齐原版 gamemd.exe
+// 依据汇编 Networking_RespondToEvent 跳转表 off_4C8114（46 分支）
 enum class NetworkEventType : int32 {
-    Place = 0, Animation = 1, Waypoints = 2, SWPlace = 3,
-    Produce = 4, Abandon = 5, Suspend = 6, Sell = 7, Repair = 8,
-    Power = 9, Chrono = 10, IronCurtain = 11, SuperWeapon = 12,
-    Speech = 13, Radar = 14, Spy = 15, Garrison = 16,
-    Fire = 17, Detonate = 18, Damage = 19, Destroy = 20,
-    TogglePower = 21, Deploy = 22, Undeploy = 23,
-    ChronoWarp = 24, DropPod = 25, Tunnel = 26,
-    Enter = 27, Exit = 28, SellBuilding = 29,
-    RepairBuilding = 30, PowerToggle = 31, Count = 32
+    // 0x00 - 0x10：常规玩家指令
+    POWERON      = 0x00,
+    POWEROFF     = 0x01,
+    ALLY         = 0x02,
+    MEGAMISSION_F= 0x03,
+    MEGAMISSION_G= 0x04,
+    IDLE         = 0x05,
+    SCATTER      = 0x06,
+    DESTRUCT     = 0x07,
+    DEPLOY       = 0x08,
+    DETONATE     = 0x09,
+    PLACE        = 0x0A,
+    OPTIONS      = 0x0B,
+    GAMESPEED    = 0x0C,
+    PRODUCE      = 0x0D,
+    SUSPEND      = 0x0E,
+    ABANDON      = 0x0F,
+    PRIMARY      = 0x10,
+
+    // 0x11 - 0x1F
+    SPECIAL_PLACE= 0x11,
+    EXIT         = 0x12,
+    ANIMATION    = 0x13,
+    REPAIR       = 0x14,
+    SELL         = 0x15,
+    SELLCELL     = 0x16,
+    SPECIAL      = 0x17,
+    PACKETTIMING = 0x18,   // 0x18-0x1B 复用
+    RESPONSE_TIME= 0x1A,
+    SAVEGAME     = 0x1C,
+    ARCHIVE      = 0x1D,
+    ADDPLAYER    = 0x1E,
+    TIMING       = 0x1F,
+
+    // 0x20 - 0x2D
+    PROCESS_TIME = 0x20,
+    PAGEUSER     = 0x21,
+    REMOVEPLAYER = 0x22,
+    LATENCYFUDGE = 0x23,
+    ABOUTTOEXIT  = 0x26,
+    FALLBACKHOST = 0x27,
+    ADDRESSCHANGE= 0x28,
+    PLANNODEDELETE= 0x29,  // 0x29-0x2B 复用
+    ALLCHEER     = 0x2C,
+    ABANDON_ALL  = 0x2D,
+
+    Count        = 0x2E    // 46 个事件
 };
 
 struct NetworkEvent {

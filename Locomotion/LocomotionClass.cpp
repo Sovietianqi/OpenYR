@@ -1049,3 +1049,81 @@ void LocomotionClass::Tilt_Pitch_AI()
         Owner->SetPitch(pitchAdjust);
     }
 }
+
+// ============================================================================
+// Non-const override shims (ILocomotion interface)
+// The original binary exposes both const and non-const entry points through
+// the ILocomotion vtable; forward them to the const implementations.
+// ============================================================================
+
+bool LocomotionClass::Is_Moving_Here(CoordStruct to)
+{
+    // ILocomotion exposes only a non-const entry point for this query;
+    // delegate to the existing concrete helper.
+    return IsMovingHere(to);
+}
+
+bool LocomotionClass::Will_Jump_Tracks()
+{
+    return static_cast<const LocomotionClass*>(this)->Will_Jump_Tracks();
+}
+
+bool LocomotionClass::Is_Really_Moving_Now()
+{
+    return static_cast<const LocomotionClass*>(this)->Is_Really_Moving_Now();
+}
+
+bool LocomotionClass::Is_Surfacing()
+{
+    return static_cast<const LocomotionClass*>(this)->Is_Surfacing();
+}
+
+bool LocomotionClass::Is_Powered()
+{
+    return static_cast<const LocomotionClass*>(this)->Is_Powered();
+}
+
+bool LocomotionClass::Is_Ion_Sensitive()
+{
+    return static_cast<const LocomotionClass*>(this)->Is_Ion_Sensitive();
+}
+
+bool LocomotionClass::Is_Moving_Now()
+{
+    return static_cast<const LocomotionClass*>(this)->Is_Moving_Now();
+}
+
+int32 LocomotionClass::Apparent_Speed()
+{
+    return static_cast<const LocomotionClass*>(this)->Apparent_Speed();
+}
+
+int32 LocomotionClass::Drawing_Code()
+{
+    return static_cast<const LocomotionClass*>(this)->Drawing_Code();
+}
+
+FireError LocomotionClass::Can_Fire()
+{
+    return static_cast<const LocomotionClass*>(this)->Can_Fire();
+}
+
+int32 LocomotionClass::Get_Status()
+{
+    return static_cast<const LocomotionClass*>(this)->Get_Status();
+}
+
+int32 LocomotionClass::Get_Track_Number()
+{
+    return static_cast<const LocomotionClass*>(this)->Get_Track_Number();
+}
+
+int32 LocomotionClass::Get_Track_Index()
+{
+    return static_cast<const LocomotionClass*>(this)->Get_Track_Index();
+}
+
+int32 LocomotionClass::Get_Speed_Accum()
+{
+    return static_cast<const LocomotionClass*>(this)->Get_Speed_Accum();
+}

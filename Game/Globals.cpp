@@ -109,42 +109,14 @@ int               g_VoiceVolume       = 100;
 
 // ── Object type arrays ────────────────────────────────────────────────────
 
-DynamicVectorClass<InfantryTypeClass*>*    InfantryTypeClass::Array    = nullptr;
-DynamicVectorClass<UnitTypeClass*>*        UnitTypeClass::Array        = nullptr;
-DynamicVectorClass<AircraftTypeClass*>*    AircraftTypeClass::Array    = nullptr;
-DynamicVectorClass<BuildingTypeClass*>*    BuildingTypeClass::Array    = nullptr;
-DynamicVectorClass<AnimTypeClass*>*        AnimTypeClass::Array        = nullptr;
-DynamicVectorClass<BulletTypeClass*>*      BulletTypeClass::Array      = nullptr;
-DynamicVectorClass<WarheadTypeClass*>*     WarheadTypeClass::Array     = nullptr;
-DynamicVectorClass<WeaponTypeClass*>*      WeaponTypeClass::Array      = nullptr;
 DynamicVectorClass<ParticleTypeClass*>*    ParticleTypeClass::Array    = nullptr;
-DynamicVectorClass<ParticleSystemTypeClass*>* ParticleSystemTypeClass::Array = nullptr;
-DynamicVectorClass<VoxelAnimTypeClass*>*   VoxelAnimTypeClass::Array   = nullptr;
-DynamicVectorClass<TerrainTypeClass*>*     TerrainTypeClass::Array     = nullptr;
-DynamicVectorClass<SmudgeTypeClass*>*      SmudgeTypeClass::Array      = nullptr;
-DynamicVectorClass<OverlayTypeClass*>*     OverlayTypeClass::Array     = nullptr;
-DynamicVectorClass<SuperWeaponTypeClass*>* SuperWeaponTypeClass::Array = nullptr;
 DynamicVectorClass<TiberiumClass*>*        TiberiumClass::Array        = nullptr;
 
 // ── Object instance arrays ────────────────────────────────────────────────
 
-DynamicVectorClass<InfantryClass*>*    InfantryClass::Array    = nullptr;
-DynamicVectorClass<UnitClass*>*        UnitClass::Array        = nullptr;
-DynamicVectorClass<AircraftClass*>*    AircraftClass::Array    = nullptr;
-DynamicVectorClass<BuildingClass*>*    BuildingClass::Array    = nullptr;
-DynamicVectorClass<AnimClass*>*        AnimClass::Array        = nullptr;
 DynamicVectorClass<BulletClass*>*      BulletClass::Array      = nullptr;
-DynamicVectorClass<ParticleClass*>*    ParticleClass::Array    = nullptr;
 DynamicVectorClass<ParticleSystemClass*>* ParticleSystemClass::Array = nullptr;
-DynamicVectorClass<VoxelAnimClass*>*   VoxelAnimClass::Array   = nullptr;
-DynamicVectorClass<TerrainClass*>*     TerrainClass::Array     = nullptr;
-DynamicVectorClass<SmudgeClass*>*      SmudgeClass::Array      = nullptr;
-DynamicVectorClass<OverlayClass*>*     OverlayClass::Array     = nullptr;
-DynamicVectorClass<SuperClass*>*       SuperClass::Array       = nullptr;
-DynamicVectorClass<TriggerClass*>*     TriggerClass::Array     = nullptr;
-DynamicVectorClass<TeamClass*>*        TeamClass::Array        = nullptr;
 DynamicVectorClass<ScriptClass*>*      ScriptClass::Array      = nullptr;
-DynamicVectorClass<AITriggerClass*>*   AITriggerClass::Array   = nullptr;
 DynamicVectorClass<WaveClass*>*        WaveClass::Array        = nullptr;
 DynamicVectorClass<RadSiteClass*>*     RadSiteClass::Array     = nullptr;
 

@@ -4,6 +4,7 @@
 #include <Math/CoordStruct.h>
 #include <Math/Timer.h>
 #include <IO/CRC.h>
+#include <Combat/DamageArea.h>
 #include <Scenario/ScenarioClass.h>
 
 #include <cstdlib>
@@ -330,6 +331,11 @@ CellClass* MapClass::GetCellAt(const CoordStruct& coord)
     return GetCellAt(idx);
 }
 
+CellClass* MapClass::GetCellAt(const CellStruct& cell)
+{
+    return GetCellAt(static_cast<int32>(cell.X), static_cast<int32>(cell.Y));
+}
+
 CellClass* MapClass::GetCellAt(int32 x, int32 y)
 {
     if (!IsValidCell(x, y)) return nullptr;
@@ -628,4 +634,91 @@ void MapClass::Update_Crate_Respawn()
             ++CrateCount;
         }
     }
+}
+// ============================================================================
+// Cell terrain queries — mirror the original MapClass interface used by the
+// TacticalClass / DamageArea / special-effects code paths.
+// ============================================================================
+
+LandType MapClass::GetLandType(const CellStruct& cell) const
+{
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    return (pCell != nullptr) ? pCell->Get_Land_Type() : LandType::Clear;
+}
+
+int32 MapClass::GetCellSlope(const CellStruct& cell) const
+{
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    return (pCell != nullptr) ? pCell->Get_Slope() : 0;
+}
+
+int32 MapClass::GetGroundHeight(const CoordStruct& coord) const
+{
+    CellStruct cell = CoordMath::CoordToCell(coord);
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    return (pCell != nullptr) ? pCell->Get_Ground_Height() : 0;
+}
+
+void MapClass::MarkCellOccupied(const CellStruct& cell, bool occupied)
+{
+    CellClass* pCell = GetCellAt(cell);
+    if (pCell == nullptr)
+        return;
+
+    ObjectClass* pOccupier = pCell->Get_Occupier();
+    if (occupied)
+    {
+        if (pOccupier != nullptr)
+            pCell->Add_Occupier(pOccupier);
+    }
+    else
+    {
+        if (pOccupier != nullptr)
+            pCell->Remove_Occupier(pOccupier);
+    }
+}
+
+bool MapClass::IsCellOccupied(const CellStruct& cell) const
+{
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    return (pCell != nullptr) && pCell->IsOccupied();
+}
+
+ObjectClass* MapClass::GetCellOccupier(const CellStruct& cell)
+{
+    CellClass* pCell = GetCellAt(cell);
+    return (pCell != nullptr) ? pCell->Get_Occupier() : nullptr;
+}
+
+bool MapClass::IsBridgeCell(const CellStruct& cell) const
+{
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    return (pCell != nullptr) && ((static_cast<uint32>(pCell->Flags) & static_cast<uint32>(CellFlags::Bridge)) != 0);
+}
+
+bool MapClass::IsBridgeDestroyed(const CellStruct& cell) const
+{
+    // A destroyed bridge is represented by the bridge-head cell holding a
+    // rubble/ruin overlay.  Without the overlay layer wired up yet, treat a
+    // bridge that is no longer a bridge cell as destroyed.
+    CellClass* pCell = const_cast<MapClass*>(this)->GetCellAt(cell);
+    if (pCell == nullptr)
+        return false;
+    return ((static_cast<uint32>(pCell->Flags) & static_cast<uint32>(CellFlags::Bridge)) == 0) && pCell->Has_Building();
+}
+
+void MapClass::ApplyDamageArea(const DamageArea& area)
+{
+    DamageArea::ApplyCellDamage(CoordStruct(area.X, area.Y, area.Z), area.Damage,
+                                nullptr, area.Warhead, false, nullptr);
+}
+
+void MapClass::CreateCrater(const CellStruct& cell, int32 size)
+{
+    (void)cell;
+    (void)size;
+
+    // The original creates a crater by replacing the overlay with a crater
+    // type and optionally expanding the zone.  The overlay system is not yet
+    // fully wired in this rebuild; leave a marker for future work.
 }

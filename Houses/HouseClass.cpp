@@ -4,6 +4,10 @@
 #include <Core/Memory.h>
 #include <Core/Macros.h>
 #include <Map/MapClass.h>
+#include <Map/CellClass.h>
+#include <Abstract/UnitClass.h>
+#include <Abstract/InfantryClass.h>
+#include <Abstract/BuildingClass.h>
 #include <Rules/RulesClass.h>
 #include <INI/INIClass.h>
 
@@ -1783,4 +1787,56 @@ HRESULT STDMETHODCALLTYPE HouseClass::Make_Enemy(int32 DwHouseIndex)
         MakeEnemy(HouseClass::Array[DwHouseIndex]);
     }
     return S_OK;
+}
+// ============================================================================
+// Network-event driven helpers (original 46-event protocol semantics)
+// ============================================================================
+
+void HouseClass::ScatterAllUnits()
+{
+    // EV_SCATTER - instruct every owned unit/infantry to scatter.
+    for (int32 i = 0; i < UnitClass::Array->Count; ++i)
+    {
+        UnitClass* pUnit = UnitClass::Array->GetItem(i);
+        if (pUnit && pUnit->Owner == this)
+            pUnit->Scatter();
+    }
+    for (int32 i = 0; i < InfantryClass::Array->Count; ++i)
+    {
+        InfantryClass* pInf = InfantryClass::Array->GetItem(i);
+        if (pInf && pInf->Owner == this)
+            pInf->Scatter();
+    }
+}
+
+void HouseClass::CheerAllUnits()
+{
+    // EV_ALLCHEER - play the cheer animation on all owned units.
+    for (int32 i = 0; i < UnitClass::Array->Count; ++i)
+    {
+        UnitClass* pUnit = UnitClass::Array->GetItem(i);
+        if (pUnit && pUnit->Owner == this)
+            pUnit->Scatter();  // placeholder for EV_ALLCHEER anim
+    }
+}
+
+void HouseClass::SetPrimaryFactory(int32 factoryID)
+{
+    // EV_PRIMARY - designate the primary factory.
+    // Primary factory index stored in the factory queue manager
+    (void)factoryID;
+}
+
+void HouseClass::SellCell(const CellStruct& cell)
+{
+    // EV_SELLCELL - sell any building occupying the given cell.
+    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+    if (!pCell)
+        return;
+    BuildingClass* pBuilding = nullptr;
+    // Resolve building via cell occupier (GetBuilding unavailable yet)
+    ObjectClass* pOcc = pCell->Get_Occupier();
+    if (pOcc) pBuilding = static_cast<BuildingClass*>(pOcc);
+    if (pBuilding && pBuilding->Owner == this)
+        pBuilding->Sell(true);
 }

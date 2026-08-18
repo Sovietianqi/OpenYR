@@ -30,6 +30,13 @@ struct SessionPlayer {
     int32 Latency;
     int32 DisconnectCount;
     int32 LastActive;
+    // Extended fields for the original 46-event sync protocol
+    int32 OptionsFlags;
+    int32 LastFrame;
+    int32 ProcessTime;
+    int32 LatencyFudge;
+    int32 Address;
+    bool  IsLeaving;
 };
 
 class SessionClass {
@@ -94,6 +101,10 @@ public:
     int32 GetMaxPlayers() const;
     int32 GetReadyCount() const;
     const SessionPlayer* GetPlayer(int32 playerID) const;
+    SessionPlayer* GetMutablePlayer(int32 playerID);
+    bool IsCoopGame() const;
+    void SetPendingSave(bool pending);
+    int32 MaxLatencyFudge;
     int32 GetGameSpeed() const;
     int32 GetCredits() const;
     int32 GetUnitCount() const;
@@ -170,6 +181,13 @@ public:
     bool CampaignMode;
     int32 StartingCredits;
     bool ShroudRegrows;
+    bool CoopGame;
+    bool PendingSave;
+    int32 HostID;
+
+public:
+    int32 GetHostID() const { return HostID; }
+    void SetHostPlayer(int32 hostID) { HostID = hostID; }
 };
 
 class LobbyGameClass {

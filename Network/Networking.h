@@ -125,6 +125,31 @@ public:
     void HandleRepairBuildingEvent(int32 playerID, int32 buildingID, int32 amount);
     void HandlePowerToggleEvent(int32 playerID, int32 buildingID, int32 state);
 
+    // Handlers completing the original 46-event dispatch table
+    // (jump table off_4C8114 in Networking_RespondToEvent)
+    void HandleAllyEvent(int32 playerID, int32 houseID, int32 allyFlag);
+    void HandleIdleEvent(int32 playerID);
+    void HandleScatterEvent(int32 playerID, int32 objectID);
+    void HandleOptionsEvent(int32 playerID, int32 optionsFlags);
+    void HandleGameSpeedEvent(int32 playerID, int32 speed);
+    void HandlePrimaryEvent(int32 playerID, int32 factoryID);
+    void HandleSellCellEvent(int32 playerID, int32 cellX, int32 cellY);
+    void HandlePacketTimingEvent(int32 playerID, int32 timing);
+    void HandleSaveGameEvent(int32 playerID, int32 saveSlot);
+    void HandleArchiveEvent(int32 playerID, int32 archiveSlot);
+    void HandleAddPlayerEvent(int32 playerID, int32 side, int32 color);
+    void HandleTimingEvent(int32 playerID, int32 frame);
+    void HandleProcessTimeEvent(int32 playerID, int32 processTime);
+    void HandlePageUserEvent(int32 playerID, int32 pageIndex);
+    void HandleRemovePlayerEvent(int32 playerID, int32 reason);
+    void HandleLatencyFudgeEvent(int32 playerID, int32 fudge);
+    void HandleAboutToExitEvent(int32 playerID);
+    void HandleFallbackHostEvent(int32 playerID, int32 newHostID);
+    void HandleAddressChangeEvent(int32 playerID, int32 newAddress);
+    void HandlePlanNodeDeleteEvent(int32 playerID, int32 nodeID);
+    void HandleAllCheerEvent(int32 playerID);
+    void HandleAbandonAllEvent(int32 playerID);
+
     int32 FrameLock;
     int32 LatencyCompensation;
     int32 CurrentFrame;

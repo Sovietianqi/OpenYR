@@ -29,6 +29,8 @@ SessionClass::SessionClass()
     , AIPlayers(0), ScenarioIndex(-1), TournamentMode(false)
     , BattleMode(false), CampaignMode(false)
     , StartingCredits(10000), ShroudRegrows(true)
+    , CoopGame(false), PendingSave(false)
+    , MaxLatencyFudge(500)
 {
     for (int32 i = 0; i < MAX_SESSION_PLAYERS; ++i) {
         Players[i].ID = i;
@@ -44,6 +46,12 @@ SessionClass::SessionClass()
         Players[i].Latency = 0;
         Players[i].DisconnectCount = 0;
         Players[i].LastActive = 0;
+        Players[i].OptionsFlags = 0;
+        Players[i].LastFrame = 0;
+        Players[i].ProcessTime = 0;
+        Players[i].LatencyFudge = 0;
+        Players[i].Address = 0;
+        Players[i].IsLeaving = false;
     }
 }
 
@@ -468,6 +476,20 @@ const SessionPlayer* SessionClass::GetPlayer(int32 playerID) const {
     if (playerID < 0 || playerID >= MAX_SESSION_PLAYERS) return nullptr;
     if (!Players[playerID].Connected) return nullptr;
     return &Players[playerID];
+}
+
+SessionPlayer* SessionClass::GetMutablePlayer(int32 playerID) {
+    if (playerID < 0 || playerID >= MAX_SESSION_PLAYERS) return nullptr;
+    if (!Players[playerID].Connected) return nullptr;
+    return &Players[playerID];
+}
+
+bool SessionClass::IsCoopGame() const {
+    return CoopGame;
+}
+
+void SessionClass::SetPendingSave(bool pending) {
+    PendingSave = pending;
 }
 
 int32 SessionClass::GetGameSpeed() const {

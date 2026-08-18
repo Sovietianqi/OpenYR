@@ -157,6 +157,10 @@ public:
     void Lose();
     void DestroyAll();
     bool Defeated() const;
+    void ScatterAllUnits();
+    void CheerAllUnits();
+    void SetPrimaryFactory(int32 factoryID);
+    void SellCell(const CellStruct& cell);
 
     // Building
     bool CanBuild(TechnoTypeClass* pType) const;
