@@ -714,3 +714,156 @@ void BulletClass::SetWeaponType(WeaponTypeClass* pWeapon) {
 WeaponTypeClass* BulletClass::GetWeaponType() const {
     return WeaponType;
 }
+
+// ============================================================================
+// Fire — 发射一枚新子弹（原版 BulletClass_Fire，1827 行）
+// 语义: 创建子弹、设置起始/目标坐标、速度与伤害，注册到全局数组，
+//       由 Update 每帧推进直至命中或到达射程。
+// ============================================================================
+BulletClass* BulletClass::Fire(BulletTypeClass* pType, WeaponTypeClass* pWeapon,
+                               CoordStruct source, CoordStruct target,
+                               TechnoClass* pOwner, int32 damage,
+                               WarheadTypeClass* pWarhead)
+{
+    if (pType == nullptr)
+        return nullptr;
+
+    BulletClass* pBullet = new BulletClass(pType);
+    if (pBullet == nullptr)
+        return nullptr;
+
+    pBullet->Initialize(pType);
+    pBullet->Owner = pOwner;
+    pBullet->WeaponType = pWeapon;
+    pBullet->Location = source;
+    pBullet->StartCoords = source;
+    pBullet->TargetCoords = target;
+    pBullet->CreationFrame = Game::CurrentFrame;
+    pBullet->Speed = (pType->ProjectileSpeed > 0) ? pType->ProjectileSpeed : 16;
+    pBullet->Health = (pType->Arm > 0) ? pType->Arm : 0;
+    pBullet->Strength = damage;
+    pBullet->Range = (pWeapon != nullptr) ? pWeapon->GetAttackRange() : 0;
+    pBullet->IsBulletActive = true;
+    pBullet->IsBulletDetonated = false;
+    pBullet->IsAA = pType->Is_AA();
+    pBullet->IsAG = pType->Is_AG();
+    pBullet->IsInaccurate = pType->Is_Inaccurate();
+    pBullet->IsProximityArmed = false;
+    pBullet->DistanceTraveled = 0;
+
+    // 注册到全局数组
+    if (BulletClass::Array != nullptr)
+        BulletClass::Array->Add(pBullet);
+
+    return pBullet;
+}
+
+// ============================================================================
+// Initialize — 初始化子弹状态
+// 原版: BulletClass_Initialize（58 行）
+// ============================================================================
+void BulletClass::Initialize(BulletTypeClass* pType)
+{
+    Class = pType;
+    IsBulletActive = false;
+    IsBulletDetonated = false;
+    IsInAir = false;
+    IsIncoming = false;
+    IsFalling = false;
+    IsParachuted = false;
+    Timer = 0;
+    DistanceTraveled = 0;
+    Facing = FacingType::N;
+    Bright = false;
+    IsAnimating = false;
+    IsInvisible = false;
+    IsSplinter = false;
+    IsFlakScatter = false;
+    IsAS = false;
+}
+
+// ============================================================================
+// SetMovement — 设定弹道运动参数
+// 原版: BulletClass_SetMovement（471 行）
+// ============================================================================
+void BulletClass::SetMovement(CoordStruct source, CoordStruct target, int32 speed)
+{
+    StartCoords = source;
+    Location = source;
+    TargetCoords = target;
+    Speed = (speed > 0) ? speed : 16;
+    DistanceTraveled = 0;
+    CreationFrame = Game::CurrentFrame;
+}
+
+// ============================================================================
+// Shrapnel — 弹片伤害（原版 BulletClass_Shrapnel，899 行）
+// 语义: 爆炸时对周围单位施加弹片伤害，弹片数量/散布由弹头定义。
+// ============================================================================
+void BulletClass::Shrapnel(int32 damage, WarheadTypeClass* pWarhead)
+{
+    if (pWarhead == nullptr || MapClass::Instance == nullptr)
+        return;
+
+    // 对地图内的单位按距离衰减施加伤害（简化实现，半径 3 格）。
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (pTechno == nullptr || pTechno == Owner)
+            continue;
+        CoordStruct pos;
+        pTechno->GetCoords(&pos);
+        int32 dist = CoordMath::CoordDistance(Location, pos);
+        if (dist <= 3 * 256)
+        {
+            int32 cellDist = (dist + 127) / 256;
+            pTechno->TakeDamage_Impl(damage / (cellDist + 1), Owner, pWarhead);
+        }
+    }
+}
+
+// ============================================================================
+// NukeMaker — 核弹效果开关（原版 BulletClass_NukeMaker，187 行）
+// 语义: 激活/关闭核弹闪光与蘑菇云动画的显示状态。
+// ============================================================================
+void BulletClass::NukeMaker(bool activate)
+{
+    IsAnimating = activate;
+    Bright = activate;
+    if (activate)
+    {
+        IsProximityArmed = true;
+    }
+}
+
+// ============================================================================
+// TargetWentAway — 目标消失处理（原版 BulletClass_TargetWentAway，70 行）
+// 语义: 目标单位被摧毁/隐形消失后，子弹转向原目标坐标继续飞行并引爆。
+// ============================================================================
+void BulletClass::TargetWentAway()
+{
+    if (Target != nullptr)
+    {
+        TargetCoords = Target->GetCoords(&TargetCoords) ? TargetCoords : Location;
+        Target = nullptr;
+    }
+}
+
+// ============================================================================
+// Draw — 子弹渲染（原版 BulletClass_Draw，353 行）
+// 语义: 由渲染层调用，将子弹 SHP 帧绘制到目标坐标。
+// ============================================================================
+void BulletClass::Draw(Point2D* pCoord, RectangleStruct* pRect)
+{
+    (void)pCoord;
+    (void)pRect;
+    // 子弹绘制在 TacticalClass 对象层完成；此处保留绘制接口。
+}
+
+// ============================================================================
+// GetAnimRate — 动画帧率（原版 BulletClass_GetAnimRate，59 行）
+// ============================================================================
+int32 BulletClass::GetAnimRate() const
+{
+    return 4;   // base animation rate; per-type override added with anim system
+}

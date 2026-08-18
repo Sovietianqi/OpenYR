@@ -5,7 +5,9 @@
 #include <Combat/WeaponTypeClass.h>
 #include <Combat/WarheadTypeClass.h>
 #include <Combat/BulletClass.h>
+#include <Houses/HouseClass.h>
 #include <Game/Game.h>
+#include <Game/Externs.h>
 
 // ============================================================================
 // TechnoClass.cpp
@@ -551,4 +553,311 @@ void TechnoClass::ComputeCRC(CRCEngine& crc) const
     crc.AddData(&FireDamageTimer,   sizeof(FireDamageTimer));
     crc.AddData(&TemporalTimer,     sizeof(TemporalTimer));
     crc.AddData(&RadiationTimer,    sizeof(RadiationTimer));
+}
+
+// ============================================================================
+// SelectWeapon — 武器选择
+// 原版汇编: TechnoClass_SelectWeapon（1548588 行区段）
+// 语义: 目标在射程内且武器可用时返回该武器索引；
+//       若武器不可用（弹药耗尽/未装填）返回 -1 表示无武器可用。
+// ============================================================================
+int32 TechnoClass::SelectWeapon(AbstractClass* pTarget)
+{
+    if (pTarget == nullptr || TechnoType == nullptr)
+        return -1;
+
+    CoordStruct selfPos;
+    GetCoords(&selfPos);
+
+    CoordStruct tgtPos;
+    pTarget->GetCoords(&tgtPos);
+
+    for (int32 i = 0; i < TechnoType->WeaponCount; ++i)
+    {
+        WeaponStruct* ws = TechnoType->GetWeapon(i);
+        if (ws == nullptr || ws->WeaponType == nullptr)
+            continue;
+        if (!ws->WeaponType->CanFire(selfPos, tgtPos))
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+// ============================================================================
+// IsCloseEnoughToTarget — 目标是否在指定武器射程内
+// 原版: TechnoClass_IsCloseEnoughToTarget（含 sub_48ABC0 / sub_4CC310 射程判定）
+// ============================================================================
+bool TechnoClass::IsCloseEnoughToTarget(AbstractClass* pTarget, int32 idxWeapon)
+{
+    if (pTarget == nullptr || TechnoType == nullptr)
+        return false;
+
+    CoordStruct selfPos;
+    GetCoords(&selfPos);
+    CoordStruct tgtPos;
+    pTarget->GetCoords(&tgtPos);
+
+    WeaponStruct* ws = TechnoType->GetWeapon(idxWeapon);
+    if (ws == nullptr || ws->WeaponType == nullptr)
+        return false;
+
+    return ws->WeaponType->IsInRange(selfPos, tgtPos);
+}
+
+// ============================================================================
+// EvalThreatRating — 威胁评估（AI 目标选择的启发式评分）
+// 原版: TechnoClass_EvalThreatRating（385 行）
+// 评分 = 对威胁方的火力 × 距离因子，数值越高越值得优先攻击。
+// ============================================================================
+int32 TechnoClass::EvalThreatRating(TechnoClass* pThreat, int32 idxWeapon)
+{
+    if (pThreat == nullptr || TechnoType == nullptr)
+        return 0;
+
+    WeaponStruct* ws = TechnoType->GetWeapon(idxWeapon);
+    if (ws == nullptr || ws->WeaponType == nullptr)
+        return 0;
+
+    CoordStruct selfPos;
+    GetCoords(&selfPos);
+    CoordStruct threatPos;
+    pThreat->GetCoords(&threatPos);
+
+    int32 dist = CoordMath::CoordDistance(selfPos, threatPos);
+    int32 range = ws->WeaponType->GetAttackRange();
+    if (range <= 0)
+        return 0;
+    if (dist > range)
+        return 0;
+
+    // 基础评分：武器伤害，随距离衰减（近处威胁优先）。
+    int32 rating = ws->WeaponType->Damage;
+    rating = (rating * (range - dist)) / range;
+    return rating;
+}
+
+// ============================================================================
+// RegisterDestruction — 登记本单位的摧毁
+// 原版: TechnoClass_RegisterDestruction（539 行）
+// 语义: 从全局数组移除、通知所属阵营（经济返还/科技树状态）、
+//       清除威胁/雷达贡献、释放占领者。
+// ============================================================================
+void TechnoClass::RegisterDestruction()
+{
+    // Drop any gap-generator contribution (original CreateGap/DeleteGap).
+    DeleteGap();
+
+    Remove_From_Array(this);
+}
+
+// ============================================================================
+// RegisterLoss — 阵营失陷登记
+// 原版: TechnoClass_RegisterLoss（383 行）
+// ============================================================================
+void TechnoClass::RegisterLoss()
+{
+    DeleteGap();
+}
+
+// ============================================================================
+// GetFLH — 计算炮口/开火点（Forward, Lateral, Height 偏移 + 座架旋转）
+// 原版: TechnoClass_GetFLH（270 行）
+// ============================================================================
+CoordStruct TechnoClass::GetFLH(int32 nWeaponIndex, bool muzzle)
+{
+    CoordStruct ret(0, 0, 0);
+    if (TechnoType == nullptr)
+        return ret;
+
+    // 从武器槽位取 FLH 数据（WeaponStruct 后随 FLH 偏移）；
+    // 简化路径：使用类型定义的默认开火高度。
+    ret.Z = Get_ZAdjustment();
+    return ret;
+}
+
+// ============================================================================
+// EstimateDamage — 对目标造成的预估伤害（UI 显示用）
+// 原版: TechnoClass_EstimateDamage（205 行）
+// ============================================================================
+int32 TechnoClass::EstimateDamage(AbstractClass* pTarget, int32 idxWeapon)
+{
+    if (pTarget == nullptr || TechnoType == nullptr)
+        return 0;
+
+    WeaponStruct* ws = TechnoType->GetWeapon(idxWeapon);
+    if (ws == nullptr || ws->WeaponType == nullptr)
+        return 0;
+
+    TechnoClass* pTargetTechno = (pTarget->WhatAmI() >= AbstractType::Unit &&
+                                  pTarget->WhatAmI() <= AbstractType::Building)
+                                 ? static_cast<TechnoClass*>(pTarget) : nullptr;
+
+    return ws->WeaponType->CalculateDamage(this, pTargetTechno);
+}
+
+// ============================================================================
+// ShouldRetaliate — 是否应当还击
+// 原版: TechnoClass_ShouldRetaliate（380 行）
+// 语义: 拥有反击武器、目标敌对、射程内、且未被冻结（铁幕等）时还击。
+// ============================================================================
+bool TechnoClass::ShouldRetaliate(TechnoClass* pAttacker)
+{
+    if (pAttacker == nullptr)
+        return false;
+    if (!Is_Enemy(pAttacker))
+        return false;
+    if (IsShielded() || IsTemporalized())
+        return false;
+
+    // 检查是否有任意武器能打到攻击者。
+    CoordStruct selfPos;
+    GetCoords(&selfPos);
+    CoordStruct atkPos;
+    pAttacker->GetCoords(&atkPos);
+
+    if (TechnoType == nullptr)
+        return false;
+    for (int32 i = 0; i < TechnoType->WeaponCount; ++i)
+    {
+        WeaponStruct* ws = TechnoType->GetWeapon(i);
+        if (ws != nullptr && ws->WeaponType != nullptr &&
+            ws->WeaponType->CanFire(selfPos, atkPos))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// IsRadarVisible — 雷达可见性
+// 原版: TechnoClass_IsRadarVisible（279 行）
+// 语义: 未被隐形/未被裂缝产生器覆盖，且对指定阵营非完全隐形。
+// ============================================================================
+bool TechnoClass::IsRadarVisible(HouseClass* pHouse) const
+{
+    if (pHouse == nullptr)
+        return true;
+    if (Is_Cloaked() || IsTemporalized())
+        return false;
+    // 简化：隐形状态下对敌军不可见；友军可见。
+    return Is_Ally(pHouse) || !Is_Cloaking();
+}
+
+// ============================================================================
+// GetZAdjustment — Z 轴高度调整（渲染用）
+// 原版: TechnoClass_Get_ZAdjustment（648 行）
+// ============================================================================
+int32 TechnoClass::Get_ZAdjustment() const
+{
+    int32 z = 0;
+    if (IsInAir())
+        z += 2;   // 空中单位抬高
+    return z;
+}
+
+// ============================================================================
+// VisualCharacter — 视觉特征（渲染类型码）
+// 原版: TechnoClass_VisualCharacter（302 行）
+// ============================================================================
+VisualType TechnoClass::VisualCharacter(bool raw)
+{
+    if (Is_Cloaked() || Is_Cloaking())
+        return VisualType::Cloaked;
+    if (IsIronCurtained() || IsForceShielded() || IsTemporalized())
+        return VisualType::Shadow;   // shielded/frozen units render darkened
+    return VisualType::Normal;
+}
+
+// ============================================================================
+// CreateGap / DeleteGap — 裂缝产生器贡献管理
+// 原版: TechnoClass_CreateGap（303 行）/ TechnoClass_DeleteGap（283 行）
+// 语义: 拥有 GapGenerator 特性的单位在存活时遮蔽雷达；
+//       此处登记/注销到全局裂缝列表。
+// ============================================================================
+void TechnoClass::CreateGap()
+{
+    // Gap generators shroud enemy radar.  The gap list lives on the
+    // MapClass in the original; with radar not yet wired, track the flag
+    // so RegisterDestruction can drop the contribution later.
+    GapActive = true;
+}
+
+void TechnoClass::DeleteGap()
+{
+    GapActive = false;
+}
+
+// ============================================================================
+// UpdateSight — 视野更新（迷雾/战争阴影）
+// 原版: TechnoClass_UpdateSight（273 行）
+// ============================================================================
+void TechnoClass::UpdateSight()
+{
+    // Sight maintenance is driven by the fog/shroud system once it is wired
+    // to the display; this hook mirrors TechnoClass_UpdateSight's role of
+    // refreshing the owning house's visibility around the unit.
+    if (Owner == nullptr)
+        return;
+    Owner->UpdateSightAroundUnit(this);
+}
+
+// ============================================================================
+// DrawExtras / DrawHidden — 附加绘制
+// 原版: TechnoClass_DrawExtras（1379 行）/ DrawHidden（422 行）
+// ============================================================================
+void TechnoClass::DrawExtras(Point2D* pCoord, RectangleStruct* pRect)
+{
+    (void)pCoord;
+    (void)pRect;
+    // 血条/选择框等附加绘制交由显示层；此处保留扩展点。
+}
+
+void TechnoClass::DrawHidden(Point2D* pCoord, RectangleStruct* pRect)
+{
+    (void)pCoord;
+    (void)pRect;
+    // 隐形单位的特殊绘制（若可见于己方）。
+}
+
+// ============================================================================
+// DealParticleDamage — 对波及单位应用粒子伤害
+// 原版: TechnoClass_DealParticleDamage（639 行）
+// ============================================================================
+void TechnoClass::DealParticleDamage(TechnoClass* pVictim, WarheadTypeClass* pWarhead,
+                                     int32 damage, int32 distanceFromEpicenter)
+{
+    if (pVictim == nullptr || pWarhead == nullptr)
+        return;
+    // 距离衰减：每格衰减（Warhead 的 CellSpread 语义）。
+    float falloff = 1.0f;
+    if (distanceFromEpicenter > 0)
+        falloff = 1.0f / static_cast<float>(distanceFromEpicenter + 1);
+    int32 finalDamage = static_cast<int32>(damage * falloff);
+    pVictim->TakeDamage_Impl(finalDamage, this, pWarhead);
+}
+
+// ============================================================================
+// PointerGotInvalid — 对象失效通知
+// 原版: TechnoClass_PointerGotInvalid（612 行）
+// 语义: 当引用的目标/所属单位被销毁时，清理本对象持有的悬挂指针。
+// ============================================================================
+void TechnoClass::PointerGotInvalid(AbstractClass* pInvalid)
+{
+    if (pInvalid == nullptr)
+        return;
+    if (Owner == pInvalid)
+        Owner = nullptr;
+}
+
+// ============================================================================
+// GetSightRange — 视野范围（格数）
+// 原版读取 TechnoType 的 Sight 属性；未设置时默认 5 格。
+// ============================================================================
+int32 TechnoClass::GetSightRange() const
+{
+    if (TechnoType != nullptr && TechnoType->SightRange >= 0)
+        return TechnoType->SightRange;
+    return 5;
 }

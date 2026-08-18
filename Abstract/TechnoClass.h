@@ -126,6 +126,31 @@ public:
     virtual void ComputeCRC(CRCEngine& crc) const override;
 
     // ========================================================================
+    // Combat core (mirrors TechnoClass_* in the original binary)
+    // ========================================================================
+    int32  SelectWeapon(AbstractClass* pTarget);
+    bool   IsCloseEnoughToTarget(AbstractClass* pTarget, int32 idxWeapon);
+    int32  EvalThreatRating(TechnoClass* pThreat, int32 idxWeapon);
+    int32  EstimateDamage(AbstractClass* pTarget, int32 idxWeapon);
+    bool   ShouldRetaliate(TechnoClass* pAttacker);
+    void   RegisterDestruction();
+    void   RegisterLoss();
+    CoordStruct GetFLH(int32 nWeaponIndex, bool muzzle);
+    bool   IsRadarVisible(HouseClass* pHouse) const;
+    int32  Get_ZAdjustment() const;
+    VisualType VisualCharacter(bool raw);
+    void   CreateGap();
+    void   DeleteGap();
+    void   UpdateSight();
+    void   DrawExtras(Point2D* pCoord, RectangleStruct* pRect);
+    void   DrawHidden(Point2D* pCoord, RectangleStruct* pRect);
+    void   DealParticleDamage(TechnoClass* pVictim, WarheadTypeClass* pWarhead,
+                              int32 damage, int32 distanceFromEpicenter);
+    void   PointerGotInvalid(AbstractClass* pInvalid);
+    int32  GetSightRange() const;
+    bool   GapActive;
+
+    // ========================================================================
     // TechnoClass virtuals (preserved from original header)
     // ========================================================================
     virtual bool IsVoxel() const { return false; }

@@ -158,6 +158,7 @@ public:
     void DestroyAll();
     bool Defeated() const;
     void ScatterAllUnits();
+    void UpdateSightAroundUnit(class TechnoClass* pUnit);
     void CheerAllUnits();
     void SetPrimaryFactory(int32 factoryID);
     void SellCell(const CellStruct& cell);
@@ -185,6 +186,14 @@ public:
     // Tracking
     void Tracking_Add(TechnoClass* pTechno);
     void Tracking_Remove(TechnoClass* pTechno);
+
+    // Production / loss bookkeeping (mirror HouseClass_* in the original)
+    bool BeginProductionOf(TechnoTypeClass* pType, int32 quantity = 1);
+    void RegisterTechnoLoss(TechnoClass* pTechno);
+    void AITakeover(TechnoClass* pTechno);
+    bool Can_Afford(int32 cost) const;
+    void GenerateAIBuildList();
+    int32 Get_Total_Value() const;
 
     // Registration
     void RegisterJustBuilt(TechnoTypeClass* pType);

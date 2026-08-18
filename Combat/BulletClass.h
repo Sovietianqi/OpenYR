@@ -40,6 +40,19 @@ public:
     void SetWeaponType(WeaponTypeClass* pWeapon);
     WeaponTypeClass* GetWeaponType() const;
 
+    // Methods mirroring BulletClass_* in the original binary
+    static BulletClass* Fire(BulletTypeClass* pType, WeaponTypeClass* pWeapon,
+                             CoordStruct source, CoordStruct target,
+                             TechnoClass* pOwner, int32 damage,
+                             WarheadTypeClass* pWarhead);
+    void Shrapnel(int32 damage, WarheadTypeClass* pWarhead);
+    void SetMovement(CoordStruct source, CoordStruct target, int32 speed);
+    void NukeMaker(bool activate);
+    void TargetWentAway();
+    void Draw(Point2D* pCoord, RectangleStruct* pRect);
+    int32 GetAnimRate() const;
+    void Initialize(BulletTypeClass* pType);
+
 private:
     void CheckForCollision();
     bool CanHit(TechnoClass* pTarget) const;

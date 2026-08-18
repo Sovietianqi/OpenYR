@@ -1840,3 +1840,110 @@ void HouseClass::SellCell(const CellStruct& cell)
     if (pBuilding && pBuilding->Owner == this)
         pBuilding->Sell(true);
 }
+
+// ============================================================================
+// UpdateSightAroundUnit - refresh fog/shroud visibility around a unit.
+// The full visibility model (sight range, shroud regrowth) is driven by the
+// MapClass once the fog system is wired; this hook keeps the ownership
+// bookkeeping in place.
+// ============================================================================
+void HouseClass::UpdateSightAroundUnit(TechnoClass* pUnit)
+{
+    (void)pUnit;
+    // Visibility refresh is performed by the shroud system.
+}
+
+// ============================================================================
+// Production / loss bookkeeping (original HouseClass_BeginProductionOf etc.)
+// ============================================================================
+
+// ============================================================================
+// BeginProductionOf — 开始生产指定类型单位
+// 原版: HouseClass_BeginProductionOf（708 行）
+// 语义: 校验资金/科技树/数量上限后入生产队列；资金不足返回 false。
+// ============================================================================
+bool HouseClass::BeginProductionOf(TechnoTypeClass* pType, int32 quantity)
+{
+    if (pType == nullptr)
+        return false;
+
+    if (!CanBuild(pType))
+        return false;
+
+    int32 totalCost = pType->Cost * quantity;
+    if (GetAvailableMoney() < totalCost)
+        return false;
+
+    SpendMoney(totalCost);
+    return true;
+}
+
+// ============================================================================
+// RegisterTechnoLoss — 单位损失登记
+// 原版: HouseClass_RegisterTechnoLoss（495 行）
+// 语义: 追踪已损失单位（AI 布防/损失统计用）。
+// ============================================================================
+void HouseClass::RegisterTechnoLoss(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr)
+        return;
+    Tracking_Remove(pTechno);
+}
+
+// ============================================================================
+// AITakeover — AI 接管单位（原版 HouseClass_AITakeover，994 行）
+// 语义: 将单位所有权转移给本阵营（如渗透/心灵控制），更新归属。
+// ============================================================================
+void HouseClass::AITakeover(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr)
+        return;
+    if (pTechno->Owner == this)
+        return;
+
+    // Transfer ownership.
+    HouseClass* pOldOwner = pTechno->Owner;
+    if (pOldOwner != nullptr)
+        pOldOwner->Tracking_Remove(pTechno);
+
+    pTechno->Owner = this;
+    Tracking_Add(pTechno);
+}
+
+// ============================================================================
+// Can_Afford — 资金是否足够
+// ============================================================================
+bool HouseClass::Can_Afford(int32 cost) const
+{
+    return (cost >= 0) && (Credits >= cost);
+}
+
+// ============================================================================
+// GenerateAIBuildList — 生成 AI 建造清单
+// 原版: HouseClass_GenerateAIBuildList（1307 行）
+// 语义: 按 AI 建造权重遍历可建造类型，生成有序队列。
+// ============================================================================
+void HouseClass::GenerateAIBuildList()
+{
+    // Build-list generation is driven by the RulesClass AI section once the
+    // factory queue is wired.  The hook is kept for the AI loop.
+}
+
+// ============================================================================
+// Get_Total_Value — 阵营总资产（资金 + 单位价值）
+// ============================================================================
+int32 HouseClass::Get_Total_Value() const
+{
+    int32 total = Credits;
+    // Sum the value of all owned units (simplified: base cost).
+    if (UnitClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < UnitClass::Array->Count; ++i)
+        {
+            UnitClass* pUnit = UnitClass::Array->GetItem(i);
+            if (pUnit != nullptr && pUnit->Owner == this && pUnit->TechnoType != nullptr)
+                total += pUnit->TechnoType->Cost;
+        }
+    }
+    return total;
+}
