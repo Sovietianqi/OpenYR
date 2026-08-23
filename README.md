@@ -120,7 +120,7 @@ The project is under rapid development. Design documents, API references, and a 
 
 ---
 
-中文 {#chinese}
+#中文 {#chinese}
 
 免责声明：OpenYR 是一个独立、开源的项目，仅用于教育和研究目的。本项目与 Electronic Arts Inc. 及其授权方无关，亦未经其认可或赞助。《命令与征服：尤里的复仇》及其所有相关商标均为 Electronic Arts Inc. 的财产。本项目不分发任何专有游戏资源；用户必须合法拥有原版游戏副本方可运行本引擎。
 
