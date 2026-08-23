@@ -10,6 +10,9 @@
 #include "Houses/FactoryClass.h"
 #include "Abstract/UnitClass.h"
 #include "Abstract/InfantryClass.h"
+#include "Combat/BulletClass.h"
+#include "Particles/ParticleClass.h"
+#include "Animations/AnimClass.h"
 #include "Locomotion/LocomotionClass.h"
 #include "SW/SuperClass.h"
 #include "Special/TiberiumClass.h"
@@ -302,16 +305,29 @@ void Update_Objects()
 
 void Update_Combat()
 {
-    // In the original engine:
-    //   1. Process all active bullets/projectiles
-    //   2. Check for collision between bullets and targets
-    //   3. Apply damage through warhead logic
-    //   4. Process area-of-effect damage
-    //   5. Handle weapon reload timers
-    //   6. Process targeting logic (acquire new targets)
-    //   7. Handle weapon firing sequences
-    //   8. Process death animations and cleanup
-    //   9. Process veterancy promotions
+    // Advance every in-flight projectile.  Each Update advances the
+    // bullet along its trajectory, checks for collision with the
+    // target or terrain, and detonates when it arrives.
+    if (BulletClass::Array == nullptr)
+        return;
+
+    for (int32 i = BulletClass::Array->Count - 1; i >= 0; --i)
+    {
+        BulletClass* pBullet = (*BulletClass::Array)[i];
+        if (pBullet == nullptr)
+            continue;
+
+        if (pBullet->IsBulletDetonated)
+        {
+            GameDelete(pBullet);
+            continue;
+        }
+
+        if (pBullet->IsBulletActive)
+        {
+            pBullet->Update();
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

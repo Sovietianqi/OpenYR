@@ -607,27 +607,31 @@ void InfantryClass::GetFiringCoordsFromBomb()
 {
     if (!Type) return;
 
-    // Bomb-type weapons (Crazy Ivan's bomb, demo charges, etc.) are placed
-    // at the target's position rather than fired from the infantry's muzzle.
-    // The firing coordinate for a bomb is therefore the infantry's current
-    // position (where the bomb is planted) with a small downward offset to
-    // place it at ground / object level.
-
     CoordStruct basePos = GetCoords();
 
-    // Bombs are placed at foot level (slightly below the unit centre).
     const int32 BOMB_Z_OFFSET = 16; // near ground level
 
     CoordStruct bombCoord(basePos.X, basePos.Y, basePos.Z - BOMB_Z_OFFSET);
     if (bombCoord.Z < 0) bombCoord.Z = 0;
 
-    // Trigger the C4 / bomb placement animation.
-    if (IsC4Now) {
+    // Deliver the charge: an anti-structure blast that deals one third of
+    // the building's maximum health.  The demolition charge is not a
+    // conventional projectile, so it bypasses the armour table.
+    if (IsC4Now)
+    {
         PlayAnim(Sequence::Down, false, false);
+
+        if (TargetObj != nullptr && TargetObj->WhatAmI() == AbstractType::Building)
+        {
+            BuildingClass* pTarget = static_cast<BuildingClass*>(TargetObj);
+            int32 maxHp = pTarget->GetMaxHealth();
+            int32 chargeDamage = (maxHp > 0) ? (maxHp / 3) : 100;
+            pTarget->TakeDamage(chargeDamage, this, nullptr);
+        }
+
+        IsC4Now = false;
     }
 
-    // The computed bomb placement coordinates would be cached in the
-    // reserved layout in the original binary.
     (void)bombCoord;
 }
 
@@ -812,10 +816,18 @@ void InfantryClass::StopCrawl() {
 void InfantryClass::Deploy() {
     if (!CanDeploy()) return;
     IsDeployedNow = true;
+
+    // A deployable infantry switches to its deploy-fire weapon slot while
+    // deployed (e.g. a mounted gunner that cannot move but fires further).
+    if (Type != nullptr && Type->HasDeployer && Type->WeaponCount >= 2)
+    {
+        IsUsingDeployFireWeapon = true;
+    }
 }
 
 void InfantryClass::Undeploy() {
     IsDeployedNow = false;
+    IsUsingDeployFireWeapon = false;
 }
 
 bool InfantryClass::CanDeploy() const {
