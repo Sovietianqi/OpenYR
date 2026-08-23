@@ -75,6 +75,8 @@ public:
     virtual bool ShouldCrashIt(TechnoClass* pTarget);
     virtual AbstractClass* AssignDestination(AbstractClass* pTarget);
     virtual bool AStarAttempt(const CellStruct& cell1, const CellStruct& cell2);
+    bool Find_Path(const CellStruct& start, const CellStruct& dest,
+                   DynamicVectorClass<CellStruct>& outPath);
     virtual Action MouseOverCell(CellStruct const* pCell, bool checkFog, bool ignoreForce) const;
     virtual Action MouseOverObject(ObjectClass const* pObject, bool ignoreForce) const;
     virtual void MarkAllOccupationBits(const CoordStruct& coords);

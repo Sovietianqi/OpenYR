@@ -3,6 +3,12 @@
 #include <Core/Memory.h>
 #include <Core/Macros.h>
 #include <Locomotion/LocomotionClass.h>
+#include <Abstract/UnitClass.h>
+#include <Map/MapClass.h>
+#include <Map/CellClass.h>
+#include <Game/Game.h>
+
+#include <cstdlib>
 
 // ============================================================================
 // FootClass.cpp
@@ -1204,3 +1210,92 @@ int32 Foot_BuildRetreatPath(const CoordStruct* pRecentPath, int32 recentCount,
 }
 
 } // extern "C"
+
+// ============================================================================
+// Movement helpers
+// ============================================================================
+
+bool FootClass::Set_Destination(const CoordStruct& dest)
+{
+    if (Locomotion == nullptr || MapClass::Instance == nullptr)
+        return false;
+
+    CellStruct destCell = CoordMath::CoordToCell(dest);
+    if (!Can_Enter_Cell(destCell))
+        return false;
+
+    // Route through the map when possible; fall back to a direct move.
+    UnitClass* pUnit = (WhatAmI() == AbstractType::Unit)
+                       ? static_cast<UnitClass*>(this) : nullptr;
+    if (pUnit != nullptr)
+    {
+        CoordStruct pos = GetCoords_Impl();
+        CellStruct startCell = CoordMath::CoordToCell(pos);
+
+        DynamicVectorClass<CellStruct> pathCells;
+        if (pUnit->Find_Path(startCell, destCell, pathCells) && pathCells.Count > 1)
+        {
+            Clear_Path();
+            for (int32 i = 1; i < pathCells.Count; ++i)
+            {
+                CoordStruct waypoint(static_cast<int32>(pathCells[i].X) * 256,
+                                     static_cast<int32>(pathCells[i].Y) * 256,
+                                     pos.Z);
+                Append_Path(waypoint);
+            }
+            Locomotion->Move_To(dest);
+            return true;
+        }
+    }
+
+    Set_Path(&dest, 1);
+    Locomotion->Move_To(dest);
+    return true;
+}
+
+bool FootClass::Can_Enter_Cell(const CellStruct& cell) const
+{
+    if (MapClass::Instance == nullptr || TechnoType == nullptr)
+        return false;
+    if (!MapClass::Instance->IsWithinUsableArea(cell.X, cell.Y))
+        return false;
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+    if (pCell == nullptr)
+        return false;
+
+    return pCell->PassableFor(TechnoType->MoveZone);
+}
+
+void FootClass::Scatter(const CoordStruct& from, bool ignoreMission)
+{
+    (void)ignoreMission;
+
+    if (MapClass::Instance == nullptr || Locomotion == nullptr)
+        return;
+
+    // Pick a random offset up to 2 cells away and head there, away from the
+    // source of the threat when one is supplied.
+    int32 dx = (rand() % 5) - 2;   // -2 .. +2
+    int32 dy = (rand() % 5) - 2;
+
+    CoordStruct pos = GetCoords_Impl();
+    CoordStruct dest = pos;
+    dest.X += dx * 256;
+    dest.Y += dy * 256;
+
+    if (from.X != 0 || from.Y != 0)
+    {
+        // Bias the offset away from 'from'.
+        int32 awayX = (pos.X - from.X) > 0 ? 1 : -1;
+        int32 awayY = (pos.Y - from.Y) > 0 ? 1 : -1;
+        dest.X = pos.X + awayX * 256;
+        dest.Y = pos.Y + awayY * 256;
+    }
+
+    CellStruct destCell = CoordMath::CoordToCell(dest);
+    if (Can_Enter_Cell(destCell))
+    {
+        Set_Destination(dest);
+    }
+}

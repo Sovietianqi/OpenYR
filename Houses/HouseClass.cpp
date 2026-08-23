@@ -1,4 +1,5 @@
 #include <Houses/HouseClass.h>
+#include <Houses/FactoryClass.h>
 #include <Houses/HouseTypeClass.h>
 #include <Core/Definitions.h>
 #include <Core/Memory.h>
@@ -1875,6 +1876,22 @@ bool HouseClass::BeginProductionOf(TechnoTypeClass* pType, int32 quantity)
         return false;
 
     SpendMoney(totalCost);
+
+    // Route the order into the first available factory for this type.
+    if (FactoryClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < FactoryClass::Array->Count; ++i)
+        {
+            FactoryClass* pFactory = (*FactoryClass::Array)[i];
+            if (pFactory != nullptr && pFactory->GetOwner() == this)
+            {
+                for (int32 q = 0; q < quantity; ++q)
+                    pFactory->QueueProduction(pType);
+                return true;
+            }
+        }
+    }
+
     return true;
 }
 

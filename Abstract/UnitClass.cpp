@@ -19,6 +19,9 @@
 #include <Math/Facing.h>
 
 #include <cmath>
+#include <queue>
+#include <utility>
+#include <vector>
 #include <cstdlib>
 
 // =============================================================================
@@ -725,6 +728,146 @@ bool UnitClass::AStarAttempt(const CellStruct& cell1, const CellStruct& cell2)
     return true; // Path is clear
 }
 
+bool UnitClass::Find_Path(const CellStruct& start, const CellStruct& dest,
+                          DynamicVectorClass<CellStruct>& outPath)
+{
+    outPath.Clear();
+    if (MapClass::Instance == nullptr || Type == nullptr)
+        return false;
+
+    MapClass* pMap = MapClass::Instance;
+    if (!pMap->IsWithinUsableArea(start.X, start.Y) ||
+        !pMap->IsWithinUsableArea(dest.X, dest.Y))
+    {
+        return false;
+    }
+
+    const int32 width  = pMap->MapWidth;
+    const int32 height = pMap->MapHeight;
+    const int32 total  = width * height;
+    if (total <= 0)
+        return false;
+
+    // A* state tables (reused per-call, allocated once).
+    std::vector<int32>  gScore(total, 0x7FFFFFFF);
+    std::vector<int32>  fScore(total, 0x7FFFFFFF);
+    std::vector<int32>  cameFrom(total, -1);
+    std::vector<bool>   inClosed(total, false);
+
+    const int32 startIdx = start.Y * width + start.X;
+    const int32 destIdx  = dest.Y  * width + dest.X;
+
+    auto idx = [width](int32 x, int32 y) { return y * width + x; };
+    auto heuristic = [](int32 ax, int32 ay, int32 bx, int32 by) {
+        int32 dx = abs(bx - ax);
+        int32 dy = abs(by - ay);
+        // Octile distance: diagonal moves cost ~1.414, straight moves 1.0.
+        int32 diag = dx < dy ? dx : dy;
+        int32 straight = dx + dy - 2 * diag;
+        return straight * 256 + diag * 362;   // 256 = 1.0 cell, 362 = sqrt(2)*256
+    };
+
+    MovementZone zone = Type->MoveZone;
+
+    // Open list: min-heap ordered by fScore.
+    std::priority_queue<std::pair<int32, int32>,
+                        std::vector<std::pair<int32, int32>>,
+                        std::greater<std::pair<int32, int32>>> openList;
+    gScore[startIdx] = 0;
+    fScore[startIdx] = heuristic(start.X, start.Y, dest.X, dest.Y);
+    openList.push({ fScore[startIdx], startIdx });
+
+    // Direction offsets in cell space: N, NE, E, SE, S, SW, W, NW
+    static const int8 dirDx[8] = {  0,  1,  1,  1,  0, -1, -1, -1 };
+    static const int8 dirDy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    while (!openList.empty())
+    {
+        auto [curF, cur] = openList.top();
+        openList.pop();
+        if (inClosed[cur])
+            continue;
+        if (cur == destIdx)
+            break;
+        inClosed[cur] = true;
+
+        const int32 cx = cur % width;
+        const int32 cy = cur / width;
+
+        for (int32 d = 0; d < 8; ++d)
+        {
+            int32 nx = cx + dirDx[d];
+            int32 ny = cy + dirDy[d];
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height)
+                continue;
+
+            int32 nIdx = idx(nx, ny);
+            if (inClosed[nIdx])
+                continue;
+
+            CellClass* pCell = &pMap->CellArray[nIdx];
+            if (pCell == nullptr)
+                continue;
+
+            // Diagonal corner-cut check: both orthogonal neighbours must be
+            // passable, otherwise the unit clips through walls.
+            if (d & 1)
+            {
+                CellClass* pA = &pMap->CellArray[idx(cx + dirDx[d - 1], cy + dirDy[d - 1])];
+                CellClass* pB = &pMap->CellArray[idx(cx + dirDx[(d + 1) & 7], cy + dirDy[(d + 1) & 7])];
+                if (pA == nullptr || pB == nullptr)
+                    continue;
+                if (!pA->PassableFor(zone) || !pB->PassableFor(zone))
+                    continue;
+            }
+
+            if (!pCell->PassableFor(zone))
+                continue;
+
+            // Move cost: straight 256, diagonal 362 (in 1/256 cell units),
+            // plus a terrain penalty for rough ground.
+            int32 moveCost = (d & 1) ? 362 : 256;
+            if (pCell->Get_Land_Type() == LandType::Rough ||
+                pCell->Get_Land_Type() == LandType::Weeds)
+            {
+                moveCost += 128;
+            }
+
+            int32 tentative = gScore[cur] + moveCost;
+            if (tentative < gScore[nIdx])
+            {
+                gScore[nIdx] = tentative;
+                int32 h = heuristic(nx, ny, dest.X, dest.Y);
+                fScore[nIdx] = tentative + h;
+                cameFrom[nIdx] = cur;
+                openList.push({ fScore[nIdx], nIdx });
+            }
+        }
+    }
+
+    if (gScore[destIdx] == 0x7FFFFFFF)
+        return false;   // unreachable
+
+    // Reconstruct the path (dest -> start), then reverse.
+    std::vector<int32> rev;
+    for (int32 c = destIdx; c != -1; c = cameFrom[c])
+    {
+        rev.push_back(c);
+        if (c == startIdx)
+            break;
+    }
+    if (rev.empty() || rev.back() != startIdx)
+        return false;
+
+    for (auto it = rev.rbegin(); it != rev.rend(); ++it)
+    {
+        int32 c = *it;
+        outPath.Add(CellStruct(static_cast<int16>(c % width), static_cast<int16>(c / width)));
+    }
+    return true;
+}
+
+
 // =============================================================================
 // Mouse interaction
 // =============================================================================
@@ -893,14 +1036,43 @@ void UnitClass::QueueMission(Mission mission)
 void UnitClass::MissionAttack()
 {
     SetMission(Mission::Attack);
-    if (HasTarget()) {
-        AbstractClass* pTarget = GetTarget();
-        if (pTarget) {
-            CoordStruct targetPos;
-            pTarget->GetCoords(&targetPos);
-            SetDestination(targetPos);
-        }
+    AbstractClass* pTarget = GetTarget();
+    if (pTarget == nullptr) {
+        MissionHunt();
+        return;
     }
+
+    // Select the best weapon and verify range before opening fire.
+    int32 weaponIdx = SelectWeapon(pTarget);
+    if (weaponIdx < 0) {
+        MissionMove();
+        return;
+    }
+
+    if (!IsCloseEnoughToTarget(pTarget, weaponIdx)) {
+        // Approach while keeping the target locked.
+        CoordStruct targetPos;
+        pTarget->GetCoords(&targetPos);
+        SetDestination(targetPos);
+        return;
+    }
+
+    // Face the target and fire.
+    CoordStruct targetPos;
+    pTarget->GetCoords(&targetPos);
+    CoordStruct myPos = GetCoords();
+
+    double ang = std::atan2(static_cast<double>(targetPos.Y - myPos.Y),
+                            static_cast<double>(targetPos.X - myPos.X));
+    int32 oct = static_cast<int32>(std::round(ang / (3.14159265358979323846 / 4.0)));
+    oct = (oct + 8) % 8;
+    static const DirType octDir[8] = {
+        DirType::E, DirType::SE, DirType::S, DirType::SW,
+        DirType::W, DirType::NW, DirType::N, DirType::NE
+    };
+    SetFacing(Facing::FromDirType(octDir[oct]));
+
+    Fire_Impl(pTarget, weaponIdx);
 }
 
 void UnitClass::MissionMove()

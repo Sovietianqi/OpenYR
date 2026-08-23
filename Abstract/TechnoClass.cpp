@@ -363,10 +363,21 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
     FireRechargeTimer = effectiveROF;
     LastFireFrame = currentFrame;
 
-    // In the full binary this would allocate a BulletClass, set its
-    // target / source / weapon pointers, and add it to the global bullet
-    // array.  The standalone build has no bullet pool yet.
-    return nullptr;
+    // Launch the projectile.  GetFLH supplies the muzzle coordinate; the
+    // warhead comes from the weapon slot.
+    WeaponStruct* ws = TechnoType->GetWeapon(nWeaponIndex);
+    WeaponTypeClass* pWeapon = (ws != nullptr) ? ws->WeaponType : nullptr;
+    if (pWeapon == nullptr || pWeapon->Projectile == nullptr)
+        return nullptr;
+
+    CoordStruct source = GetFLH(nWeaponIndex, true);
+
+    CoordStruct targetPos;
+    pTarget->GetCoords(&targetPos);
+
+    return BulletClass::Fire(
+        pWeapon->Projectile, pWeapon, source, targetPos, this,
+        pWeapon->Damage, pWeapon->Warhead);
 }
 
 // ============================================================================
@@ -382,19 +393,45 @@ bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
     if (damage <= 0)
         return false;
 
-    // The full binary looks up the warhead's Verses[Armor] entry and
-    // scales the damage.  The standalone build applies the raw damage.
-    Health -= damage;
+    // Invulnerability from Iron Curtain / Force Shield / temporal freeze.
+    if (IsShielded() || IsTemporalized())
+        return false;
 
-    // Award experience to the attacker if one was supplied.
-    if (pSource != nullptr)
+    // Apply the warhead's armor-class multiplier (Verses[]).
+    int32 finalDamage = damage;
+    if (pWarhead != nullptr && TechnoType != nullptr)
     {
-        // The full binary dispatches through HouseClass::GainExperience.
+        float mult = pWarhead->GetDamageMultiplier(static_cast<int32>(TechnoType->Get_Armor()));
+        finalDamage = static_cast<int32>(damage * mult + 0.5f);
     }
+    if (finalDamage <= 0)
+        return false;
+
+    Health -= finalDamage;
 
     if (Health <= 0)
     {
         Health = 0;
+
+        // Award experience to the killer (elite promotion handled by
+        // Update_Veterancy on the killer's next update).
+        if (pSource != nullptr)
+        {
+            TechnoClass* pKiller = (pSource->WhatAmI() >= AbstractType::Unit &&
+                                    pSource->WhatAmI() <= AbstractType::Building)
+                                   ? static_cast<TechnoClass*>(pSource) : nullptr;
+            if (pKiller != nullptr && pKiller != this)
+            {
+                int32 bounty = (TechnoType != nullptr) ? (TechnoType->Cost / 10) : 10;
+                pKiller->Experience += bounty;
+            }
+        }
+
+        // Notify the owning house so credits/tech-tree stay consistent.
+        if (Owner != nullptr)
+            Owner->RegisterTechnoLoss(this);
+
+        RegisterDestruction();
         Destroyed(pSource);
         return true;
     }

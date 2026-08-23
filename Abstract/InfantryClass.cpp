@@ -942,7 +942,48 @@ Mission InfantryClass::GetQueuedMission() const {
 }
 
 void InfantryClass::MissionAttack() {
+    AbstractClass* pTarget = TargetObj;
+    if (pTarget == nullptr) {
+        MissionHunt();
+        return;
+    }
+
+    // Select the best weapon for this target.
+    int32 weaponIdx = SelectWeapon(pTarget);
+    if (weaponIdx < 0) {
+        // No weapon in range; close the distance or give up.
+        MissionMove();
+        return;
+    }
+
+    if (!IsCloseEnoughToTarget(pTarget, weaponIdx)) {
+        MissionMove();
+        return;
+    }
+
+    // Face the target and open fire.
+    CoordStruct targetPos;
+    pTarget->GetCoords(&targetPos);
+    CoordStruct myPos = GetCoords();
+
+    // Convert the world delta to an 8-way facing (N=0, NE=16, ...).
+    double ang = std::atan2(static_cast<double>(targetPos.Y - myPos.Y),
+                            static_cast<double>(targetPos.X - myPos.X));
+    int32 oct = static_cast<int32>(std::round(ang / (3.14159265358979323846 / 4.0)));
+    oct = (oct + 8) % 8;
+    static const DirType octDir[8] = {
+        DirType::E, DirType::SE, DirType::S, DirType::SW,
+        DirType::W, DirType::NW, DirType::N, DirType::NE
+    };
+    SetFacing(Facing::FromDirType(octDir[oct]));
+
     IsAiming = true;
+    IsFiringNow = true;
+
+    BulletClass* pBullet = Fire_Impl(pTarget, weaponIdx);
+    if (pBullet != nullptr) {
+        // Fire succeeded; reload gating is handled inside Fire_Impl.
+    }
 }
 
 void InfantryClass::MissionMove() {

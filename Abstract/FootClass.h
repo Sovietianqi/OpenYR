@@ -92,6 +92,13 @@ public:
     // ========================================================================
     virtual void ComputeCRC(CRCEngine& crc) const override;
 
+    // ========================================================================
+    // Movement helpers
+    // ========================================================================
+    bool Set_Destination(const CoordStruct& dest);
+    bool Can_Enter_Cell(const CellStruct& cell) const;
+    void Scatter(const CoordStruct& from, bool ignoreMission = true);
+
     DirStruct PrimaryFacing;
     DirStruct TurretFacing;
     int32 Pitch;

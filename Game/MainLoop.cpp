@@ -6,6 +6,7 @@
 #include "Rendering/GScreenClass.h"
 #include "Rendering/TacticalClass.h"
 #include "Rendering/DisplayClass.h"
+#include "Houses/FactoryClass.h"
 
 #include "Core/Definitions.h"
 #include "Core/Macros.h"
@@ -276,17 +277,17 @@ void Update_AI()
 
 void Update_Objects()
 {
-    // In the original engine:
-    //   1. Iterate over all active game objects
-    //   2. Call ObjectClass::Update() for each object
-    //   3. Process object state machines
-    //   4. Handle object creation and destruction queues
-    //   5. Process object cleanup for destroyed objects
-    //   6. Update object visibility
-    //
-    // Object updates are distributed across frames to maintain
-    // consistent performance.  The update order is:
-    //   Buildings → Infantry → Vehicles → Aircraft → Projectiles
+    // Advance every production factory (build progress, completion,
+    // queue draining).
+    if (FactoryClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < FactoryClass::Array->Count; ++i)
+        {
+            FactoryClass* pFactory = (*FactoryClass::Array)[i];
+            if (pFactory != nullptr)
+                pFactory->Update();
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
