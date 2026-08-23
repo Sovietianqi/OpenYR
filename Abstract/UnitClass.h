@@ -48,6 +48,7 @@ public:
     virtual void StopHarvesting();
     virtual void HarvestTiberium();
     virtual void EnterTiberiumField();
+    virtual void DumpTiberium();
 
     // ========================================================================
     // UnitClass specific virtuals - driving, harvesting, turret

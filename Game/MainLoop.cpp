@@ -7,6 +7,8 @@
 #include "Rendering/TacticalClass.h"
 #include "Rendering/DisplayClass.h"
 #include "Houses/FactoryClass.h"
+#include "SW/SuperClass.h"
+#include "Special/TiberiumClass.h"
 
 #include "Core/Definitions.h"
 #include "Core/Macros.h"
@@ -364,14 +366,17 @@ void Update_Particles()
 
 void Update_SuperWeapons()
 {
-    // In the original engine:
-    //   1. Iterate over all houses with superweapons
-    //   2. Update superweapon charge timers
-    //   3. Process superweapon targeting
-    //   4. Handle superweapon activation
-    //   5. Process superweapon effects (nuke, lightning, etc.)
-    //   6. Update superweapon UI indicators
-    //   7. Handle superweapon cooldown
+    // Drive the charge / ready / firing state machine of every super
+    // weapon in the game.
+    if (SuperClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < SuperClass::Array->Count; ++i)
+        {
+            SuperClass* pSW = (*SuperClass::Array)[i];
+            if (pSW != nullptr)
+                pSW->Update();
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -380,15 +385,12 @@ void Update_SuperWeapons()
 
 void Update_SpecialEffects()
 {
-    // In the original engine:
-    //   1. Process screen shake effects
-    //   2. Process palette effects (lightning flashes, etc.)
-    //   3. Process map reveal effects
-    //   4. Process weather effects
-    //   5. Process ion storm effects
-    //   6. Process chrono effects
-    //   7. Process iron curtain effects
-    //   8. Process mind control effects
+    // Grow / spread tiberium deposits every frame.
+    TiberiumManagerClass* pMgr = TiberiumManagerClass::GetInstance();
+    if (pMgr != nullptr)
+    {
+        pMgr->UpdateAllTiberium();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

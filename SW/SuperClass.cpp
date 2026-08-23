@@ -522,6 +522,14 @@ void SuperClass::Update() {
 
     case SWState::Ready:
         CheckAvailability();
+        // AI-controlled houses fire automatically once charged.
+        if (State == SWState::Ready && Owner->IsHumanPlayer == false)
+        {
+            if (IsAutoFire() && CanTargetCell(TargetCell))
+            {
+                Launch(TargetCell);
+            }
+        }
         break;
 
     case SWState::Firing:

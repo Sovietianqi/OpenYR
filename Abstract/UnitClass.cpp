@@ -2096,3 +2096,44 @@ int32 UnitClass::Size() const
 {
     return sizeof(UnitClass);
 }
+
+void UnitClass::DumpTiberium()
+{
+    // Unload the harvested tiberium at a refinery and convert it to
+    // credits.  The unload completes when the harvester is back at the
+    // refinery's bay; the value is credited once per full dump.
+    if (HarvestAmount <= 0)
+    {
+        IsDumpingTiberium = false;
+        return;
+    }
+
+    if (Owner == nullptr)
+    {
+        IsDumpingTiberium = false;
+        HarvestAmount = 0;
+        return;
+    }
+
+    // Credit the refined value.  The per-cell tiberium value is looked up
+    // from the map (the harvest weight of one unit of the deposit); each
+    // point of load is worth that many credits.
+    int32 cellValue = 10;   // fallback: one unit of tiberium ≈ $10
+    if (MapClass::Instance != nullptr)
+    {
+        CoordStruct pos = GetCoords();
+        CellStruct cellPos = Math::CoordToCell(pos);
+        CellClass* pCell = MapClass::Instance->GetCellAt(cellPos);
+        if (pCell != nullptr && pCell->TiberiumValue > 0)
+            cellValue = pCell->TiberiumValue;
+    }
+    int32 credits = HarvestAmount * cellValue;
+    Owner->GiveMoney(credits);
+
+    HarvestAmount = 0;
+    TotalTiberiumValue = 0;
+    IsDumpingTiberium = false;
+
+    // Resume harvesting on the next AI tick.
+    IsHarvestingTiberium = true;
+}
