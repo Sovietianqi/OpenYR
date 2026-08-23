@@ -18,6 +18,7 @@ public:
 
     virtual Layer In_Which_Layer() override { return Layer::Ground; }
     virtual bool Process() override;
+    void blah();
     virtual void Move_To(CoordStruct to) override;
     virtual void Stop_Moving() override;
     virtual bool Is_Moving_Now() override { return IsDriving; }

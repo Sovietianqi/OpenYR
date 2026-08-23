@@ -176,84 +176,110 @@ void DriveLocomotionClass::Do_Turret_Turn(DirStruct coord)
 
 bool DriveLocomotionClass::Process()
 {
+    blah();
+    return IsDriving || IsRotating || IsRocking;
+}
+
+void DriveLocomotionClass::blah()
+{
     if (IsLocked) {
-        return false;
+        return;
     }
 
     if (!IsDriving && !IsRotating && !IsRocking) {
-        return false;
+        return;
     }
 
     if (IsRocking) {
-        return ProcessRocking();
+        ProcessRocking();
+        return;
     }
 
-    if (IsRotating && !IsDriving) {
+    // --- turning (stationary or while driving) ---
+    if (IsRotating) {
         RotateTowards(TargetFacing);
         if (CurrentFacing.Value == TargetFacing.Value) {
             IsRotating = false;
         }
-        return true;
+        if (!IsDriving) {
+            return;
+        }
+    }
+
+    if (!IsDriving) {
+        return;
+    }
+
+    // --- terrain speed modifiers ---
+    Movement_AI();
+
+    // --- speed with acceleration curve & arrival deceleration ---
+    float targetSpeed = static_cast<float>(Speed) * SpeedPercentage * MovementSpeed;
+
+    int32 distToDest = CurrentCoord.DistanceFrom(Destination);
+    const int32 decelDist = (Speed > 0) ? Speed * 4 : 256;
+    if (distToDest < decelDist) {
+        float factor = static_cast<float>(distToDest) / static_cast<float>(decelDist);
+        targetSpeed *= (0.4f + 0.6f * factor);
+    }
+
+    int32 effectiveSpeed = static_cast<int32>(targetSpeed);
+    if (effectiveSpeed <= 0) {
+        effectiveSpeed = 1;
+    }
+
+    // --- slope adaptation: climbing slows down, descending speeds up ---
+    if (MapClass::Instance != nullptr) {
+        CellStruct curCell = CoordMath::CoordToCell(CurrentCoord);
+        CellStruct dstCell = CoordMath::CoordToCell(Destination);
+        CellClass* pCur = MapClass::Instance->GetCellAt(curCell);
+        CellClass* pDst = MapClass::Instance->GetCellAt(dstCell);
+        if (pCur != nullptr && pDst != nullptr) {
+            int32 heightDelta = pDst->Get_Ground_Height() - pCur->Get_Ground_Height();
+            if (heightDelta > 0) {
+                effectiveSpeed = (effectiveSpeed * 3) / 4;   // uphill penalty
+            } else if (heightDelta < 0) {
+                effectiveSpeed = (effectiveSpeed * 5) / 4;   // downhill bonus
+            }
+        }
+    }
+
+    SpeedAccum += effectiveSpeed;
+
+    // --- step-based movement ---
+    const int32 stepThreshold = 256;
+    while (SpeedAccum >= stepThreshold && IsDriving) {
+        SpeedAccum -= stepThreshold;
+
+        UpdatePosition();
+
+        // Track animation advances with each step (tread rendering).
+        ++TrackNumber;
+
+        int32 dist = CurrentCoord.DistanceFrom(Destination);
+        if (dist <= effectiveSpeed) {
+            CurrentCoord = Destination;
+            if (Owner) {
+                Owner->SetCoords(CurrentCoord);
+            }
+            IsDriving = false;
+            IsMoving = false;
+            break;
+        }
     }
 
     if (IsDriving) {
-        if (IsRotating) {
-            RotateTowards(TargetFacing);
-            if (CurrentFacing.Value == TargetFacing.Value) {
-                IsRotating = false;
-            }
+        CheckCrush();
+        CheckBridge();
+
+        if (IsOnBridge() && CheckBridge()) {
+            SlopeTimer.Update(effectiveSpeed);
         }
 
-        if (!IsRotating) {
-            CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
-            CellStruct destCell = CoordMath::CoordToCell(Destination);
-
-            Movement_AI();
-
-            int32 effectiveSpeed = static_cast<int32>(
-                static_cast<float>(Speed) * SpeedPercentage * MovementSpeed);
-
-            if (effectiveSpeed <= 0) {
-                effectiveSpeed = 1;
-            }
-
-            SpeedAccum += effectiveSpeed;
-
-            int32 stepThreshold = 256;
-            while (SpeedAccum >= stepThreshold && IsDriving) {
-                SpeedAccum -= stepThreshold;
-
-                UpdatePosition();
-
-                int32 dist = CurrentCoord.DistanceFrom(Destination);
-                if (dist <= effectiveSpeed) {
-                    CurrentCoord = Destination;
-                    if (Owner) {
-                        Owner->SetCoords(CurrentCoord);
-                    }
-                    IsDriving = false;
-                    IsMoving = false;
-                    break;
-                }
-            }
-
-            if (IsDriving) {
-                CheckCrush();
-                CheckBridge();
-
-                if (IsOnBridge() && CheckBridge()) {
-                    SlopeTimer.Update(effectiveSpeed);
-                }
-            }
-        }
+        Tilt_Pitch_AI();
     }
-
-    if (IsDriving && Owner) {
-        Owner->SetSequence(Sequence::Walk);
-    }
-
-    return IsDriving || IsRotating || IsRocking;
 }
+
 
 // ============================================================================
 // UpdatePosition - Moves the vehicle toward its destination.
@@ -266,6 +292,17 @@ void DriveLocomotionClass::UpdatePosition()
             static_cast<float>(Speed) * SpeedPercentage * MovementSpeed);
 
         CurrentCoord = VectorMath::MoveTowards(CurrentCoord, Destination, effectiveSpeed);
+
+        // Ground the vehicle on the terrain height below.  Hovering units
+        // keep altitude but never sink beneath the terrain.
+        if (MapClass::Instance != nullptr) {
+            int32 groundZ = MapClass::Instance->GetGroundHeight(CurrentCoord);
+            if (!IsHovering) {
+                CurrentCoord.Z = groundZ;
+            } else if (CurrentCoord.Z < groundZ) {
+                CurrentCoord.Z = groundZ;
+            }
+        }
 
         if (Owner) {
             Owner->SetCoords(CurrentCoord);

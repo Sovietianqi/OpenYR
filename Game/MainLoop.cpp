@@ -6,7 +6,11 @@
 #include "Rendering/GScreenClass.h"
 #include "Rendering/TacticalClass.h"
 #include "Rendering/DisplayClass.h"
+#include "Rendering/RadarClass.h"
 #include "Houses/FactoryClass.h"
+#include "Abstract/UnitClass.h"
+#include "Abstract/InfantryClass.h"
+#include "Locomotion/LocomotionClass.h"
 #include "SW/SuperClass.h"
 #include "Special/TiberiumClass.h"
 
@@ -316,15 +320,37 @@ void Update_Combat()
 
 void Update_Locomotion()
 {
-    // In the original engine:
-    //   1. Iterate over all mobile objects
-    //   2. Call LocomotionClass::Update() for each
-    //   3. Process pathfinding updates
-    //   4. Handle movement along waypoints
-    //   5. Process unit formation movement
-    //   6. Handle collision avoidance
-    //   7. Update facing direction
-    //   8. Process terrain-based movement modifiers
+    // Drive the per-frame movement update of every ground/water unit.
+    // FootClass::Locomotion->Process() dispatches into the concrete
+    // locomotion's main loop (DriveLocomotionClass::blah etc.).
+    if (UnitClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < UnitClass::Array->Count; ++i)
+        {
+            UnitClass* pUnit = (*UnitClass::Array)[i];
+            if (pUnit == nullptr)
+                continue;
+
+            LocomotionClass* pLoco = pUnit->Get_Locomotion();
+            if (pLoco != nullptr)
+                pLoco->Process();
+        }
+    }
+
+    // Infantry and other foot types share the same locomotion interface.
+    if (InfantryClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < InfantryClass::Array->Count; ++i)
+        {
+            InfantryClass* pInf = (*InfantryClass::Array)[i];
+            if (pInf == nullptr)
+                continue;
+
+            LocomotionClass* pLoco = pInf->Get_Locomotion();
+            if (pLoco != nullptr)
+                pLoco->Process();
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -402,12 +428,13 @@ void Update_Radar()
     if (TheRadar == nullptr)
         return;
 
-    // In the original engine:
-    //   1. Update radar visibility
-    //   2. Re-render radar surface if needed
-    //   3. Process radar events (clicks)
-    //   4. Handle radar jamming updates
-    //   5. Update spy-plane radar sweep
+    // 1. Update power/availability state (jamming, spy effects are
+    //    folded into the availability check by the radar itself).
+    TheRadar->Update();
+
+    // 2. Re-render the radar surface when the map or object set changed;
+    //    Draw() is cheap when nothing is dirty.
+    TheRadar->Draw();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

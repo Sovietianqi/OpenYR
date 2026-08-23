@@ -3,6 +3,7 @@
 #include <Combat/WarheadTypeClass.h>
 #include <Combat/WeaponTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
+#include <Abstract/BuildingClass.h>
 #include <Map/MapClass.h>
 #include <Map/CellClass.h>
 #include <Houses/HouseClass.h>
@@ -1044,9 +1045,7 @@ void InfantryClass::MissionHarvest() {
     }
 }
 
-void InfantryClass::MissionCapture() {
-    IsAiming = true;
-}
+
 
 void InfantryClass::MissionEnter() {
     IsBoarding = true;
@@ -2743,10 +2742,7 @@ void InfantryClass::Infiltrate(BuildingClass* pBuilding) {
     if (!CanInfiltrate()) return;
 }
 
-void InfantryClass::CaptureBuilding(BuildingClass* pBuilding) {
-    if (!pBuilding) return;
-    if (!CanCaptureBuilding()) return;
-}
+
 
 void InfantryClass::Detach_Target() {
     TargetObj = nullptr;
@@ -2804,4 +2800,143 @@ HRESULT InfantryClass::GetClassID(CLSID* pClassID) {
 void InfantryClass::TakeDamage(int32 damage, ObjectClass* source, WarheadTypeClass* warhead) {
     TechnoClass* pSource = reinterpret_cast<TechnoClass*>(source);
     TakeDamage(damage, pSource, warhead);
+}
+// ============================================================================
+// DoAction - action-code dispatcher.  Validates preconditions for each
+// action and either starts the corresponding mission or performs the action
+// immediately.  Returns false when the action cannot be carried out.
+// ============================================================================
+bool InfantryClass::DoAction(Action action, AbstractClass* pTarget, CellStruct* pCell)
+{
+    switch (action)
+    {
+        case Action::Move:
+        {
+            if (pCell != nullptr)
+            {
+                CoordStruct dest = CoordMath::CellToCoord(*pCell);
+                if (!Can_Enter_Cell(*pCell))
+                    return false;
+                SetTarget(nullptr);
+                QueueMission(Mission::Move);
+                return true;
+            }
+            return false;
+        }
+
+        case Action::Attack:
+        {
+            if (pTarget == nullptr)
+                return false;
+            if (pTarget->WhatAmI() < AbstractType::Unit || pTarget->WhatAmI() > AbstractType::Building)
+                return false;
+            TechnoClass* pTechno = static_cast<TechnoClass*>(pTarget);
+            if (!Is_Enemy(pTechno))
+                return false;
+            SetTarget(pTarget);
+            QueueMission(Mission::Attack);
+            return true;
+        }
+
+        case Action::Capture:
+        {
+            if (pTarget->WhatAmI() != AbstractType::Building || !CanCaptureBuilding())
+                return false;
+            BuildingClass* pBuilding = static_cast<BuildingClass*>(pTarget);
+                return false;
+            SetTarget(pBuilding);
+            QueueMission(Mission::Capture);
+            return true;
+        }
+
+        case Action::Enter:
+        {
+            if (pTarget == nullptr)
+                return false;
+            SetTarget(pTarget);
+            QueueMission(Mission::Enter);
+            return true;
+        }
+
+        case Action::Deploy:
+        {
+            if (!CanDeploy())
+                return false;
+            Deploy();
+            return true;
+        }
+
+        case Action::Harvest:
+        {
+            QueueMission(Mission::Harvest);
+            return true;
+        }
+
+        case Action::Guard:
+        {
+            QueueMission(Mission::Guard);
+            return true;
+        }
+
+        case Action::Scatter:
+        {
+            Scatter();
+            return true;
+        }
+
+        default:
+            break;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// MissionCapture - engineer capture: approach the building, enter it and
+// flip ownership.  The capture completes when the infantry is close enough
+// to the building's foundation cell.
+// ============================================================================
+void InfantryClass::MissionCapture()
+{
+    if (TargetObj == nullptr || TargetObj->WhatAmI() != AbstractType::Building)
+    {
+        MissionHunt();
+        return;
+    }
+    BuildingClass* pBuilding = static_cast<BuildingClass*>(TargetObj);
+
+    // Close enough: perform the capture.
+    CoordStruct myPos = GetCoords();
+    CoordStruct bldPos = pBuilding->GetCoords();
+
+    int32 dist = CoordMath::CoordDistance(myPos, bldPos);
+    if (dist <= 2 * 256)
+    {
+        CaptureBuilding(pBuilding);
+        QueueMission(Mission::Stop);
+        return;
+    }
+
+    // Approach the building.
+    IsAiming = true;
+    MissionMove();
+}
+
+// ============================================================================
+// CaptureBuilding - flip the building's ownership to this infantry's house.
+// ============================================================================
+void InfantryClass::CaptureBuilding(BuildingClass* pBuilding)
+{
+    if (!pBuilding)
+        return;
+    if (!CanCaptureBuilding())
+        return;
+
+    HouseClass* pNewOwner = Owner;
+    if (pNewOwner == nullptr)
+        return;
+
+    pBuilding->OnCaptured(pNewOwner);
+    IsAiming = false;
+    IsFiringNow = false;
 }

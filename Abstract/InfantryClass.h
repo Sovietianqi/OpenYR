@@ -87,6 +87,7 @@ public:
     virtual bool HasTarget() const;
     virtual void SetMission(Mission mission);
     virtual Mission GetMission() const;
+    virtual bool DoAction(Action action, AbstractClass* pTarget, CellStruct* pCell);
     virtual void QueueMission(Mission mission);
     virtual Mission GetQueuedMission() const;
     virtual void MissionAttack();
