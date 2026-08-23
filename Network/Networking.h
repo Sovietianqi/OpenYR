@@ -150,6 +150,16 @@ public:
     void HandleAllCheerEvent(int32 playerID);
     void HandleAbandonAllEvent(int32 playerID);
 
+    // FrameSync retransmission (original "Resending framesync")
+    void ResendSyncFrame(int32 playerID);
+
+    // NAT traversal (original NET_PORT_PROBE / NET_PORT_UNREACHABLE)
+    void SendPortProbe();
+    void HandlePortProbe(int32 playerID, int32 port);
+    void HandlePortUnreachable(int32 playerID);
+    void UpdateNATStatus();
+    int32 GetLocalPort() const;
+
     int32 FrameLock;
     int32 LatencyCompensation;
     int32 CurrentFrame;

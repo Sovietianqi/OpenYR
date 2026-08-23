@@ -122,6 +122,7 @@ public:
     virtual void Disconnect() = 0;
     virtual bool IsConnected() const;
     virtual uint32 GetAddress() const;
+    virtual int32 GetLocalPort() const { return 0; }
 
     void SetTimeout(int32 timeoutMs);
     int32 GetTimeout() const;
@@ -249,6 +250,8 @@ public:
     void SetRemoteAddress(uint32 address, uint16 port);
     void UpdateUDPConnection();
     bool HasTimedOut() const;
+
+    virtual int32 GetLocalPort() const override { return static_cast<int32>(LocalPort); }
 
     uint32 RemoteAddress;
     uint16 RemotePort;

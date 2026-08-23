@@ -963,8 +963,32 @@ void NetworkingClass::ProcessSync() {
     if (!IsNetworkGame || !GameRunning) return;
 
     // Send periodic sync frames
-    if (CurrentFrame % SyncInterval == 0 && IsHost) {
+    const bool bSyncTick = (CurrentFrame % SyncInterval == 0);
+    if (bSyncTick && IsHost) {
         SendSyncFrame();
+
+        // Retransmission: a peer whose confirmed frame lags behind by more
+        // than two sync intervals receives the frame again.
+        const int32 lagThreshold = SyncInterval * 2;
+        for (int32 i = 0; i < MAX_SESSION_PLAYERS; ++i)
+        {
+            SessionPlayer* pPlayer = SessionClass::GetInstance()
+                ? SessionClass::GetInstance()->GetMutablePlayer(i) : nullptr;
+            if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->IsAI)
+                continue;
+            if ((CurrentFrame - pPlayer->LastFrame) > lagThreshold)
+            {
+                ResendSyncFrame(i);
+            }
+        }
+    }
+
+    // NAT liveness: probe every 5 seconds and expire silent peers.
+    static int32 s_ProbeTick = 0;
+    if ((++s_ProbeTick % 300) == 0)   // 5 seconds at 60 fps
+    {
+        SendPortProbe();
+        UpdateNATStatus();
     }
 
     // Check for frame advance
@@ -1396,6 +1420,14 @@ void NetworkingClass::HandleAddressChangeEvent(int32 playerID, int32 newAddress)
     if (playerID < 0 || playerID >= MAX_PLAYERS) return;
     SessionPlayer* pPlayer = SessionClass::GetInstance() ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
     if (pPlayer) pPlayer->Address = newAddress;
+
+    // The endpoint channel doubles as the NAT probe: peers advertise their
+    // external port here so the host can translate replies.  A value that
+    // is not a plausible port is a corrupted packet and is ignored.
+    if (newAddress > 0 && newAddress <= 65535)
+    {
+        HandlePortProbe(playerID, newAddress);
+    }
 }
 
 void NetworkingClass::HandlePlanNodeDeleteEvent(int32 playerID, int32 nodeID) {
@@ -1416,4 +1448,130 @@ void NetworkingClass::HandleAbandonAllEvent(int32 playerID) {
         house->IsDefeated = true;
         house->IsWinner = false;
     }
+}
+
+// ============================================================================
+// FrameSync retransmission
+// ============================================================================
+void NetworkingClass::ResendSyncFrame(int32 playerID)
+{
+    // Re-broadcast the last sync frame to a lagging peer.  The host keeps
+    // the latest queued sync packet and pushes it again when a player's
+    // confirmed frame falls behind the running frame by more than a
+    // threshold (the original "Resending framesync" path).
+    if (!IsHost || SyncQueue.Count == 0)
+        return;
+
+    const NetworkEvent& lastSync = SyncQueue[SyncQueue.Count - 1];
+    if (playerID >= 0)
+    {
+        // Targeted resend: only the lagging peer needs the frame.
+        SessionPlayer* pPlayer = SessionClass::GetInstance()
+            ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+        if (pPlayer == nullptr || !pPlayer->Connected)
+            return;
+
+        NetworkEvent resend = lastSync;
+        resend.PlayerID = playerID;
+        SendEventToPlayer(resend, playerID);
+    }
+}
+
+// ============================================================================
+// NAT traversal
+// ============================================================================
+void NetworkingClass::SendPortProbe()
+{
+    // Broadcast our local port so every peer can learn our external
+    // endpoint.  If the NAT has translated our port, peers see the
+    // translated value in the packet header and record it for replies.
+    if (!IsNetworkGame || !GameRunning)
+        return;
+
+    NetworkEvent probe;
+    probe.Type = NetworkEventType::ADDRESSCHANGE;   // 0x28 - endpoint channel
+    probe.Frame = CurrentFrame;
+    probe.PlayerID = -1;
+    probe.Value1 = GetLocalPort();
+    probe.Value2 = 0;
+    probe.Value3 = 0;
+    probe.Value4 = 0;
+    probe.CRC = 0;
+    BroadcastEvent(probe);
+}
+
+void NetworkingClass::HandlePortProbe(int32 playerID, int32 port)
+{
+    if (playerID < 0 || playerID >= MAX_SESSION_PLAYERS)
+        return;
+
+    // Sanity check: a real UDP port lives in 1..65535.  Port 0 or values
+    // beyond the valid range indicate a corrupt or hostile packet.
+    if (port <= 0 || port > 65535)
+        return;
+
+    SessionPlayer* pPlayer = SessionClass::GetInstance()
+        ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer == nullptr || !pPlayer->Connected)
+        return;
+
+    // Record the peer's (possibly NAT-translated) port and stamp the
+    // arrival time so the liveness check can expire it.
+    pPlayer->Port = port;
+    pPlayer->PortLastProbeTime = static_cast<int32>(SystemTimer::GetTime());
+    pPlayer->IsPortReachable = true;
+}
+
+void NetworkingClass::HandlePortUnreachable(int32 playerID)
+{
+    if (playerID < 0 || playerID >= MAX_SESSION_PLAYERS)
+        return;
+
+    SessionPlayer* pPlayer = SessionClass::GetInstance()
+        ? SessionClass::GetInstance()->GetMutablePlayer(playerID) : nullptr;
+    if (pPlayer == nullptr)
+        return;
+
+    // Mark the peer unreachable; the next successful probe clears it.
+    pPlayer->IsPortReachable = false;
+}
+
+void NetworkingClass::UpdateNATStatus()
+{
+    if (!IsNetworkGame || !GameRunning)
+        return;
+
+    if (SessionClass::GetInstance() == nullptr)
+        return;
+
+    const int32 now = static_cast<int32>(SystemTimer::GetTime());
+
+    for (int32 i = 0; i < SessionClass::GetInstance()->GetPlayerCount(); ++i)
+    {
+        SessionPlayer* pPlayer = SessionClass::GetInstance()->GetMutablePlayer(i);
+        if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->IsAI)
+            continue;
+
+        // A peer that has not sent a probe in 40 seconds is presumed to be
+        // behind a firewall or an expired NAT mapping.
+        if (pPlayer->PortLastProbeTime > 0 &&
+            (now - pPlayer->PortLastProbeTime) > 40000)
+        {
+            pPlayer->IsPortReachable = false;
+        }
+    }
+}
+
+int32 NetworkingClass::GetLocalPort() const
+{
+    // The socket layer owns the actual local endpoint; expose the bound
+    // port of the first live UDP connection, otherwise a placeholder.
+    ConnectionManager* pMgr = ConnectionManager::GetInstance();
+    if (pMgr != nullptr && pMgr->GetConnectionCount() > 0)
+    {
+        ConnectionClass* pConn = pMgr->GetConnection(0);
+        if (pConn != nullptr)
+            return pConn->GetLocalPort();
+    }
+    return 0;
 }

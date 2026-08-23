@@ -51,7 +51,10 @@ SessionClass::SessionClass()
         Players[i].ProcessTime = 0;
         Players[i].LatencyFudge = 0;
         Players[i].Address = 0;
+        Players[i].Port = 0;
+        Players[i].PortLastProbeTime = 0;
         Players[i].IsLeaving = false;
+        Players[i].IsPortReachable = true;
     }
 }
 

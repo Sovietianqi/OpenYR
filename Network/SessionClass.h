@@ -36,7 +36,10 @@ struct SessionPlayer {
     int32 ProcessTime;
     int32 LatencyFudge;
     int32 Address;
+    int32 Port;
+    int32 PortLastProbeTime;
     bool  IsLeaving;
+    bool  IsPortReachable;
 };
 
 class SessionClass {
