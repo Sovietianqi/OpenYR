@@ -11,6 +11,10 @@
 #include "Abstract/UnitClass.h"
 #include "Abstract/InfantryClass.h"
 #include "Combat/BulletClass.h"
+#include "Houses/HouseClass.h"
+#include "AI/TeamTypeClass.h"
+#include "AI/TeamClass.h"
+#include "AI/AITriggerTypeClass.h"
 #include "Particles/ParticleClass.h"
 #include "Animations/AnimClass.h"
 #include "Locomotion/LocomotionClass.h"
@@ -264,20 +268,74 @@ void Update_Network()
 
 void Update_AI()
 {
-    // In the original engine:
-    //   1. Iterate over all AI-controlled houses
-    //   2. Run base building logic
-    //   3. Run unit production logic
-    //   4. Run attack planning logic
-    //   5. Run defense planning logic
-    //   6. Run harvesting logic
-    //   7. Process AI triggers
-    //   8. Process AI team scripts
-    //   9. Run skirmish AI behaviors
-    //
-    // The AI update is throttled — not every house is processed
-    // every frame.  Houses are distributed across frames to avoid
-    // performance spikes.
+    // 1. Advance every formed team (all houses, human and AI alike) so
+    //    their scripts and movement keep executing.
+    if (TeamClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < TeamClass::Array->Count; ++i)
+        {
+            TeamClass* pTeam = (*TeamClass::Array)[i];
+            if (pTeam != nullptr)
+                pTeam->Update();
+        }
+    }
+
+    // AI triggers are re-evaluated on a fixed cadence (15 frames) rather
+    // than every frame, mirroring the original AI tick behaviour.
+    static int32 s_AITick = 0;
+    if ((++s_AITick % 15) != 0)
+        return;
+
+    if (AITriggerTypeClass::Array == nullptr)
+        return;
+
+    // 2. For every AI house, walk the trigger table and launch the attack
+    //    wave bound to any trigger whose conditions are satisfied.
+    for (int32 h = 0; h < HouseClass::ArrayCount; ++h)
+    {
+        HouseClass* pHouse = HouseClass::Array[h];
+        if (pHouse == nullptr || pHouse->IsHumanPlayer)
+            continue;
+
+        // Resolve the primary enemy once per house.
+        HouseClass* pTarget = nullptr;
+        for (int32 th = 0; th < HouseClass::ArrayCount; ++th)
+        {
+            HouseClass* pOther = HouseClass::Array[th];
+            if (pOther != nullptr && pOther != pHouse && !pHouse->IsAlliedWith(pOther))
+            {
+                pTarget = pOther;
+                break;
+            }
+        }
+
+        for (int32 t = 0; t < AITriggerTypeClass::Array->Count; ++t)
+        {
+            AITriggerTypeClass* pTrigger = (*AITriggerTypeClass::Array)[t];
+            if (pTrigger == nullptr || !pTrigger->IsEnabled)
+                continue;
+            if (pHouse->TechLevel < pTrigger->TechLevel)
+                continue;
+            if (pTrigger->Weight_Current < pTrigger->Weight_Minimum)
+                continue;
+
+            if (pTrigger->ConditionMet(pHouse, pTarget, false))
+            {
+                TeamTypeClass* pWave = (pTrigger->Team1 != nullptr) ? pTrigger->Team1 : pTrigger->Team2;
+                if (pWave != nullptr && TeamClass::Array != nullptr)
+                {
+                    TeamClass* pTeam = new TeamClass(pWave, pHouse, 0);
+                    if (pTeam != nullptr)
+                        TeamClass::Array->Add(pTeam);
+                }
+                pTrigger->RegisterSuccess();
+            }
+            else
+            {
+                pTrigger->RegisterFailure();
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

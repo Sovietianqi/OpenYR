@@ -5,6 +5,7 @@
 #include "FactoryClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Abstract/BuildingClass.h"
+#include "../Abstract/BuildingTypeClass.h"
 #include "../Abstract/TechnoTypeClass.h"
 #include "../Abstract/UnitClass.h"
 #include "../Abstract/UnitTypeClass.h"
@@ -309,6 +310,22 @@ void FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
                 pAircraft->Type = static_cast<AircraftTypeClass*>(pType);
                 pAircraft->Owner = Owner;
                 pAircraft->SetCoords(exitCoord);
+            }
+            break;
+        }
+        case AbstractType::BuildingType:
+        {
+            // Buildings are placed at the exit cell of the constructing
+            // yard; the foundation is registered and the structure becomes
+            // live immediately.  (Animated construction overlay is handled
+            // by the animation layer once a construction anim is attached.)
+            BuildingClass* pBuilding = new BuildingClass(Owner);
+            if (pBuilding != nullptr)
+            {
+                pBuilding->Type = static_cast<BuildingTypeClass*>(pType);
+                pBuilding->Owner = Owner;
+                pBuilding->SetCoords(exitCoord);
+                pBuilding->Place(true);
             }
             break;
         }
