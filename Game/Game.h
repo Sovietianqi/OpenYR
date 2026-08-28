@@ -201,6 +201,10 @@ public:
     static void BeginLoad();
     static void EndLoad();
 
+    // ── Save/Load Entry Points ──────────────────────────────────────────
+    static bool SaveGame(const char* pFilename);
+    static bool LoadGame(const char* pFilename);
+
     // ── Debug / Dev ─────────────────────────────────────────────────────
     static void ToggleDebugInfo();
     static bool IsDebugInfoVisible();

@@ -125,6 +125,10 @@ public:
     // ========================================================================
     virtual void ComputeCRC(CRCEngine& crc) const override;
 
+    // Per-instance serialization for the save-game stream.
+    void Save(class SaveGameClass& saver) const;
+    void Load(class LoadGameClass& loader);
+
     // ========================================================================
     // Combat core (mirrors TechnoClass_* in the original binary)
     // ========================================================================

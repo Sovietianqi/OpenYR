@@ -6,6 +6,7 @@
 #include <Combat/WarheadTypeClass.h>
 #include <Combat/BulletClass.h>
 #include <Houses/HouseClass.h>
+#include <Game/SaveGameClass.h>
 #include <Game/Game.h>
 #include <Game/Externs.h>
 
@@ -897,4 +898,92 @@ int32 TechnoClass::GetSightRange() const
     if (TechnoType != nullptr && TechnoType->SightRange >= 0)
         return TechnoType->SightRange;
     return 5;
+}
+
+
+// ============================================================================
+// Per-instance serialization (mirrors the ComputeCRC field set so the
+// save stream and the sync CRC stay in lockstep).
+// ============================================================================
+void TechnoClass::Save(SaveGameClass& saver) const
+{
+    // Ownership is stored as the owning house's array index so the stream
+    // is position independent; -1 encodes "no owner".
+    int32 ownerIndex = -1;
+    if (Owner != nullptr)
+    {
+        for (int32 i = 0; i < HouseClass::ArrayCount; ++i)
+        {
+            if (HouseClass::Array[i] == Owner)
+            {
+                ownerIndex = i;
+                break;
+            }
+        }
+    }
+
+    CoordStruct pos;
+    GetCoords(&pos);
+
+    saver.Write(ownerIndex);
+    saver.Write(pos.X);
+    saver.Write(pos.Y);
+    saver.Write(pos.Z);
+    saver.Write(Health);
+    saver.Write(MaxHealth);
+    saver.Write(VeterancyLevel);
+    saver.Write(Experience);
+    saver.Write(static_cast<int32>(CloakState));
+    saver.Write(static_cast<int32>(CloakAlpha));
+    saver.Write(FireRechargeTimer);
+    saver.Write(CloakTimer);
+    saver.Write(static_cast<int8>(RepairActive ? 1 : 0));
+    saver.Write(RepairRate);
+    saver.Write(IronCurtainTimer);
+    saver.Write(ForceShieldTimer);
+}
+
+void TechnoClass::Load(LoadGameClass& loader)
+{
+    int32 ownerIndex = -1;
+    int32 posX = 0, posY = 0, posZ = 0;
+
+    loader.Read(ownerIndex);
+    loader.Read(posX);
+    loader.Read(posY);
+    loader.Read(posZ);
+    loader.Read(Health);
+    loader.Read(MaxHealth);
+    loader.Read(VeterancyLevel);
+    loader.Read(Experience);
+
+    int32 cloakState = 0;
+    int32 cloakAlpha = 0;
+    loader.Read(cloakState);
+    loader.Read(cloakAlpha);
+    CloakState = static_cast<CloakStateEnum>(cloakState);
+    CloakAlpha = static_cast<uint8>(cloakAlpha);
+
+    loader.Read(FireRechargeTimer);
+    loader.Read(CloakTimer);
+
+    int8 repairActive = 0;
+    loader.Read(repairActive);
+    RepairActive = (repairActive != 0);
+
+    loader.Read(RepairRate);
+    loader.Read(IronCurtainTimer);
+    loader.Read(ForceShieldTimer);
+
+    if (ownerIndex >= 0 && ownerIndex < HouseClass::ArrayCount)
+        Owner = HouseClass::Array[ownerIndex];
+    else
+        Owner = nullptr;
+
+    // Position restore is the responsibility of the concrete subclass
+    // (FootClass/AircraftClass/BuildingClass own their SetCoords entry);
+    // the streamed coordinates are kept for the subclass loader.
+    (void)posX;
+    (void)posY;
+    (void)posZ;
 }

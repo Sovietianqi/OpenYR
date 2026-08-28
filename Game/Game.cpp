@@ -3,6 +3,9 @@
 #include "Core/Definitions.h"
 #include "Core/Macros.h"
 #include "Core/Memory.h"
+#include "Houses/HouseClass.h"
+#include "Game/SaveGameClass.h"
+#include "IO/CCFileClass.h"
 
 // ── Platform Detection ────────────────────────────────────────────────────
 #if !defined(PLATFORM_WINDOWS) && !defined(PLATFORM_LINUX)
@@ -1092,4 +1095,146 @@ int Game::GetFPS()
 {
     if (FrameDelay == 0) return 60;
     return 1000 / static_cast<int>(FrameDelay);
+}
+// ============================================================================
+// SaveGame - write the current mission state to a file.
+// ============================================================================
+bool Game::SaveGame(const char* pFilename)
+{
+    if (pFilename == nullptr || pFilename[0] == '\0')
+        return false;
+    if (IsSaving() || IsLoadingSave())
+        return false;
+
+    CCFileClass file(pFilename);
+    if (!file.Open(1))   // FM_WRITE
+        return false;
+
+    BeginSave();
+
+    SaveGameClass saver(&file);
+    if (!saver.IsOpen())
+    {
+        file.Close();
+        EndSave();
+        return false;
+    }
+
+    // Header: magic, version, frame counter, random seed.
+    saver.WriteHeader(SaveGameVersion, CurrentFrame, static_cast<int32>(Seed));
+
+    // Global state: frame count (kept separately for forward compat).
+    saver.Write(static_cast<int32>(CurrentFrame));
+
+    // House table: each house's persistent flags and treasury.
+    int32 houseCount = 0;
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i)
+    {
+        if (HouseClass::Array[i] != nullptr)
+            ++houseCount;
+    }
+    saver.Write(houseCount);
+
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i)
+    {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr)
+            continue;
+
+        saver.Write(i);
+        saver.Write(static_cast<int8>(pHouse->IsHumanPlayer ? 1 : 0));
+        saver.Write(static_cast<int8>(pHouse->IsDefeated ? 1 : 0));
+        saver.Write(static_cast<int8>(pHouse->IsWinner ? 1 : 0));
+        saver.Write(pHouse->Credits);
+    }
+
+    file.Close();
+
+    EndSave();
+    return true;
+}
+
+// ============================================================================
+// LoadGame - restore mission state from a file.
+// ============================================================================
+bool Game::LoadGame(const char* pFilename)
+{
+    if (pFilename == nullptr || pFilename[0] == '\0')
+        return false;
+    if (IsSaving() || IsLoadingSave())
+        return false;
+
+    CCFileClass file(pFilename);
+    if (!file.Open(0))   // FM_READ
+        return false;
+
+    BeginLoad();
+
+    LoadGameClass loader(&file);
+    if (!loader.IsOpen())
+    {
+        file.Close();
+        EndLoad();
+        return false;
+    }
+
+    int32 version = 0;
+    int32 frame = 0;
+    int32 seed = 0;
+
+    if (!loader.ReadHeader(version, frame, seed))
+    {
+        file.Close();
+        EndLoad();
+        return false;
+    }
+
+    if (!IsSaveVersionCompatible(version))
+    {
+        file.Close();
+        EndLoad();
+        return false;
+    }
+
+    // Restore the random generator so the deterministic stream matches
+    // the saved game's expectations.
+    Random_Seed(static_cast<unsigned int>(seed));
+    CurrentFrame = frame;
+
+    // House table.
+    int32 houseCount = 0;
+    if (!loader.Read(houseCount))
+    {
+        file.Close();
+        EndLoad();
+        return false;
+    }
+
+    for (int32 i = 0; i < houseCount; ++i)
+    {
+        int32  houseIndex = 0;
+        int8   isHuman = 0;
+        int8   isDefeated = 0;
+        int8   isWinner = 0;
+        int32  credits = 0;
+
+        loader.Read(houseIndex);
+        loader.Read(isHuman);
+        loader.Read(isDefeated);
+        loader.Read(isWinner);
+        loader.Read(credits);
+
+        HouseClass* pHouse = HouseClass::GetHouseByIndex(houseIndex);
+        if (pHouse == nullptr)
+            continue;
+
+        pHouse->IsHumanPlayer = (isHuman != 0);
+        pHouse->IsDefeated = (isDefeated != 0);
+        pHouse->IsWinner = (isWinner != 0);
+        pHouse->Credits = credits;
+    }
+
+    file.Close();
+    EndLoad();
+    return true;
 }
