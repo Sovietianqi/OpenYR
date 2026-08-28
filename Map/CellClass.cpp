@@ -1,4 +1,7 @@
 #include "CellClass.h"
+#include <vector>
+#include <queue>
+#include <utility>
 #include "../Abstract/ObjectClass.h"
 #include "../Abstract/BuildingClass.h"
 #include "../Abstract/UnitClass.h"
@@ -692,4 +695,180 @@ void CellClass::Unshroud() {
     SetFlag(CellFlags::Revealed, true);
     SetFlag(CellFlags::Explored, true);
     SetFlag(CellFlags::Fogged, false);
+}
+
+// ============================================================================
+// Hierarchical pathfinding
+// ============================================================================
+bool CellClass::Pathfinding_Hierarchical(const CellStruct& from, const CellStruct& to,
+                                         DynamicVectorClass<CellStruct>& outPath,
+                                         MovementZone zone)
+{
+    outPath.Clear();
+
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr || pMap->CellArray == nullptr)
+        return false;
+
+    const int32 width  = pMap->MapWidth;
+    const int32 height = pMap->MapHeight;
+    if (width <= 0 || height <= 0)
+        return false;
+
+    // Block abstraction: 8x8 cells per block.
+    static const int32 BLOCK = 8;
+    const int32 bw = (width  + BLOCK - 1) / BLOCK;
+    const int32 bh = (height + BLOCK - 1) / BLOCK;
+
+    const int32 fromBX = from.X / BLOCK;
+    const int32 fromBY = from.Y / BLOCK;
+    const int32 toBX   = to.X / BLOCK;
+    const int32 toBY   = to.Y / BLOCK;
+
+    if (fromBX == toBX && fromBY == toBY)
+    {
+        // Same block: nothing for the abstraction layer to decide; the
+        // per-cell search handles it.
+        return false;
+    }
+
+    // Representative cell per block: the first passable cell inside the
+    // block, used as the connection point for the abstract graph.
+    struct BlockNode {
+        int32 RepX;
+        int32 RepY;
+        bool  HasRep;
+        int32 G;
+        int32 F;
+        int32 CameFrom;
+        bool  Closed;
+    };
+
+    const int32 blockCount = bw * bh;
+    std::vector<BlockNode> nodes(blockCount);
+    for (int32 by = 0; by < bh; ++by)
+    {
+        for (int32 bx = 0; bx < bw; ++bx)
+        {
+            BlockNode& n = nodes[by * bw + bx];
+            n.RepX = -1;
+            n.RepY = -1;
+            n.HasRep = false;
+            n.G = 0x7FFFFFFF;
+            n.F = 0x7FFFFFFF;
+            n.CameFrom = -1;
+            n.Closed = false;
+
+            // Scan the block for a passable representative cell.
+            for (int32 y = by * BLOCK; y < (by + 1) * BLOCK && !n.HasRep; ++y)
+            {
+                for (int32 x = bx * BLOCK; x < (bx + 1) * BLOCK && !n.HasRep; ++x)
+                {
+                    if (x >= width || y >= height)
+                        continue;
+                    CellClass* pCell = &pMap->CellArray[y * width + x];
+                    if (pCell != nullptr && pCell->PassableFor(zone))
+                    {
+                        n.RepX = x;
+                        n.RepY = y;
+                        n.HasRep = true;
+                    }
+                }
+            }
+        }
+    }
+
+    const int32 startIdx = fromBY * bw + fromBX;
+    const int32 goalIdx  = toBY * bw + toBX;
+    if (!nodes[startIdx].HasRep || !nodes[goalIdx].HasRep)
+        return false;
+
+    auto blockDist = [](int32 ax, int32 ay, int32 bx, int32 by) {
+        int32 dx = (bx > ax) ? (bx - ax) : (ax - bx);
+        int32 dy = (by > ay) ? (by - ay) : (ay - by);
+        int32 diag = (dx < dy) ? dx : dy;
+        int32 straight = dx + dy - 2 * diag;
+        return straight * 256 + diag * 362;
+    };
+
+    // A* over the block graph (8-way).
+    std::priority_queue<std::pair<int32, int32>,
+                        std::vector<std::pair<int32, int32>>,
+                        std::greater<std::pair<int32, int32>>> openList;
+
+    nodes[startIdx].G = 0;
+    nodes[startIdx].F = blockDist(fromBX, fromBY, toBX, toBY);
+    openList.push({ nodes[startIdx].F, startIdx });
+
+    static const int8 ddx[8] = {  0,  1,  1,  1,  0, -1, -1, -1 };
+    static const int8 ddy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    while (!openList.empty())
+    {
+        auto [curF, cur] = openList.top();
+        openList.pop();
+        if (nodes[cur].Closed)
+            continue;
+        if (cur == goalIdx)
+            break;
+        nodes[cur].Closed = true;
+
+        const int32 cx = cur % bw;
+        const int32 cy = cur / bw;
+
+        for (int32 d = 0; d < 8; ++d)
+        {
+            int32 nx = cx + ddx[d];
+            int32 ny = cy + ddy[d];
+            if (nx < 0 || ny < 0 || nx >= bw || ny >= bh)
+                continue;
+
+            int32 nIdx = ny * bw + nx;
+            if (nodes[nIdx].Closed || !nodes[nIdx].HasRep)
+                continue;
+
+            // Diagonal corner-cut check at the block level: the two
+            // orthogonal neighbour blocks must also be reachable.
+            if (d & 1)
+            {
+                int32 aIdx = (cy + ddy[d - 1]) * bw + (cx + ddx[d - 1]);
+                int32 bIdx = (cy + ddy[(d + 1) & 7]) * bw + (cx + ddx[(d + 1) & 7]);
+                if (!nodes[aIdx].HasRep || !nodes[bIdx].HasRep)
+                    continue;
+            }
+
+            int32 moveCost = (d & 1) ? 362 : 256;
+            int32 tentative = nodes[cur].G + moveCost;
+            if (tentative < nodes[nIdx].G)
+            {
+                nodes[nIdx].G = tentative;
+                nodes[nIdx].F = tentative + blockDist(nx, ny, toBX, toBY);
+                nodes[nIdx].CameFrom = cur;
+                openList.push({ nodes[nIdx].F, nIdx });
+            }
+        }
+    }
+
+    if (nodes[goalIdx].G == 0x7FFFFFFF)
+        return false;   // no abstract route
+
+    // Emit the abstract waypoint chain: start cell, each traversed block's
+    // representative cell, and the destination.
+    std::vector<int32> rev;
+    for (int32 c = goalIdx; c != -1; c = nodes[c].CameFrom)
+    {
+        rev.push_back(c);
+        if (c == startIdx)
+            break;
+    }
+
+    outPath.Add(from);
+    for (auto it = rev.rbegin(); it != rev.rend(); ++it)
+    {
+        const BlockNode& n = nodes[*it];
+        outPath.Add(CellStruct(static_cast<int16>(n.RepX), static_cast<int16>(n.RepY)));
+    }
+    outPath.Add(to);
+
+    return true;
 }

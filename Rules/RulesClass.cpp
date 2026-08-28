@@ -175,7 +175,6 @@ RulesClass::RulesClass()
     , Paratrooper(nullptr), EliteFlashTimer(0)
     , ChronoDelay(0), ChronoReinfDelay(0), ChronoDistanceFactor(0)
     , ChronoTrigger(false), ChronoMinimumDelay(0), ChronoRangeMinimum(0)
-    , SecretSum(0)
     , AlliedDisguise(nullptr), SovietDisguise(nullptr), ThirdDisguise(nullptr)
     , SpyPowerBlackout(0), SpyMoneyStealPercent(0.0f), AttackCursorOnDisguise(false)
     , AIMinorSuperReadyPercent(0.0f), AISafeDistance(0)
@@ -350,7 +349,6 @@ void RulesClass::Read_File(CCINIClass* pINI)
     Read_Radiation(pINI);
     Read_ElevationModel(pINI);
     Read_WallModel(pINI);
-    Read_Difficulty(pINI);
     Read_Colors(pINI);
     Read_ColorAdd(pINI);
     Read_General(pINI);
@@ -376,7 +374,6 @@ void RulesClass::Read_File(CCINIClass* pINI)
     Read_LandCharacteristics(pINI);
     Read_IQ(pINI);
     Read_JumpjetControls(pINI);
-    Read_Difficulties(pINI);
     Read_Movies(pINI);
     Read_AdvancedCommandBar(pINI);
     Read_HarvesterRules(pINI);
@@ -624,45 +621,6 @@ void RulesClass::Read_WallModel(CCINIClass* pINI)
     WallBuildSpeedCoefficient = pINI->ReadDouble(section, "WallBuildSpeedCoefficient", WallBuildSpeedCoefficient);
 }
 
-// ============================================================================
-// Read_Difficulty - [Difficulty] section
-// ============================================================================
-
-void RulesClass::Read_Difficulty(CCINIClass* pINI)
-{
-    if (!pINI) return;
-    const char* section = "Difficulty";
-
-    Easy.Firepower     = pINI->ReadDouble(section, "EasyFirepower", Easy.Firepower);
-    Easy.GroundSpeed   = pINI->ReadDouble(section, "EasyGroundSpeed", Easy.GroundSpeed);
-    Easy.AirSpeed      = pINI->ReadDouble(section, "EasyAirSpeed", Easy.AirSpeed);
-    Easy.Armor         = pINI->ReadDouble(section, "EasyArmor", Easy.Armor);
-    Easy.ROF           = pINI->ReadDouble(section, "EasyROF", Easy.ROF);
-    Easy.Cost          = pINI->ReadDouble(section, "EasyCost", Easy.Cost);
-    Easy.BuildTime     = pINI->ReadDouble(section, "EasyBuildTime", Easy.BuildTime);
-    Easy.RepairDelay   = pINI->ReadDouble(section, "EasyRepairDelay", Easy.RepairDelay);
-    Easy.BuildDelay    = pINI->ReadDouble(section, "EasyBuildDelay", Easy.BuildDelay);
-
-    Normal.Firepower   = pINI->ReadDouble(section, "NormalFirepower", Normal.Firepower);
-    Normal.GroundSpeed = pINI->ReadDouble(section, "NormalGroundSpeed", Normal.GroundSpeed);
-    Normal.AirSpeed    = pINI->ReadDouble(section, "NormalAirSpeed", Normal.AirSpeed);
-    Normal.Armor       = pINI->ReadDouble(section, "NormalArmor", Normal.Armor);
-    Normal.ROF         = pINI->ReadDouble(section, "NormalROF", Normal.ROF);
-    Normal.Cost        = pINI->ReadDouble(section, "NormalCost", Normal.Cost);
-    Normal.BuildTime   = pINI->ReadDouble(section, "NormalBuildTime", Normal.BuildTime);
-    Normal.RepairDelay = pINI->ReadDouble(section, "NormalRepairDelay", Normal.RepairDelay);
-    Normal.BuildDelay  = pINI->ReadDouble(section, "NormalBuildDelay", Normal.BuildDelay);
-
-    Difficult.Firepower   = pINI->ReadDouble(section, "DifficultFirepower", Difficult.Firepower);
-    Difficult.GroundSpeed = pINI->ReadDouble(section, "DifficultGroundSpeed", Difficult.GroundSpeed);
-    Difficult.AirSpeed    = pINI->ReadDouble(section, "DifficultAirSpeed", Difficult.AirSpeed);
-    Difficult.Armor       = pINI->ReadDouble(section, "DifficultArmor", Difficult.Armor);
-    Difficult.ROF         = pINI->ReadDouble(section, "DifficultROF", Difficult.ROF);
-    Difficult.Cost        = pINI->ReadDouble(section, "DifficultCost", Difficult.Cost);
-    Difficult.BuildTime   = pINI->ReadDouble(section, "DifficultBuildTime", Difficult.BuildTime);
-    Difficult.RepairDelay = pINI->ReadDouble(section, "DifficultRepairDelay", Difficult.RepairDelay);
-    Difficult.BuildDelay  = pINI->ReadDouble(section, "DifficultBuildDelay", Difficult.BuildDelay);
-}
 
 // ============================================================================
 // Read_Colors - [Colors] section
@@ -823,7 +781,6 @@ void RulesClass::Read_General(CCINIClass* pINI)
     ChronoMinimumDelay             = pINI->ReadInteger(section, "ChronoMinimumDelay", ChronoMinimumDelay);
     ChronoRangeMinimum             = pINI->ReadInteger(section, "ChronoRangeMinimum", ChronoRangeMinimum);
 
-    SecretSum                      = pINI->ReadInteger(section, "SecretSum", SecretSum);
     EliteFlashTimer                = pINI->ReadInteger(section, "EliteFlashTimer", EliteFlashTimer);
 
     IronCurtainDuration            = pINI->ReadInteger(section, "IronCurtainDuration", IronCurtainDuration);
@@ -1563,55 +1520,7 @@ void RulesClass::Read_JumpjetControls(CCINIClass* pINI)
 // Read_Difficulties - [Difficulties] section
 // ----------------------------------------------------------------------------
 
-void RulesClass::Read_Difficulties(CCINIClass* pINI)
-{
-    if (!pINI) return;
-    const char* section = "Difficulties";
 
-    // Double multipliers (also read in Read_Difficulty from [Difficulty])
-    Easy.Firepower      = pINI->ReadDouble(section, "EasyFirepower", Easy.Firepower);
-    Easy.GroundSpeed    = pINI->ReadDouble(section, "EasyGroundSpeed", Easy.GroundSpeed);
-    Easy.AirSpeed       = pINI->ReadDouble(section, "EasyAirSpeed", Easy.AirSpeed);
-    Easy.Armor          = pINI->ReadDouble(section, "EasyArmor", Easy.Armor);
-    Easy.ROF            = pINI->ReadDouble(section, "EasyROF", Easy.ROF);
-    Easy.Cost           = pINI->ReadDouble(section, "EasyCost", Easy.Cost);
-    Easy.BuildTime      = pINI->ReadDouble(section, "EasyBuildTime", Easy.BuildTime);
-    Easy.RepairDelay    = pINI->ReadDouble(section, "EasyRepairDelay", Easy.RepairDelay);
-    Easy.BuildDelay     = pINI->ReadDouble(section, "EasyBuildDelay", Easy.BuildDelay);
-
-    Normal.Firepower    = pINI->ReadDouble(section, "NormalFirepower", Normal.Firepower);
-    Normal.GroundSpeed  = pINI->ReadDouble(section, "NormalGroundSpeed", Normal.GroundSpeed);
-    Normal.AirSpeed     = pINI->ReadDouble(section, "NormalAirSpeed", Normal.AirSpeed);
-    Normal.Armor        = pINI->ReadDouble(section, "NormalArmor", Normal.Armor);
-    Normal.ROF          = pINI->ReadDouble(section, "NormalROF", Normal.ROF);
-    Normal.Cost         = pINI->ReadDouble(section, "NormalCost", Normal.Cost);
-    Normal.BuildTime    = pINI->ReadDouble(section, "NormalBuildTime", Normal.BuildTime);
-    Normal.RepairDelay  = pINI->ReadDouble(section, "NormalRepairDelay", Normal.RepairDelay);
-    Normal.BuildDelay   = pINI->ReadDouble(section, "NormalBuildDelay", Normal.BuildDelay);
-
-    Difficult.Firepower   = pINI->ReadDouble(section, "DifficultFirepower", Difficult.Firepower);
-    Difficult.GroundSpeed = pINI->ReadDouble(section, "DifficultGroundSpeed", Difficult.GroundSpeed);
-    Difficult.AirSpeed    = pINI->ReadDouble(section, "DifficultAirSpeed", Difficult.AirSpeed);
-    Difficult.Armor       = pINI->ReadDouble(section, "DifficultArmor", Difficult.Armor);
-    Difficult.ROF         = pINI->ReadDouble(section, "DifficultROF", Difficult.ROF);
-    Difficult.Cost        = pINI->ReadDouble(section, "DifficultCost", Difficult.Cost);
-    Difficult.BuildTime   = pINI->ReadDouble(section, "DifficultBuildTime", Difficult.BuildTime);
-    Difficult.RepairDelay = pINI->ReadDouble(section, "DifficultRepairDelay", Difficult.RepairDelay);
-    Difficult.BuildDelay  = pINI->ReadDouble(section, "DifficultBuildDelay", Difficult.BuildDelay);
-
-    // Boolean fields (not read by Read_Difficulty)
-    Easy.BuildSlowdown    = pINI->ReadBool(section, "EasyBuildSlowdown", Easy.BuildSlowdown);
-    Easy.DestroyWalls     = pINI->ReadBool(section, "EasyDestroyWalls", Easy.DestroyWalls);
-    Easy.ContentScan      = pINI->ReadBool(section, "EasyContentScan", Easy.ContentScan);
-
-    Normal.BuildSlowdown  = pINI->ReadBool(section, "NormalBuildSlowdown", Normal.BuildSlowdown);
-    Normal.DestroyWalls   = pINI->ReadBool(section, "NormalDestroyWalls", Normal.DestroyWalls);
-    Normal.ContentScan    = pINI->ReadBool(section, "NormalContentScan", Normal.ContentScan);
-
-    Difficult.BuildSlowdown  = pINI->ReadBool(section, "DifficultBuildSlowdown", Difficult.BuildSlowdown);
-    Difficult.DestroyWalls   = pINI->ReadBool(section, "DifficultDestroyWalls", Difficult.DestroyWalls);
-    Difficult.ContentScan    = pINI->ReadBool(section, "DifficultContentScan", Difficult.ContentScan);
-}
 
 // ----------------------------------------------------------------------------
 // Read_Movies - [Movies] section
@@ -1639,13 +1548,13 @@ void RulesClass::Read_AdvancedCommandBar(CCINIClass* pINI)
 }
 
 // ----------------------------------------------------------------------------
-// Read_HarvesterRules - [HarvesterRules] section
+// Read_HarvesterRules - harvester tuning keys (reside in [General])
 // ----------------------------------------------------------------------------
 
 void RulesClass::Read_HarvesterRules(CCINIClass* pINI)
 {
     if (!pINI) return;
-    const char* section = "HarvesterRules";
+    const char* section = "General";
 
     TiberiumShortScan           = pINI->ReadInteger(section, "TiberiumShortScan", TiberiumShortScan);
     TiberiumLongScan            = pINI->ReadInteger(section, "TiberiumLongScan", TiberiumLongScan);
@@ -1722,16 +1631,3 @@ void RulesClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
         VeinholeTypeClass = nullptr;
 }
 
-// ============================================================================
-// GetDifficulty - Get difficulty struct for given level
-// ============================================================================
-
-const DifficultyStruct* RulesClass::GetDifficulty(int32 level) const
-{
-    switch (level) {
-        case 0: return &Easy;
-        case 1: return &Normal;
-        case 2: return &Difficult;
-        default: return &Normal;
-    }
-}

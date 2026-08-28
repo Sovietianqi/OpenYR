@@ -4,6 +4,10 @@
 #include "Core/Macros.h"
 #include "Core/Memory.h"
 #include "Houses/HouseClass.h"
+#include "Abstract/BuildingClass.h"
+#include "Abstract/AircraftClass.h"
+#include "Abstract/InfantryClass.h"
+#include "Abstract/UnitClass.h"
 #include "Game/SaveGameClass.h"
 #include "IO/CCFileClass.h"
 
@@ -89,6 +93,7 @@ int         Game::PrevGameState       = GAMESTATE_TITLE;
 bool        Game::bStateTransition    = false;
 
 // ── Save/Load ─────────────────────────────────────────────────────────────
+int         Game::CurrentDifficulty   = 2;
 int         Game::SaveGameVersion     = 0;
 int         Game::CurrentSaveNumber   = 0;
 bool        Game::bIsLoadingSave      = false;
@@ -1096,6 +1101,11 @@ int Game::GetFPS()
     if (FrameDelay == 0) return 60;
     return 1000 / static_cast<int>(FrameDelay);
 }
+// Forward declarations for the object-array serialization helpers defined
+// below (they are called from SaveGame/LoadGame).
+static void WriteGameObjects(SaveGameClass& saver);
+static bool ReadGameObjects(LoadGameClass& loader);
+
 // ============================================================================
 // SaveGame - write the current mission state to a file.
 // ============================================================================
@@ -1147,6 +1157,9 @@ bool Game::SaveGame(const char* pFilename)
         saver.Write(static_cast<int8>(pHouse->IsWinner ? 1 : 0));
         saver.Write(pHouse->Credits);
     }
+
+    // Dynamic object arrays: units, infantry, aircraft, buildings.
+    WriteGameObjects(saver);
 
     file.Close();
 
@@ -1234,7 +1247,224 @@ bool Game::LoadGame(const char* pFilename)
         pHouse->Credits = credits;
     }
 
+    // Restore the dynamic object arrays.
+    if (!ReadGameObjects(loader))
+    {
+        file.Close();
+        EndLoad();
+        return false;
+    }
+
     file.Close();
     EndLoad();
     return true;
+}
+
+// ============================================================================
+// Object-array serialization helpers.  Each dynamic object array is stored
+// as [count] followed by [class-id, instance data] per object; loading
+// recreates each object and appends it to its array.
+// ============================================================================
+
+static void WriteObjectArray(SaveGameClass& saver, DynamicVectorClass<UnitClass*>* pArray)
+{
+    int32 count = (pArray != nullptr) ? pArray->Count : 0;
+    saver.Write(count);
+    if (pArray == nullptr)
+        return;
+    for (int32 i = 0; i < count; ++i)
+    {
+        UnitClass* pObj = (*pArray)[i];
+        if (pObj == nullptr)
+        {
+            saver.Write(static_cast<int32>(0));   // sentinel: null object
+            continue;
+        }
+        saver.Write(static_cast<int32>(AbstractType::Unit));
+        pObj->Save(saver);
+    }
+}
+
+static void WriteObjectArray(SaveGameClass& saver, DynamicVectorClass<InfantryClass*>* pArray)
+{
+    int32 count = (pArray != nullptr) ? pArray->Count : 0;
+    saver.Write(count);
+    if (pArray == nullptr)
+        return;
+    for (int32 i = 0; i < count; ++i)
+    {
+        InfantryClass* pObj = (*pArray)[i];
+        if (pObj == nullptr)
+        {
+            saver.Write(static_cast<int32>(0));
+            continue;
+        }
+        saver.Write(static_cast<int32>(AbstractType::Infantry));
+        pObj->Save(saver);
+    }
+}
+
+static void WriteObjectArray(SaveGameClass& saver, DynamicVectorClass<AircraftClass*>* pArray)
+{
+    int32 count = (pArray != nullptr) ? pArray->Count : 0;
+    saver.Write(count);
+    if (pArray == nullptr)
+        return;
+    for (int32 i = 0; i < count; ++i)
+    {
+        AircraftClass* pObj = (*pArray)[i];
+        if (pObj == nullptr)
+        {
+            saver.Write(static_cast<int32>(0));
+            continue;
+        }
+        saver.Write(static_cast<int32>(AbstractType::Aircraft));
+        pObj->Save(saver);
+    }
+}
+
+static void WriteObjectArray(SaveGameClass& saver, DynamicVectorClass<BuildingClass*>* pArray)
+{
+    int32 count = (pArray != nullptr) ? pArray->Count : 0;
+    saver.Write(count);
+    if (pArray == nullptr)
+        return;
+    for (int32 i = 0; i < count; ++i)
+    {
+        BuildingClass* pObj = (*pArray)[i];
+        if (pObj == nullptr)
+        {
+            saver.Write(static_cast<int32>(0));
+            continue;
+        }
+        saver.Write(static_cast<int32>(AbstractType::Building));
+        pObj->Save(saver);
+    }
+}
+
+static void WriteGameObjects(SaveGameClass& saver)
+{
+    WriteObjectArray(saver, UnitClass::Array);
+    WriteObjectArray(saver, InfantryClass::Array);
+    WriteObjectArray(saver, AircraftClass::Array);
+    WriteObjectArray(saver, BuildingClass::Array);
+}
+
+static bool ReadObjectArray(LoadGameClass& loader, DynamicVectorClass<UnitClass*>* pArray)
+{
+    int32 count = 0;
+    if (!loader.Read(count))
+        return false;
+    if (count < 0 || count > 65536)
+        return false;
+    if (pArray == nullptr)
+        return true;
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        int32 classId = 0;
+        if (!loader.Read(classId))
+            return false;
+        if (classId == 0)
+            continue;   // null object sentinel
+
+        UnitClass* pObj = new UnitClass(nullptr);
+        if (pObj == nullptr)
+            return false;
+        pObj->Load(loader);
+        pArray->Add(pObj);
+    }
+    return true;
+}
+
+static bool ReadObjectArray(LoadGameClass& loader, DynamicVectorClass<InfantryClass*>* pArray)
+{
+    int32 count = 0;
+    if (!loader.Read(count))
+        return false;
+    if (count < 0 || count > 65536)
+        return false;
+    if (pArray == nullptr)
+        return true;
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        int32 classId = 0;
+        if (!loader.Read(classId))
+            return false;
+        if (classId == 0)
+            continue;
+
+        InfantryClass* pObj = new InfantryClass(nullptr);
+        if (pObj == nullptr)
+            return false;
+        pObj->Load(loader);
+        pArray->Add(pObj);
+    }
+    return true;
+}
+
+static bool ReadObjectArray(LoadGameClass& loader, DynamicVectorClass<AircraftClass*>* pArray)
+{
+    int32 count = 0;
+    if (!loader.Read(count))
+        return false;
+    if (count < 0 || count > 65536)
+        return false;
+    if (pArray == nullptr)
+        return true;
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        int32 classId = 0;
+        if (!loader.Read(classId))
+            return false;
+        if (classId == 0)
+            continue;
+
+        AircraftClass* pObj = new AircraftClass(nullptr);
+        if (pObj == nullptr)
+            return false;
+        pObj->Load(loader);
+        pArray->Add(pObj);
+    }
+    return true;
+}
+
+static bool ReadObjectArray(LoadGameClass& loader, DynamicVectorClass<BuildingClass*>* pArray)
+{
+    int32 count = 0;
+    if (!loader.Read(count))
+        return false;
+    if (count < 0 || count > 65536)
+        return false;
+    if (pArray == nullptr)
+        return true;
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        int32 classId = 0;
+        if (!loader.Read(classId))
+            return false;
+        if (classId == 0)
+            continue;
+
+        BuildingClass* pObj = new BuildingClass(nullptr);
+        if (pObj == nullptr)
+            return false;
+        pObj->Load(loader);
+        pArray->Add(pObj);
+    }
+    return true;
+}
+
+static bool ReadGameObjects(LoadGameClass& loader)
+{
+    if (!ReadObjectArray(loader, UnitClass::Array))
+        return false;
+    if (!ReadObjectArray(loader, InfantryClass::Array))
+        return false;
+    if (!ReadObjectArray(loader, AircraftClass::Array))
+        return false;
+    return ReadObjectArray(loader, BuildingClass::Array);
 }

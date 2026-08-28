@@ -380,5 +380,9 @@ public:
     bool IsCurrentlyOccupied;
     bool IsStateChanging;
     bool IsBeingSabotaged;
+
+    // Per-instance serialization for the save-game stream (base + derived).
+    void Save(class SaveGameClass& saver) const;
+    void Load(class LoadGameClass& loader);
     BYTE ReservedLayout[0x70C - 0x548];
 };

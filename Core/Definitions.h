@@ -402,14 +402,25 @@ enum class RadioCommand : int32 {
 };
 
 enum class Action : int32 {
-    None = 0, Move = 1, Select = 2, Attack = 3, Guard = 4, Deploy = 5,
-    Repair = 6, Sell = 7, Enter = 8, Capture = 9, Harvest = 10,
-    NoMove = 11, NoSelect = 12, NoAttack = 13, NoDeploy = 14,
-    Scatter = 15, TogglePrimary = 16, Scroll = 17, Waypoint = 18,
-    Nuke = 19, IronCurtain = 20, ChronoSphere = 21, LightningStorm = 22,
-    Dominator = 23, ParaDrop = 24, ForceShield = 25, IonCannon = 26,
-    HunterSeeker = 27, SpyPlane = 28, GeneticMutator = 29,
-    PsychicReveal = 30, ChronoWarp = 31, DropPod = 32
+    None = 0, Move = 1, NoMove = 2, Enter = 3, Self = 4, Attack = 5,
+    Harvest = 6, Select = 7, ToggleSelect = 8, Capture = 9, Eaten = 10,
+    Repair = 11, Sell = 12, SellUnit = 13, NoSell = 14, NoRepair = 15,
+    Sabotage = 16, ToTe = 17, DoNotUse2 = 18, DoNotUse3 = 19, Nuke = 20,
+    DoNotUse4 = 21, DoNotUse5 = 22, DoNotUse6 = 23, DoNotUse7 = 24,
+    DoNotUse8 = 25, GuardArea = 26, Heal = 27, Damage = 28, GRepair = 29,
+    NoDeploy = 30, NoEnter = 31, NoGRepair = 32, TogglePower = 33,
+    NoTogglePower = 34, EnterTunnel = 35, NoEnterTunnel = 36,
+    IronCurtain = 37, LightningStorm = 38, ChronoSphere = 39, ChronoWarp = 40,
+    ParaDrop = 41, PlaceWaypoint = 42, TibSunBug = 43, EnterWaypointMode = 44,
+    FollowWaypoint = 45, SelectWaypoint = 46, LoopWaypointPath = 47,
+    DragWaypoint = 48, AttackWaypoint = 49, EnterWaypoint = 50,
+    PatrolWaypoint = 51, AreaAttack = 52, IvanBomb = 53, NoIvanBomb = 54,
+    Detonate = 55, DetonateAll = 56, DisarmBomb = 57, SelectNode = 58,
+    AttackSupport = 59, PlaceBeacon = 60, SelectBeacon = 61,
+    AttackMoveNav = 62, AttackMoveTar = 63, Demolish = 64,
+    AmerParaDrop = 65, PsychicDominator = 66, SpyPlane = 67,
+    GeneticConverter = 68, ForceShield = 69, NoForceShield = 70,
+    Airstrike = 71, PsychicReveal = 72
 };
 
 enum class BuildCat : int32 {

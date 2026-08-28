@@ -1,4 +1,5 @@
 #include <Abstract/AircraftClass.h>
+#include <Game/SaveGameClass.h>
 #include <Abstract/AircraftTypeClass.h>
 #include <Abstract/BuildingClass.h>
 #include <Abstract/TechnoTypeClass.h>
@@ -2810,3 +2811,36 @@ bool AircraftClass::IsSleeping() const {
     return unknown_844 != 0;
 }
 
+
+// ============================================================================
+// Per-instance serialization (base fields + aircraft-specific fields).
+// ============================================================================
+void AircraftClass::Save(SaveGameClass& saver) const
+{
+    TechnoClass::Save(saver);
+
+    saver.Write(Altitude);
+    saver.Write(static_cast<int8>(IsLanding ? 1 : 0));
+    saver.Write(static_cast<int8>(IsDocking ? 1 : 0));
+    saver.Write(static_cast<int8>(IsLoaded ? 1 : 0));
+    saver.Write(LandingAltitude);
+    saver.Write(static_cast<int32>(CurrentMission));
+    saver.Write(MissionStatus);
+}
+
+void AircraftClass::Load(LoadGameClass& loader)
+{
+    TechnoClass::Load(loader);
+
+    loader.Read(Altitude);
+    int8 flag = 0;
+    loader.Read(flag); IsLanding = (flag != 0);
+    loader.Read(flag); IsDocking = (flag != 0);
+    loader.Read(flag); IsLoaded = (flag != 0);
+    loader.Read(LandingAltitude);
+
+    int32 mission = 0;
+    loader.Read(mission);
+    CurrentMission = static_cast<Mission>(mission);
+    loader.Read(MissionStatus);
+}

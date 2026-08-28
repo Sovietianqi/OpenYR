@@ -1,4 +1,5 @@
 #include <Abstract/InfantryClass.h>
+#include <Game/SaveGameClass.h>
 #include <Abstract/InfantryTypeClass.h>
 #include <Combat/WarheadTypeClass.h>
 #include <Combat/WeaponTypeClass.h>
@@ -2870,29 +2871,9 @@ bool InfantryClass::DoAction(Action action, AbstractClass* pTarget, CellStruct* 
             return true;
         }
 
-        case Action::Deploy:
-        {
-            if (!CanDeploy())
-                return false;
-            Deploy();
-            return true;
-        }
-
         case Action::Harvest:
         {
             QueueMission(Mission::Harvest);
-            return true;
-        }
-
-        case Action::Guard:
-        {
-            QueueMission(Mission::Guard);
-            return true;
-        }
-
-        case Action::Scatter:
-        {
-            Scatter();
             return true;
         }
 
@@ -2951,4 +2932,37 @@ void InfantryClass::CaptureBuilding(BuildingClass* pBuilding)
     pBuilding->OnCaptured(pNewOwner);
     IsAiming = false;
     IsFiringNow = false;
+}
+
+// ============================================================================
+// Per-instance serialization (base fields + infantry-specific fields).
+// ============================================================================
+void InfantryClass::Save(SaveGameClass& saver) const
+{
+    TechnoClass::Save(saver);
+
+    saver.Write(static_cast<int32>(CurrentSequence));
+    saver.Write(static_cast<int8>(IsDeployedNow ? 1 : 0));
+    saver.Write(static_cast<int8>(IsBoarding ? 1 : 0));
+    saver.Write(static_cast<int8>(IsFiringNow ? 1 : 0));
+    saver.Write(static_cast<int8>(IsAiming ? 1 : 0));
+    saver.Write(static_cast<int8>(IsC4Now ? 1 : 0));
+    saver.Write(static_cast<int8>(IsUsingDeployFireWeapon ? 1 : 0));
+}
+
+void InfantryClass::Load(LoadGameClass& loader)
+{
+    TechnoClass::Load(loader);
+
+    int32 seq = 0;
+    loader.Read(seq);
+    CurrentSequence = static_cast<Sequence>(seq);
+
+    int8 flag = 0;
+    loader.Read(flag); IsDeployedNow = (flag != 0);
+    loader.Read(flag); IsBoarding = (flag != 0);
+    loader.Read(flag); IsFiringNow = (flag != 0);
+    loader.Read(flag); IsAiming = (flag != 0);
+    loader.Read(flag); IsC4Now = (flag != 0);
+    loader.Read(flag); IsUsingDeployFireWeapon = (flag != 0);
 }

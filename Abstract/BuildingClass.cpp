@@ -23,6 +23,7 @@
 // =============================================================================
 
 #include <Abstract/BuildingClass.h>
+#include <Game/SaveGameClass.h>
 #include <Abstract/BuildingTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
 #include <Houses/HouseClass.h>
@@ -2692,4 +2693,30 @@ AbstractType BuildingClass::WhatAmI() const
 int32 BuildingClass::Size() const
 {
     return sizeof(BuildingClass);
+}
+
+// ============================================================================
+// Per-instance serialization (base fields + building-specific fields).
+// ============================================================================
+void BuildingClass::Save(SaveGameClass& saver) const
+{
+    TechnoClass::Save(saver);
+
+    saver.Write(static_cast<int8>(HasBeenCaptured ? 1 : 0));
+    saver.Write(static_cast<int8>(IsPrimaryFactory ? 1 : 0));
+    saver.Write(static_cast<int8>(IsTentativelyOccupied ? 1 : 0));
+    saver.Write(static_cast<int8>(IsCurrentlyOccupied ? 1 : 0));
+    saver.Write(static_cast<int8>(IsStateChanging ? 1 : 0));
+}
+
+void BuildingClass::Load(LoadGameClass& loader)
+{
+    TechnoClass::Load(loader);
+
+    int8 flag = 0;
+    loader.Read(flag); HasBeenCaptured = (flag != 0);
+    loader.Read(flag); IsPrimaryFactory = (flag != 0);
+    loader.Read(flag); IsTentativelyOccupied = (flag != 0);
+    loader.Read(flag); IsCurrentlyOccupied = (flag != 0);
+    loader.Read(flag); IsStateChanging = (flag != 0);
 }

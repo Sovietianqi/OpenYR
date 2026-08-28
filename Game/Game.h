@@ -111,6 +111,9 @@ public:
     static char     CheatBuffer[32];
     static int      CheatBufferPos;
 
+    // ── Current Difficulty (integer level, matches the original) ───────
+    static int CurrentDifficulty;
+
     // ── Difficulty Multipliers ──────────────────────────────────────────
     enum DiffMultType
     {

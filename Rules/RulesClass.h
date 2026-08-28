@@ -129,7 +129,6 @@ public:
     void Read_Radiation(CCINIClass* pINI);
     void Read_ElevationModel(CCINIClass* pINI);
     void Read_WallModel(CCINIClass* pINI);
-    void Read_Difficulty(CCINIClass* pINI);
     void Read_Colors(CCINIClass* pINI);
     void Read_ColorAdd(CCINIClass* pINI);
     void Read_General(CCINIClass* pINI);
@@ -155,7 +154,6 @@ public:
     void Read_LandCharacteristics(CCINIClass* pINI);
     void Read_IQ(CCINIClass* pINI);
     void Read_JumpjetControls(CCINIClass* pINI);
-    void Read_Difficulties(CCINIClass* pINI);
     void Read_Movies(CCINIClass* pINI);
     void Read_AdvancedCommandBar(CCINIClass* pINI);
     void Read_HarvesterRules(CCINIClass* pINI);
@@ -165,7 +163,6 @@ public:
     // ========================================================================
     // Helper: get difficulty struct for current difficulty
     // ========================================================================
-    const DifficultyStruct* GetDifficulty(int32 level) const;
 
     // ========================================================================
     // Properties - General
@@ -653,7 +650,6 @@ public:
     DynamicVectorClass<InfantryTypeClass*> SecretInfantry;
     DynamicVectorClass<UnitTypeClass*> SecretUnits;
     DynamicVectorClass<BuildingTypeClass*> SecretBuildings;
-    int32       SecretSum;
 
     // ========================================================================
     // Properties - Spy
@@ -956,9 +952,6 @@ public:
     // ========================================================================
     // Properties - Difficulty
     // ========================================================================
-    DifficultyStruct Easy;
-    DifficultyStruct Normal;
-    DifficultyStruct Difficult;
     DWORD       align_1628[4];
 
     // ========================================================================

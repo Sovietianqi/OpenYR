@@ -439,14 +439,14 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCanBeSuppressed_  = pINI->ReadBool(section, "CanSuppressed",   IsCanBeSuppressed_);
     IsCanBeOccupied_    = pINI->ReadBool(section, "CanBeOccupied",   IsCanBeOccupied_);
     IsCanBeDriven_      = pINI->ReadBool(section, "CanBeDriven",     IsCanBeDriven_);
-    IsCanBeCaptured_    = pINI->ReadBool(section, "CanBeCaptured",   IsCanBeCaptured_);
-    IsCanBeRepaired_    = pINI->ReadBool(section, "CanBeRepaired",   IsCanBeRepaired_);
+    IsCanBeCaptured_    = pINI->ReadBool(section, "Capturable",   IsCanBeCaptured_);
+    IsCanBeRepaired_    = pINI->ReadBool(section, "Repairable",   IsCanBeRepaired_);
     IsCanBeSold_        = pINI->ReadBool(section, "CanBeSold",       IsCanBeSold_);
-    IsCanBePowered_     = pINI->ReadBool(section, "CanBePowered",    IsCanBePowered_);
+    IsCanBePowered_     = pINI->ReadBool(section, "Powered",    IsCanBePowered_);
     IsCanBeDestroyed_   = pINI->ReadBool(section, "CanBeDestroyed",  IsCanBeDestroyed_);
     IsCanBeDamaged_     = pINI->ReadBool(section, "CanBeDamaged",    IsCanBeDamaged_);
     IsCanBeInfiltrated_ = pINI->ReadBool(section, "CanBeInfiltrated",IsCanBeInfiltrated_);
-    IsCanBeSpied_       = pINI->ReadBool(section, "CanBeSpied",      IsCanBeSpied_);
+    IsCanBeSpied_       = pINI->ReadBool(section, "Spyable",      IsCanBeSpied_);
     IsCanBeSabotaged_   = pINI->ReadBool(section, "CanBeSabotaged",  IsCanBeSabotaged_);
     IsCanBeStolen_      = pINI->ReadBool(section, "CanBeStolen",     IsCanBeStolen_);
     IsCanBeHijacked_    = pINI->ReadBool(section, "CanBeHijacked",   IsCanBeHijacked_);
@@ -455,7 +455,7 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // Crush / movement flags
     // ------------------------------------------------------------------
     IsCrushable   = pINI->ReadBool(section, "Crushable",   IsCrushable);
-    IsCrushable2  = pINI->ReadBool(section, "Crushable2",  IsCrushable2);
+    IsCrushable2  = pINI->ReadBool(section, "Crushable",  IsCrushable2);
     IsTeleporter  = pINI->ReadBool(section, "Teleporter",  IsTeleporter);
     IsChrono      = pINI->ReadBool(section, "Chrono",      IsChrono);
     IsBomb        = pINI->ReadBool(section, "Bomb",        IsBomb);
@@ -490,7 +490,7 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     Speed    = pINI->ReadInteger(section, "Speed",    Speed);
     ROT      = pINI->ReadInteger(section, "ROT",      ROT);
-    TurretROT= pINI->ReadInteger(section, "TurretROT", TurretROT);
+    TurretROT= pINI->ReadInteger(section, "ROT", TurretROT);
 
     // ------------------------------------------------------------------
     // Weapons
@@ -517,7 +517,7 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Deploy fire sequence
     // ------------------------------------------------------------------
-    int32 deploySeq = pINI->ReadInteger(section, "DeployFireSequence",
+    int32 deploySeq = pINI->ReadInteger(section, "DeployFire",
                                         static_cast<int32>(DeployFireSequence));
     DeployFireSequence = static_cast<Sequence>(deploySeq);
 
@@ -534,7 +534,7 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     IsLeader          = pINI->ReadBool(section, "Leader",          IsLeader);
     IsCarryall        = pINI->ReadBool(section, "Carryall",        IsCarryall);
     IsTrain           = pINI->ReadBool(section, "Train",           IsTrain);
-    IsSimpleDeployer  = pINI->ReadBool(section, "SimpleDeployer",  IsSimpleDeployer);
+    IsSimpleDeployer  = pINI->ReadBool(section, "Deployer",  IsSimpleDeployer);
     IsFirebase        = pINI->ReadBool(section, "Firebase",        IsFirebase);
     IsSonic           = pINI->ReadBool(section, "Sonic",           IsSonic);
     IsVan             = pINI->ReadBool(section, "Van",             IsVan);
@@ -621,7 +621,7 @@ bool InfantryTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteInteger(section, "EliteWeaponCount", EliteWeaponCount);
     pINI->WriteInteger(section, "DeathWeapon",      DeathWeaponIndex);
     pINI->WriteInteger(section, "WeaponCharge",     WeaponCharge);
-    pINI->WriteInteger(section, "DeployFireSequence", static_cast<int32>(DeployFireSequence));
+    pINI->WriteInteger(section, "DeployFire", static_cast<int32>(DeployFireSequence));
     pINI->WriteFloat(section,  "ThreatPosed",      ThreatPosedValue);
 
     pINI->WriteBool(section, "Engineer", Engineer);
@@ -638,20 +638,20 @@ bool InfantryTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteBool(section, "CanSuppressed",    IsCanBeSuppressed_);
     pINI->WriteBool(section, "CanBeOccupied",    IsCanBeOccupied_);
     pINI->WriteBool(section, "CanBeDriven",      IsCanBeDriven_);
-    pINI->WriteBool(section, "CanBeCaptured",    IsCanBeCaptured_);
-    pINI->WriteBool(section, "CanBeRepaired",    IsCanBeRepaired_);
+    pINI->WriteBool(section, "Capturable",    IsCanBeCaptured_);
+    pINI->WriteBool(section, "Repairable",    IsCanBeRepaired_);
     pINI->WriteBool(section, "CanBeSold",        IsCanBeSold_);
-    pINI->WriteBool(section, "CanBePowered",     IsCanBePowered_);
+    pINI->WriteBool(section, "Powered",     IsCanBePowered_);
     pINI->WriteBool(section, "CanBeDestroyed",   IsCanBeDestroyed_);
     pINI->WriteBool(section, "CanBeDamaged",     IsCanBeDamaged_);
     pINI->WriteBool(section, "CanBeInfiltrated", IsCanBeInfiltrated_);
-    pINI->WriteBool(section, "CanBeSpied",       IsCanBeSpied_);
+    pINI->WriteBool(section, "Spyable",       IsCanBeSpied_);
     pINI->WriteBool(section, "CanBeSabotaged",   IsCanBeSabotaged_);
     pINI->WriteBool(section, "CanBeStolen",      IsCanBeStolen_);
     pINI->WriteBool(section, "CanBeHijacked",    IsCanBeHijacked_);
 
     pINI->WriteBool(section, "Crushable",   IsCrushable);
-    pINI->WriteBool(section, "Crushable2",  IsCrushable2);
+    pINI->WriteBool(section, "Crushable",  IsCrushable2);
     pINI->WriteBool(section, "Teleporter",  IsTeleporter);
     pINI->WriteBool(section, "Chrono",      IsChrono);
     pINI->WriteBool(section, "Bomb",        IsBomb);
@@ -667,7 +667,7 @@ bool InfantryTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteBool(section, "Leader",          IsLeader);
     pINI->WriteBool(section, "Carryall",        IsCarryall);
     pINI->WriteBool(section, "Train",           IsTrain);
-    pINI->WriteBool(section, "SimpleDeployer",  IsSimpleDeployer);
+    pINI->WriteBool(section, "Deployer",  IsSimpleDeployer);
     pINI->WriteBool(section, "Firebase",        IsFirebase);
     pINI->WriteBool(section, "Sonic",           IsSonic);
     pINI->WriteBool(section, "Van",             IsVan);

@@ -252,6 +252,7 @@ public:
     uint32              AvailableSuperWeapons;
     uint32              UsedSuperWeapons;
     int32               TechLevel;
+    int32               DifficultyLevel;
     int32               IQLevel;
     int32               IQLevel2;
     int32               Edge;

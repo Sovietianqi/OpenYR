@@ -1,5 +1,7 @@
 #pragma once
 
+template <class T> class DynamicVectorClass;
+
 #include <Core/Definitions.h>
 #include <Core/Macros.h>
 #include <Math/CoordStruct.h>
@@ -132,6 +134,14 @@ public:
 
     bool PassableFor(MovementZone zone) const;
     bool CanEnterTunnelHere() const;
+
+    // Hierarchical pathfinding: route through an 8x8-cell block abstraction
+    // first, then refine inside the traversed blocks.  Returns false when no
+    // block-level route exists (the caller then falls back to the regular
+    // per-cell search).
+    static bool Pathfinding_Hierarchical(const CellStruct& from, const CellStruct& to,
+                                         DynamicVectorClass<CellStruct>& outPath,
+                                         MovementZone zone);
 
     // ========================================================================
     // Adjacency

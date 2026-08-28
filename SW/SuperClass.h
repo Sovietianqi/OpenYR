@@ -86,9 +86,6 @@ public:
     void LaunchParaDrop();
     void LaunchSpyPlane();
     void LaunchPsychicReveal();
-    void LaunchSonarPulse();
-    void LaunchHunterSeeker();
-    void LaunchDropPod();
 
     // Type-specific update methods
     void UpdateNukeFiring();

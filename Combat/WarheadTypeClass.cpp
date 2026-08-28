@@ -373,19 +373,18 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
 
     pINI->GetInteger(sectionName, "ArrayIndex", ArrayIndex);
 
-    IsWallDestroyer = pINI->ReadBool(sectionName, "WallDestroyer", IsWallDestroyer);
-    IsWoodDestroyer = pINI->ReadBool(sectionName, "WoodDestroyer", IsWoodDestroyer);
+    IsWallDestroyer = pINI->ReadInteger(sectionName, "Wall", 0) > 0;
+    IsWoodDestroyer = pINI->ReadInteger(sectionName, "Wood", 0) > 0;
     IsWallAbsoluteDestroyer = pINI->ReadBool(sectionName, "WallAbsoluteDestroyer", IsWallAbsoluteDestroyer);
-    IsTiberiumDestroyer = pINI->ReadBool(sectionName, "TiberiumDestroyer", IsTiberiumDestroyer);
-    IsOreDestroyer = pINI->ReadBool(sectionName, "OreDestroyer", IsOreDestroyer);
+    IsTiberiumDestroyer = pINI->ReadInteger(sectionName, "Tiberium", 0) > 0;
     IsSparky = pINI->ReadBool(sectionName, "Sparky", IsSparky);
     IsFire = pINI->ReadBool(sectionName, "Fire", IsFire);
     IsSmoke = pINI->ReadBool(sectionName, "Smoke", IsSmoke);
     IsGas = pINI->ReadBool(sectionName, "Gas", IsGas);
     IsLocomotor = pINI->ReadBool(sectionName, "Locomotor", IsLocomotor);
     IsSonic = pINI->ReadBool(sectionName, "IsSonic", IsSonic);
-    IsRadiation = pINI->ReadBool(sectionName, "IsRadiation", IsRadiation);
-    IsPsychic = pINI->ReadBool(sectionName, "IsPsychic", IsPsychic);
+    IsRadiation = pINI->ReadInteger(sectionName, "Radiation", 0) > 0;
+    IsPsychic = pINI->ReadInteger(sectionName, "PsychicDamage", 0) > 0;
     IsMechanical = pINI->ReadBool(sectionName, "IsMechanical", IsMechanical);
     Bullets = pINI->ReadBool(sectionName, "Bullets", Bullets);
     Temporal = pINI->ReadBool(sectionName, "Temporal", Temporal);
@@ -453,11 +452,10 @@ bool WarheadTypeClass::SaveToINIList(CCINIClass* pINI) {
 
     pINI->WriteInteger(sectionName, "ArrayIndex", ArrayIndex);
 
-    pINI->WriteBool(sectionName, "WallDestroyer", IsWallDestroyer);
-    pINI->WriteBool(sectionName, "WoodDestroyer", IsWoodDestroyer);
+    pINI->WriteInteger(sectionName, "Wall", IsWallDestroyer ? 1 : 0);
+    pINI->WriteInteger(sectionName, "Wood", IsWoodDestroyer ? 1 : 0);
     pINI->WriteBool(sectionName, "WallAbsoluteDestroyer", IsWallAbsoluteDestroyer);
-    pINI->WriteBool(sectionName, "TiberiumDestroyer", IsTiberiumDestroyer);
-    pINI->WriteBool(sectionName, "OreDestroyer", IsOreDestroyer);
+    pINI->WriteInteger(sectionName, "Tiberium", IsTiberiumDestroyer ? 1 : 0);
     pINI->WriteBool(sectionName, "Sparky", IsSparky);
     pINI->WriteBool(sectionName, "Fire", IsFire);
     pINI->WriteBool(sectionName, "Smoke", IsSmoke);

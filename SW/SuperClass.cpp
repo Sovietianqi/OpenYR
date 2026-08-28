@@ -712,7 +712,7 @@ void SuperClass::Launch(CellStruct target) {
     // Type-specific pre-launch
     switch (Type->Type)
     {
-    case SuperWeaponType::Nuke:
+    case SuperWeaponType::MultiMissile:
         LaunchNuke();
         break;
     case SuperWeaponType::IronCurtain:
@@ -727,7 +727,7 @@ void SuperClass::Launch(CellStruct target) {
     case SuperWeaponType::PsychicDominator:
         LaunchPsychicDominator();
         break;
-    case SuperWeaponType::GeneticMutator:
+    case SuperWeaponType::GeneticConverter:
         LaunchGeneticMutator();
         break;
     case SuperWeaponType::ChronoSphere:
@@ -745,15 +745,6 @@ void SuperClass::Launch(CellStruct target) {
     case SuperWeaponType::PsychicReveal:
         LaunchPsychicReveal();
         break;
-    case SuperWeaponType::SonarPulse:
-        LaunchSonarPulse();
-        break;
-    case SuperWeaponType::HunterSeeker:
-        LaunchHunterSeeker();
-        break;
-    case SuperWeaponType::DropPod:
-        LaunchDropPod();
-        break;
     default:
         break;
     }
@@ -764,7 +755,7 @@ void SuperClass::UpdateFiring() {
 
     switch (Type->Type)
     {
-    case SuperWeaponType::Nuke:
+    case SuperWeaponType::MultiMissile:
         UpdateNukeFiring();
         break;
     case SuperWeaponType::LightningStorm:
@@ -776,7 +767,7 @@ void SuperClass::UpdateFiring() {
     case SuperWeaponType::PsychicDominator:
         UpdateDominatorFiring();
         break;
-    case SuperWeaponType::GeneticMutator:
+    case SuperWeaponType::GeneticConverter:
         UpdateGeneticMutatorFiring();
         break;
     case SuperWeaponType::ParaDrop:
@@ -1429,80 +1420,6 @@ void SuperClass::LaunchPsychicReveal() {
     if (Type->FireSound >= 0) {
         // VocClass::PlayGlobal(Type->FireSound, Type->FireSoundPriority, 1.0f);
     }
-
-    State = SWState::Active;
-    OnDone();
-}
-
-// ============================================================================
-// Type-specific: SonarPulse
-// ============================================================================
-
-void SuperClass::LaunchSonarPulse() {
-    if (!Type || !Owner) return;
-
-    // Reveal all submarines/water units on the map
-    // MapClass::SonarPulse(Owner);
-
-    // Play fire sound
-    if (Type->FireSound >= 0) {
-        // VocClass::PlayGlobal(Type->FireSound, Type->FireSoundPriority, 1.0f);
-    }
-
-    State = SWState::Active;
-    OnDone();
-}
-
-// ============================================================================
-// Type-specific: HunterSeeker
-// ============================================================================
-
-void SuperClass::LaunchHunterSeeker() {
-    if (!Type || !Owner) return;
-
-    // Create a HunterSeeker unit that seeks the nearest enemy
-    // UnitTypeClass* hsType = UnitTypeClass::Find("HUNTERSEEKER");
-    // if (hsType) {
-    //     UnitClass* hunterSeeker = new UnitClass(hsType, Owner);
-    //     hunterSeeker->SetLocation(Owner->GetBaseCenter());
-    //     hunterSeeker->SetMission(MissionType::Hunt);
-    // }
-
-    // Play fire sound
-    if (Type->FireSound >= 0) {
-        // VocClass::PlayGlobal(Type->FireSound, Type->FireSoundPriority, 1.0f);
-    }
-
-    State = SWState::Active;
-    OnDone();
-}
-
-// ============================================================================
-// Type-specific: DropPod
-// ============================================================================
-
-void SuperClass::LaunchDropPod() {
-    if (!Type) return;
-
-    // Create drop pod animation
-    if (Type->SWAnim) {
-        AnimClass* anim = new AnimClass(Type->SWAnim, TargetCoord, 0, 1, 0x600, 0, false);
-        anim->Owner = Owner;
-    }
-
-    // Play fire sound
-    if (Type->FireSound >= 0) {
-        // VocClass::PlayGlobal(Type->FireSound, Type->FireSoundPriority, 1.0f);
-    }
-
-    // Spawn drop pod infantry
-    // for (int32 i = 0; i < Type->ParaDropNum; ++i) {
-    //     CoordStruct dropPos = TargetCoord;
-    //     dropPos.X += (std::rand() % 201 - 100) * LeptonsPerCell / 256;
-    //     dropPos.Y += (std::rand() % 201 - 100) * LeptonsPerCell / 256;
-    //     InfantryClass* infantry = new InfantryClass(Type->ParaDropType, Owner);
-    //     infantry->SetLocation(dropPos);
-    // }
 
     State = SWState::Active;
     OnDone();

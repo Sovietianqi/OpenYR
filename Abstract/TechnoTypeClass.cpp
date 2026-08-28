@@ -485,7 +485,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     Speed    = pINI->ReadInteger(section, "Speed", Speed);
     ROT      = pINI->ReadInteger(section, "ROT",   ROT);
-    TurretROT= pINI->ReadInteger(section, "TurretROT", TurretROT);
+    TurretROT= pINI->ReadInteger(section, "ROT", TurretROT);
     IdleTimer= pINI->ReadInteger(section, "IdleTimer", IdleTimer);
 
     char speedBuf[32];
@@ -604,7 +604,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsInsignificant_ = pINI->ReadBool(section, "Insignificant", IsInsignificant_);
     IsLegalTarget_   = pINI->ReadBool(section, "LegalTarget",   IsLegalTarget_);
     IsImmune_        = pINI->ReadBool(section, "Immune",        IsImmune_);
-    IsLegalDamsel_   = pINI->ReadBool(section, "LegalDamsel",   IsLegalDamsel_);
+    IsLegalDamsel_   = pINI->ReadBool(section, "LegalTarget",   IsLegalDamsel_);
     IsUnsellable     = pINI->ReadBool(section, "Unsellable",    IsUnsellable);
     IsRepairable     = pINI->ReadBool(section, "Repairable",    IsRepairable);
     IsSellable       = pINI->ReadBool(section, "Sellable",      IsSellable);
@@ -644,7 +644,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     // Crush / teleport / chrono / bomb
     // ------------------------------------------------------------------
     IsCrushable   = pINI->ReadBool(section, "Crushable",   IsCrushable);
-    IsCrushable2  = pINI->ReadBool(section, "Crushable2",  IsCrushable2);
+    IsCrushable2  = pINI->ReadBool(section, "Crushable",  IsCrushable2);
     IsTeleporter  = pINI->ReadBool(section, "Teleporter",  IsTeleporter);
     IsChrono      = pINI->ReadBool(section, "Chrono",      IsChrono);
     IsBomb        = pINI->ReadBool(section, "Bomb",        IsBomb);
@@ -661,7 +661,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsLeader         = pINI->ReadBool(section, "Leader",         IsLeader);
     IsCarryall       = pINI->ReadBool(section, "Carryall",       IsCarryall);
     IsTrain          = pINI->ReadBool(section, "Train",          IsTrain);
-    IsSimpleDeployer = pINI->ReadBool(section, "SimpleDeployer", IsSimpleDeployer);
+    IsSimpleDeployer = pINI->ReadBool(section, "Deployer", IsSimpleDeployer);
     IsFirebase       = pINI->ReadBool(section, "Firebase",       IsFirebase);
     IsSonic          = pINI->ReadBool(section, "Sonic",          IsSonic);
     IsVan            = pINI->ReadBool(section, "Van",            IsVan);
@@ -694,14 +694,14 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCanBeSuppressed  = pINI->ReadBool(section, "CanSuppressed",  IsCanBeSuppressed);
     IsCanBeOccupied    = pINI->ReadBool(section, "CanBeOccupied",  IsCanBeOccupied);
     IsCanBeDriven      = pINI->ReadBool(section, "CanBeDriven",    IsCanBeDriven);
-    IsCanBeCaptured    = pINI->ReadBool(section, "CanBeCaptured",  IsCanBeCaptured);
-    IsCanBeRepaired    = pINI->ReadBool(section, "CanBeRepaired",  IsCanBeRepaired);
+    IsCanBeCaptured    = pINI->ReadBool(section, "Capturable",  IsCanBeCaptured);
+    IsCanBeRepaired    = pINI->ReadBool(section, "Repairable",  IsCanBeRepaired);
     IsCanBeSold        = pINI->ReadBool(section, "CanBeSold",      IsCanBeSold);
-    IsCanBePowered     = pINI->ReadBool(section, "CanBePowered",   IsCanBePowered);
+    IsCanBePowered     = pINI->ReadBool(section, "Powered",   IsCanBePowered);
     IsCanBeDestroyed   = pINI->ReadBool(section, "CanBeDestroyed", IsCanBeDestroyed);
     IsCanBeDamaged     = pINI->ReadBool(section, "CanBeDamaged",   IsCanBeDamaged);
     IsCanBeInfiltrated = pINI->ReadBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
-    IsCanBeSpied       = pINI->ReadBool(section, "CanBeSpied",     IsCanBeSpied);
+    IsCanBeSpied       = pINI->ReadBool(section, "Spyable",     IsCanBeSpied);
     IsCanBeSabotaged   = pINI->ReadBool(section, "CanBeSabotaged", IsCanBeSabotaged);
     IsCanBeStolen      = pINI->ReadBool(section, "CanBeStolen",    IsCanBeStolen);
     IsCanBeHijacked    = pINI->ReadBool(section, "CanBeHijacked",  IsCanBeHijacked);
@@ -791,7 +791,7 @@ bool TechnoTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteInteger(section, "RepairCost",   RepairCost);
     pINI->WriteInteger(section, "RefundPercent",RefundPercent);
     pINI->WriteInteger(section, "ROT",          ROT);
-    pINI->WriteInteger(section, "TurretROT",    TurretROT);
+    pINI->WriteInteger(section, "ROT",    TurretROT);
     pINI->WriteInteger(section, "IdleTimer",    IdleTimer);
     pINI->WriteInteger(section, "WeaponCount",  WeaponCount);
     pINI->WriteInteger(section, "DeathWeapon",  DeathWeaponIndex);

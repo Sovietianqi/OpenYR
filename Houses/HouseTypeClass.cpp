@@ -150,17 +150,14 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     // ── Parent country / suffix / prefix ────────────────────────────────
     pINI->ReadString(section, "ParentCountry", "", ParentCountry, sizeof(ParentCountry));
     pINI->ReadString(section, "Suffix", "", Suffix, sizeof(Suffix));
-    Prefix = static_cast<char>(pINI->ReadInteger(section, "Prefix", 0));
+    char prefixBuf[8];
+    if (pINI->ReadString(section, "Prefix", "", prefixBuf, sizeof(prefixBuf)) && prefixBuf[0]) {
+        Prefix = prefixBuf[0];
+    }
 
     // ── Side + color scheme ─────────────────────────────────────────────
     SideIndex = pINI->ReadInteger(section, "Side", SideIndex);
     ColorSchemeIndex = pINI->ReadInteger(section, "Color", ColorSchemeIndex);
-
-    // Allow the INI to override the color via an explicit R,G,B tuple.
-    uint8 rgb[3] = {0, 0, 0};
-    if (pINI->Read3Bytes(rgb, section, "ColorRGB", rgb)) {
-        ColorSchemeIndex = HouseTypeClass::Parse_Color_RGB(rgb[0], rgb[1], rgb[2]);
-    }
 
     // ── Multiplay flags ─────────────────────────────────────────────────
     Multiplay = pINI->ReadBool(section, "Multiplay", Multiplay);
@@ -168,17 +165,14 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     WallOwner = pINI->ReadBool(section, "WallOwner", WallOwner);
     SmartAI = pINI->ReadBool(section, "SmartAI", SmartAI);
 
-    // ── Tech level ──────────────────────────────────────────────────────
-    TechLevel = pINI->ReadInteger(section, "TechLevel", TechLevel);
-
     // ── Global multipliers (doubles) ────────────────────────────────────
-    FirepowerMult = pINI->ReadDouble(section, "FirepowerMult", 1.0);
-    GroundspeedMult = pINI->ReadDouble(section, "GroundspeedMult", 1.0);
-    AirspeedMult = pINI->ReadDouble(section, "AirspeedMult", 1.0);
-    ArmorMult = pINI->ReadDouble(section, "ArmorMult", 1.0);
-    ROFMult = pINI->ReadDouble(section, "ROFMult", 1.0);
-    CostMult = pINI->ReadDouble(section, "CostMult", 1.0);
-    BuildtimeMult = pINI->ReadDouble(section, "BuildtimeMult", 1.0);
+    FirepowerMult = pINI->ReadDouble(section, "Firepower", 1.0);
+    GroundspeedMult = pINI->ReadDouble(section, "Groundspeed", 1.0);
+    AirspeedMult = pINI->ReadDouble(section, "Airspeed", 1.0);
+    ArmorMult = pINI->ReadDouble(section, "Armor", 1.0);
+    ROFMult = pINI->ReadDouble(section, "ROF", 1.0);
+    CostMult = pINI->ReadDouble(section, "Cost", 1.0);
+    BuildtimeMult = pINI->ReadDouble(section, "BuildTime", 1.0);
 
     // ── Armor multipliers ───────────────────────────────────────────────
     ArmorInfantryMult = static_cast<float>(pINI->ReadDouble(section, "ArmorInfantryMult", 1.0));
@@ -200,11 +194,11 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     SpeedAircraftMult = static_cast<float>(pINI->ReadDouble(section, "SpeedAircraftMult", 1.0));
 
     // ── Build time multipliers ──────────────────────────────────────────
-    BuildtimeInfantryMult = static_cast<float>(pINI->ReadDouble(section, "BuildtimeInfantryMult", 1.0));
-    BuildtimeUnitsMult = static_cast<float>(pINI->ReadDouble(section, "BuildtimeUnitsMult", 1.0));
-    BuildtimeAircraftMult = static_cast<float>(pINI->ReadDouble(section, "BuildtimeAircraftMult", 1.0));
-    BuildtimeBuildingsMult = static_cast<float>(pINI->ReadDouble(section, "BuildtimeBuildingsMult", 1.0));
-    BuildtimeDefensesMult = static_cast<float>(pINI->ReadDouble(section, "BuildtimeDefensesMult", 1.0));
+    BuildtimeInfantryMult = static_cast<float>(pINI->ReadDouble(section, "BuildTimeInfantryMult", 1.0));
+    BuildtimeUnitsMult = static_cast<float>(pINI->ReadDouble(section, "BuildTimeUnitsMult", 1.0));
+    BuildtimeAircraftMult = static_cast<float>(pINI->ReadDouble(section, "BuildTimeAircraftMult", 1.0));
+    BuildtimeBuildingsMult = static_cast<float>(pINI->ReadDouble(section, "BuildTimeBuildingsMult", 1.0));
+    BuildtimeDefensesMult = static_cast<float>(pINI->ReadDouble(section, "BuildTimeDefensesMult", 1.0));
 
     // ── Income multiplier ───────────────────────────────────────────────
     IncomeMult = static_cast<float>(pINI->ReadDouble(section, "IncomeMult", 1.0));
@@ -240,17 +234,14 @@ bool HouseTypeClass::SaveToINI(CCINIClass* pINI) {
     pINI->WriteBool(section, "WallOwner", WallOwner);
     pINI->WriteBool(section, "SmartAI", SmartAI);
 
-    // ── Tech level ──────────────────────────────────────────────────────
-    pINI->WriteInteger(section, "TechLevel", TechLevel);
-
     // ── Global multipliers ──────────────────────────────────────────────
-    pINI->WriteDouble(section, "FirepowerMult", FirepowerMult);
-    pINI->WriteDouble(section, "GroundspeedMult", GroundspeedMult);
-    pINI->WriteDouble(section, "AirspeedMult", AirspeedMult);
-    pINI->WriteDouble(section, "ArmorMult", ArmorMult);
-    pINI->WriteDouble(section, "ROFMult", ROFMult);
-    pINI->WriteDouble(section, "CostMult", CostMult);
-    pINI->WriteDouble(section, "BuildtimeMult", BuildtimeMult);
+    pINI->WriteDouble(section, "Firepower", FirepowerMult);
+    pINI->WriteDouble(section, "Groundspeed", GroundspeedMult);
+    pINI->WriteDouble(section, "Airspeed", AirspeedMult);
+    pINI->WriteDouble(section, "Armor", ArmorMult);
+    pINI->WriteDouble(section, "ROF", ROFMult);
+    pINI->WriteDouble(section, "Cost", CostMult);
+    pINI->WriteDouble(section, "BuildTime", BuildtimeMult);
 
     // ── Armor multipliers ───────────────────────────────────────────────
     pINI->WriteDouble(section, "ArmorInfantryMult", static_cast<double>(ArmorInfantryMult));
@@ -272,11 +263,11 @@ bool HouseTypeClass::SaveToINI(CCINIClass* pINI) {
     pINI->WriteDouble(section, "SpeedAircraftMult", static_cast<double>(SpeedAircraftMult));
 
     // ── Build time multipliers ──────────────────────────────────────────
-    pINI->WriteDouble(section, "BuildtimeInfantryMult", static_cast<double>(BuildtimeInfantryMult));
-    pINI->WriteDouble(section, "BuildtimeUnitsMult", static_cast<double>(BuildtimeUnitsMult));
-    pINI->WriteDouble(section, "BuildtimeAircraftMult", static_cast<double>(BuildtimeAircraftMult));
-    pINI->WriteDouble(section, "BuildtimeBuildingsMult", static_cast<double>(BuildtimeBuildingsMult));
-    pINI->WriteDouble(section, "BuildtimeDefensesMult", static_cast<double>(BuildtimeDefensesMult));
+    pINI->WriteDouble(section, "BuildTimeInfantryMult", static_cast<double>(BuildtimeInfantryMult));
+    pINI->WriteDouble(section, "BuildTimeUnitsMult", static_cast<double>(BuildtimeUnitsMult));
+    pINI->WriteDouble(section, "BuildTimeAircraftMult", static_cast<double>(BuildtimeAircraftMult));
+    pINI->WriteDouble(section, "BuildTimeBuildingsMult", static_cast<double>(BuildtimeBuildingsMult));
+    pINI->WriteDouble(section, "BuildTimeDefensesMult", static_cast<double>(BuildtimeDefensesMult));
 
     // ── Income multiplier ───────────────────────────────────────────────
     pINI->WriteDouble(section, "IncomeMult", static_cast<double>(IncomeMult));

@@ -282,6 +282,10 @@ public:
     DWORD unknown_810;
     Mission CurrentMission;
     int32 MissionStatus;
+
+    // Per-instance serialization for the save-game stream (base + derived).
+    void Save(class SaveGameClass& saver) const;
+    void Load(class LoadGameClass& loader);
     DWORD unknown_81C;
     DWORD unknown_820;
     DWORD unknown_824;

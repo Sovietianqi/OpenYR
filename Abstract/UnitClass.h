@@ -254,6 +254,10 @@ public:
     int32 DeathFrameCounter;
     int32 NonPassengerCount;
     bool HasFollowerCar;
+
+    // Per-instance serialization for the save-game stream (base + derived).
+    void Save(class SaveGameClass& saver) const;
+    void Load(class LoadGameClass& loader);
     UnitClass* FollowerCar;
     DWORD unknown_7E0;
     DWORD unknown_7E4;

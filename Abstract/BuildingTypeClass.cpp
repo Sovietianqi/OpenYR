@@ -656,12 +656,12 @@ bool BuildingTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCanC4            = pINI->ReadBool(section, "CanC4",          IsCanC4);
     IsCanBeOccupied    = pINI->ReadBool(section, "CanBeOccupied",  IsCanBeOccupied);
     IsCanBeDriven      = pINI->ReadBool(section, "CanBeDriven",    IsCanBeDriven);
-    IsCanBeCaptured    = pINI->ReadBool(section, "CanBeCaptured",  IsCanBeCaptured);
-    IsCanBePowered     = pINI->ReadBool(section, "CanBePowered",   IsCanBePowered);
+    IsCanBeCaptured    = pINI->ReadBool(section, "Capturable",  IsCanBeCaptured);
+    IsCanBePowered     = pINI->ReadBool(section, "Powered",   IsCanBePowered);
     IsCanBeDestroyed   = pINI->ReadBool(section, "CanBeDestroyed", IsCanBeDestroyed);
     IsCanBeDamaged     = pINI->ReadBool(section, "CanBeDamaged",   IsCanBeDamaged);
     IsCanBeInfiltrated = pINI->ReadBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
-    IsCanBeSpied       = pINI->ReadBool(section, "CanBeSpied",     IsCanBeSpied);
+    IsCanBeSpied       = pINI->ReadBool(section, "Spyable",     IsCanBeSpied);
     IsCanBeSabotaged   = pINI->ReadBool(section, "CanBeSabotaged", IsCanBeSabotaged);
     IsCanBeStolen      = pINI->ReadBool(section, "CanBeStolen",    IsCanBeStolen);
     IsCanBeHijacked    = pINI->ReadBool(section, "CanBeHijacked",  IsCanBeHijacked);
@@ -752,7 +752,7 @@ bool BuildingTypeClass::LoadFromINI(CCINIClass* pINI)
     // Undeployable / simple-deployer / firebase
     // ------------------------------------------------------------------
     IsUndeployable_     = pINI->ReadBool(section, "Undeployable",   IsUndeployable_);
-    IsSimpleDeployer_   = pINI->ReadBool(section, "SimpleDeployer", IsSimpleDeployer_);
+    IsSimpleDeployer_   = pINI->ReadBool(section, "Deployer", IsSimpleDeployer_);
     IsFirebase_         = pINI->ReadBool(section, "Firebase",       IsFirebase_);
     IsUndeployable__    = IsUndeployable_;
     IsUndeployableMember= IsUndeployable_;
@@ -830,18 +830,18 @@ bool BuildingTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteBool(section, "Repairable",       IsRepairable);
     pINI->WriteBool(section, "Ungarrisonable",   IsUngarrisonable);
     pINI->WriteBool(section, "Undeployable",     IsUndeployable_);
-    pINI->WriteBool(section, "SimpleDeployer",   IsSimpleDeployer_);
+    pINI->WriteBool(section, "Deployer",   IsSimpleDeployer_);
     pINI->WriteBool(section, "Firebase",         IsFirebase_);
 
     pINI->WriteBool(section, "CanC4",            IsCanC4);
     pINI->WriteBool(section, "CanBeOccupied",    IsCanBeOccupied);
     pINI->WriteBool(section, "CanBeDriven",      IsCanBeDriven);
-    pINI->WriteBool(section, "CanBeCaptured",    IsCanBeCaptured);
-    pINI->WriteBool(section, "CanBePowered",     IsCanBePowered);
+    pINI->WriteBool(section, "Capturable",    IsCanBeCaptured);
+    pINI->WriteBool(section, "Powered",     IsCanBePowered);
     pINI->WriteBool(section, "CanBeDestroyed",   IsCanBeDestroyed);
     pINI->WriteBool(section, "CanBeDamaged",     IsCanBeDamaged);
     pINI->WriteBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
-    pINI->WriteBool(section, "CanBeSpied",       IsCanBeSpied);
+    pINI->WriteBool(section, "Spyable",       IsCanBeSpied);
     pINI->WriteBool(section, "CanBeSabotaged",   IsCanBeSabotaged);
     pINI->WriteBool(section, "CanBeStolen",      IsCanBeStolen);
     pINI->WriteBool(section, "CanBeHijacked",    IsCanBeHijacked);

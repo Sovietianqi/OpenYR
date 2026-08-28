@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include <Abstract/UnitClass.h>
+#include <Game/SaveGameClass.h>
 #include <Abstract/UnitTypeClass.h>
 #include <Combat/WeaponTypeClass.h>
 #include <Combat/WarheadTypeClass.h>
@@ -753,6 +754,16 @@ bool UnitClass::Find_Path(const CellStruct& start, const CellStruct& dest,
     std::vector<int32>  fScore(total, 0x7FFFFFFF);
     std::vector<int32>  cameFrom(total, -1);
     std::vector<bool>   inClosed(total, false);
+
+    // Prefer the hierarchical route when the abstraction layer can find
+    // one; the per-cell search below remains as the regular fallback.
+    DynamicVectorClass<CellStruct> hierPath;
+    if (CellClass::Pathfinding_Hierarchical(start, dest, hierPath, Type->MoveZone))
+    {
+        for (int32 i = 0; i < hierPath.Count; ++i)
+            outPath.Add(hierPath[i]);
+        return true;
+    }
 
     const int32 startIdx = start.Y * width + start.X;
     const int32 destIdx  = dest.Y  * width + dest.X;
@@ -2136,4 +2147,53 @@ void UnitClass::DumpTiberium()
 
     // Resume harvesting on the next AI tick.
     IsHarvestingTiberium = true;
+}
+
+// ============================================================================
+// Per-instance serialization (base fields + unit-specific fields).
+// ============================================================================
+void UnitClass::Save(SaveGameClass& saver) const
+{
+    TechnoClass::Save(saver);
+
+    saver.Write(static_cast<int32>(TurretDir.Value));
+    saver.Write(static_cast<int32>(BarrelDir.Value));
+    saver.Write(static_cast<int8>(IsHarvestingTiberium ? 1 : 0));
+    saver.Write(static_cast<int8>(IsDumpingTiberium ? 1 : 0));
+    saver.Write(HarvestAmount);
+    saver.Write(static_cast<int8>(IsMCV ? 1 : 0));
+    saver.Write(static_cast<int8>(IsHarvester ? 1 : 0));
+    saver.Write(static_cast<int8>(IsAPC ? 1 : 0));
+    saver.Write(static_cast<int8>(IsDeployer ? 1 : 0));
+    saver.Write(static_cast<int8>(IsChrono ? 1 : 0));
+    saver.Write(static_cast<int8>(IsUnderground ? 1 : 0));
+    saver.Write(static_cast<int8>(IsSubterranean ? 1 : 0));
+    saver.Write(static_cast<int8>(IsCarryall ? 1 : 0));
+    saver.Write(static_cast<int8>(IsJumpJet ? 1 : 0));
+}
+
+void UnitClass::Load(LoadGameClass& loader)
+{
+    TechnoClass::Load(loader);
+
+    int32 turretDir = 0;
+    int32 barrelDir = 0;
+    loader.Read(turretDir);
+    loader.Read(barrelDir);
+    TurretDir.Value = turretDir;
+    BarrelDir.Value = barrelDir;
+
+    int8 flag = 0;
+    loader.Read(flag); IsHarvestingTiberium = (flag != 0);
+    loader.Read(flag); IsDumpingTiberium = (flag != 0);
+    loader.Read(HarvestAmount);
+    loader.Read(flag); IsMCV = (flag != 0);
+    loader.Read(flag); IsHarvester = (flag != 0);
+    loader.Read(flag); IsAPC = (flag != 0);
+    loader.Read(flag); IsDeployer = (flag != 0);
+    loader.Read(flag); IsChrono = (flag != 0);
+    loader.Read(flag); IsUnderground = (flag != 0);
+    loader.Read(flag); IsSubterranean = (flag != 0);
+    loader.Read(flag); IsCarryall = (flag != 0);
+    loader.Read(flag); IsJumpJet = (flag != 0);
 }

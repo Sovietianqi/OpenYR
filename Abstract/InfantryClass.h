@@ -320,5 +320,9 @@ public:
     bool           IsAliveNow;         // liveness flag (cleared by Kill/OnDestroyed)
     bool           IsMindControlledNow;// true while under external mind control
     bool           IsDisguisedNow;     // true while a spy is disguised
+
+    // Per-instance serialization for the save-game stream (base + derived).
+    void Save(class SaveGameClass& saver) const;
+    void Load(class LoadGameClass& loader);
     TechnoClass*   MindControlVictim;  // techno this infantry is controlling
 };

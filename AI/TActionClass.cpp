@@ -337,21 +337,11 @@ void TActionClass::Action_ChangeAI() {
     pHouse->IQLevel = iqForDifficulty[newDifficulty];
     pHouse->IQLevel2 = pHouse->IQLevel;
 
-    // Apply the matching difficulty multipliers from the rules database
-    // so the combat/production/economy code picks them up on the next
-    // update pass.
-    if (RulesClass::Instance) {
-        const DifficultyStruct* diff = RulesClass::Instance->GetDifficulty(newDifficulty);
-        if (diff) {
-            Game::DifficultyFirepowerMult = diff->Firepower;
-            Game::DifficultyArmorMult = diff->Armor;
-            Game::DifficultySpeedMult = diff->GroundSpeed;
-            Game::DifficultyROFMult = diff->ROF;
-            Game::DifficultyCostMult = diff->Cost;
-            Game::DifficultyBuildTimeMult = diff->BuildTime;
-        }
-    }
-
+    // The difficulty level is recorded as an integer on the house; AI
+    // behaviour branches on it (trigger enablement per difficulty, IQ)
+    // rather than through global combat multipliers.
+    pHouse->DifficultyLevel = newDifficulty;
+    Game::CurrentDifficulty = newDifficulty;
     Game::SetDifficulty(newDifficulty);
     pHouse->LastTriggerTime = Game::CurrentFrame;
 }

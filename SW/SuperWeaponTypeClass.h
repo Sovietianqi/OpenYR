@@ -10,6 +10,7 @@
 
 class AnimTypeClass;
 class WarheadTypeClass;
+class WeaponTypeClass;
 class BuildingTypeClass;
 class HouseTypeClass;
 class AircraftTypeClass;
@@ -18,44 +19,29 @@ class SHPStruct;
 
 // ============================================================================
 // SuperWeaponType
+//
+//  Values mirror the original "Type" string list (strlist_SuperTypes):
+//  MultiMissile, IronCurtain, LightningStorm, ChronoSphere, ChronoWarp,
+//  ParaDrop, AmerParaDrop, PsychicDominator, SpyPlane, GeneticConverter,
+//  ForceShield, PsychicReveal.  An unset Type stays -1 in the original
+//  constructor.
 // ============================================================================
 
 enum class SuperWeaponType : int32 {
-    None                = 0,
-    Nuke                = 1,
-    IronCurtain         = 2,
-    ForceShield         = 3,
-    LightningStorm      = 4,
-    PsychicDominator    = 5,
-    GeneticMutator      = 6,
-    ChronoSphere        = 7,
-    ChronoWarp          = 8,
-    ParaDrop            = 9,
-    SpyPlane            = 10,
+    None                = -1,
+    MultiMissile        = 0,
+    IronCurtain         = 1,
+    LightningStorm      = 2,
+    ChronoSphere        = 3,
+    ChronoWarp          = 4,
+    ParaDrop            = 5,
+    AmerParaDrop        = 6,
+    PsychicDominator    = 7,
+    SpyPlane            = 8,
+    GeneticConverter    = 9,
+    ForceShield         = 10,
     PsychicReveal       = 11,
-    SonarPulse          = 12,
-    HunterSeeker        = 13,
-    DropPod             = 14,
-    Count               = 15
-};
-
-enum class SuperWeaponAction : int32 {
-    None                = 0,
-    Nuke                = 1,
-    IronCurtain         = 2,
-    ForceShield         = 3,
-    LightningStorm      = 4,
-    PsychicDominator    = 5,
-    GeneticMutator      = 6,
-    ChronoSphere        = 7,
-    ChronoWarp          = 8,
-    ParaDrop            = 9,
-    SpyPlane            = 10,
-    PsychicReveal       = 11,
-    SonarPulse          = 12,
-    HunterSeeker        = 13,
-    DropPod             = 14,
-    Count               = 15
+    Count               = 12
 };
 
 enum class MissionType : int32 {
@@ -99,8 +85,6 @@ public:
     int32 GetRechargeTime() const;
     int32 GetCost() const;
 
-    static void RegisterAll();
-
 public:
     static SuperWeaponTypeClass* Last;
     static int32 Count;
@@ -108,11 +92,12 @@ public:
     char ID[0x20];
     char Name[0x20];
     char UIName[0x20];
+    WeaponTypeClass* WeaponType;
     SuperWeaponType Type;
     int32 RechargeTime;
     int32 Cost;
     int32 Side;
-    SuperWeaponAction Action;
+    int32 Action;
     bool IsPowered;
     bool IsPersistent;
     bool IsOneTime;
@@ -138,11 +123,17 @@ public:
     BYTE PadByte3;
     bool PreClick;
     bool PostClick;
+    bool AIDefendAgainst;
+    bool ManualControl;
     int32 Cursor;
     int32 NoCursor;
     int32 AnimCount;
     int32 PreDependent;
     int32 FlashSidebarTabFrames;
+    int32 SpecialSound;
+    int32 StartSound;
+    int32 LineMultiplier;
+    float Range;
     int32 unknown_3C;
     int32 PreSound;
     int32 PreSoundPriority;
@@ -242,6 +233,7 @@ public:
     // UI
     char MenuText[0x20];
     char HelpText[0x20];
+    char SidebarImageName[0x18];
     SHPStruct* CameoShape;
     SHPStruct* SidebarImage;
 };
