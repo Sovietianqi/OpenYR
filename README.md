@@ -1,72 +1,75 @@
-# OpenYR
+OpenYR
 
-[![GPL v3](https://www.gnu.org/graphics/gplv3-127x51.png)](https://opensource.org/license/GPL-3.0)
-
----
-
-🌐 **Language / 语言**：[English](#english) | [中文](#chinese)
+https://www.gnu.org/graphics/gplv3-127x51.png
 
 ---
 
-# English {#english}
+🌐 Language / 语言：English | 中文
 
-> **Disclaimer**: OpenYR is an independent, open-source project created for educational and research purposes. It is **not affiliated with, endorsed by, or sponsored by Electronic Arts Inc. or its licensors**. "Command & Conquer: Yuri's Revenge" and all related trademarks are the property of Electronic Arts Inc. This project does not distribute any proprietary game assets; users must legally own a copy of the original game to run this engine.
+---
 
-## Overview
+English {#english}
 
-**OpenYR** is an open-source engine reimplementation project for *Command & Conquer: Yuri's Revenge*, initiated and maintained by **sovietianqi**. The project is built upon binary reverse engineering of the original `gamemd.exe` executable, combined with interface definitions and data structure research from the **YRpp** library (https://github.com/Phobos-developers/YRpp). OpenYR aims to reconstruct and reimplement the core logic of the original engine independently.
+Disclaimer: OpenYR is an independent, open-source, non-commercial project created solely for educational and research purposes. It is not affiliated with, endorsed by, sponsored by, or in any way associated with Electronic Arts Inc. or its licensors. "Command & Conquer: Yuri's Revenge" and all related titles, trademarks, and intellectual property are the exclusive property of Electronic Arts Inc.
 
-The primary goal is to break free from the constraints of the original closed-source binary, providing the community with an open, extensible, and portable engine alternative. This opens up broader technical possibilities for MOD development, toolchain integration, and cross-platform adaptation.
+This project is a reverse-engineering-based reimplementation of engine behavior. Its implementation is derived from independent analysis of the original game's observable behavior, disassembly research, and publicly available documentation. The source code is independently written and does not include, copy, or redistribute any proprietary game assets, original source code, or binaries. Users must legally own a copy of the original game to run this engine.
 
-## Current Status
+This project is strictly non-profit. It does not accept donations, sponsorships, or any form of commercial funding, and it is not intended for any commercial use.
 
-> 🚧 **Active Development — Continuously Evolving** — The core architecture and foundational components are gradually taking shape. Due to the inherent uncertainties and potential misunderstandings in reverse engineering-based reconstruction, the current version does **not** yet achieve full gameplay parity and may contain logical discrepancies from the original behavior. Developers are welcome to participate in code reviews and testing feedback to help refine the implementation.
+Overview
 
-## Core Technical Directions
+OpenYR is an open-source, reverse-engineering-based reimplementation of an engine compatible with Command & Conquer: Yuri's Revenge, initiated and maintained by sovietianqi. The project reconstructs the core logic of the original real-time strategy engine through independent analysis of observable game behavior, disassembly research, and publicly available documentation.
 
-OpenYR rethinks the original engine from the ground up with a comprehensive architectural overhaul. Key technical directions include:
+OpenYR aims to break free from the constraints of closed-source binaries, providing the community with an open, extensible, and portable engine alternative. This opens up broader technical possibilities for MOD development, toolchain integration, and cross-platform adaptation — all within a strictly non-commercial, educational framework.
 
-### 1. Modular Architecture Design
+Current Status
+
+🚧 Active Development — Continuously Evolving — The core architecture and foundational components are gradually taking shape. As a reimplementation project, some behaviors may not yet fully match the original game, and logical discrepancies may exist. Developers are welcome to participate in code reviews and testing feedback to help refine the implementation.
+
+Core Technical Directions
+
+OpenYR rethinks the engine from the ground up with a comprehensive architectural overhaul. Key technical directions include:
+
+1. Modular Architecture Design
 
 The project adopts a modular layered architecture with independently encapsulated core subsystems, including but not limited to:
 
-- **Core**: Engine core infrastructure
-- **Game**: Game main loop and state management
-- **Combat**: Combat logic and damage calculation
-- **AI**: Artificial intelligence decision-making system
-- **Audio**: Audio playback and management
-- **FileFormats**: Resource file parsing for Mix / INI / SHP / VXL formats
+· Core: Engine core infrastructure
+· Game: Game main loop and state management
+· Combat: Combat logic and damage calculation
+· AI: Artificial intelligence decision-making system
+· Audio: Audio playback and management
+· FileFormats: Resource file parsing for Mix / INI / SHP / VXL formats
 
 Each module interacts through well-defined interfaces, reducing coupling and facilitating independent testing and replacement.
 
-### 2. Modern Build System
+2. Modern Build System
 
-- **CMake** as the build system, supporting multi-platform compilation configurations
-- **C++** as the development language, leveraging modern C++ features for improved expressiveness and safety
-- Clear dependency management for seamless integration of third-party libraries
+· CMake as the build system, supporting multi-platform compilation configurations
+· C++ as the development language, leveraging modern C++ features for improved expressiveness and safety
+· Clear dependency management for seamless integration of third-party libraries
 
-### 3. Open Game Logic Extension
+3. Open Game Logic Extension
 
-- Game logic fully implemented in source code, no longer constrained by original hardcoded behaviors
-- Provides MOD authors with direct entry points for logic modification, eliminating reliance on DLL injection or hooking techniques
-- Facilitates implementation of new mechanics and gameplay that were difficult or impossible to achieve with the original engine
+· Game logic fully implemented in source code, no longer constrained by hardcoded behaviors
+· Provides MOD authors with direct entry points for logic modification, eliminating reliance on DLL injection or hooking techniques
+· Facilitates implementation of new mechanics and gameplay that were difficult or impossible to achieve previously
 
-### 4. Cross-Platform Portability
+4. Cross-Platform Portability
 
 Through an abstraction layer independent of Windows-specific APIs, OpenYR has the potential to be ported to other operating systems (such as Linux and macOS), offering a native experience to a broader player base.
 
-## Technical Architecture
+Technical Architecture
 
-| Component          | Description                                                       |
-|--------------------|-------------------------------------------------------------------|
-| Language           | C++                                                               |
-| Build System       | CMake                                                             |
-| Reverse Eng. Base  | gamemd.exe (Yuri's Revenge 1.001)                                 |
-| Reference Impl.    | YRpp support library (https://github.com/Phobos-developers/YRpp)  |
-| Target Game        | Command & Conquer: Yuri's Revenge                                 |
-| License            | GNU General Public License v3.0                                   |
+Component Description
+Language C++
+Build System CMake
+Project Nature Reverse-engineering-based reimplementation
+Compatibility Target Command & Conquer: Yuri's Revenge (behavioral compatibility)
+License GNU General Public License v3.0
+Commercial Use Prohibited — strictly non-profit, educational/research only
 
-## Directory Structure
+Directory Structure
 
 ```text
 OpenYR/
@@ -92,7 +95,7 @@ Prerequisites
 
 · A C++17 (or later) compliant compiler (MSVC / GCC / Clang)
 · CMake 3.10 or higher
-· Original game asset files (for testing and runtime)
+· Legally obtained original game asset files (for testing and runtime)
 
 Build Steps
 
@@ -114,29 +117,35 @@ OpenYR is in its early development stages, and community contributions are highl
 · Code Contributions: Pull Requests are welcome
 · Discussions: Feel free to reach out via Issues or email
 
+Note: OpenYR is a strictly non-commercial, educational project. We do not accept donations, sponsorships, or any form of financial support. All contributions must comply with the GPL v3 license and respect the intellectual property rights of Electronic Arts Inc.
+
 ---
 
 The project is under rapid development. Design documents, API references, and a comprehensive build guide will be released in subsequent updates.
 
 ---
 
-# 中文 {#chinese}
+中文 {#chinese}
 
-免责声明：OpenYR 是一个独立、开源的项目，仅用于教育和研究目的。本项目与 Electronic Arts Inc. 及其授权方无关，亦未经其认可或赞助。《命令与征服：尤里的复仇》及其所有相关商标均为 Electronic Arts Inc. 的财产。本项目不分发任何专有游戏资源；用户必须合法拥有原版游戏副本方可运行本引擎。
+免责声明：OpenYR 是一个独立、开源、非商业项目，仅用于教育与研究目的。本项目与 Electronic Arts Inc. 及其授权方无任何关联，亦未经其认可、赞助或以任何形式合作。《命令与征服：尤里的复仇》及其所有相关名称、商标及知识产权均为 Electronic Arts Inc. 的独家财产。
+
+本项目是基于逆向工程的重实现。其实现来源于对原版游戏可观察行为的独立分析、反汇编研究以及公开文档。源代码为独立编写，不包含、不复制、不再分发任何专有游戏资源、原版源代码或二进制文件。用户必须合法拥有原版游戏副本方可运行本引擎。
+
+本项目严格非盈利，不接受任何形式的捐赠、赞助或商业资助，亦不用于任何商业用途。
 
 概述
 
-OpenYR 是由 sovietianqi 发起并维护的《命令与征服：尤里的复仇》开源引擎实现项目。项目基于对原版 gamemd.exe 可执行文件的二进制逆向分析，结合 YRpp（https://github.com/Phobos-developers/YRpp） 库的接口定义与数据结构研究成果，对原版引擎的核心逻辑进行独立重建与重新实现。
+OpenYR 是由 sovietianqi 发起并维护的、面向《命令与征服：尤里的复仇》的开源逆向工程重实现项目。本项目通过对原版游戏可观察行为、反汇编研究与公开文档的独立分析，重建即时战略引擎的核心逻辑。
 
-OpenYR 旨在摆脱原版二进制文件的封闭性约束，为社区提供一个开放、可扩展、可移植的引擎替代方案，同时为 MOD 开发、工具链集成及跨平台适配提供更广阔的技术空间。
+OpenYR 旨在摆脱封闭源代码二进制的约束，为社区提供一个开放、可扩展、可移植的引擎替代方案，同时为 MOD 开发、工具链集成及跨平台适配提供更广阔的技术空间——所有这些都在严格非商业、教育性的框架内进行。
 
 当前状态
 
-🚧 开发阶段，持续建设中 —— 项目的核心架构与基础组件已逐步搭建完成。由于基于逆向分析的重建工作存在固有的不确定性与理解偏差，当前版本尚未实现完整的游戏可玩性，且可能存在与原版行为不符的逻辑错误。欢迎开发者参与代码审查与测试反馈，共同完善引擎实现。
+🚧 开发阶段，持续建设中 —— 项目的核心架构与基础组件已逐步搭建完成。作为一个重实现项目，部分行为可能尚未与原版游戏完全一致，且可能存在逻辑偏差。欢迎开发者参与代码审查与测试反馈，共同完善引擎实现。
 
 核心技术方向
 
-OpenYR 从架构设计的源头出发，对原版引擎进行了全面重构，主要技术方向包括：
+OpenYR 从架构设计的源头出发，对引擎进行了全面重构，主要技术方向包括：
 
 1. 模块化架构设计
 
@@ -159,9 +168,9 @@ OpenYR 从架构设计的源头出发，对原版引擎进行了全面重构，�
 
 3. 开放的游戏逻辑扩展
 
-· 游戏逻辑完全由源代码实现，不再受限于原版硬编码行为
+· 游戏逻辑完全由源代码实现，不再受限于硬编码行为
 · 为 MOD 作者提供更直接的逻辑修改入口，无需依赖注入或 Hook 手段
-· 便于实现原版引擎难以支持的新机制与新玩法
+· 便于实现此前难以支持的新机制与新玩法
 
 4. 跨平台可移植性
 
@@ -172,10 +181,10 @@ OpenYR 从架构设计的源头出发，对原版引擎进行了全面重构，�
 组件 说明
 开发语言 C++
 构建系统 CMake
-逆向分析基础 gamemd.exe（尤里的复仇 1.001）
-参考实现 YRpp 支持库（https://github.com/Phobos-developers/YRpp）
-目标游戏 命令与征服：尤里的复仇
+项目性质 基于逆向工程的重实现
+兼容目标 《命令与征服：尤里的复仇》（行为兼容）
 许可协议 GNU General Public License v3.0
+商业用途 禁止——严格非盈利，仅限教育/研究
 
 目录结构
 
@@ -203,7 +212,7 @@ OpenYR/
 
 · 支持 C++17 或更高版本的编译器（MSVC / GCC / Clang）
 · CMake 3.10 或更高版本
-· 游戏原版资源文件（用于测试与运行）
+· 合法获取的游戏原版资源文件（用于测试与运行）
 
 构建步骤
 
@@ -225,8 +234,8 @@ OpenYR 目前处于早期开发阶段，诚邀社区开发者参与共建。
 · 代码贡献：欢迎提交 Pull Request
 · 讨论交流：欢迎通过 Issues 或邮件与作者沟通
 
+注意：OpenYR 是一个严格非商业的教育性项目。我们不接受任何形式的捐赠、赞助或财务支持。所有贡献必须遵守 GPL v3 许可协议，并尊重 Electronic Arts Inc. 的知识产权。
+
 ---
 
 项目仍在快速发展中，后续将陆续补充设计文档、API 参考与完整的构建指南。
-
----
