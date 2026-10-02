@@ -1,4 +1,5 @@
 #include <Abstract/MissionClass.h>
+#include <INI/INIClass.h>
 
 // ============================================================================
 // Static member definitions
@@ -29,16 +30,12 @@ const char* MissionControlClass::GetName()
 const char* MissionControlClass::FindName(const Mission& index)
 {
     static const char* names[] = {
-        "Sleep", "Harmless", "Ambush", "Attack", "Capture", "Eaten",
-        "Guard", "AreaGuard", "Harvest", "Hunt", "Move", "Retreat",
-        "Return", "Stop", "Unload", "Enter", "Construction", "Selling",
-        "Repair", "Missile", "Open", "Rescue", "Patrol",
-        "ParaDropApproach", "ParaDropOverfly", "Wait",
-        "SpyPlaneApproach", "SpyPlaneOverfly",
-        // Yuri's Revenge extended missions.
-        "Deploy", "Follow", "Spy", "EnterTunnel", "ChronoWarp",
-        "ChronoSphere", "IronCurtain", "SelfDestruct", "Circle",
-        "Recycle", "Sticky", "Emergency", "TakeCover", "Gibber"
+        "Sleep", "Attack", "Move", "QMove", "Retreat", "Guard", "Sticky",
+        "Enter", "Capture", "Eaten", "Harvest", "Area Guard", "Return",
+        "Stop", "Ambush", "Hunt", "Unload", "Sabotage", "Construction",
+        "Selling", "Repair", "Rescue", "Missile", "Harmless", "Open",
+        "Patrol", "Paradrop Approach", "Paradrop Overfly", "Wait",
+        "Attack Move", "Spyplane Approach", "Spyplane Overfly"
     };
     int32 idx = static_cast<int32>(index);
     if (idx >= 0 && idx < static_cast<int32>(Mission::Count)) {
@@ -62,17 +59,52 @@ Mission MissionControlClass::FindIndex(const char* pName)
 void MissionControlClass::LoadFromINI(CCINIClass* pINI)
 {
     if (!pINI) return;
-    // Load mission control settings from INI
-    // Example: NoThreat, Zombie, Recruitable, etc.
-    // These would be read from rulesmd.ini [MissionControl] section
-    NoThreat = false;
-    Zombie = false;
-    Recruitable = false;
-    Paralyzed = false;
-    Retaliate = false;
-    Scatter = false;
-    Rate = 0.016;
-    AARate = 0.016;
+
+    const char* section = MissionControlClass::FindName(static_cast<Mission>(ArrayIndex));
+    if (section == nullptr)
+        section = "<none>";
+
+    if (pINI->GetSection(section) == nullptr)
+        return;
+
+    NoThreat    = pINI->ReadBool(section, "NoThreat", NoThreat);
+    Zombie      = pINI->ReadBool(section, "Zombie", Zombie);
+    Recruitable = pINI->ReadBool(section, "Recruitable", Recruitable);
+    Paralyzed   = pINI->ReadBool(section, "Paralyzed", Paralyzed);
+    Retaliate   = pINI->ReadBool(section, "Retaliate", Retaliate);
+    Scatter     = pINI->ReadBool(section, "Scatter", Scatter);
+    Rate        = pINI->ReadFixed(section, "Rate", Rate);
+    AARate      = pINI->ReadFixed(section, "AARate", AARate);
+}
+
+MissionControlClass* MissionControlClass::Find(const Mission& index)
+{
+    int32 idx = static_cast<int32>(index);
+    if (idx < 0 || idx >= MissionControlClass::Array.Count)
+        return nullptr;
+
+    return &MissionControlClass::Array.Items[idx];
+}
+
+void MissionControlClass::LoadAllFromINI(CCINIClass* pINI)
+{
+    if (!pINI) return;
+
+    if (MissionControlClass::Array.Count <= 0)
+    {
+        for (int32 i = 0; i < static_cast<int32>(Mission::Count); ++i)
+        {
+            if (MissionControlClass::FindName(static_cast<Mission>(i)) == nullptr)
+                continue;
+
+            MissionControlClass entry;
+            entry.ArrayIndex = i;
+            MissionControlClass::Array.Add(entry);
+        }
+    }
+
+    for (int32 i = 0; i < MissionControlClass::Array.Count; ++i)
+        MissionControlClass::Array.Items[i].LoadFromINI(pINI);
 }
 
 // ============================================================================

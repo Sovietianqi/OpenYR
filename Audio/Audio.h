@@ -239,6 +239,47 @@ private:
 };
 
 // ============================================================================
+// AudioIndexTable - the sorted sample name table backing audio.idx
+//
+// The mixer addresses every sample through the position of its name inside
+// this table, so the table is kept sorted and searched with a binary search.
+// Each record is 0x24 bytes; the name occupies the first 0x20.
+// ============================================================================
+
+struct AudioIndexEntry {
+    char   Name[0x20];
+    uint32 Offset;
+};
+
+class AudioIndexTable {
+public:
+    AudioIndexTable();
+    ~AudioIndexTable();
+
+    bool Load(const char* pFileName, const char* pDirectory);
+
+    int32 FindIndex(const char* pName) const;
+    const char* GetName(int32 index) const;
+
+    int32 GetCount() const { return Count; }
+    bool  IsLoaded() const { return Entries != nullptr; }
+    void  Clear();
+
+    AudioIndexEntry* GetEntries() const { return Entries; }
+
+private:
+    AudioIndexEntry* Entries;
+    int32            Count;
+    int32            Capacity;
+    char             Directory[0x104];
+};
+
+extern AudioIndexTable* g_pAudioIndexTable;
+
+int32 Audio_FindSampleIndex(const char* pName);
+bool  Audio_LoadSampleIndex(const char* pFileName, const char* pDirectory);
+
+// ============================================================================
 // AudioManager - singleton managing all audio playback
 // ============================================================================
 
@@ -268,6 +309,11 @@ public:
     void MuteAll(bool mute);
     bool IsMuted() const { return Muted; }
 
+    // sub_406760 - the pool statistics dump.  Writes the live event and
+    // static-sound counts against their capacities; the callback receives
+    // each already-formatted line.
+    void DumpPoolStats(void (*pCallback)(const char*));
+
     // Playback
     void PlaySample(AudioSample* sample, float volume = 1.0f, int32 panning = 0x2000);
     void StopAllSamples();
@@ -292,6 +338,14 @@ private:
     float MusicVolume;
     bool Muted;
     bool Initialized;
+
+    // Pool counters reported by DumpPoolStats.  The event pool mirrors the
+    // original's VocGlobalA live count against its configured maximum, and
+    // the static-sound pool the two globals at 0xB1D3A8 / 0xB1D3AC.
+    int32 VoiceCount;
+    int32 VoiceCapacity;
+    int32 StaticSoundCount;
+    int32 StaticSoundCapacity;
 };
 
 // ============================================================================

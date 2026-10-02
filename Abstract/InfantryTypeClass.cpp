@@ -1,4 +1,7 @@
 #include <Abstract/InfantryTypeClass.h>
+#include <Combat/WeaponTypeClass.h>
+#include <Audio/VocClass.h>
+#include <Animations/AnimTypeClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -407,9 +410,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     Engineer = pINI->ReadBool(section, "Engineer", Engineer);
     Thief    = pINI->ReadBool(section, "Thief",    Thief);
-    Cow      = pINI->ReadBool(section, "Cow",      Cow);
-    Dog      = pINI->ReadBool(section, "Dog",      Dog);
-    Boris    = pINI->ReadBool(section, "Boris",    Boris);
 
     IsCow_   = Cow;
     IsDog_   = Dog;
@@ -423,9 +423,7 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Combat flags (with underscore-suffixed own fields)
     // ------------------------------------------------------------------
-    IsArmed_          = pINI->ReadBool(section, "Armed",          IsArmed_);
     IsMissileSpawn_   = pINI->ReadBool(section, "MissileSpawn",   IsMissileSpawn_);
-    IsFake_           = pINI->ReadBool(section, "Fake",           IsFake_);
     IsDisableable_    = pINI->ReadBool(section, "Disableable",    IsDisableable_);
 
     TechnoTypeClass::IsArmed        = IsArmed_;
@@ -436,20 +434,11 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // CanBeXxx interaction flags
     // ------------------------------------------------------------------
-    IsCanBeSuppressed_  = pINI->ReadBool(section, "CanSuppressed",   IsCanBeSuppressed_);
     IsCanBeOccupied_    = pINI->ReadBool(section, "CanBeOccupied",   IsCanBeOccupied_);
-    IsCanBeDriven_      = pINI->ReadBool(section, "CanBeDriven",     IsCanBeDriven_);
     IsCanBeCaptured_    = pINI->ReadBool(section, "Capturable",   IsCanBeCaptured_);
     IsCanBeRepaired_    = pINI->ReadBool(section, "Repairable",   IsCanBeRepaired_);
-    IsCanBeSold_        = pINI->ReadBool(section, "CanBeSold",       IsCanBeSold_);
     IsCanBePowered_     = pINI->ReadBool(section, "Powered",    IsCanBePowered_);
-    IsCanBeDestroyed_   = pINI->ReadBool(section, "CanBeDestroyed",  IsCanBeDestroyed_);
-    IsCanBeDamaged_     = pINI->ReadBool(section, "CanBeDamaged",    IsCanBeDamaged_);
-    IsCanBeInfiltrated_ = pINI->ReadBool(section, "CanBeInfiltrated",IsCanBeInfiltrated_);
     IsCanBeSpied_       = pINI->ReadBool(section, "Spyable",      IsCanBeSpied_);
-    IsCanBeSabotaged_   = pINI->ReadBool(section, "CanBeSabotaged",  IsCanBeSabotaged_);
-    IsCanBeStolen_      = pINI->ReadBool(section, "CanBeStolen",     IsCanBeStolen_);
-    IsCanBeHijacked_    = pINI->ReadBool(section, "CanBeHijacked",   IsCanBeHijacked_);
 
     // ------------------------------------------------------------------
     // Crush / movement flags
@@ -457,7 +446,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCrushable   = pINI->ReadBool(section, "Crushable",   IsCrushable);
     IsCrushable2  = pINI->ReadBool(section, "Crushable",  IsCrushable2);
     IsTeleporter  = pINI->ReadBool(section, "Teleporter",  IsTeleporter);
-    IsChrono      = pINI->ReadBool(section, "Chrono",      IsChrono);
     IsBomb        = pINI->ReadBool(section, "Bomb",        IsBomb);
 
     TechnoTypeClass::IsCrushable  = IsCrushable;
@@ -465,6 +453,12 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     TechnoTypeClass::IsTeleporter = IsTeleporter;
     TechnoTypeClass::IsChrono     = IsChrono;
     TechnoTypeClass::IsBomb       = IsBomb;
+
+    // ------------------------------------------------------------------
+    // Pips
+    // ------------------------------------------------------------------
+    Pip       = pINI->ReadPipIdx(section, "Pip",       Pip);
+    OccupyPip = pINI->ReadPipIdx(section, "OccupyPip", OccupyPip);
 
     // ------------------------------------------------------------------
     // Voxel / SHP classification
@@ -476,8 +470,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     HasTurret     = pINI->ReadBool(section, "Turret",     HasTurret);
     CanCloak      = pINI->ReadBool(section, "Cloakable",  CanCloak);
     HasDeployer   = pINI->ReadBool(section, "Deployer",   HasDeployer);
-    HasUndeployer = pINI->ReadBool(section, "Undeployer", HasUndeployer);
-    HasFirewall   = pINI->ReadBool(section, "Firewall",   HasFirewall);
 
     Turret     = HasTurret;
     Cloak      = CanCloak;
@@ -503,7 +495,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
         std::memset(&Weapons[i], 0, sizeof(WeaponStruct));
     }
 
-    EliteWeaponCount = pINI->ReadInteger(section, "EliteWeaponCount", EliteWeaponCount);
     if (EliteWeaponCount < 0) EliteWeaponCount = 0;
     if (EliteWeaponCount > 2) EliteWeaponCount = 2;
     for (int32 i = 0; i < EliteWeaponCount; ++i)
@@ -512,7 +503,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     }
 
     DeathWeaponIndex = pINI->ReadInteger(section, "DeathWeapon", -1);
-    WeaponCharge     = pINI->ReadInteger(section, "WeaponCharge", 0);
 
     // ------------------------------------------------------------------
     // Deploy fire sequence
@@ -531,17 +521,12 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     // Special classification flags
     // ------------------------------------------------------------------
     IsIvan            = pINI->ReadBool(section, "Ivan",            IsIvan);
-    IsLeader          = pINI->ReadBool(section, "Leader",          IsLeader);
     IsCarryall        = pINI->ReadBool(section, "Carryall",        IsCarryall);
-    IsTrain           = pINI->ReadBool(section, "Train",           IsTrain);
     IsSimpleDeployer  = pINI->ReadBool(section, "Deployer",  IsSimpleDeployer);
-    IsFirebase        = pINI->ReadBool(section, "Firebase",        IsFirebase);
     IsSonic           = pINI->ReadBool(section, "Sonic",           IsSonic);
-    IsVan             = pINI->ReadBool(section, "Van",             IsVan);
     IsBalloonHover    = pINI->ReadBool(section, "BalloonHover",    IsBalloonHover);
     IsCyborg          = pINI->ReadBool(section, "Cyborg",          IsCyborg);
     IsConsideredAircraft = pINI->ReadBool(section, "ConsideredAircraft", IsConsideredAircraft);
-    IsConsideredVehicle  = pINI->ReadBool(section, "ConsideredVehicle",  IsConsideredVehicle);
 
     TechnoTypeClass::IsIvan            = IsIvan;
     TechnoTypeClass::IsLeader          = IsLeader;
@@ -562,13 +547,10 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     IsImmuneToPsionics  = pINI->ReadBool(section, "ImmuneToPsionics",  IsImmuneToPsionics);
     IsImmuneToPoison    = pINI->ReadBool(section, "ImmuneToPoison",    IsImmuneToPoison);
     IsImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", IsImmuneToRadiation);
-    IsImmuneToBerserk   = pINI->ReadBool(section, "ImmuneToBerserk",   IsImmuneToBerserk);
-    IsImmuneToEMP       = pINI->ReadBool(section, "ImmuneToEMP",       IsImmuneToEMP);
 
     // ------------------------------------------------------------------
     // Misc flags
     // ------------------------------------------------------------------
-    IsTilter          = pINI->ReadBool(section, "Tilter",          IsTilter);
     IsToProtect       = pINI->ReadBool(section, "ToProtect",       IsToProtect);
     IsNominal         = pINI->ReadBool(section, "Nominal",         IsNominal);
     IsRadarInvisible  = pINI->ReadBool(section, "RadarInvisible",  IsRadarInvisible);
@@ -583,9 +565,6 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     IsNotHuman         = pINI->ReadBool(section, "NotHuman",         IsNotHuman);
     IsOrganic          = pINI->ReadBool(section, "Organic",          IsOrganic);
     IsNeutral          = pINI->ReadBool(section, "Neutral",          IsNeutral);
-    IsInfiltratable    = pINI->ReadBool(section, "Infiltratable",    IsInfiltratable);
-    IsStealthy         = pINI->ReadBool(section, "Stealthy",         IsStealthy);
-    IsHealable         = pINI->ReadBool(section, "Healable",         IsHealable);
 
     // ------------------------------------------------------------------
     // Factory type
@@ -598,7 +577,58 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (!_strcmpi(factoryBuf, "Aircraft")) Factory = AbstractType::Aircraft;
     else                                     Factory = AbstractType::Infantry;
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Pip = pINI->ReadPipIdx(section, "Pip", Pip);
+    OccupyPip = pINI->ReadPipIdx(section, "OccupyPip", OccupyPip);
+    { char _buf[0x40]; if (pINI->ReadString(section, "OccupyWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) OccupyWeapon = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EliteOccupyWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) EliteOccupyWeapon = _p; } }
+    pINI->ReadString(section, "VoiceComment", VoiceComment, VoiceComment, sizeof(VoiceComment));
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeadBodies", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DeadBodies = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeathAnims", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DeathAnims = _p; } }
+    Cyborg = pINI->ReadBool(section, "Cyborg", Cyborg);
+    NotHuman = pINI->ReadBool(section, "NotHuman", NotHuman);
+    { char _buf[0x40]; if (pINI->ReadString(section, "EnterWaterSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) EnterWaterSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LeaveWaterSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) LeaveWaterSound = _i; } }
+    Fearless = pINI->ReadBool(section, "Fearless", Fearless);
+    Fraidycat = pINI->ReadBool(section, "Fraidycat", Fraidycat);
+    Infiltrate = pINI->ReadBool(section, "Infiltrate", Infiltrate);
+    Ivan = pINI->ReadBool(section, "Ivan", Ivan);
+    Occupier = pINI->ReadBool(section, "Occupier", Occupier);
+    Assaulter = pINI->ReadBool(section, "Assaulter", Assaulter);
+    DetectionDistance = pINI->ReadInteger(section, "DetectionDistance", DetectionDistance);
+    HarvestRate = pINI->ReadInteger(section, "HarvestRate", HarvestRate);
+    C4 = pINI->ReadBool(section, "C4", C4);
+    Civilian = pINI->ReadBool(section, "Civilian", Civilian);
+    Engineer = pINI->ReadBool(section, "Engineer", Engineer);
+    TiberiumProof = pINI->ReadBool(section, "TiberiumProof", TiberiumProof);
+    Agent = pINI->ReadBool(section, "Agent", Agent);
+    Thief = pINI->ReadBool(section, "Thief", Thief);
+    VehicleThief = pINI->ReadBool(section, "VehicleThief", VehicleThief);
+    Doggie = pINI->ReadBool(section, "Doggie", Doggie);
+    Deployer = pINI->ReadBool(section, "Deployer", Deployer);
+    DeployedCrushable = pINI->ReadBool(section, "DeployedCrushable", DeployedCrushable);
+    UseOwnName = pINI->ReadBool(section, "UseOwnName", UseOwnName);
+    JumpJetTurn = pINI->ReadBool(section, "JumpJetTurn", JumpJetTurn);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    Crawls = pArt->ReadBool(section, "Crawls", Crawls);
+    FireUp = pArt->ReadInteger(section, "FireUp", FireUp);
+    FireProne = pArt->ReadInteger(section, "FireProne", FireProne);
+    SecondaryFire = pArt->ReadInteger(section, "SecondaryFire", SecondaryFire);
+    SecondaryProne = pArt->ReadInteger(section, "SecondaryProne", SecondaryProne);
+
+        return true;
 }
 
 // ============================================================================
@@ -763,4 +793,173 @@ int32 InfantryTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// InfantryTypeClass - static lookup helpers
+// ============================================================================
+
+InfantryTypeClass* InfantryTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    InfantryTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    InfantryTypeClass* newItem = GameCreate<InfantryTypeClass>();
+    if (newItem)
+    {
+        strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
+        newItem->ID[sizeof(newItem->ID) - 1] = '\0';
+    }
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
+}
+
+// ============================================================================
+// InfantryTypeClass sequence data
+//
+//   Every entry of the Sequences table owns a 0x24 byte record.  The first
+//   dword is the facing index (the "N"/"NE"/... token from the artmd.ini
+//   value); the next two dwords are frame counters; the two VocClass slots
+//   and their frame numbers fill the rest.  The original walks the records
+//   with a 0x24 stride from SequenceData[0].
+// ============================================================================
+
+namespace {
+
+// The 42 sequence names the original's "Sequences" table holds, in order.
+const char* const g_SequenceNames[] = {
+    "Ready", "Guard", "Prone", "Walk", "FireUp", "Down",
+    "Crawl", "Up", "FireProne", "Idle1", "Idle2", "Die1",
+    "Die2", "Die3", "Die4", "Die5", "Tread", "Swim",
+    "WetIdle1", "WetIdle2", "WetDie1", "WetDie2", "WetAttack", "Hover",
+    "Fly", "Tumble", "FireFly", "Deploy", "Deployed", "DeployedFire",
+    "DeployedIdle", "Undeploy", "Cheer", "Paradrop", "AirDeathStart",
+    "AirDeathFalling", "AirDeathFinish", "Panic", "Shovel", "Carry",
+    "SecondaryFire", "SecondaryProne"
+};
+
+const int32 g_SequenceCount =
+    sizeof(g_SequenceNames) / sizeof(g_SequenceNames[0]);
+
+// Facing tokens in the order the original compares them.
+const char* const g_FacingNames[] = {
+    "N", "NE", "E", "SE", "S", "SW", "W", "NW"
+};
+
+int32 FacingFromName(const char* pName)
+{
+    for (int32 i = 0; i < 8; ++i)
+    {
+        if (std::strcmp(pName, g_FacingNames[i]) == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+const char* InfantryTypeClass::GetSequenceName(int32 index)
+{
+    if (index < 0 || index >= g_SequenceCount) {
+        return nullptr;
+    }
+    return g_SequenceNames[index];
+}
+
+int32 InfantryTypeClass::GetSequenceNameCount()
+{
+    return g_SequenceCount;
+}
+
+// ============================================================================
+// InfantryTypeClass_ParseSequence - asm 0x523D20
+//
+//   artmd.ini's section for this infantry is scanned twice per sequence.  The
+//   "<Name>" key carries a "%d,%d,%d,%s" value: two frame numbers, a count,
+//   and a facing token that selects the facing slot.  The "<Name>Sounds" key
+//   then carries a whitespace separated run of "<frame>,<voc name>" pairs,
+//   each of which is resolved through VocClass::FindIndexOfName and stored in
+//   the sequence's two sound slots.
+//
+//   ParseSequence exits early when the section has no "Sequence" key at all.
+// ============================================================================
+void InfantryTypeClass::ParseSequence()
+{
+    // The section is the art image tag, normally this type's Image name.
+    const char* pImage = Image;
+    if (pImage == nullptr || pImage[0] == '\0') {
+        pImage = ID;
+    }
+
+    char section[0x20];
+    section[0] = '\0';
+
+    CCINIClass* pArt = CCINIClass::GetArtINI();
+    if (pArt == nullptr) {
+        return;
+    }
+
+    if (pArt->ReadString(pImage, "Sequence", "", section,
+                         sizeof(section)) <= 0) {
+        return;
+    }
+
+    for (int32 seqIndex = 0; seqIndex < g_SequenceCount; ++seqIndex)
+    {
+        SequenceDataRec& data = SequenceDataAt(seqIndex);
+
+        char value[0x20];
+        value[0] = '\0';
+        if (pArt->ReadString(section, g_SequenceNames[seqIndex], "", value,
+                             sizeof(value)) <= 0) {
+            continue;
+        }
+
+        // "%d,%d,%d,%s" -> StartFrame, FrameCount, unused, facing token.
+        int32 first = 0;
+        int32 second = 0;
+        char facing[0x20];
+        facing[0] = '\0';
+        if (std::sscanf(value, "%d,%d,%d,%s", &first, &data.FrameCount,
+                        &second, facing) < 4) {
+            continue;
+        }
+
+        data.Facing = FacingFromName(facing);
+        data.Frames[0].StartFrame = first;
+        data.Frames[0].FrameCount = second;
+
+        char key[0x40];
+        std::sprintf(key, "%sSounds", g_SequenceNames[seqIndex]);
+
+        char sounds[0x20];
+        sounds[0] = '\0';
+        if (pArt->ReadString(section, key, "", sounds, sizeof(sounds)) <= 0) {
+            continue;
+        }
+
+        int32 slot = 0;
+        char* pToken = std::strtok(sounds, " ,\t");
+        while (pToken != nullptr)
+        {
+            const int32 frame = std::atoi(pToken);
+
+            pToken = std::strtok(nullptr, " ,\t");
+            if (pToken == nullptr) {
+                break;
+            }
+
+            const int32 sound = VocClass::FindIndexOfName(pToken);
+            if (sound != -1 && slot < 2)
+            {
+                data.Sounds[slot].Frame = frame;
+                data.Sounds[slot].SoundIndex = sound;
+                ++slot;
+            }
+
+            pToken = std::strtok(nullptr, " ,\t");
+        }
+    }
 }

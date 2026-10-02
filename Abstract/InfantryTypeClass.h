@@ -12,6 +12,7 @@ public:
 
     // Static lookup / array management
     static InfantryTypeClass* Find(const char* pID);
+    static InfantryTypeClass* FindOrAllocate(const char* pID);
     static InfantryTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -138,5 +139,69 @@ public:
     bool        HasUndeployer;
     bool        HasFirewall;
     Sequence    DeployFireSequence;
+
+    // InfantryTypeClass_ParseSequence: for every entry of the Sequences
+    // table, reads "<SequenceName>" out of artmd.ini's section for this
+    // infantry and unpacks the "%d,%d,%d,%s" frame triple into the six-slot
+    // SequenceData record that starts at SequenceData[0].
+    void ParseSequence();
+    static const char* GetSequenceName(int32 index);
+    static int32 GetSequenceNameCount();
+
+    // One 0x24 byte record per entry of the Sequences table.  The original
+    // keeps the block at +SequenceData and straddles it with a 0x24 stride.
+    struct SequenceFrame { int32 StartFrame; int32 FrameCount; };
+    struct SequenceSound { int32 Frame; int32 SoundIndex; };
+    struct SequenceDataRec
+    {
+        int32           Facing;      // +00
+        int32           FrameCount;  // +04
+        SequenceFrame   Frames[2];   // +08, +10
+        SequenceSound   Sounds[2];   // +18, +20
+    };
+
+    static constexpr int32 MaxSequences = 42;
+    SequenceDataRec SequenceData[MaxSequences];
+
+    SequenceDataRec& SequenceDataAt(int32 index) {
+        return SequenceData[index];
+    }
     BYTE        padding_InfantryType[4];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    int32        Pip;
+    int32        OccupyPip;
+    WeaponTypeClass* OccupyWeapon;
+    WeaponTypeClass* EliteOccupyWeapon;
+    char        VoiceComment[0x100];
+    AnimTypeClass* DeadBodies;
+    AnimTypeClass* DeathAnims;
+    bool         Cyborg;
+    bool         NotHuman;
+    int32 EnterWaterSound;
+    int32 LeaveWaterSound;
+    bool         Fearless;
+    bool         Fraidycat;
+    bool         Infiltrate;
+    bool         Ivan;
+    bool         Occupier;
+    bool         Assaulter;
+    int32        DetectionDistance;
+    int32        HarvestRate;
+    bool         C4;
+    bool         Civilian;
+    bool         TiberiumProof;
+    bool         Agent;
+    bool         VehicleThief;
+    bool         Doggie;
+    bool         Deployer;
+    bool         DeployedCrushable;
+    bool         UseOwnName;
+    bool         JumpJetTurn;
+    bool         Crawls;
+    int32        FireUp;
+    int32        FireProne;
+    int32        SecondaryFire;
+    int32        SecondaryProne;
 };

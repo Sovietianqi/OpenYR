@@ -11,6 +11,8 @@
 #include <Abstract/BuildingClass.h>
 #include <Rules/RulesClass.h>
 #include <INI/INIClass.h>
+#include <Scenario/ScenarioClass.h>
+#include <Rendering/ConvertClass.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -50,6 +52,8 @@ HouseClass* HouseClass::Observer = nullptr;
 
 HouseClass::HouseClass(HouseTypeClass* pType)
     : Type(pType)
+    , InitialName{}
+    , CSFName{}
     , TimesDefeated(0)
     , TimesWon(0)
     , Credits(0)
@@ -91,10 +95,15 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , ActiveSuperWeapons(0)
     , AvailableSuperWeapons(0)
     , UsedSuperWeapons(0)
+    , UIName{}
+    , RatioAITriggerTeam(0)
+    , RatioTeamAircraft(0)
+    , RatioTeamInfantry(0)
+    , RatioTeamUnits(0)
     , TechLevel(0)
     , IQLevel(0)
     , IQLevel2(0)
-    , Edge(0)
+    , Edge(-1)
     , ColorSchemeIndex(0)
     , UnitCount(0)
     , InfantryCount(0)
@@ -1963,4 +1972,218 @@ int32 HouseClass::Get_Total_Value() const
         }
     }
     return total;
+}
+
+// ============================================================================
+// FindIndexByName - HouseClass_FindIndexByName
+//
+//   Scan the live house array for a house whose InitialName matches.  The
+//   original compares with a case-insensitive strcmpi; the index returned is
+//   the *player number*, i.e. the house's own ArrayIndex slot.
+// ============================================================================
+int32 HouseClass::FindIndexByName(const char* pName)
+{
+    if (pName == nullptr)
+        return -1;
+
+    for (int32 i = 0; i < ArrayCount; ++i)
+    {
+        HouseClass* pHouse = Array[i];
+        if (pHouse == nullptr)
+            continue;
+
+        if (_strcmpi(pHouse->InitialName, pName) == 0)
+            return i;
+    }
+
+    return -1;
+}
+
+// ============================================================================
+// InitFromINI - HouseClass_InitFromINI
+//
+//   Per-house scenario block.  The section name is the house's InitialName,
+//   established earlier by LoadFromINIList.  Key order and defaults follow
+//   the original exactly:
+//
+//     TechLevel            int   (falls back to the scenario tech level)
+//     Credits              int   (x100 -> internal credit units)
+//     PlayerControl        bool
+//     UIName               str   0x20 bytes -> CSFName
+//     RatioAITriggerTeam   int
+//     RatioTeamAircraft    int   75
+//     RatioTeamInfantry    int   75
+//     RatioTeamUnits       int   75
+//     IQ                   int   (clamped to the rules maximum)
+//     Edge                 dir
+//     Color                colour scheme index
+//     Allies               bitfield of allied house numbers
+// ============================================================================
+bool HouseClass::InitFromINI(CCINIClass* pINI)
+{
+    if (pINI == nullptr)
+        return false;
+
+    char section[0x20];
+    std::strncpy(section, InitialName, sizeof(section) - 1);
+    section[sizeof(section) - 1] = '\0';
+
+    // ---------------------------------------------------------------
+    // TechLevel - the scenario value is the fallback
+    // ---------------------------------------------------------------
+    int32 techLevel = TechLevel;
+    if (ScenarioClass::Instance != nullptr)
+        techLevel = ScenarioClass::Instance->TechLevel;
+
+    TechLevel = pINI->ReadInteger(section, "TechLevel", techLevel);
+
+    // ---------------------------------------------------------------
+    // Credits - the INI value is expressed in hundreds; the engine keeps
+    // them as raw credit units (value * 25 * 4).
+    // ---------------------------------------------------------------
+    Credits = pINI->ReadInteger(section, "Credits", 0) * 25 * 4;
+
+    // ---------------------------------------------------------------
+    // PlayerControl
+    // ---------------------------------------------------------------
+    PlayerControl = pINI->ReadBool(section, "PlayerControl", false);
+
+    // ---------------------------------------------------------------
+    // UIName -> CSFName, truncated to 0x1F characters
+    // ---------------------------------------------------------------
+    char uiName[0x20];
+    uiName[0] = '\0';
+    pINI->ReadString(section, "UIName", "", uiName, sizeof(uiName));
+
+    if (uiName[0] != '\0')
+    {
+        char dest[0x20];
+        std::strncpy(dest, uiName, 0x1F);
+        dest[0x1F] = '\0';
+
+        for (int32 i = 0; i < 0x20; ++i)
+            CSFName[i] = static_cast<wchar_t>(dest[i]);
+    }
+
+    // ---------------------------------------------------------------
+    // AI ratios
+    // ---------------------------------------------------------------
+    RatioAITriggerTeam = pINI->ReadInteger(section, "RatioAITriggerTeam", RatioAITriggerTeam);
+    RatioTeamAircraft  = pINI->ReadInteger(section, "RatioTeamAircraft",  75);
+    RatioTeamInfantry  = pINI->ReadInteger(section, "RatioTeamInfantry",  75);
+    RatioTeamUnits     = pINI->ReadInteger(section, "RatioTeamUnits",     75);
+
+    // ---------------------------------------------------------------
+    // DifficultyLevel - carried on the house record itself.  The original
+    // copies it from a per-type field maintained by the multiplayer dialog;
+    // a negative value means "no override" and becomes zero.
+    // ---------------------------------------------------------------
+    if (DifficultyLevel == -1)
+        DifficultyLevel = 0;
+
+    // ---------------------------------------------------------------
+    // IQ - clamped against the rules maximum.  A value above the limit is
+    // treated as a malformed entry and reset to 1, as in the original.
+    // ---------------------------------------------------------------
+    int32 iq = pINI->ReadInteger(section, "IQ", 0);
+    if (RulesClass::Instance != nullptr && iq > RulesClass::Instance->MaxIQLevels)
+        iq = 1;
+
+    IQLevel  = iq;
+    IQLevel2 = iq;
+
+    // ---------------------------------------------------------------
+    // Edge - map border direction
+    // ---------------------------------------------------------------
+    Edge = pINI->GetEdge(section, "Edge", -1);
+
+    // ---------------------------------------------------------------
+    // Color - resolve the colour scheme index.  Values below zero fall back
+    // to white (5); so does a slot that holds no scheme.
+    // ---------------------------------------------------------------
+    ColorSchemeIndex = pINI->ReadColorSchemeIndex(section, "Color", ColorSchemeIndex);
+
+    if (ColorSchemeIndex < 0)
+        ColorSchemeIndex = 5;
+
+    if (ColorScheme::Array != nullptr
+        && ColorSchemeIndex >= 0
+        && ColorSchemeIndex < ColorScheme::Array->Count
+        && (*ColorScheme::Array)[ColorSchemeIndex] == nullptr)
+    {
+        ColorSchemeIndex = 5;
+    }
+
+    // ---------------------------------------------------------------
+    // Self alliance, then the Allies bitfield.
+    // ---------------------------------------------------------------
+    if (ArrayIndex >= 0 && ArrayIndex < ArrayCount && Array[ArrayIndex] != nullptr)
+        MakeAlly(Array[ArrayIndex]);
+
+    const uint32 allies = pINI->GetAlliesBitfield(section, "Allies", 0);
+    for (int32 i = 0; i < ArrayCount; ++i)
+    {
+        HouseClass* pHouse = Array[i];
+        if (pHouse == nullptr)
+            continue;
+
+        if ((allies & (1u << pHouse->ArrayIndex)) != 0)
+            MakeAlly(pHouse);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// LoadFromINIList - HouseClass_LoadFromINIList
+//
+//   Reads the [Houses] section of the scenario, allocating one HouseClass
+//   per entry from the "Country=" value, and remembering the key name as the
+//   house's InitialName.  InitFromINI then fills in each house's block.
+//   When the list is empty every house type gets a default house instead.
+// ============================================================================
+bool HouseClass::LoadFromINIList(CCINIClass* pINI)
+{
+    if (pINI == nullptr)
+        return false;
+
+    const int32 count = pINI->GetKeyCount("Houses");
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName("Houses", i);
+        if (pKeyName == nullptr)
+            continue;
+
+        char name[0x14];
+        name[0] = '\0';
+        pINI->ReadString("Houses", pKeyName, "", name, sizeof(name));
+        if (name[0] == '\0')
+            continue;
+
+        char countryBuf[0x20];
+        countryBuf[0] = '\0';
+        pINI->ReadString(name, "Country", "", countryBuf, sizeof(countryBuf));
+
+        HouseTypeClass* pType = HouseTypeClass::FindOrAllocate(countryBuf);
+        if (pType == nullptr)
+            pType = HouseTypeClass::Array[0];
+
+        HouseClass* pHouse = new HouseClass(pType);
+
+        std::strncpy(pHouse->InitialName, name, sizeof(pHouse->InitialName) - 1);
+        pHouse->InitialName[sizeof(pHouse->InitialName) - 1] = '\0';
+
+        Array[ArrayCount] = pHouse;
+        pHouse->ArrayIndex = ArrayCount;
+        pHouse->AllHousesIndex = ArrayCount;
+        ++ArrayCount;
+    }
+
+    for (int32 i = 0; i < ArrayCount; ++i)
+    {
+        if (Array[i] != nullptr)
+            Array[i]->InitFromINI(pINI);
+    }
+
+    return true;
 }

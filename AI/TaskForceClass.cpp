@@ -451,3 +451,43 @@ bool TaskForceClass::Is_Valid() const {
     }
     return false;
 }
+
+// ----------------------------------------------------------------------------
+// CreateFromINIList - TaskForceClass_CreateFromINIList (asm 0x6E822B)
+//
+//   Walks the [TaskForces] section.  Each key's value names the task force to
+//   create; the sentinels "<none>" and "none" are skipped, and a name that is
+//   already registered is reused rather than duplicated.
+// ----------------------------------------------------------------------------
+void TaskForceClass::CreateFromINIList(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+
+    static const char* const SECTION = "TaskForces";
+    const int32 count = pINI->GetKeyCount(SECTION);
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName(SECTION, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+
+        char name[0x18];
+        name[0] = '\0';
+        if (pINI->ReadString(SECTION, pKeyName, "", name, sizeof(name)) <= 0) {
+            continue;
+        }
+
+        if (_strcmpi(name, "<none>") == 0 || _strcmpi(name, "none") == 0) {
+            continue;
+        }
+
+        TaskForceClass* pItem = FindOrAllocate(name);
+        if (pItem != nullptr) {
+            pItem->LoadFromINI(pINI);
+        }
+    }
+}

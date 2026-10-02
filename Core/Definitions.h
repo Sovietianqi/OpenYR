@@ -372,17 +372,22 @@ enum class DamageType : int32 {
     Special = 6
 };
 
+// The value stored in MissionClass::CurrentMission doubles as the index into
+// MissionControls[] and into the mission name table, so the numbering below is
+// fixed by the tables the rules parser walks.
 enum class Mission : int32 {
-    Sleep = 0, Harmless, Ambush, Attack, Capture, Eaten, Guard, AreaGuard,
-    Harvest, Hunt, Move, Retreat, Return, Stop, Unload, Enter, Construction,
-    Selling, Repair, Missile, Open, Rescue, Patrol, ParaDropApproach,
-    ParaDropOverfly, Wait, SpyPlaneApproach, SpyPlaneOverfly,
-    // Yuri's Revenge extended missions (added to support script actions that
-    // previously used fallback missions because these were missing).
-    Deploy, Follow, Spy, EnterTunnel, ChronoWarp, ChronoSphere,
-    IronCurtain, SelfDestruct, Circle, Recycle, Sticky,
-    Emergency, TakeCover, Gibber,
-    Count
+    None = -1,
+    Sleep = 0, Attack, Move, QMove, Retreat, Guard, Sticky, Enter, Capture,
+    Eaten, Harvest, AreaGuard, Return, Stop, Ambush, Hunt, Unload, Sabotage,
+    Construction, Selling, Repair, Rescue, Missile, Harmless, Open, Patrol,
+    ParaDropApproach, ParaDropOverfly, Wait, AttackMove,
+    SpyPlaneApproach, SpyPlaneOverfly,
+    Count = 32,
+    // Script level pseudo missions.  These never reach MissionControls[] - the
+    // script actions that name them are carried out directly by the team logic
+    // instead of being dispatched through a mission handler.
+    Deploy = 32, Follow, Spy, EnterTunnel, ChronoWarp, ChronoSphere,
+    IronCurtain, SelfDestruct, Circle, Recycle, Emergency, TakeCover, Gibber
 };
 
 enum class Sequence : int32 {
@@ -405,9 +410,9 @@ enum class Action : int32 {
     None = 0, Move = 1, NoMove = 2, Enter = 3, Self = 4, Attack = 5,
     Harvest = 6, Select = 7, ToggleSelect = 8, Capture = 9, Eaten = 10,
     Repair = 11, Sell = 12, SellUnit = 13, NoSell = 14, NoRepair = 15,
-    Sabotage = 16, ToTe = 17, DoNotUse2 = 18, DoNotUse3 = 19, Nuke = 20,
-    DoNotUse4 = 21, DoNotUse5 = 22, DoNotUse6 = 23, DoNotUse7 = 24,
-    DoNotUse8 = 25, GuardArea = 26, Heal = 27, Damage = 28, GRepair = 29,
+    Sabotage = 16, Tote = 17, DontUse2 = 18, DontUse3 = 19, Nuke = 20,
+    DontUse4 = 21, DontUse5 = 22, DontUse6 = 23, DontUse7 = 24,
+    DontUse8 = 25, GuardArea = 26, Heal = 27, Damage = 28, GRepair = 29,
     NoDeploy = 30, NoEnter = 31, NoGRepair = 32, TogglePower = 33,
     NoTogglePower = 34, EnterTunnel = 35, NoEnterTunnel = 36,
     IronCurtain = 37, LightningStorm = 38, ChronoSphere = 39, ChronoWarp = 40,
@@ -424,7 +429,9 @@ enum class Action : int32 {
 };
 
 enum class BuildCat : int32 {
-    Tech = 0, Resource = 1, Power = 2, Infrastructure = 3, Combat = 4
+    DontCare = 0, Tech = 1, Resource = 2, Power = 3,
+    Infrastructure = 4, Combat = 5,
+    Count = 6
 };
 
 enum class VisualType : int32 {
@@ -432,7 +439,8 @@ enum class VisualType : int32 {
 };
 
 enum class Layer : int32 {
-    Ground = 0, Surface = 1, Air = 2, Top = 3
+    Underground = 0, Surface = 1, Ground = 2, Air = 3, Top = 4,
+    Count = 5
 };
 
 enum class Move : int32 {
@@ -460,21 +468,26 @@ using COLORREF = uint32;
 
 // Movement zone types
 enum class MovementZone : int32 {
-    Normal = 0, Crusher = 1, Destroyer = 2, Water = 3,
-    WaterBeach = 4, Amphibious = 5, AmphibiousCrusher = 6,
-    AmphibiousDestroyer = 7, Fly = 8
+    Normal = 0, Crusher = 1, Destroyer = 2,
+    AmphibiousDestroyer = 3, AmphibiousCrusher = 4, Amphibious = 5,
+    Subterannean = 6, Infantry = 7, InfantryDestroyer = 8, Fly = 9,
+    Water = 10, WaterBeach = 11, CrusherAll = 12,
+    Count = 13
 };
 
 // Land types
 enum class LandType : int32 {
-    Clear = 0, Rough = 1, Road = 2, Water = 3, Rock = 4,
-    Wall = 5, Tiberium = 6, Beach = 7, Tunnel = 8,
-    Railroad = 9, Weeds = 10, Ice = 11
+    Clear = 0, Road = 1, Water = 2, Rock = 3, Wall = 4,
+    Tiberium = 5, Beach = 6, Rough = 7, Ice = 8,
+    Railroad = 9, Tunnel = 10, Weeds = 11,
+    Count = 12
 };
 
 // Speed types
 enum class SpeedType : int32 {
-    Slow = 0, Medium = 1, Fast = 2, VeryFast = 3
+    Foot = 0, Track = 1, Wheel = 2, Hover = 3,
+    Winged = 4, Float = 5, Amphibious = 6, FloatBeach = 7,
+    Count = 8
 };
 
 // Damage area result
@@ -491,8 +504,44 @@ enum class TheaterType : int32 {
 // Armor types
 enum class Armor : int32 {
     None = 0, Flak = 1, Plate = 2, Light = 3, Medium = 4,
-    Heavy = 5, Wood = 6, Steel = 7, Concrete = 8, Drone = 9,
-    Special_1 = 10
+    Heavy = 5, Wood = 6, Steel = 7, Concrete = 8,
+    Special_1 = 9, Special_2 = 10,
+    Count = 11
+};
+
+// TechnoType classification shown in the sidebar and used by the AI when
+// picking counter-units.  Both the long and the abbreviated spelling are
+// accepted by the parser.
+enum class Category : int32 {
+    Soldier = 0, Civilian = 1, VIPAgent = 2, ReconVehicle = 3,
+    ArmoredFightingVehicle = 4, InfantryFightingVehicle = 5,
+    IndirectFireSupport = 6, MiscSupportVehicle = 7,
+    TransportVehicle = 8, AirCombatSupport = 9, AirTransport = 10,
+    Count = 11
+};
+
+// Voxel hit-point scan behaviour
+enum class VHPScan : int32 {
+    None = 0, Normal = 1, Strong = 2,
+    Count = 3
+};
+
+// Building footprints.  Index maps onto the footprint table the renderer
+// uses when stamping the foundation outline.
+enum class Foundation : int32 {
+    _1x1 = 0, _2x1 = 1, _1x2 = 2, _2x2 = 3, _2x3 = 4,
+    _3x2 = 5, _3x3 = 6, _3x5 = 7, _4x2 = 8, _3x3Refinery = 9,
+    _1x3 = 10, _3x1 = 11, _4x3 = 12, _1x4 = 13, _1x5 = 14,
+    _2x6 = 15, _2x5 = 16, _5x3 = 17, _4x4 = 18, _3x4 = 19,
+    _6x4 = 20, _0x0 = 21,
+    Count = 22
+};
+
+// What the pips drawn under a selected unit represent
+enum class PipScale : int32 {
+    None = 0, Ammo = 1, Tiberium = 2, Passengers = 3,
+    Power = 4, MindControl = 5,
+    Count = 6
 };
 
 // Add DistanceSquaredFrom to CoordStruct

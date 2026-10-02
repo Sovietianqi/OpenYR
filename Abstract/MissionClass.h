@@ -12,6 +12,8 @@ public:
     static DynamicVectorClass<MissionControlClass> Array;
     static const char* FindName(const Mission& index);
     static Mission FindIndex(const char* pName);
+    static void LoadAllFromINI(CCINIClass* pINI);
+    static MissionControlClass* Find(const Mission& index);
 
     MissionControlClass();
     const char* GetName();

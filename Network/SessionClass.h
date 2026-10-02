@@ -5,6 +5,7 @@
 #include "../Core/Memory.h"
 #include "../Containers/VectorClass.h"
 #include "../Math/Timer.h"
+#include "GameTypePrefsClass.h"
 
 static constexpr int32 MAX_SESSION_PLAYERS = 8;
 
@@ -129,6 +130,16 @@ public:
     void ResetSession();
     void SetupFromLobby();
 
+    // ── Preferences (RA2MD.INI) ─────────────────────────────────────────
+    //
+    //  SessionClass::Read_MultiPlayer_Settings (asm 0x698074) restores the
+    //  persistent multiplayer configuration from RA2MD.INI.  The three
+    //  per-mode preference blocks (Skirmish / LAN / WonlinePref) are read
+    //  through Game_GetGameTypePrefs.
+    void ReadMultiPlayerSettings();
+    void ReadSerialDefaults();
+    void ReadSyncBugSettings();
+
     void SetStartingCredits(int32 credits);
     int32 GetStartingCredits() const;
     int32 GetAIPlayerCount() const;
@@ -187,6 +198,53 @@ public:
     bool CoopGame;
     bool PendingSave;
     int32 HostID;
+
+    // ── Persistent multiplayer preferences (RA2MD.INI) ──────────────────
+    //
+    //  Layout mirrors GameModeClass at +0x28A8..+0x30CC.
+    int32               PortBase;
+    int32               ForcePortBase;
+    int32               PortPool;
+    bool                SendDelay;
+    int32               PortNumberOverride;
+    int32               PhoneIndex;
+    int32               CheckHeap;
+    bool                WOLLimitResolution;
+    int32               LastNickSlot;
+    wchar_t             Handle[0x14];
+    int32               Color;
+    int32               ColorEx;
+    int32               Side;
+    int32               SideEx;
+    int32               SideIdx;
+    int32               SideExIdx;
+    int32               ScenIndex;
+    bool                WOLTaunts;
+    bool                LANTaunts;
+    bool                WOLScrollText;
+    bool                LANScrollText;
+    char                ModemName[0x40];
+    int32               Port;
+    int32               IRQ;
+    int32               Baud;
+    int32               Compression;
+    int32               ErrorCorrection;
+    int32               DialMethod;
+    int32               InitStringIndex;
+    int32               CallWaitStringIndex;
+    char                CallWaitString[0x10];
+
+    // ── SyncBug diagnostics (RA2MD.INI [SyncBug]) ───────────────────────
+    int32               SyncBugFrame;
+    int32               SyncBugType;
+    int32               SyncBugTarget;
+    char                SyncBugCoord[0x50];
+    char                SyncBugCell[0x50];
+    int32               SyncBugPrintCRC;
+
+    GameTypePrefsClass  SkirmishPrefs;
+    GameTypePrefsClass  LANPrefs;
+    GameTypePrefsClass  WOLPrefs;
 
 public:
     int32 GetHostID() const { return HostID; }

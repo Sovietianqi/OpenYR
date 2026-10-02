@@ -170,6 +170,22 @@ public:
     bool            WallOwner;
     bool            SmartAI;
     BYTE            padding_1A9[7];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    int32        Color;
+    double       Groundspeed;
+    double       Airspeed;
+    double       ArmorType;
+    double       ROF;
+    double       Cost;
+    double       BuildTime;
+    double       BuildTimeInfantryMult;
+    double       BuildTimeUnitsMult;
+    double       BuildTimeAircraftMult;
+    double       BuildTimeBuildingsMult;
+    double       BuildTimeDefensesMult;
+    int32        Side;
 };
 
 // ============================================================================

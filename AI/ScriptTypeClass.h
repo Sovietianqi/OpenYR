@@ -12,6 +12,10 @@ public:
 
     static DynamicVectorClass<ScriptTypeClass*>* Array;
 
+    // ScriptTypeClass_CreateFromINIList: walks [ScriptTypes] and builds
+    // one script per listed name.
+    static void CreateFromINIList(CCINIClass* pINI);
+
     static ScriptTypeClass* Find(const char* pID);
     static ScriptTypeClass* FindOrAllocate(const char* pID);
 

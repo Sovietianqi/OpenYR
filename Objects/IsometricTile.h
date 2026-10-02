@@ -20,6 +20,7 @@
 #include <Core/Definitions.h>
 #include <Core/Macros.h>
 #include <Core/Memory.h>
+#include <Containers/DynamicVectorClass.h>
 
 #include <cstdint>
 
@@ -241,3 +242,59 @@ private:
     SmudgeClass*               Smudge;         // Smudge object (scorch, crater)
     CellClass*                 Owner;          // Owning CellClass (back-pointer)
 };
+
+// ============================================================================
+// IsometricTileType - one [TileSet%04d] block of isometr(md).ini
+//
+//  A tile set groups the art files a theater needs for one category of
+//  terrain (clear ground, water, cliffs, ...).  Each set owns TilesInSet
+//  tiles; every tile has its own ZAdjust/XOffset/YOffset/AttachesTo triplet
+//  keyed with the two digit tile number.
+// ============================================================================
+
+class IsometricTileType
+{
+public:
+    IsometricTileType() noexcept;
+    ~IsometricTileType() noexcept;
+
+    bool LoadFromINI(class CCINIClass* pINI);
+
+    static void CreateFromINIList(class CCINIClass* pINI, bool bTheater);
+
+    static int32 GetTileSetCount();
+    static IsometricTileType* GetTileSet(int32 index);
+
+    // IsometricTileTypeClass_FindIndex - the ordinal of the tile set whose
+    // SetName matches pID, or -1.  BuildingTypeClass::ToTile uses it to
+    // resolve the "ToTile" key of a building section.
+    static int32 FindIndex(const char* pID);
+
+    // ---- [TileSet%04d] scalars ----
+    int32       TilesInSet;
+    int32       LastTilesInSet;
+    char        SetName[0x40];
+    char        FileName[0x40];
+    int32       MarbleMadness;
+    int32       NonMarbleMadness;
+    bool        Morphable;
+    bool        AllowToPlace;
+    bool        AllowBurrowing;
+    bool        AllowTiberium;
+    bool        RequiredForRMG;
+    int32       ToSnowTheater;
+    int32       ToTemperateTheater;
+    bool        ShadowCaster;
+    int32       ShadowTiles;
+
+    // ---- per tile arrays (indexed by tile number) ----
+    int32*      TileXOffset;
+    int32*      TileYOffset;
+    int32*      TileAttachesTo;
+    int32*      TileZAdjust;
+
+    int32       ArrayIndex;
+};
+
+extern DynamicVectorClass<IsometricTileType*>* TileTypeClass_Array;
+extern int32                                    TileSet_TotalTileCount;

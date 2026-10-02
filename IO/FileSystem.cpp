@@ -585,6 +585,8 @@ CDFileClass::~CDFileClass()
 FileFindClass::FileFindClass()
     : IsFindValid(false)
     , m_pHandle(nullptr)
+    , m_IsDirectory(false)
+    , m_IsHidden(false)
 {
     m_FindName[0] = '\0';
     m_SearchPath[0] = '\0';
@@ -709,6 +711,8 @@ bool FileFindClass::FindNext()
             // Match any file/directory
             std::strncpy(m_FindName, pEntry->d_name, MAX_PATH_LEN - 1);
             m_FindName[MAX_PATH_LEN - 1] = '\0';
+            m_IsDirectory = (pEntry->d_type == DT_DIR);
+            m_IsHidden = (pEntry->d_name[0] == '.');
             IsFindValid = true;
             return true;
         }
@@ -726,6 +730,8 @@ bool FileFindClass::FindNext()
                     {
                         std::strncpy(m_FindName, pEntry->d_name, MAX_PATH_LEN - 1);
                         m_FindName[MAX_PATH_LEN - 1] = '\0';
+                        m_IsDirectory = (pEntry->d_type == DT_DIR);
+                        m_IsHidden = (pEntry->d_name[0] == '.');
                         IsFindValid = true;
                         return true;
                     }
@@ -738,6 +744,8 @@ bool FileFindClass::FindNext()
                 {
                     std::strncpy(m_FindName, pEntry->d_name, MAX_PATH_LEN - 1);
                     m_FindName[MAX_PATH_LEN - 1] = '\0';
+                    m_IsDirectory = (pEntry->d_type == DT_DIR);
+                    m_IsHidden = (pEntry->d_name[0] == '.');
                     IsFindValid = true;
                     return true;
                 }
@@ -763,6 +771,16 @@ void FileFindClass::Close()
 const char* FileFindClass::GetFileName() const
 {
     return m_FindName;
+}
+
+bool FileFindClass::IsDirectory() const
+{
+    return m_IsDirectory;
+}
+
+bool FileFindClass::IsHidden() const
+{
+    return m_IsHidden;
 }
 
 // ============================================================================
@@ -819,4 +837,65 @@ int32 FileSystem::GetFileSize(const char* pFilename)
         return 0;
 
     return static_cast<int32>(st.st_size);
+}
+// ============================================================================
+// CD - the forced-drive selector (asm 0x47909D / 0x4790EA)
+// ============================================================================
+
+namespace {
+// The current forced drive, mirroring the binary's ForcedCDNumber global.
+// 0xFFFFFFFE ("current drive") is the initial value.
+int32 g_ForcedCDNumber = static_cast<int32>(0xFFFFFFFE);
+} // namespace
+
+bool CD::CD_Files_Local = false;
+
+void CD::Set_Volume(int32 nVolume)
+{
+    // CD::Set_Volume (asm 0x47909D): when the "CD files are local" flag is
+    // set, the selector is pinned to the current-drive sentinel and the
+    // caller's value is ignored.  Otherwise a non-negative value wins and a
+    // negative one leaves the selector untouched.
+    if (CD::CD_Files_Local) {
+        g_ForcedCDNumber = static_cast<int32>(0xFFFFFFFE);
+        return;
+    }
+
+    if (nVolume >= 0) {
+        g_ForcedCDNumber = nVolume;
+    }
+}
+
+int32 CD::Get_Volume()
+{
+    return g_ForcedCDNumber;
+}
+
+bool CD::Is_Available(int32 nIndex)
+{
+    // CD::Is_Available (asm 0x4790EA): the current-drive sentinel is always
+    // available; the numbered drives are available when they match the
+    // forced selection or when nothing has been forced.
+    if (nIndex == static_cast<int32>(0xFFFFFFFE)) {
+        return true;
+    }
+
+    if (g_ForcedCDNumber == static_cast<int32>(0xFFFFFFFE)) {
+        return true;
+    }
+
+    return nIndex == g_ForcedCDNumber;
+}
+
+bool CD_ForceAvailable(int32 nIndex)
+{
+    if (CD::CD_Files_Local) {
+        return true;
+    }
+
+    if (g_ForcedCDNumber == static_cast<int32>(0xFFFFFFFE)) {
+        return true;
+    }
+
+    return nIndex == g_ForcedCDNumber || nIndex == 0;
 }

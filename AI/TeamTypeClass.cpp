@@ -486,3 +486,43 @@ bool TeamTypeClass::Is_Allowed_Difficulty(int32 difficulty) const {
         default: return false;
     }
 }
+
+// ----------------------------------------------------------------------------
+// CreateFromINIList - TeamTypes_CreateFromINIList (asm 0x5CC2E0)
+//
+//   Walks the [TeamTypes] section.  Each key's value names the team type to
+//   create; the sentinels "<none>" and "none" are skipped, and a name that is
+//   already registered is reused rather than duplicated.
+// ----------------------------------------------------------------------------
+void TeamTypeClass::CreateFromINIList(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+
+    static const char* const SECTION = "TeamTypes";
+    const int32 count = pINI->GetKeyCount(SECTION);
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName(SECTION, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+
+        char name[0x18];
+        name[0] = '\0';
+        if (pINI->ReadString(SECTION, pKeyName, "", name, sizeof(name)) <= 0) {
+            continue;
+        }
+
+        if (_strcmpi(name, "<none>") == 0 || _strcmpi(name, "none") == 0) {
+            continue;
+        }
+
+        TeamTypeClass* pItem = FindOrAllocate(name);
+        if (pItem != nullptr) {
+            pItem->LoadFromINI(pINI);
+        }
+    }
+}

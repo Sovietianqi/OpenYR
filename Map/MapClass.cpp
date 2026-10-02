@@ -6,6 +6,8 @@
 #include <IO/CRC.h>
 #include <Combat/DamageArea.h>
 #include <Scenario/ScenarioClass.h>
+#include <INI/INIClass.h>
+#include <AI/TagClass.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -721,4 +723,72 @@ void MapClass::CreateCrater(const CellStruct& cell, int32 size)
     // The original creates a crater by replacing the overlay with a crater
     // type and optionally expanding the zone.  The overlay system is not yet
     // fully wired in this rebuild; leave a marker for future work.
+}
+
+// ============================================================================
+// MapClass::ReadCellTags
+//
+//   DisplayClass::Read_INI cell-tag stage (asm 0x4AD1B7..0x4AD332) and its
+//   partner writer MapClass_SaveMapToINI.  The [CellTags] section lists one
+//   entry per tagged cell:
+//
+//     <key>   the packed cell index, as a decimal string
+//     <value> the tag name, resolved through TagClass::FindOrAllocate
+//
+//   The packed index is decoded differently by map format.  Format 4 and
+//   later store it as row * 1000 + column; older maps use row * 128 + column.
+//   A value that fails to resolve leaves the cell's tag cleared.
+// ============================================================================
+void MapClass::ReadCellTags(CCINIClass* pINI, const char* pSection,
+                            int32 newINIFormat)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+
+    const char* pTagSection = (pSection != nullptr) ? pSection : "CellTags";
+    const int32 count = pINI->GetKeyCount(pTagSection);
+    if (count <= 0) {
+        return;
+    }
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName(pTagSection, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+
+        char name[0x80];
+        name[0] = '\0';
+        if (pINI->ReadString(pTagSection, pKeyName, "", name,
+                             sizeof(name)) == 0) {
+            continue;
+        }
+
+        TagClass* pTag = TagClass::FindOrAllocate(name);
+
+        const int32 packed = std::atoi(pKeyName);
+
+        int32 x = 0;
+        int32 y = 0;
+        if (newINIFormat >= 4)
+        {
+            y = packed / 1000;
+            x = packed % 1000;
+        }
+        else
+        {
+            x = packed & 0x7F;
+            y = packed / 128;
+        }
+
+        CellStruct cell(static_cast<int16>(x), static_cast<int16>(y));
+        CellClass* pCell = GetCellAt(cell);
+        if (pCell == nullptr) {
+            continue;
+        }
+
+        pCell->AttachedTag = pTag;
+    }
 }

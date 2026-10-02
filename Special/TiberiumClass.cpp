@@ -4,6 +4,10 @@
 #include "../Houses/HouseClass.h"
 #include "../Abstract/ObjectClass.h"
 #include "../Abstract/TechnoClass.h"
+#include "../Combat/AnimTypeClass.h"
+#include "../INI/INIClass.h"
+
+#include <cstring>
 
 #include <cmath>
 #include <cstdlib>
@@ -548,4 +552,114 @@ int32 TiberiumManagerClass::GetGlobalSpreadRate() const {
 
 float TiberiumManagerClass::GetGlobalValueMultiplier() const {
     return GlobalValueMultiplier;
+}
+// ============================================================
+// INI loading
+// ============================================================
+
+bool TiberiumClass::LoadFromINI(CCINIClass* pINI)
+{
+    if (!pINI)
+        return false;
+
+    const char* pSection = Name;
+    if (!pSection[0])
+        return false;
+
+    if (pINI->GetSection(pSection) == nullptr)
+        return false;
+
+    Spread           = pINI->ReadInteger(pSection, "Spread", Spread);
+    SpreadPercentage = pINI->ReadFixed(pSection, "SpreadPercentage", SpreadPercentage);
+    Growth           = pINI->ReadInteger(pSection, "Growth", Growth);
+    GrowthPercentage = pINI->ReadFixed(pSection, "GrowthPercentage", GrowthPercentage);
+    Value            = pINI->ReadInteger(pSection, "Value", Value);
+    Power            = pINI->ReadInteger(pSection, "Power", Power);
+    Color            = pINI->ReadColorSchemeIndex(pSection, "Color", Color);
+
+    {
+        char buffer[0x80];
+        buffer[0] = '\0';
+
+        if (pINI->ReadString(pSection, "Debris", "", buffer, sizeof(buffer)) > 0) {
+            DebrisAnims.Clear();
+
+            char* pToken = std::strtok(buffer, ",");
+            while (pToken != nullptr) {
+                if (*pToken == '\0')
+                    break;
+
+                AnimTypeClass* pAnim = AnimTypeClass::FindOrAllocate(pToken);
+                if (pAnim != nullptr)
+                    DebrisAnims.Add(pAnim);
+
+                pToken = std::strtok(nullptr, ",");
+            }
+        }
+    }
+
+    Image = pINI->ReadInteger(pSection, "Image", Image);
+
+    switch (Image + 1) {
+    case 3:
+        ImageIndex = 0x0C;
+        break;
+    case 4:
+        ImageIndex = 0x0C;
+        break;
+    case 5:
+        ImageIndex = 0x0C;
+        break;
+    default:
+        ImageIndex = 0x0C;
+        break;
+    }
+
+    MaxCellLevel = 8;
+
+    return true;
+}
+
+void TiberiumClass::LoadAllFromINI(CCINIClass* pINI)
+{
+    if (!pINI)
+        return;
+
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i)
+            (*Array)[i]->LoadFromINI(pINI);
+    }
+
+    if (pINI->GetSection("Tiberiums") != nullptr) {
+        for (int32 i = 0; i < pINI->GetKeyCount("Tiberiums"); ++i) {
+            const char* pKeyName = pINI->GetKeyName("Tiberiums", i);
+            if (!pKeyName || !pKeyName[0])
+                continue;
+
+            char name[0x40];
+            name[0] = '\0';
+            if (pINI->ReadString("Tiberiums", pKeyName, "", name, sizeof(name)) <= 0)
+                continue;
+
+            TiberiumClass* pTiberium = FindOrAllocate(name);
+            if (pTiberium != nullptr)
+                pTiberium->LoadFromINI(pINI);
+        }
+    }
+}
+
+TiberiumClass* TiberiumClass::FindOrAllocate(const char* pName)
+{
+    if (!pName || !pName[0])
+        return nullptr;
+
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            TiberiumClass* pEntry = (*Array)[i];
+            if (pEntry && _strcmpi(pEntry->Name, pName) == 0)
+                return pEntry;
+        }
+    }
+
+    return nullptr;
 }

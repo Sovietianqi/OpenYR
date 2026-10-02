@@ -1,4 +1,5 @@
 #include <Abstract/OverlayTypeClass.h>
+#include <Animations/AnimTypeClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -362,31 +363,20 @@ bool OverlayTypeClass::LoadFromINI(CCINIClass* pINI)
     // Classification flags
     // ------------------------------------------------------------------
     Wall            = pINI->ReadBool(section, "Wall",            Wall);
-    Climbs          = pINI->ReadBool(section, "Climbs",          Climbs);
     IsTiberium      = pINI->ReadBool(section, "Tiberium",        IsTiberium);
-    IsVeins         = pINI->ReadBool(section, "Veins",           IsVeins);
-    IsBridge        = pINI->ReadBool(section, "Bridge",          IsBridge);
-    IsRamp          = pINI->ReadBool(section, "Ramp",            IsRamp);
     IsWater         = pINI->ReadBool(section, "Water",           IsWater);
-    IsVisible       = pINI->ReadBool(section, "Visible",         IsVisible);
-    RadialInventory = pINI->ReadBool(section, "RadialInventory", RadialInventory);
 
     // ------------------------------------------------------------------
     // Combat properties
     // ------------------------------------------------------------------
     Damage           = pINI->ReadInteger(section, "Damage",          Damage);
     ArmorIndex       = pINI->ReadInteger(section, "Armor",           ArmorIndex);
-    WallBonusDamage  = pINI->ReadInteger(section, "WallBonusDamage", WallBonusDamage);
-    DeathAnim        = pINI->ReadInteger(section, "DeathAnim",       DeathAnim);
 
     // ------------------------------------------------------------------
     // Tiberium properties
     // ------------------------------------------------------------------
     Tiberium                 = pINI->ReadInteger(section, "Tiberium",               Tiberium);
-    TiberiumGrowthStage      = pINI->ReadInteger(section, "TiberiumGrowthStage",    TiberiumGrowthStage);
     TiberiumSpreadRadius     = pINI->ReadInteger(section, "TiberiumSpreadRadius",   TiberiumSpreadRadius);
-    TiberiumSpreadProbability= pINI->ReadInteger(section, "TiberiumSpreadProbability",
-                                                  TiberiumSpreadProbability);
 
     // ------------------------------------------------------------------
     // Land type
@@ -441,7 +431,6 @@ bool OverlayTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (comp == 0) { r = val; }
     RadarColor = ColorStruct(static_cast<uint8>(r), static_cast<uint8>(g), static_cast<uint8>(b));
 
-    RadarBrightness = pINI->ReadInteger(section, "RadarBrightness", RadarBrightness);
 
     // ------------------------------------------------------------------
     // Art reference
@@ -469,9 +458,40 @@ bool OverlayTypeClass::LoadFromINI(CCINIClass* pINI)
         ArtName[j] = '\0';
     }
 
-    ShapeCount = pINI->ReadInteger(section, "ShapeCount", ShapeCount);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    LandValue = pINI->GetLandType(section, "Land", LandValue);
+    Strength = pINI->ReadInteger(section, "Strength", Strength);
+    Wall = pINI->ReadBool(section, "Wall", Wall);
+    Tiberium = pINI->ReadBool(section, "Tiberium", Tiberium);
+    Crate = pINI->ReadBool(section, "Crate", Crate);
+    CrateTrigger = pINI->ReadBool(section, "CrateTrigger", CrateTrigger);
+    Explodes = pINI->ReadBool(section, "Explodes", Explodes);
+    Overrides = pINI->ReadBool(section, "Overrides", Overrides);
+    { char _buf[0x40]; if (pINI->ReadString(section, "CellAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) CellAnim = _p; } }
+    NoUseTileLandType = pINI->ReadBool(section, "NoUseTileLandType", NoUseTileLandType);
+    IsVeinholeMonster = pINI->ReadBool(section, "IsVeinholeMonster", IsVeinholeMonster);
+    IsVeins = pINI->ReadBool(section, "IsVeins", IsVeins);
+    ChainReaction = pINI->ReadBool(section, "ChainReaction", ChainReaction);
+    DrawFlat = pINI->ReadBool(section, "DrawFlat", DrawFlat);
+    IsARock = pINI->ReadBool(section, "IsARock", IsARock);
+    IsRubble = pINI->ReadBool(section, "IsRubble", IsRubble);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    DamageLevels = pArt->ReadInteger(section, "DamageLevels", DamageLevels);
+
+        return true;
 }
 
 // ============================================================================
@@ -579,4 +599,19 @@ int32 OverlayTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// OverlayTypeClass - static lookup helpers
+// ============================================================================
+
+OverlayTypeClass* OverlayTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    OverlayTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    OverlayTypeClass* newItem = GameCreate<OverlayTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

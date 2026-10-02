@@ -170,7 +170,6 @@ bool TriggerClass::LoadFromINIList(CCINIClass* pINI) {
     }
 
     // --- Difficulty flags ---
-    Repeatable = pINI->ReadBool(sectionName, "Repeatable", Repeatable);
     Easy   = pINI->ReadBool(sectionName, "Easy", Easy);
     Normal = pINI->ReadBool(sectionName, "Normal", Normal);
     Medium = pINI->ReadBool(sectionName, "Medium", Medium);
@@ -213,18 +212,15 @@ bool TriggerClass::LoadFromINIList(CCINIClass* pINI) {
 
     // --- Linked trigger ---
     char linkedId[32];
-    pINI->ReadString(sectionName, "LinkedTrigger", "", linkedId, sizeof(linkedId));
     if (linkedId[0] && _strcmpi(linkedId, "<none>") != 0) {
         LinkedTrigger = TriggerClass::FindOrAllocate(linkedId);
         if (LinkedTrigger) IsLinked = true;
     }
 
     // --- Numeric data ---
-    pINI->GetInteger(sectionName, "Data", Data);
 
     // --- Optional initial timer (delay before first evaluation) ---
     int32 iniTimer = 0;
-    pINI->GetInteger(sectionName, "Timer", iniTimer);
     if (iniTimer > 0) {
         Timer = iniTimer;
         State = TriggerState::Waiting;

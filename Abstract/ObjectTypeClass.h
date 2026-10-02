@@ -126,4 +126,27 @@ public:
     bool    IsTheater;      // does the art vary by theater?
     Layer   IdleLayer;      // render layer when idle
     LandType Land;          // land type the object occupies
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    char        Image[0x20];
+    char        AlphaImage[0x20];
+    int32 CrushSound;
+    int32 AmbientSound;
+    bool         Crushable;
+    bool         Bombable;
+    bool         NoSpawnAlt;
+    bool         AlternateArcticArt;
+    bool         RadarInvisible;
+    Armor        ArmorType;
+    int32        Strength;
+    bool         HasRadialIndicator;
+    uint8        RadialColor[3];
+    bool         IgnoresFirestorm;
+    bool         UseLineTrail;
+    uint8        LineTrailColor[3];
+    int32        LineTrailColorDecrement;
+    bool         Theater;
+    bool         NewTheater;
+    bool         Voxel;
 };

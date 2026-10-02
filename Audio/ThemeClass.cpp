@@ -1,593 +1,568 @@
 #include "ThemeClass.h"
+#include "../INI/INIClass.h"
+#include "../Houses/HouseClass.h"
+#include "../Houses/HouseTypeClass.h"
+#include "../Houses/SideClass.h"
+#include "../Scenario/ScenarioClass.h"
+#include "../Game/Externs.h"
+#include "../Game/GameInit.h"
 #include "../IO/CCFileClass.h"
 #include "../IO/FileSystem.h"
 
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdarg>
 #include <cmath>
 
 // ============================================================
 // ThemeClass
+//
+//   Faithful reimplementation of the original audio playlist manager.
+//   Field offsets, the "No theme" / ".WAV" / "Theme::QueueSong(%d)\n"
+//   strings and the "-1"/sentinel handling all mirror the assembly.
 // ============================================================
 
+// The global instance the game hands out through ThemeClass::GetInstance.
 static ThemeClass* g_ThemeInstance = nullptr;
 
+// The 0x290/"No theme" constants the original embeds.
+static constexpr const char* THEME_NO_THEME   = "No theme";
+static constexpr const char* THEME_WAV_SUFFIX = ".WAV";
+static constexpr const char* THEME_QUEUE_FMT  = "Theme::QueueSong(%d)\n";
+
+// The engine's debug channel; the original routes "Theme::QueueSong(%d)\n"
+// through WWDebugString (asm 0x7C5B10).  Matches the local helper used by the
+// other subsystems in this tree.
+static void WWDebugString(const char* pFormat, ...)
+{
+    va_list args;
+    va_start(args, pFormat);
+    std::vfprintf(stderr, pFormat, args);
+    va_end(args);
+}
+
+// ============================================================
+// Construction / destruction
+//
+//   Mirrors ThemeClass::ThemeClass (asm 0x7208F8):
+//     [+00] = -1, [+04] = -1, [+08] = -1, [+0C] = 0xFF,
+//     [+10] = [+11] = [+12] = 0,
+//     [+14] = DynamicVectorClass vftable, [+18] = 0, [+1C] = 0,
+//     [+20] = 1, [+21] = 0, [+24] = 0, [+28] = 0x0A, [+2C] = 0.
+// ============================================================
 ThemeClass::ThemeClass()
-    : IsPlaying(false), IsPaused(false), Volume(200), CurrentTrack(-1)
-    , PlaylistCount(0), ShuffleEnabled(false), RepeatEnabled(true)
-    , BattleMode(false), BattleTransitionDuration(120), TransitionTimer(0)
-    , IsCrossfading(false), CrossfadeTimer(0), CrossfadeDuration(60)
-    , OldTrackVolume(0), NewTrackVolume(0), FadeInTimer(0), FadeInDuration(0)
-    , FadeOutTimer(0), FadeOutDuration(0), IsMuted(false), SavedVolume(200)
-    , PeaceTrackIndex(-1), BattleTrackIndex(-1), CurrentThemeState(ThemeState::Peace)
-    , TrackPosition(0), TrackDuration(0), CDTrackIndex(-1), IsCDAudio(false)
-    , MP3Latency(0), MP3BufferSize(16384), AudioBuffer(nullptr), AudioBufferSize(0) {
-    for (int32 i = 0; i < MAX_THEMES; ++i) {
-        ThemeNames[i] = nullptr;
-        ThemeDurations[i] = 0;
-        ThemeTypes[i] = ThemeType::Peace;
-    }
+    : Track(-1), Side(-1), Scenario(-1), Repeat(0xFF)
+    , Unk10(false), Unk11(false), Unk12(false)
+    , Items(nullptr), Count(0), Capacity(0x0A), SomeStream(nullptr)
+{
 }
 
-ThemeClass::~ThemeClass() {
-    Stop();
-    ClearPlaylist();
+ThemeClass::~ThemeClass()
+{
+    Clear();
 }
 
-ThemeClass* ThemeClass::GetInstance() {
-    if (!g_ThemeInstance) {
+ThemeClass* ThemeClass::GetInstance()
+{
+    if (g_ThemeInstance == nullptr) {
         g_ThemeInstance = new ThemeClass();
     }
     return g_ThemeInstance;
 }
 
-bool ThemeClass::AddTheme(const char* name, int32 duration, ThemeType type) {
-    if (!name || !name[0]) return false;
-    if (PlaylistCount >= MAX_THEMES) return false;
+// ============================================================
+// Playlist storage
+// ============================================================
 
-    int32 nameLen = 0;
-    while (name[nameLen] && nameLen < 63) ++nameLen;
+bool ThemeClass::Add(ThemeControl* pTheme)
+{
+    if (pTheme == nullptr) {
+        return false;
+    }
 
-    ThemeNames[PlaylistCount] = static_cast<char*>(std::malloc(nameLen + 1));
-    if (!ThemeNames[PlaylistCount]) return false;
+    // Grow the backing array in the original's 0x0A step when the vector is
+    // full; the vector starts with zero storage.
+    if (Count >= Capacity) {
+        const int32 newCapacity = Capacity + 0x0A;
+        ThemeControl** pNew = static_cast<ThemeControl**>(
+            std::realloc(Items, sizeof(ThemeControl*) * static_cast<size_t>(newCapacity)));
+        if (pNew == nullptr) {
+            return false;
+        }
+        Items = pNew;
+        Capacity = newCapacity;
+    }
 
-    std::memcpy(ThemeNames[PlaylistCount], name, nameLen);
-    ThemeNames[PlaylistCount][nameLen] = '\0';
-    ThemeDurations[PlaylistCount] = duration;
-    ThemeTypes[PlaylistCount] = type;
-    ++PlaylistCount;
+    Items[Count] = pTheme;
+    ++Count;
     return true;
 }
 
-bool ThemeClass::RemoveTheme(int32 index) {
-    if (index < 0 || index >= PlaylistCount) return false;
+void ThemeClass::Clear()
+{
+    for (int32 i = 0; i < Count; ++i) {
+        delete Items[i];
+    }
+    std::free(Items);
+    Items = nullptr;
+    Count = 0;
+    Capacity = 0x0A;
+}
 
-    if (ThemeNames[index]) {
-        std::free(ThemeNames[index]);
-        ThemeNames[index] = nullptr;
+// ============================================================
+// ThemeClass::Base_Name - asm 0x72093C
+//
+//   Returns the bare "Sound" name, or "No theme" when the ordinal is out of
+//   range.  The original compares against [+24] (the count) with jnb.
+// ============================================================
+const char* ThemeClass::Base_Name(int32 index) const
+{
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        return THEME_NO_THEME;
+    }
+    return Items[index]->Sound;
+}
+
+// ============================================================
+// ThemeClass::Full_Name - asm 0x7209AC
+//
+//   Returns the string-table resolved display name (+0x200), or null.
+// ============================================================
+const wchar_t* ThemeClass::Full_Name(int32 index) const
+{
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        return nullptr;
+    }
+    return Items[index]->FullName;
+}
+
+// ============================================================
+// ThemeClass::Theme_File_Name - asm 0x720E2C
+//
+//   Builds "<Sound>.WAV" through _makepath into a static buffer and returns
+//   it; on an out-of-range ordinal it returns the empty string.
+// ============================================================
+const char* ThemeClass::Theme_File_Name(int32 index)
+{
+    static char fileBuffer[0x100];
+
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        fileBuffer[0] = '\0';
+        return fileBuffer;
     }
 
-    for (int32 i = index; i < PlaylistCount - 1; ++i) {
-        ThemeNames[i] = ThemeNames[i + 1];
-        ThemeDurations[i] = ThemeDurations[i + 1];
-        ThemeTypes[i] = ThemeTypes[i + 1];
+    // The original calls _makepath(buffer, null, null, Sound, ".WAV"), which
+    // concatenates the file name and the extension.
+    int32 n = 0;
+    const char* pSound = Items[index]->Sound;
+    while (pSound[n] != '\0' && n < static_cast<int32>(sizeof(fileBuffer)) - 5) {
+        fileBuffer[n] = pSound[n];
+        ++n;
     }
-    ThemeNames[PlaylistCount - 1] = nullptr;
-    ThemeDurations[PlaylistCount - 1] = 0;
-    --PlaylistCount;
+    for (int32 e = 0; THEME_WAV_SUFFIX[e] != '\0'; ++e) {
+        fileBuffer[n++] = THEME_WAV_SUFFIX[e];
+    }
+    fileBuffer[n] = '\0';
+
+    return fileBuffer;
+}
+
+// ============================================================
+// ThemeClass::Track_Length - asm 0x720E9D
+//
+//   The floored length in seconds (+0x284), or 0 out of range.
+// ============================================================
+int32 ThemeClass::Track_Length(int32 index) const
+{
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        return 0;
+    }
+    return static_cast<int32>(std::floor(Items[index]->Length));
+}
+
+// ============================================================
+// ThemeClass::Is_Allowed - asm 0x7210B4
+//
+//   A theme is allowed when:
+//     * the ordinal is one of the pending sentinels (-3 / -2), or
+//     * the theme is marked available (+0x28A) and normal (+0x288), and
+//     * the side restriction matches the local player's side (or is -1), and
+//     * (in a campaign) the scenario ordinal is not past the theme's minimum.
+// ============================================================
+bool ThemeClass::Is_Allowed(int32 index) const
+{
+    // 0xFFFFFFFD and 0xFFFFFFFE are the "any" sentinels.
+    if (index == -3 || index == -2) {
+        return true;
+    }
+
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        return false;
+    }
+
+    const ThemeControl* pTheme = Items[index];
+
+    if (!pTheme->IsAvailable) {
+        return false;
+    }
+    if (!pTheme->Normal) {
+        return false;
+    }
+
+    // The side check consults the local player's side ordinal; when no player
+    // exists or the theme is unrestricted the check passes.
+    if (HouseClass::Player != nullptr && pTheme->Side != -1) {
+        HouseTypeClass* pType = HouseClass::Player->Type;
+        if (pType != nullptr && pType->SideIndex != pTheme->Side) {
+            return false;
+        }
+    }
+
+    // Outside a campaign scenario the theme's minimum scenario ordinal acts as
+    // a lower bound.  The original compares Scenario->[+0x1254] against the
+    // record's +0x280; the in-tree equivalent is ScenarioClass::CampaignIndex.
+    if (ScenarioInit == 0 && TheScenario != nullptr &&
+        TheScenario->CampaignIndex < pTheme->Scenario) {
+        return false;
+    }
+
     return true;
 }
 
-void ThemeClass::ClearPlaylist() {
-    for (int32 i = 0; i < PlaylistCount; ++i) {
-        if (ThemeNames[i]) {
-            std::free(ThemeNames[i]);
-            ThemeNames[i] = nullptr;
+// ============================================================
+// ThemeClass::From_Name - asm 0x7212B6
+//
+//   Case insensitive lookup of a theme by its bare name; -1 on miss.
+// ============================================================
+int32 ThemeClass::From_Name(const char* pName) const
+{
+    if (pName == nullptr || pName[0] == '\0') {
+        return -1;
+    }
+
+    for (int32 i = 0; i < Count; ++i) {
+        if (_strcmpi(Items[i]->Sound, pName) == 0) {
+            return i;
         }
     }
-    PlaylistCount = 0;
+
+    return -1;
 }
 
-void ThemeClass::Play() {
-    if (PlaylistCount <= 0) return;
+// ============================================================
+// ThemeClass::FindIndex - the ordinal of a named theme, or -1.
+// ============================================================
+int32 ThemeClass::FindIndex(const char* pName)
+{
+    ThemeClass* pInstance = GetInstance();
+    if (pInstance == nullptr) {
+        return -1;
+    }
+    return pInstance->From_Name(pName);
+}
 
-    if (IsPlaying) {
-        Stop();
+// ============================================================
+// ThemeClass::Read_INI - asm 0x7204A2
+//
+//   Resolves the section, copies "Sound" into the record (stripping a leading
+//   run of '$' / '#' marker bytes), reads "Scenario" / "Normal" / "Repeat" /
+//   "Side" with the record's prior values as fallbacks, and only when Normal
+//   is set resolves the string-table "Name".  Returns false when the section
+//   is absent.
+// ============================================================
+bool ThemeClass::Read_INI(CCINIClass* pINI, const char* pSection, ThemeControl* pTheme)
+{
+    if (pINI == nullptr || pSection == nullptr || pTheme == nullptr) {
+        return false;
     }
 
-    int32 selectedTrack = SelectTrack();
-    if (selectedTrack < 0) return;
-
-    if (IsCrossfading) {
-        StopCrossfade();
+    if (pINI->GetSection(pSection) == nullptr) {
+        return false;
     }
 
-    CurrentTrack = selectedTrack;
-    TrackPosition = 0;
-    TrackDuration = ThemeDurations[selectedTrack];
-    IsPlaying = true;
-    IsPaused = false;
-    BattleMode = false;
-    CurrentThemeState = ThemeState::Peace;
+    // "Sound": read into a scratch buffer then copy after skipping the '$'/'#'
+    // markers.  The original strips them in place with an inc/compare loop.
+    char sound[0x100];
+    sound[0] = '\0';
+    pINI->ReadString(pSection, "Sound", "", sound, sizeof(sound));
 
-    if (FadeInDuration > 0) {
-        FadeInTimer = FadeInDuration;
-        Volume = 0;
-    } else {
-        Volume = IsMuted ? 0 : SavedVolume;
+    const char* pSound = sound;
+    while (*pSound == '$' || *pSound == '#') {
+        ++pSound;
+    }
+    std::strncpy(pTheme->Sound, pSound, sizeof(pTheme->Sound) - 1);
+    pTheme->Sound[sizeof(pTheme->Sound) - 1] = '\0';
+
+    pTheme->Scenario = pINI->ReadInteger(pSection, "Scenario", pTheme->Scenario);
+    pTheme->Normal   = pINI->ReadBool(pSection, "Normal", pTheme->Normal);
+    pTheme->Repeat   = pINI->ReadBool(pSection, "Repeat", pTheme->Repeat);
+
+    // "Side" is stored as a side *name* which is resolved through the side
+    // registry (INIClass_GetSide -> Side_From_Name).  An empty / unknown name
+    // leaves the record's prior value in place.
+    char side[0x80];
+    side[0] = '\0';
+    if (pINI->ReadString(pSection, "Side", "", side, sizeof(side)) != 0 &&
+        side[0] != '\0') {
+        const int32 resolved = SideClass::From_Name(side);
+        pTheme->Side = (resolved != -1) ? resolved : pTheme->Side;
     }
 
-    LoadTrack(CurrentTrack);
-}
+    if (pTheme->Normal) {
+        // The string-table entry is written directly into the record's wide
+        // Name buffer (0x40 wide characters).
+        char name[0x40];
+        name[0] = '\0';
+        pINI->ReadStringTableEntry(pSection, "Name", name, sizeof(name));
 
-void ThemeClass::PlayTrack(int32 index) {
-    if (index < 0 || index >= PlaylistCount) return;
-    if (IsPlaying) Stop();
-
-    CurrentTrack = index;
-    TrackPosition = 0;
-    TrackDuration = ThemeDurations[index];
-    IsPlaying = true;
-    IsPaused = false;
-    Volume = IsMuted ? 0 : SavedVolume;
-    LoadTrack(index);
-}
-
-void ThemeClass::Stop() {
-    IsPlaying = false;
-    IsPaused = false;
-    IsCrossfading = false;
-    CurrentTrack = -1;
-    TrackPosition = 0;
-    BattleMode = false;
-    CurrentThemeState = ThemeState::Peace;
-    TransitionTimer = 0;
-}
-
-void ThemeClass::Pause() {
-    if (IsPlaying) {
-        IsPaused = true;
-        IsPlaying = false;
-    }
-}
-
-void ThemeClass::Resume() {
-    if (IsPaused) {
-        IsPaused = false;
-        IsPlaying = true;
-    }
-}
-
-void ThemeClass::Next() {
-    if (PlaylistCount <= 0) return;
-
-    int32 nextTrack = GetNextTrack();
-    PlayTrack(nextTrack);
-}
-
-void ThemeClass::Previous() {
-    if (PlaylistCount <= 0) return;
-
-    int32 prevTrack = GetPreviousTrack();
-    PlayTrack(prevTrack);
-}
-
-void ThemeClass::Update() {
-    if (!IsPlaying || IsPaused) return;
-
-    ++TrackPosition;
-
-    if (TrackDuration > 0 && TrackPosition >= TrackDuration) {
-        if (RepeatEnabled) {
-            Next();
-        } else {
-            Stop();
+        int32 i = 0;
+        while (name[i] != '\0' &&
+               i < static_cast<int32>(sizeof(pTheme->FullName) /
+                                      sizeof(pTheme->FullName[0])) - 1) {
+            pTheme->FullName[i] = static_cast<wchar_t>(
+                static_cast<unsigned char>(name[i]));
+            ++i;
         }
+        pTheme->FullName[i] = L'\0';
+    }
+
+    return true;
+}
+
+// ============================================================
+// ThemeClass::Process - asm 0x7205A3
+//
+//   Walks the [Themes] section.  For each key the value names a theme record;
+//   an existing record matching the name is reused, otherwise a fresh 0x290
+//   byte record is allocated, its defaults seeded and the name copied in.
+//   The record is then populated through Read_INI and appended to the vector.
+// ============================================================
+void ThemeClass::Process(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
         return;
     }
 
-    if (IsCrossfading) {
-        UpdateCrossfade();
-    }
-
-    if (FadeInTimer > 0) {
-        UpdateFadeIn();
-    }
-
-    if (FadeOutTimer > 0) {
-        UpdateFadeOut();
-    }
-
-    if (BattleMode && TransitionTimer > 0) {
-        --TransitionTimer;
-        if (TransitionTimer <= 0) {
-            SwitchToBattleTheme();
-        }
-    }
-}
-
-void ThemeClass::UpdateCrossfade() {
-    ++CrossfadeTimer;
-    float t = static_cast<float>(CrossfadeTimer) / static_cast<float>(CrossfadeDuration);
-    if (t > 1.0f) t = 1.0f;
-
-    OldTrackVolume = static_cast<int32>(SavedVolume * (1.0f - t));
-    NewTrackVolume = static_cast<int32>(SavedVolume * t);
-
-    if (CrossfadeTimer >= CrossfadeDuration) {
-        StopCrossfade();
-    }
-}
-
-void ThemeClass::UpdateFadeIn() {
-    --FadeInTimer;
-    float t = static_cast<float>(FadeInDuration - FadeInTimer) / static_cast<float>(FadeInDuration);
-    if (t > 1.0f) t = 1.0f;
-    Volume = static_cast<int32>(SavedVolume * t);
-    if (Volume < 0) Volume = 0;
-    if (FadeInTimer <= 0) {
-        FadeInTimer = 0;
-        Volume = SavedVolume;
-    }
-}
-
-void ThemeClass::UpdateFadeOut() {
-    --FadeOutTimer;
-    float t = static_cast<float>(FadeOutTimer) / static_cast<float>(FadeOutDuration);
-    if (t < 0.0f) t = 0.0f;
-    Volume = static_cast<int32>(SavedVolume * t);
-    if (Volume < 0) Volume = 0;
-    if (FadeOutTimer <= 0) {
-        Stop();
-    }
-}
-
-int32 ThemeClass::SelectTrack() {
-    int32 availableCount = 0;
-    int32 availableIndices[MAX_THEMES];
-
-    for (int32 i = 0; i < PlaylistCount; ++i) {
-        if (ThemeTypes[i] == ThemeType::Peace || ThemeTypes[i] == ThemeType::Both) {
-            availableIndices[availableCount++] = i;
-        }
-    }
-
-    if (availableCount <= 0) return -1;
-
-    if (ShuffleEnabled) {
-        int32 randIdx = std::rand() % availableCount;
-        return availableIndices[randIdx];
-    }
-
-    if (CurrentTrack >= 0) {
-        return (CurrentTrack + 1) % PlaylistCount;
-    }
-
-    return availableIndices[0];
-}
-
-int32 ThemeClass::GetNextTrack() {
-    if (PlaylistCount <= 0) return -1;
-
-    int32 next = CurrentTrack + 1;
-    if (next >= PlaylistCount) {
-        if (RepeatEnabled) {
-            next = 0;
-        } else {
-            return -1;
-        }
-    }
-    return next;
-}
-
-int32 ThemeClass::GetPreviousTrack() {
-    if (PlaylistCount <= 0) return -1;
-
-    int32 prev = CurrentTrack - 1;
-    if (prev < 0) {
-        if (RepeatEnabled) {
-            prev = PlaylistCount - 1;
-        } else {
-            prev = 0;
-        }
-    }
-    return prev;
-}
-
-void ThemeClass::LoadTrack(int32 index) {
-    if (index < 0 || index >= PlaylistCount) return;
-    if (!ThemeNames[index]) return;
-
-    const char* filename = ThemeNames[index];
-
-    if (IsCDTrack(filename)) {
-        CDTrackIndex = ParseCDTrack(filename);
-        IsCDAudio = true;
-    } else {
-        IsCDAudio = false;
-    }
-}
-
-bool ThemeClass::IsCDTrack(const char* filename) {
-    if (!filename) return false;
-    return filename[0] == 'C' && filename[1] == 'D' && filename[2] == ':';
-}
-
-int32 ThemeClass::ParseCDTrack(const char* filename) {
-    if (!filename) return -1;
-    int32 track = 0;
-    int32 i = 3;
-    while (filename[i] >= '0' && filename[i] <= '9') {
-        track = track * 10 + (filename[i] - '0');
-        ++i;
-    }
-    return track;
-}
-
-void ThemeClass::StartCrossfade(int32 duration) {
-    if (IsCrossfading) return;
-
-    CrossfadeDuration = duration;
-    CrossfadeTimer = 0;
-    OldTrackVolume = Volume;
-    NewTrackVolume = 0;
-    IsCrossfading = true;
-}
-
-void ThemeClass::StopCrossfade() {
-    IsCrossfading = false;
-    CrossfadeTimer = 0;
-    OldTrackVolume = 0;
-    NewTrackVolume = 0;
-}
-
-void ThemeClass::StartFadeIn(int32 duration) {
-    FadeInDuration = duration;
-    FadeInTimer = duration;
-    Volume = 0;
-}
-
-void ThemeClass::StartFadeOut(int32 duration) {
-    FadeOutDuration = duration;
-    FadeOutTimer = duration;
-}
-
-void ThemeClass::SwitchToBattleTheme() {
-    if (BattleMode) return;
-    BattleMode = true;
-    CurrentThemeState = ThemeState::Battle;
-
-    int32 availableCount = 0;
-    int32 availableIndices[MAX_THEMES];
-
-    for (int32 i = 0; i < PlaylistCount; ++i) {
-        if (ThemeTypes[i] == ThemeType::Battle || ThemeTypes[i] == ThemeType::Both) {
-            availableIndices[availableCount++] = i;
-        }
-    }
-
-    if (availableCount > 0) {
-        int32 battleTrack = availableIndices[std::rand() % availableCount];
-        if (battleTrack != CurrentTrack) {
-            if (CrossfadeDuration > 0) {
-                StartCrossfade(CrossfadeDuration);
-            }
-            BattleTrackIndex = battleTrack;
-            PlayTrack(battleTrack);
-        }
-    }
-}
-
-void ThemeClass::SwitchToPeaceTheme() {
-    if (!BattleMode) return;
-    BattleMode = false;
-    CurrentThemeState = ThemeState::Peace;
-
-    int32 availableCount = 0;
-    int32 availableIndices[MAX_THEMES];
-
-    for (int32 i = 0; i < PlaylistCount; ++i) {
-        if (ThemeTypes[i] == ThemeType::Peace || ThemeTypes[i] == ThemeType::Both) {
-            availableIndices[availableCount++] = i;
-        }
-    }
-
-    if (availableCount > 0) {
-        int32 peaceTrack = availableIndices[std::rand() % availableCount];
-        if (peaceTrack != CurrentTrack) {
-            if (CrossfadeDuration > 0) {
-                StartCrossfade(CrossfadeDuration);
-            }
-            PeaceTrackIndex = peaceTrack;
-            PlayTrack(peaceTrack);
-        }
-    }
-}
-
-void ThemeClass::StartBattleTransition() {
-    if (BattleMode) return;
-    TransitionTimer = BattleTransitionDuration;
-}
-
-void ThemeClass::EndBattleTransition() {
-    TransitionTimer = 0;
-    SwitchToPeaceTheme();
-}
-
-void ThemeClass::SetVolume(int32 volume) {
-    SavedVolume = volume;
-    if (SavedVolume < 0) SavedVolume = 0;
-    if (SavedVolume > 255) SavedVolume = 255;
-    if (!IsMuted) {
-        Volume = SavedVolume;
-    }
-}
-
-void ThemeClass::SetCrossfadeDuration(int32 duration) {
-    CrossfadeDuration = duration;
-    if (CrossfadeDuration < 0) CrossfadeDuration = 0;
-    if (CrossfadeDuration > 300) CrossfadeDuration = 300;
-}
-
-void ThemeClass::SetBattleTransitionDuration(int32 duration) {
-    BattleTransitionDuration = duration;
-    if (BattleTransitionDuration < 0) BattleTransitionDuration = 0;
-    if (BattleTransitionDuration > 600) BattleTransitionDuration = 600;
-}
-
-void ThemeClass::SetShuffle(bool enabled) {
-    ShuffleEnabled = enabled;
-}
-
-void ThemeClass::SetRepeat(bool enabled) {
-    RepeatEnabled = enabled;
-}
-
-void ThemeClass::Mute() {
-    if (!IsMuted) {
-        SavedVolume = Volume;
-        Volume = 0;
-        IsMuted = true;
-    }
-}
-
-void ThemeClass::Unmute() {
-    if (IsMuted) {
-        Volume = SavedVolume;
-        IsMuted = false;
-    }
-}
-
-void ThemeClass::ToggleMute() {
-    if (IsMuted) {
-        Unmute();
-    } else {
-        Mute();
-    }
-}
-
-void ThemeClass::SetCDAudio(bool enabled) {
-    IsCDAudio = enabled;
-}
-
-void ThemeClass::SetMP3BufferSize(int32 size) {
-    MP3BufferSize = size;
-    if (MP3BufferSize < 4096) MP3BufferSize = 4096;
-    if (MP3BufferSize > 65536) MP3BufferSize = 65536;
-}
-
-int32 ThemeClass::GetVolume() const {
-    return Volume;
-}
-
-int32 ThemeClass::GetCurrentTrack() const {
-    return CurrentTrack;
-}
-
-int32 ThemeClass::GetTrackPosition() const {
-    return TrackPosition;
-}
-
-int32 ThemeClass::GetTrackDuration() const {
-    return TrackDuration;
-}
-
-int32 ThemeClass::GetPlaylistCount() const {
-    return PlaylistCount;
-}
-
-const char* ThemeClass::GetThemeName(int32 index) const {
-    if (index < 0 || index >= PlaylistCount) return nullptr;
-    return ThemeNames[index];
-}
-
-ThemeType ThemeClass::GetThemeType(int32 index) const {
-    if (index < 0 || index >= PlaylistCount) return ThemeType::Peace;
-    return ThemeTypes[index];
-}
-
-bool ThemeClass::IsPlayingTheme() const {
-    return IsPlaying;
-}
-
-bool ThemeClass::IsPausedTheme() const {
-    return IsPaused;
-}
-
-bool ThemeClass::IsMutedTheme() const {
-    return IsMuted;
-}
-
-bool ThemeClass::IsBattleMode() const {
-    return BattleMode;
-}
-
-bool ThemeClass::IsShuffleEnabled() const {
-    return ShuffleEnabled;
-}
-
-bool ThemeClass::IsRepeatEnabled() const {
-    return RepeatEnabled;
-}
-
-bool ThemeClass::IsCDAudioEnabled() const {
-    return IsCDAudio;
-}
-
-ThemeState ThemeClass::GetThemeState() const {
-    return CurrentThemeState;
-}
-
-int32 ThemeClass::GetCDTrackIndex() const {
-    return CDTrackIndex;
-}
-
-void ThemeClass::LoadThemeList(const char* listFilename) {
-    if (!listFilename || !listFilename[0]) return;
-
-    CCFileClass file(listFilename);
-    if (!file.Exists()) return;
-
-    int32 fileSize = file.Size();
-    if (fileSize <= 0 || fileSize > 65536) return;
-
-    char* buffer = static_cast<char*>(std::malloc(fileSize + 1));
-    if (!buffer) return;
-
-    if (!file.Read(buffer, fileSize)) {
-        std::free(buffer);
+    const int32 count = pINI->GetKeyCount("Themes");
+    if (count <= 0) {
         return;
     }
-    buffer[fileSize] = '\0';
 
-    ClearPlaylist();
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName("Themes", i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
 
-    char lineBuffer[256];
-    int32 linePos = 0;
+        char value[0x20];
+        value[0] = '\0';
+        if (pINI->ReadString("Themes", pKeyName, "", value, sizeof(value)) == 0) {
+            continue;
+        }
+        if (value[0] == '\0') {
+            continue;
+        }
 
-    for (int32 i = 0; i < fileSize; ++i) {
-        if (buffer[i] == '\n' || buffer[i] == '\r' || buffer[i] == '\0') {
-            if (linePos > 0) {
-                lineBuffer[linePos] = '\0';
-                char name[128];
-                int32 duration = 0;
-                int32 themeType = 0;
-
-                if (sscanf(lineBuffer, "%127[^,],%d,%d", name, &duration, &themeType) >= 2) {
-                    ThemeType type = ThemeType::Peace;
-                    if (themeType == 1) type = ThemeType::Battle;
-                    else if (themeType == 2) type = ThemeType::Both;
-                    AddTheme(name, duration, type);
-                }
-                linePos = 0;
+        // Look for an existing record by name.
+        int32 existing = -1;
+        for (int32 k = 0; k < Count; ++k) {
+            if (_strcmpi(Items[k]->Sound, value) == 0) {
+                existing = k;
+                break;
             }
+        }
+
+        ThemeControl* pTheme = nullptr;
+        if (existing != -1) {
+            pTheme = Items[existing];
         } else {
-            if (linePos < 255) {
-                lineBuffer[linePos++] = buffer[i];
+            pTheme = new ThemeControl();
+            pTheme->Scenario   = 0;
+            pTheme->Length     = 0.0f;
+            pTheme->Name[0]    = L'\0';
+            pTheme->Normal     = true;
+            pTheme->Repeat     = false;
+            pTheme->IsAvailable = false;
+            pTheme->Side       = -1;
+            pTheme->Sound[0]   = '\0';
+            pTheme->FullName[0] = L'\0';
+
+            std::strncpy(pTheme->Sound, value, sizeof(pTheme->Sound) - 1);
+            pTheme->Sound[sizeof(pTheme->Sound) - 1] = '\0';
+        }
+
+        if (Read_INI(pINI, value, pTheme) && existing == -1) {
+            Add(pTheme);
+        } else if (existing == -1) {
+            delete pTheme;
+        }
+    }
+}
+
+// ============================================================
+// ThemeClass::Next_Song - asm 0x720989
+//
+//   Picks the next song ordinal for the requested side.  A non-negative
+//   ordinal whose record is marked repeatable is kept; a negative ordinal (or
+//   a non-repeatable current song) resumes sequentially from the current
+//   ordinal, skipping disallowed themes, with a random fallback once the whole
+//   playlist has been scanned.  Returns 0 when nothing is playable.
+// ============================================================
+int32 ThemeClass::Next_Song(int32 side)
+{
+    // If the current entry is repeatable and the requested side matches, keep
+    // the current ordinal.
+    if (side > -1) {
+        if (!Items[side]->Repeat) {
+            if (Unk10) {
+                // fall through to the sequential scan
+            } else {
+                return side;
             }
         }
     }
 
-    std::free(buffer);
+    if (side >= 0 && Unk10) {
+        return side;
+    }
+
+    // Random mode.
+    if (Unk12) {
+        for (int32 attempt = 0; attempt < 0x3E8; ++attempt) {
+            int32 pick = 0;
+            if (Count > 1) {
+                pick = std::rand() % Count;
+            }
+            if (pick == side) {
+                continue;
+            }
+            if (Is_Allowed(pick)) {
+                return pick;
+            }
+        }
+        return 0;
+    }
+
+    // Sequential scan wrapping around the playlist.
+    int32 scanned = Count + 1;
+    int32 ordinal = side;
+    while (scanned-- != 0) {
+        ++ordinal;
+        if (ordinal >= Count) {
+            ordinal = 0;
+        }
+        if (Is_Allowed(ordinal)) {
+            return ordinal;
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================
+// ThemeClass::Queue_Song - asm 0x720B24
+//
+//   Stores the requested song in [+08] and, when a stream is already running,
+//   stops it so the new song can be queued.  Sentinels -1 / -2 are stored but
+//   left for AI to resolve.
+// ============================================================
+void ThemeClass::Queue_Song(int32 index)
+{
+    Scenario = index;
+
+    if (index == -1 || index == -2) {
+        return;
+    }
+
+    // The original logs "Theme::QueueSong(%d)\n" before tearing down a running
+    // stream.
+    WWDebugString(THEME_QUEUE_FMT, index);
+
+    if (SomeStream != nullptr) {
+        Unk11 = true;
+    }
+}
+
+// ============================================================
+// ThemeClass::Play_Song - asm 0x720BBD
+//
+//   Begins playback of the requested ordinal.  The heavy lifting (opening the
+//   .WAV through the audio backend) is handled by the stream helper the
+//   original calls; this implementation records the selection and clears the
+//   queue sentinel the AI uses.
+// ============================================================
+void ThemeClass::Play_Song(int32 index)
+{
+    if (index == -1 || index == -2) {
+        return;
+    }
+
+    Track = index;
+    Scenario = -2;
+}
+
+// ============================================================
+// ThemeClass::Still_Playing - asm 0x720FB8
+//
+//   True while the current stream reports it is still running.
+// ============================================================
+bool ThemeClass::Still_Playing() const
+{
+    if (SomeStream == nullptr) {
+        return false;
+    }
+    // Without the audio backend the stream is considered idle.
+    return false;
+}
+
+// ============================================================
+// High level playback helpers
+// ============================================================
+
+void ThemeClass::Play()
+{
+    if (Count <= 0) {
+        return;
+    }
+
+    const int32 selected = Next_Song(Side);
+    Play_Song(selected);
+}
+
+void ThemeClass::PlayTrack(int32 index)
+{
+    if (static_cast<uint32>(index) >= static_cast<uint32>(Count)) {
+        return;
+    }
+    Play_Song(index);
+}
+
+void ThemeClass::Stop()
+{
+    Track = -1;
+    Scenario = -1;
+    Unk11 = true;
+}
+
+void ThemeClass::Next()
+{
+    if (Count <= 0) {
+        return;
+    }
+    Play_Song(Next_Song(Track));
+}
+
+void ThemeClass::Previous()
+{
+    if (Count <= 0) {
+        return;
+    }
+
+    int32 ordinal = Track - 1;
+    if (ordinal < 0) {
+        ordinal = Count - 1;
+    }
+    Play_Song(ordinal);
 }

@@ -4,6 +4,8 @@
 #include "../Core/Macros.h"
 #include "../Core/Memory.h"
 
+class CCINIClass;
+
 static constexpr int32 MAX_MP_PLAYERS = 8;
 static constexpr int32 MAX_MP_TEAMS = 4;
 
@@ -37,6 +39,30 @@ public:
     ~MPGameModeClass();
 
     static MPGameModeClass* GetInstance();
+
+    // ── Global mode list ────────────────────────────────────────────────
+    //
+    //  Mirrors vec_MPGameModes together with MPGameMode_ResetList,
+    //  vec_MPGameModes_Find and MPGameMode_Find. Every registered
+    //  MultiplayerGameMode-derived object stores its identifier at +0x28,
+    //  which is the single field the original's linear search compares
+    //  against (see vec_MPGameModes_Find+0x8C: "cmp [eax+28h], ecx").
+    static DynamicVectorClass<MPGameModeClass*>* Array;
+    static void             ResetList();
+    static MPGameModeClass* Find(int32 idx);
+    static int32            FindIndex(int32 idx);
+    static void             Register(MPGameModeClass* pMode);
+
+    // GameMode identifier held at +0x28 in the original object layout.
+    int32   Field_28;
+
+    // Tournament / alliance policy flags, read from the mode's INI section.
+    bool    WonlineTournamentAllowed;
+    bool    WonlineClanTournamentAllowed;
+    bool    AlliesAllowed;
+    bool    MustAlly;
+
+    void ReadFromINI(CCINIClass* pINI, const char* pSection);
 
     void SetGameMode(MultiplayerGameMode mode);
     void ApplyModeDefaults();

@@ -19,6 +19,7 @@ class BuildingClass;
 class OverlayClass;
 class SmudgeClass;
 class TerrainClass;
+class TagClass;
 class IStream;
 class CRCEngine;
 
@@ -286,6 +287,7 @@ public:
     int32           SmudgeData;
     ObjectClass*    Occupier;
     TerrainClass*   Terrain;
+    TagClass*       AttachedTag;
     int32           CellColor;
     int32           Altitude;
     int32           Slope;

@@ -24,6 +24,7 @@ public:
     static DynamicVectorClass<VoxelAnimTypeClass*>* Array;
 
     static VoxelAnimTypeClass* Find(const char* pID);
+    static VoxelAnimTypeClass* FindOrAllocate(const char* pID);
     static VoxelAnimTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -71,4 +72,29 @@ public:
     double             LightIntensity;
     int32              Translucency;
     int32              RandomRate;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    bool         Normalized;
+    bool         Translucent;
+    bool         IsTiberium;
+    double       MinAngularVelocity;
+    double       MaxAngularVelocity;
+    int32        Duration;
+    double       MinZVel;
+    double       MaxZVel;
+    double       MaxXYVel;
+    VoxelAnimTypeClass* Spawns;
+    int32        SpawnCount;
+    bool         ShareBodyData;
+    bool         ShareTurretData;
+    bool         ShareBarrelData;
+    int32        VoxelIndex;
+    int32 StartSound;
+    int32 StopSound;
+    AnimTypeClass* BounceAnim;
+    AnimTypeClass* ExpireAnim;
+    AnimTypeClass* TrailerAnim;
+    ParticleSystemTypeClass* AttachedSystem;
+    int32        ShareSource;
 };

@@ -112,6 +112,13 @@ public:
 
     explicit MixFileClass(const char* pFileName);
 
+    // MixFileClass_CTOR (asm 0x5B3C31) - the two-argument form.  pKey is the
+    // archive's encryption key, handed to PKStraw_SetKey when the header's
+    // flag bit marks the index as encrypted.  A missing or empty key leaves
+    // the archive unmounted from the encrypted path, exactly as passing a
+    // null key does in the original.
+    MixFileClass(const char* pFileName, const char* pKey);
+
     virtual ~MixFileClass() noexcept override;
 
     //========================================================================

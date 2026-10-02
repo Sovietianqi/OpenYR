@@ -26,6 +26,8 @@ public:
     static DynamicVectorClass<ParticleSystemTypeClass*>* Array;
 
     static ParticleSystemTypeClass* Find(const char* pID);
+    static ParticleSystemTypeClass* FindOrAllocate(const char* pID);
+    static int32 FindIndexOrAllocate(const char* pID);
     static ParticleSystemTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
 
@@ -44,6 +46,11 @@ public:
 
     void SetName(const char* name);
 
+    // "BehavesLike=" is matched against the five entry behaviour table the
+    // rules parser walks; an unknown token stores -1.
+    static int32 BehavesLikeFromName(const char* pName);
+    static const char* BehavesLikeToName(int32 nIndex);
+
     // Particle type this system emits (index + resolved pointer)
     int32              ParticleTypeIndex;
     ParticleTypeClass* ParticleType;
@@ -57,4 +64,30 @@ public:
 
     bool IsLooping;
     bool Enabled;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    int32 HoldsWhat;
+    bool         Spawns;
+    int32        SpawnFrames;
+    int32        ParticleCap;
+    int32        SpawnRadius;
+    double       Slowdown;
+    double       SpawnCutoff;
+    double       SpawnTranslucencyCutoff;
+    int32        Lifetime;
+    int32 BehavesLike;
+    double       SpawnDirection[3];
+    double       ParticlesPerCoord;
+    double       SpiralDeltaPerCoord;
+    double       SpiralRadius;
+    double       PositionPerturbationCoefficient;
+    double       MovementPerturbationCoefficient;
+    double       VelocityPerturbationCoefficient;
+    bool         Laser;
+    uint8        LaserColor[3];
+    int32        SparkSpawnFrames;
+    int32        LightSize;
+    bool         OneFrameLight;
+    double       SpawnSparkPercentage;
 };

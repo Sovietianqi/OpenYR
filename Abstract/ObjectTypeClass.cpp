@@ -1,4 +1,5 @@
 #include <Abstract/ObjectTypeClass.h>
+#include <Audio/VocClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -410,7 +411,6 @@ bool ObjectTypeClass::LoadFromINI(CCINIClass* pINI)
     Unsellable     = pINI->ReadBool(section, "Unsellable",     Unsellable);
     Cloakable      = pINI->ReadBool(section, "Cloakable",      Cloakable);
     TurretEquipped = pINI->ReadBool(section, "Turret",         TurretEquipped);
-    IsStealthy     = pINI->ReadBool(section, "Stealthy",       IsStealthy);
     IsTrainable    = pINI->ReadBool(section, "Trainable",      IsTrainable);
     IsNotHuman     = pINI->ReadBool(section, "NotHuman",       IsNotHuman);
     IsTheater      = pINI->ReadBool(section, "Theater",        IsTheater);
@@ -442,7 +442,46 @@ bool ObjectTypeClass::LoadFromINI(CCINIClass* pINI)
     // Delegate flag parsing to the shared helper.
     Read_TypeFlags(pINI, section);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    pINI->ReadString(section, "Image", Image, Image, sizeof(Image));
+    pINI->ReadString(section, "AlphaImage", AlphaImage, AlphaImage, sizeof(AlphaImage));
+    { char _buf[0x40]; if (pINI->ReadString(section, "CrushSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) CrushSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "AmbientSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) AmbientSound = _i; } }
+    Crushable = pINI->ReadBool(section, "Crushable", Crushable);
+    Bombable = pINI->ReadBool(section, "Bombable", Bombable);
+    NoSpawnAlt = pINI->ReadBool(section, "NoSpawnAlt", NoSpawnAlt);
+    AlternateArcticArt = pINI->ReadBool(section, "AlternateArcticArt", AlternateArcticArt);
+    RadarInvisible = pINI->ReadBool(section, "RadarInvisible", RadarInvisible);
+    Selectable = pINI->ReadBool(section, "Selectable", Selectable);
+    LegalTarget = pINI->ReadBool(section, "LegalTarget", LegalTarget);
+    ArmorType = pINI->GetArmorType(section, "Armor", ArmorType);
+    Strength = pINI->ReadInteger(section, "Strength", Strength);
+    Immune = pINI->ReadBool(section, "Immune", Immune);
+    Insignificant = pINI->ReadBool(section, "Insignificant", Insignificant);
+    HasRadialIndicator = pINI->ReadBool(section, "HasRadialIndicator", HasRadialIndicator);
+    pINI->Get3Bytes(section, "RadialColor", RadialColor);
+    IgnoresFirestorm = pINI->ReadBool(section, "IgnoresFirestorm", IgnoresFirestorm);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    UseLineTrail = pArt->ReadBool(section, "UseLineTrail", UseLineTrail);
+    pArt->Get3Bytes(section, "LineTrailColor", LineTrailColor);
+    LineTrailColorDecrement = pArt->ReadInteger(section, "LineTrailColorDecrement", LineTrailColorDecrement);
+    Theater = pArt->ReadBool(section, "Theater", Theater);
+    NewTheater = pArt->ReadBool(section, "NewTheater", NewTheater);
+    Voxel = pArt->ReadBool(section, "Voxel", Voxel);
+
+        return true;
 }
 
 // ============================================================================
@@ -533,7 +572,6 @@ void ObjectTypeClass::Read_TypeFlags(CCINIClass* pINI, const char* pSection)
     Repairable     = pINI->ReadBool(pSection, "Repairable",     Repairable);
     Unsellable     = pINI->ReadBool(pSection, "Unsellable",     Unsellable);
     Cloakable      = pINI->ReadBool(pSection, "Cloakable",      Cloakable);
-    IsStealthy     = pINI->ReadBool(pSection, "Stealthy",       IsStealthy);
     IsTrainable    = pINI->ReadBool(pSection, "Trainable",      IsTrainable);
     IsNotHuman     = pINI->ReadBool(pSection, "NotHuman",       IsNotHuman);
     IsTheater      = pINI->ReadBool(pSection, "Theater",        IsTheater);

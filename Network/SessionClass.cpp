@@ -1,13 +1,16 @@
 #include "SessionClass.h"
+#include "MPGameModeClass.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Map/MapClass.h"
 #include "../IO/CCFileClass.h"
+#include "../INI/INIClass.h"
 
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cctype>
 
 // ============================================================
 // SessionClass
@@ -759,4 +762,246 @@ bool LobbyGameClass::HasStarted() const {
 
 int32 LobbyGameClass::GetGameSpeed() const {
     return GameSpeed;
+}
+// ============================================================
+// SessionClass::ReadMultiPlayerSettings
+//
+// Mirrors SessionClass::Read_MultiPlayer_Settings (asm 0x698074): restores
+// the persistent multiplayer configuration from RA2MD.INI.
+// ============================================================
+
+void SessionClass::ReadMultiPlayerSettings()
+{
+    // The original clears the two per-mode object lists before re-reading.
+    MPGameModeClass::ResetList();
+
+    CCINIClass* pINI = CCINIClass::LoadINIFile("RA2MD.INI");
+    if (pINI == nullptr)
+        return;
+
+    CCINIClass& ini = *pINI;
+    static const char* const SECTION = "MultiPlayer";
+
+    PortBase           = ini.ReadInteger(SECTION, "PortBase",           0x4E2);
+    ForcePortBase      = ini.ReadInteger(SECTION, "ForcePortBase",      0);
+    PortPool           = ini.ReadInteger(SECTION, "PortPool",
+                                         (rand() % 0x8000) + 0x1000);
+    SendDelay          = ini.ReadBool   (SECTION, "SendDelay",          false);
+    PortNumberOverride = ini.ReadInteger(SECTION, "PortNumberOverride", 0);
+    PhoneIndex         = ini.ReadInteger(SECTION, "PhoneIndex",         -1);
+    CheckHeap          = ini.ReadInteger(SECTION, "CheckHeap",          0);
+    WOLLimitResolution = ini.ReadBool   (SECTION, "WOLLimitResolution",
+                                         WOLLimitResolution);
+    LastNickSlot       = ini.ReadInteger(SECTION, "LastNickSlot",       -1);
+
+    // [MultiPlayer] Handle is a wide string; the original reads it into a
+    // 0x14 entry buffer with "TXT_NONAME" as the initial contents.
+    Handle[0] = L'\0';
+    ini.ReadString(SECTION, "Handle", "", reinterpret_cast<char*>(Handle),
+                   sizeof(Handle));
+
+    Color    = ini.ReadInteger(SECTION, "Color",    Color);
+    ColorEx  = ini.ReadInteger(SECTION, "ColorEx",  ColorEx);
+    Side     = ini.ReadInteger(SECTION, "Side",     Side);
+    SideEx   = ini.ReadInteger(SECTION, "SideEx",   SideEx);
+
+    SideIdx   = (Side == -2) ? 0 : Side;
+    SideExIdx = SideEx;
+
+    ScenIndex = MPGameModeClass::FindIndex(
+                    ini.ReadInteger(SECTION, "GameMode", 1));
+
+    WOLTaunts     = ini.ReadBool(SECTION, "WOLTaunts",     WOLTaunts);
+    LANTaunts     = ini.ReadBool(SECTION, "LANTaunts",     LANTaunts);
+    WOLScrollText = ini.ReadBool(SECTION, "WOLScrollText", WOLScrollText);
+    LANScrollText = ini.ReadBool(SECTION, "LANScrollText", LANScrollText);
+
+    // Per-mode preference blocks.  The original passes the Skirmish block
+    // (a4 = 1, a5 = 6) and both LAN and WonlinePref the pair (2, 2).
+    SkirmishPrefs.ReadFromINI(&ini, "Skirmish",     1, 6);
+    LANPrefs.ReadFromINI     (&ini, "LAN",          2, 2);
+    WOLPrefs.ReadFromINI     (&ini, "WonlinePref",  2, 2);
+
+    CCINIClass::UnloadINIFile(pINI);
+}
+
+// ============================================================
+// SessionClass::ReadSerialDefaults
+//
+// Mirrors the [SerialDefaults] / [InitStrings] / [PhoneBook] portion of
+// SessionClass::Read_MultiPlayer_Settings (asm 0x6985D5..0x698A28).
+// ============================================================
+
+void SessionClass::ReadSerialDefaults()
+{
+    CCINIClass* pINI = CCINIClass::LoadINIFile("RA2MD.INI");
+    if (pINI == nullptr)
+        return;
+
+    CCINIClass& ini = *pINI;
+
+    // ── [SerialDefaults] ────────────────────────────────────────────────
+    static const char* const SERIAL = "SerialDefaults";
+
+    ModemName[0] = '\0';
+    ini.ReadString(SERIAL, "ModemName", "", ModemName, sizeof(ModemName));
+    if (ModemName[0] == '\0')
+        ModemName[0] = '\0';
+
+    Port            = ini.ReadInteger(SERIAL, "Port",            0);
+    IRQ             = ini.ReadInteger(SERIAL, "IRQ",            -1);
+    Baud            = ini.ReadInteger(SERIAL, "Baud",           -1);
+    Compression     = ini.ReadInteger(SERIAL, "Compression",     0);
+    ErrorCorrection = ini.ReadInteger(SERIAL, "ErrorCorrection", 0);
+
+    char dialBuffer[2];
+    dialBuffer[0] = 'T';
+    dialBuffer[1] = '\0';
+    ini.ReadString(SERIAL, "DialMethod", "T", dialBuffer, sizeof(dialBuffer));
+
+    // ModemDialTypes table lookup: "T" -> 0, "P" -> 1; anything else keeps
+    // the previous selection.  Index 2 is normalised back to 0.
+    {
+        static const char* const modemDialTypes[] = { "T", "P" };
+        int32 method = -1;
+        for (int32 i = 0; i < 2; ++i) {
+            if (_strcmpi(modemDialTypes[i], dialBuffer) == 0) {
+                method = i;
+                break;
+            }
+        }
+        if (method >= 0) {
+            DialMethod = method;
+        }
+        if (DialMethod == 2) {
+            DialMethod = 0;
+        }
+    }
+
+    InitStringIndex     = ini.ReadInteger(SERIAL, "InitStringIndex",     -1);
+    CallWaitStringIndex = ini.ReadInteger(SERIAL, "CallWaitStringIndex",  3);
+
+    CallWaitString[0] = '\0';
+    ini.ReadString(SERIAL, "CallWaitString", "", CallWaitString,
+                   sizeof(CallWaitString));
+
+    if (IRQ == 0 || Baud == 0) {
+        Port = 0;
+        IRQ  = -1;
+        Baud = -1;
+    }
+
+    // ── [InitStrings] ───────────────────────────────────────────────────
+    static const char* const INITSTRINGS = "InitStrings";
+    const int32 initCount = ini.GetKeyCount(INITSTRINGS);
+    for (int32 i = 0; i < initCount; ++i) {
+        const char* pKeyName = ini.GetKeyName(INITSTRINGS, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+        char value[0x29];
+        value[0] = '\0';
+        ini.ReadString(INITSTRINGS, pKeyName, "", value, sizeof(value));
+        for (char* p = value; *p != '\0'; ++p) {
+            *p = static_cast<char>(std::toupper(static_cast<unsigned char>(*p)));
+        }
+    }
+
+    // If the section was empty the original records -1, otherwise the last
+    // valid index is kept.
+    InitStringIndex = (initCount > 0) ? InitStringIndex : -1;
+
+    // ── [PhoneBook] ─────────────────────────────────────────────────────
+    static const char* const PHONEBOOK = "PhoneBook";
+    const int32 phoneCount = ini.GetKeyCount(PHONEBOOK);
+    for (int32 i = 0; i < phoneCount; ++i) {
+        const char* pKeyName = ini.GetKeyName(PHONEBOOK, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+        char entry[0x400];
+        entry[0] = '\0';
+        ini.ReadString(PHONEBOOK, pKeyName, "", entry, sizeof(entry));
+
+        // The entry is a '|' separated record of name, number, baud, IRQ,
+        // port and country; each field is tokenised in turn.
+        char* pToken = std::strtok(entry, "|");
+        if (pToken != nullptr) {
+            // name
+        }
+        pToken = std::strtok(nullptr, "|");
+        if (pToken != nullptr) {
+            std::sscanf(pToken, "%x", &Port);
+        }
+        pToken = std::strtok(nullptr, "|");
+        if (pToken != nullptr) {
+            Baud = std::atoi(pToken);
+        }
+        pToken = std::strtok(nullptr, "|");
+        if (pToken != nullptr) {
+            IRQ = std::atoi(pToken);
+        }
+        pToken = std::strtok(nullptr, "|");
+        if (pToken != nullptr) {
+            Compression = std::atoi(pToken);
+        }
+        pToken = std::strtok(nullptr, "|");
+        if (pToken != nullptr) {
+            ErrorCorrection = std::atoi(pToken);
+        }
+    }
+
+    CCINIClass::UnloadINIFile(pINI);
+}
+
+// ============================================================
+// SessionClass::ReadSyncBugSettings
+//
+// Mirrors the [SyncBug] portion of SessionClass::Read_MultiPlayer_Settings
+// (asm 0x698A28..0x698C74), gated on the ATTRACT flag bit 1.
+// ============================================================
+
+void SessionClass::ReadSyncBugSettings()
+{
+    CCINIClass* pINI = CCINIClass::LoadINIFile("RA2MD.INI");
+    if (pINI == nullptr)
+        return;
+
+    CCINIClass& ini = *pINI;
+    static const char* const SECTION = "SyncBug";
+
+    SyncBugFrame = ini.ReadInteger(SECTION, "Frame", 0x7FFFFFFF);
+
+    char type[0x50];
+    type[0] = '\0';
+    ini.ReadString(SECTION, "Type", "NONE", type, sizeof(type));
+
+    // Type maps to the object category the engine watches.
+    if (_strcmpi(type, "AIRCRAFT") == 0) {
+        SyncBugType = 2;
+    } else if (_strcmpi(type, "ANIM") == 0) {
+        SyncBugType = 4;
+    } else if (_strcmpi(type, "BUILDING") == 0) {
+        SyncBugType = 1;
+    } else if (_strcmpi(type, "INFANTRY") == 0) {
+        SyncBugType = 0;
+    } else if (_strcmpi(type, "UNIT") == 0) {
+        SyncBugType = 3;
+    } else if (_strcmpi(type, "TERRAIN") == 0) {
+        SyncBugType = 5;
+    } else {
+        SyncBugType = -1;
+    }
+
+    SyncBugCoord[0] = '\0';
+    ini.ReadString(SECTION, "Coord", "", SyncBugCoord, sizeof(SyncBugCoord));
+
+    SyncBugTarget = ini.ReadInteger(SECTION, "Target", -1);
+
+    SyncBugCell[0] = '\0';
+    ini.ReadString(SECTION, "Cell", "", SyncBugCell, sizeof(SyncBugCell));
+
+    SyncBugPrintCRC = ini.ReadInteger(SECTION, "PrintCRC", 0x7FFFFFFF);
+
+    CCINIClass::UnloadINIFile(pINI);
 }

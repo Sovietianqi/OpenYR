@@ -55,6 +55,15 @@ class ParticleTypeClass {
 public:
     static DynamicVectorClass<ParticleTypeClass*>* Array;
 
+    static ParticleTypeClass* Find(const char* pID);
+    static ParticleTypeClass* FindOrAllocate(const char* pID);
+    static int32 FindIndexOrAllocate(const char* pID);
+
+    // "BehavesLike=" is matched against the five entry behaviour table the
+    // rules parser walks; an unrecognised token stores -1.
+    static int32 BehavesLikeFromName(const char* pName);
+    static const char* BehavesLikeToName(int32 nIndex);
+
     ParticleTypeClass();
     ~ParticleTypeClass();
 
@@ -172,4 +181,38 @@ public:
     int32 SizeGradientKeyCount;
     FloatKey* AlphaGradientKeys;
     int32 AlphaGradientKeyCount;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    DynamicVectorClass<ColorStruct> ColorList;
+    int32        MaxDC;
+    int32        MaxEC;
+    int32        Damage;
+    WarheadTypeClass* Warhead;
+    int32        StartFrame;
+    int32        NumLoopFrames;
+    int32        Translucency;
+    int32        WindEffect;
+    double       Velocity;
+    double       Deacc;
+    int32        Radius;
+    bool         DeleteOnStateLimit;
+    int32        EndStateAI;
+    int32        StartStateAI;
+    int32        StateAIAdvance;
+    int32        Translucent50State;
+    int32        Translucent25State;
+    bool         Normalized;
+    double       ColorSpeed;
+    int32        XVelocity;
+    int32        YVelocity;
+    int32        MinZVelocity;
+    int32        ZVelocityRange;
+    int32        NextParticleOffset[3];
+    uint8        StartColor1[3];
+    uint8        StartColor2[3];
+    int32        FinalDamageState;
+    char        NextParticle[0x20];
+    int32        NextParticleIndex;
+    int32 BehavesLike;
 };

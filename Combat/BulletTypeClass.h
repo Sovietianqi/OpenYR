@@ -85,4 +85,31 @@ public:
     bool CourseLocked;
     int32 Arm;
     int32 ProjectileSpeed;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    int32        CourseLockDuration;
+    double       Elasticity;
+    int32        Acceleration;
+    int32        Color;
+    bool         Floater;
+    bool         Degenerates;
+    bool         Bouncy;
+    bool         Airburst;
+    int32        Cluster;
+    char        Image[0x20];
+    AnimTypeClass* Trailer;
+    int32        SpawnDelay;
+    bool         Rotates;
+    bool         Flat;
+    WeaponTypeClass* AirburstWeapon;
+    WeaponTypeClass* ShrapnelWeapon;
+    int32        ShrapnelCount;
+    int32        DetonationAltitude;
+    bool         Vertical;
+    bool         FirersPalette;
+    int32        AnimLow;
+    int32        AnimHigh;
+    int32        AnimRate;
+    bool         AnimPalette;
 };

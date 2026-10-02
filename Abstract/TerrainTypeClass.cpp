@@ -319,14 +319,8 @@ bool TerrainTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Classification flags
     // ------------------------------------------------------------------
-    IsTree         = pINI->ReadBool(section, "Tree",        IsTree);
     IsRocks        = pINI->ReadBool(section, "Rocks",       IsRocks);
-    IsMarble       = pINI->ReadBool(section, "Marble",      IsMarble);
     IsTiberium     = pINI->ReadBool(section, "Tiberium",    IsTiberium);
-    IsVein         = pINI->ReadBool(section, "Veins",       IsVein);
-    IsFog          = pINI->ReadBool(section, "Fog",         IsFog);
-    IsAnimated     = pINI->ReadBool(section, "Animated",    IsAnimated);
-    IsFlammable    = pINI->ReadBool(section, "Flammable",   IsFlammable);
     IsCrushable    = pINI->ReadBool(section, "Crushable",   IsCrushable);
     SpawnsTiberium = pINI->ReadBool(section, "SpawnsTiberium", SpawnsTiberium);
 
@@ -339,15 +333,15 @@ bool TerrainTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Tiberium spawning parameters
     // ------------------------------------------------------------------
-    SpawnsTiberiumType   = pINI->ReadInteger(section, "SpawnsTiberiumType",   SpawnsTiberiumType);
-    SpawnsTiberiumRadius = pINI->ReadInteger(section, "SpawnsTiberiumRadius", SpawnsTiberiumRadius);
-    SpawnsTiberiumChance = pINI->ReadInteger(section, "SpawnsTiberiumChance", SpawnsTiberiumChance);
 
     // ------------------------------------------------------------------
     // Animation properties
     // ------------------------------------------------------------------
-    FrameCount = pINI->ReadInteger(section, "Frames",   FrameCount);
-    FireAnim   = pINI->ReadInteger(section, "FireAnim", FireAnim);
+
+    // ------------------------------------------------------------------
+    // Radar colour - three raw bytes.
+    // ------------------------------------------------------------------
+    pINI->Get3Bytes(section, "RadarColor", RadarColor);
 
     // ------------------------------------------------------------------
     // Art reference - falls back to the type ID when no Image is given.
@@ -375,7 +369,29 @@ bool TerrainTypeClass::LoadFromINI(CCINIClass* pINI)
         ArtName[j] = '\0';
     }
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    IsVeinhole = pINI->ReadBool(section, "IsVeinhole", IsVeinhole);
+    WaterBound = pINI->ReadBool(section, "WaterBound", WaterBound);
+    SpawnsTiberium = pINI->ReadBool(section, "SpawnsTiberium", SpawnsTiberium);
+    IsFlammable = pINI->ReadBool(section, "IsFlammable", IsFlammable);
+    FoundationValue = pINI->GetFoundation(section, "Foundation", FoundationValue);
+    pINI->Get3Bytes(section, "RadarColor", RadarColor);
+    IsAnimated = pINI->ReadBool(section, "IsAnimated", IsAnimated);
+    AnimationRate = pINI->ReadInteger(section, "AnimationRate", AnimationRate);
+    AnimationProbability = pINI->ReadFixed(section, "AnimationProbability", AnimationProbability);
+    TemperateOccupationBits = pINI->ReadInteger(section, "TemperateOccupationBits", TemperateOccupationBits);
+    SnowOccupationBits = pINI->ReadInteger(section, "SnowOccupationBits", SnowOccupationBits);
+
+        return true;
 }
 
 // ============================================================================
@@ -411,4 +427,19 @@ int32 TerrainTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// TerrainTypeClass - static lookup helpers
+// ============================================================================
+
+TerrainTypeClass* TerrainTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    TerrainTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    TerrainTypeClass* newItem = GameCreate<TerrainTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

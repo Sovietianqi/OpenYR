@@ -7,6 +7,12 @@
 
 #include <cstring>
 
+// The FilePipe chain references a file object; the concrete type is
+// CCFileClass, declared by IO/FileSystem.h, which this header deliberately
+// does not pull in to keep the straw/pipe layer free of file-system
+// dependencies.
+class CCFileClass;
+
 //========================================================================
 // Pipes - Data transformation / compression pipeline
 //
@@ -108,6 +114,45 @@ private:
 };
 
 //========================================================================
+// Base64Pipe - Write base64-encoded text
+//
+// Base64Pipe buffers three input bytes at a time and emits four
+// base64 characters for each full group, flushing the short tail with
+// '=' padding when the stream ends.  It is the mirror of Base64Straw
+// and backs INIClass::Put_UUBlock, which writes a binary blob into an
+// INI file as numbered base64 lines.
+//
+// The alphabet is the binary's Base64_EncodeTable
+// (aAbcdefghijklmn: "A-Za-z0-9+/").
+//========================================================================
+
+class Base64Pipe : public Pipe
+{
+public:
+    Base64Pipe()
+        : Pipe()
+        , PendingCount(0)
+    {
+        Pending[0] = Pending[1] = Pending[2] = 0;
+    }
+
+    virtual ~Base64Pipe() noexcept override {}
+
+    // Encode nLength bytes and forward the text to the chained pipe.
+    virtual int32 Put(const void* pSource, int32 nLength) override;
+
+    // Flush the pending short group, appending the '=' padding.
+    virtual int32 Flush() override;
+
+    // The three-byte assembly buffer and its fill level.
+    uint8 Pending[3];
+    int32 PendingCount;
+
+private:
+    DISABLE_COPY_AND_MOVE(Base64Pipe)
+};
+
+//========================================================================
 // BufferPipe - Write to a fixed memory buffer
 //
 // Writes data to a pre-allocated memory buffer. Used for writing
@@ -122,28 +167,28 @@ public:
         : Pipe()
         , Index(0)
     {
-        Buffer.Buffer = pBuffer;
-        Buffer.Size = static_cast<uint32>(nLength);
+        Buffer.Data = static_cast<uint8*>(pBuffer);
+        Buffer.Size = static_cast<int32>(nLength);
     }
 
     virtual ~BufferPipe() noexcept override final {}
 
     virtual int32 Put(const void* pSource, int32 nLength) override final
     {
-        if (Buffer.Buffer && pSource && nLength > 0)
+        if (Buffer.Data && pSource && nLength > 0)
         {
-            if (Buffer.Size > 0)
-            {
-                int32 residue = static_cast<int32>(Buffer.Size) - Index;
-                if (nLength > residue)
-                    nLength = residue;
-            }
+            // Clamp to the remaining space in the view.  As with BufferStraw,
+            // a zero-length view has zero residue, so nothing is written; the
+            // old `Buffer.Size > 0` guard skipped this clamp for empty views.
+            const int32 residue = static_cast<int32>(Buffer.Size) - Index;
+            if (nLength > residue)
+                nLength = residue;
 
-            if (nLength > 0)
-            {
-                uint8* dest = static_cast<uint8*>(Buffer.Buffer);
-                memcpy(dest + Index, pSource, static_cast<size_t>(nLength));
-            }
+            if (nLength <= 0)
+                return 0;
+
+            uint8* dest = static_cast<uint8*>(Buffer.Data);
+            memcpy(dest + Index, pSource, static_cast<size_t>(nLength));
 
             Index += nLength;
             return nLength;
@@ -170,7 +215,7 @@ class FilePipe : public Pipe
 {
 public:
     FilePipe() = delete;
-    explicit FilePipe(FileClass* pFile)
+    explicit FilePipe(CCFileClass* pFile)
         : Pipe()
         , File(pFile)
         , HasOpened(false)
@@ -211,7 +256,7 @@ public:
         return 0;
     }
 
-    FileClass* File;
+    CCFileClass* File;
     bool HasOpened;
 
 private:
@@ -520,13 +565,101 @@ private:
 };
 
 //========================================================================
+// Base64 Encoding Implementation
+//========================================================================
+
+// The binary's Base64_EncodeTable (aAbcdefghijklmn).
+static const char s_Base64PipeTable[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+inline int32 Base64Pipe::Put(const void* pSource, int32 nLength)
+{
+    if (!pSource || nLength <= 0)
+        return 0;
+
+    const uint8* src = static_cast<const uint8*>(pSource);
+    int32 consumed = 0;
+    char out[4];
+
+    while (consumed < nLength)
+    {
+        // Accumulate into the three-byte staging buffer.
+        while (PendingCount < 3 && consumed < nLength)
+            Pending[PendingCount++] = src[consumed++];
+
+        if (PendingCount < 3)
+            break;   // stash the partial group until Flush()
+
+        const uint32 group =
+            (static_cast<uint32>(Pending[0]) << 16) |
+            (static_cast<uint32>(Pending[1]) << 8) |
+            (static_cast<uint32>(Pending[2]));
+
+        out[0] = s_Base64PipeTable[(group >> 18) & 0x3F];
+        out[1] = s_Base64PipeTable[(group >> 12) & 0x3F];
+        out[2] = s_Base64PipeTable[(group >> 6) & 0x3F];
+        out[3] = s_Base64PipeTable[group & 0x3F];
+
+        // Clear the whole staging buffer, not just the count - a stale byte in
+        // an unused slot would otherwise leak into the next group's bits.
+        Pending[0] = Pending[1] = Pending[2] = 0;
+        PendingCount = 0;
+
+        if (ChainTo)
+            ChainTo->Put(out, 4);
+    }
+
+    return consumed;
+}
+
+inline int32 Base64Pipe::Flush()
+{
+    int32 written = 0;
+
+    // Emit the trailing short group with '=' padding.
+    //
+    // The staging bytes sit in the group at bits 16..23 (b0), 8..15 (b1) and
+    // 0..7 (b2).  Because base64 reads the stream big-endian, a partial group
+    // is padded on the RIGHT (low bits) with zeroes, which is exactly what the
+    // untouched Pending[2] = 0 provides - so the same shifts as the full-group
+    // path yield the correct sextets:
+    //   1 byte  b0:  >>18 = b0>>2          >>12 = (b0&3)<<4
+    //   2 bytes b0,b1: third sextet >>6 = (b1&0xF)<<2
+    // Everything past the real data is dropped and replaced by '='.
+    if (PendingCount > 0)
+    {
+        char out[4];
+        const uint32 group = (static_cast<uint32>(Pending[0]) << 16) |
+                             (static_cast<uint32>(Pending[1]) << 8) |
+                             (static_cast<uint32>(Pending[2]));
+
+        out[0] = s_Base64PipeTable[(group >> 18) & 0x3F];
+        out[1] = s_Base64PipeTable[(group >> 12) & 0x3F];
+        out[2] = (PendingCount >= 2)
+                     ? s_Base64PipeTable[(group >> 6) & 0x3F]
+                     : '=';
+        out[3] = '=';
+
+        PendingCount = 0;
+
+        if (ChainTo)
+            written += ChainTo->Put(out, 4);
+    }
+
+    if (ChainTo)
+        written += ChainTo->Flush();
+
+    return written;
+}
+
+//========================================================================
 // Multi-stage compression pipeline convenience functions
 //========================================================================
 
 namespace Pipes
 {
     // Create a compression chain: Data -> Blowfish -> File
-    inline ChainPipe* CreateCompressChain(FileClass* pFile, const void* pKey, int32 keyLen)
+    inline ChainPipe* CreateCompressChain(CCFileClass* pFile, const void* pKey, int32 keyLen)
     {
         ChainPipe* chain = new ChainPipe();
 
@@ -546,7 +679,7 @@ namespace Pipes
     }
 
     // Create a chain: LCW compression -> File
-    inline ChainPipe* CreateLCWCompressChain(FileClass* pFile, bool bControl, size_t blockSize)
+    inline ChainPipe* CreateLCWCompressChain(CCFileClass* pFile, bool bControl, size_t blockSize)
     {
         ChainPipe* chain = new ChainPipe();
         chain->Add(new LCWPipe(bControl, blockSize));

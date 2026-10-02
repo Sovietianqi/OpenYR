@@ -3,6 +3,7 @@
 #include "../Rules/RulesClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Map/MapClass.h"
+#include "../INI/INIClass.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -13,8 +14,11 @@
 
 static MPGameModeClass* g_MPGameModeInstance = nullptr;
 
+DynamicVectorClass<MPGameModeClass*>* MPGameModeClass::Array = nullptr;
+
 MPGameModeClass::MPGameModeClass()
-    : GameMode(MultiplayerGameMode::FreeForAll)
+    : Field_28(0)
+    , GameMode(MultiplayerGameMode::FreeForAll)
     , MaxPlayers(8), MinPlayers(2)
     , StartingCredits(10000), StartingUnits(0)
     , MapRevealed(false), AlliesRevealed(false)
@@ -32,6 +36,10 @@ MPGameModeClass::MPGameModeClass()
     , NoInfantry(false), NoVehicles(false)
     , NoNavy(false), NoAircraft(false)
     , NoBuildings(false), NoDefenses(false)
+    , WonlineTournamentAllowed(true)
+    , WonlineClanTournamentAllowed(true)
+    , AlliesAllowed(true)
+    , MustAlly(false)
 {
     for (int32 i = 0; i < MAX_TEAMS; ++i) {
         TeamScores[i] = 0;
@@ -764,4 +772,85 @@ void MPGameModeClass::AddObserver() {
 
 void MPGameModeClass::RemoveObserver() {
     if (ObserverCount > 0) --ObserverCount;
+}
+// ============================================================
+// Global mode list
+//
+// Mirrors vec_MPGameModes / MPGameMode_ResetList / vec_MPGameModes_Find.
+// ============================================================
+
+void MPGameModeClass::ResetList()
+{
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<MPGameModeClass*>();
+    }
+    for (int32 i = 0; i < Array->Count; ++i) {
+        delete Array->Items[i];
+        Array->Items[i] = nullptr;
+    }
+    Array->Clear();
+}
+
+int32 MPGameModeClass::FindIndex(int32 idx)
+{
+    if (Array == nullptr) {
+        return 0;
+    }
+    // vec_MPGameModes_Find: linear scan comparing the identifier at +0x28.
+    for (int32 i = 0; i < Array->Count; ++i) {
+        MPGameModeClass* pMode = Array->Items[i];
+        if (pMode != nullptr && pMode->Field_28 == idx) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+MPGameModeClass* MPGameModeClass::Find(int32 idx)
+{
+    if (Array == nullptr || Array->Count <= 0) {
+        ResetList();
+        return (Array != nullptr && Array->Count > 0) ? Array->Items[0] : nullptr;
+    }
+    const int32 index = FindIndex(idx);
+    if (Array->Count > 0) {
+        return Array->Items[index];
+    }
+    return nullptr;
+}
+
+void MPGameModeClass::Register(MPGameModeClass* pMode)
+{
+    if (pMode == nullptr) {
+        return;
+    }
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<MPGameModeClass*>();
+    }
+    Array->Add(pMode);
+}
+
+// ============================================================
+// MPGameModeClass::ReadFromINI
+//
+// Mirrors the tournament/alliance flags read from the mode's own INI file.
+// WonlineTournamentAllowed and WonlineClanTournamentAllowed live in the
+// same section as the mode definition; AlliesAllowed and MustAlly describe
+// whether the mode permits player chosen alliances.
+// ============================================================
+
+void MPGameModeClass::ReadFromINI(CCINIClass* pINI, const char* pSection)
+{
+    if (pINI == nullptr || pSection == nullptr) {
+        return;
+    }
+
+    WonlineTournamentAllowed =
+        pINI->ReadBool(pSection, "WonlineTournamentAllowed",
+                       WonlineTournamentAllowed);
+    WonlineClanTournamentAllowed =
+        pINI->ReadBool(pSection, "WonlineClanTournamentAllowed",
+                       WonlineClanTournamentAllowed);
+    AlliesAllowed = pINI->ReadBool(pSection, "AlliesAllowed", AlliesAllowed);
+    MustAlly      = pINI->ReadBool(pSection, "MustAlly",      MustAlly);
 }

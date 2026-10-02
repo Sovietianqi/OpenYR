@@ -285,12 +285,14 @@ bool SmudgeTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCrater   = pINI->ReadBool(section, "Crater",   IsCrater);
     IsScorch   = pINI->ReadBool(section, "Scorch",   IsScorch);
     IsBib      = pINI->ReadBool(section, "Bib",      IsBib);
-    IsAnimated = pINI->ReadBool(section, "Animated", IsAnimated);
     IsFlat     = pINI->ReadBool(section, "Flat",     IsFlat);
+    IsBurn     = pINI->ReadBool(section, "Burn",     IsBurn);
 
     // ------------------------------------------------------------------
     // Dimensions
     // ------------------------------------------------------------------
+    Width  = pINI->ReadInteger(section, "Width",  Width);
+    Height = pINI->ReadInteger(section, "Height", Height);
     int32 defSize[2] = { CellSize.X, CellSize.Y };
     int32* pSize = pINI->Read2Integers(defSize, section, "Size", defSize);
     if (pSize != nullptr)
@@ -302,9 +304,6 @@ bool SmudgeTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Animation / chain parameters
     // ------------------------------------------------------------------
-    Frames     = pINI->ReadInteger(section, "Frames",     Frames);
-    ChainCount = pINI->ReadInteger(section, "ChainCount", ChainCount);
-    ChainSteps = pINI->ReadInteger(section, "ChainSteps", ChainSteps);
 
     // ------------------------------------------------------------------
     // Art reference - falls back to the type ID when no Image is given.
@@ -395,4 +394,20 @@ int32 SmudgeTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+
+// ============================================================================
+// SmudgeTypeClass - static lookup helpers
+// ============================================================================
+SmudgeTypeClass* SmudgeTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    SmudgeTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    if (!Array) return nullptr;
+    SmudgeTypeClass* newItem = GameCreate<SmudgeTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

@@ -352,7 +352,6 @@ bool ScriptTypeClass::LoadFromINIList(CCINIClass* pINI, bool IsGlobal) {
 
     this->IsGlobal = IsGlobal;
 
-    pINI->GetInteger(sectionName, "ArrayIndex", ArrayIndex);
 
     // Parse every action line. The original game stores actions as numbered
     // keys ("0", "1", "2", ...) whose value is "action,argument". We also
@@ -506,4 +505,44 @@ void ScriptTypeClass::ClearActions() {
         ScriptActions[i].Argument = 0;
     }
     ActionsCount = 0;
+}
+
+// ----------------------------------------------------------------------------
+// CreateFromINIList - ScriptTypeClass_CreateFromINIList (asm 0x5C9CD7)
+//
+//   Walks the [ScriptTypes] section.  Each key's value names the script to
+//   create; the sentinels "<none>" and "none" are skipped, and a name that is
+//   already registered is reused rather than duplicated.
+// ----------------------------------------------------------------------------
+void ScriptTypeClass::CreateFromINIList(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+
+    static const char* const SECTION = "ScriptTypes";
+    const int32 count = pINI->GetKeyCount(SECTION);
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName(SECTION, i);
+        if (pKeyName == nullptr) {
+            continue;
+        }
+
+        char name[0x18];
+        name[0] = '\0';
+        if (pINI->ReadString(SECTION, pKeyName, "", name, sizeof(name)) <= 0) {
+            continue;
+        }
+
+        if (_strcmpi(name, "<none>") == 0 || _strcmpi(name, "none") == 0) {
+            continue;
+        }
+
+        ScriptTypeClass* pItem = FindOrAllocate(name);
+        if (pItem != nullptr) {
+            pItem->LoadFromINI(pINI);
+        }
+    }
 }

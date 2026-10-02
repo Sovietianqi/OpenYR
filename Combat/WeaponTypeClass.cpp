@@ -1,4 +1,5 @@
 // =============================================================================
+#include <Animations/AnimTypeClass.h>
 // WeaponTypeClass.cpp - Weapon type definitions and combat calculations
 //
 // Defines the static data for each weapon in the game. A WeaponTypeClass
@@ -387,14 +388,12 @@ bool WeaponTypeClass::LoadFromINIList(CCINIClass* pINI) {
     if (!pINI->SectionExists(sectionName)) return false;
 
     // ── Integer properties ──────────────────────────────────────────────
-    pINI->GetInteger(sectionName, "ArrayIndex", ArrayIndex);
     Damage         = pINI->ReadInteger(sectionName, "Damage", Damage);
     ROF            = pINI->ReadInteger(sectionName, "ROF", ROF);
     Range          = pINI->ReadInteger(sectionName, "Range", Range);
     Burst          = pINI->ReadInteger(sectionName, "Burst", Burst);
     MinimumRange   = pINI->ReadInteger(sectionName, "MinimumRange", MinimumRange);
     Speed          = pINI->ReadInteger(sectionName, "Speed", Speed);
-    ProjectileRange = pINI->ReadInteger(sectionName, "ProjectileRange", ProjectileRange);
 
     // Clamp values to sane ranges.
     if (Burst < 1)        Burst = 1;
@@ -423,16 +422,11 @@ bool WeaponTypeClass::LoadFromINIList(CCINIClass* pINI) {
 
     // ── Boolean flags ───────────────────────────────────────────────────
     IsLaser           = pINI->ReadBool(sectionName, "IsLaser", IsLaser);
-    IsElectric        = pINI->ReadBool(sectionName, "IsElectric", IsElectric);
     IsRadBeam         = pINI->ReadBool(sectionName, "IsRadBeam", IsRadBeam);
     IsSonic           = pINI->ReadBool(sectionName, "IsSonic", IsSonic);
-    IsMagazine        = pINI->ReadBool(sectionName, "IsMagazine", IsMagazine);
     Camera            = pINI->ReadBool(sectionName, "Camera", Camera);
-    Discardable       = pINI->ReadBool(sectionName, "Discardable", Discardable);
     UseFireParticles  = pINI->ReadBool(sectionName, "UseFireParticles", UseFireParticles);
     UseSparkParticles = pINI->ReadBool(sectionName, "UseSparkParticles", UseSparkParticles);
-    IsCharge          = pINI->ReadBool(sectionName, "IsCharge", IsCharge);
-    IsOverpowered     = pINI->ReadBool(sectionName, "IsOverpowered", IsOverpowered);
 
     // ── Projectile (BulletTypeClass) lookup ─────────────────────────────
     char projName[0x18];
@@ -498,7 +492,6 @@ bool WeaponTypeClass::LoadFromINIList(CCINIClass* pINI) {
 
     // ── Damage type ─────────────────────────────────────────────────────
     int32 damageType = static_cast<int32>(DamageType::Normal);
-    pINI->GetInteger(sectionName, "DamageType", damageType);
     if (damageType < 0 || damageType > static_cast<int32>(DamageType::Special)) {
         damageType = static_cast<int32>(DamageType::Normal);
     }
@@ -515,7 +508,75 @@ bool WeaponTypeClass::LoadFromINIList(CCINIClass* pINI) {
         IsSonic = true;
     }
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    const char* section = sectionName;
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    AmbientDamage = pINI->ReadInteger(section, "AmbientDamage", AmbientDamage);
+    IsSonic = pINI->ReadBool(section, "IsSonic", IsSonic);
+    Spawner = pINI->ReadBool(section, "Spawner", Spawner);
+    LimboLaunch = pINI->ReadBool(section, "LimboLaunch", LimboLaunch);
+    DecloakToFire = pINI->ReadBool(section, "DecloakToFire", DecloakToFire);
+    CellRangefinding = pINI->ReadBool(section, "CellRangefinding", CellRangefinding);
+    FireOnce = pINI->ReadBool(section, "FireOnce", FireOnce);
+    NeverUse = pINI->ReadBool(section, "NeverUse", NeverUse);
+    RevealOnFire = pINI->ReadBool(section, "RevealOnFire", RevealOnFire);
+    TerrainFire = pINI->ReadBool(section, "TerrainFire", TerrainFire);
+    SabotageCursor = pINI->ReadBool(section, "SabotageCursor", SabotageCursor);
+    MigAttackCursor = pINI->ReadBool(section, "MigAttackCursor", MigAttackCursor);
+    DisguiseFireOnly = pINI->ReadBool(section, "DisguiseFireOnly", DisguiseFireOnly);
+    InfiniteMindControl = pINI->ReadBool(section, "InfiniteMindControl", InfiniteMindControl);
+    FireWhileMoving = pINI->ReadBool(section, "FireWhileMoving", FireWhileMoving);
+    DrainWeapon = pINI->ReadBool(section, "DrainWeapon", DrainWeapon);
+    FireInTransport = pINI->ReadBool(section, "FireInTransport", FireInTransport);
+    DisguiseFakeBlinkTime = pINI->ReadInteger(section, "DisguiseFakeBlinkTime", DisguiseFakeBlinkTime);
+    Suicide = pINI->ReadBool(section, "Suicide", Suicide);
+    Supress = pINI->ReadBool(section, "Supress", Supress);
+    Burst = pINI->ReadInteger(section, "Burst", Burst);
+    Damage = pINI->ReadInteger(section, "Damage", Damage);
+    Speed = pINI->ReadIntHundredth(section, "Speed", Speed);
+    ROF = pINI->ReadInteger(section, "ROF", ROF);
+    pINI->ReadString(section, "DownReport", DownReport, DownReport, sizeof(DownReport));
+    { char _buf[0x40]; if (pINI->ReadString(section, "AssaultAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) AssaultAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "OccupantAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) OccupantAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "OpenToppedAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) OpenToppedAnim = _p; } }
+    Camera = pINI->ReadBool(section, "Camera", Camera);
+    IsLaser = pINI->ReadBool(section, "IsLaser", IsLaser);
+    DiskLaser = pINI->ReadBool(section, "DiskLaser", DiskLaser);
+    IsLine = pINI->ReadBool(section, "IsLine", IsLine);
+    IsHouseColor = pINI->ReadBool(section, "IsHouseColor", IsHouseColor);
+    Charges = pINI->ReadBool(section, "Charges", Charges);
+    TurboBoost = pINI->ReadBool(section, "TurboBoost", TurboBoost);
+    UseFireParticles = pINI->ReadBool(section, "UseFireParticles", UseFireParticles);
+    UseSparkParticles = pINI->ReadBool(section, "UseSparkParticles", UseSparkParticles);
+    OmniFire = pINI->ReadBool(section, "OmniFire", OmniFire);
+    DistributedWeaponFire = pINI->ReadBool(section, "DistributedWeaponFire", DistributedWeaponFire);
+    IsRailgun = pINI->ReadBool(section, "IsRailgun", IsRailgun);
+    Lobber = pINI->ReadBool(section, "Lobber", Lobber);
+    pINI->Get3Bytes(section, "LaserInnerColor", LaserInnerColor);
+    pINI->Get3Bytes(section, "LaserOuterColor", LaserOuterColor);
+    pINI->Get3Bytes(section, "LaserOuterSpread", LaserOuterSpread);
+    LaserDuration = pINI->ReadInteger(section, "LaserDuration", LaserDuration);
+    IsBigLaser = pINI->ReadBool(section, "IsBigLaser", IsBigLaser);
+    Bright = pINI->ReadBool(section, "Bright", Bright);
+    IonSensitive = pINI->ReadBool(section, "IonSensitive", IonSensitive);
+    AreaFire = pINI->ReadBool(section, "AreaFire", AreaFire);
+    IsElectricBolt = pINI->ReadBool(section, "IsElectricBolt", IsElectricBolt);
+    DrawBoltAsLaser = pINI->ReadBool(section, "DrawBoltAsLaser", DrawBoltAsLaser);
+    IsAlternateColor = pINI->ReadBool(section, "IsAlternateColor", IsAlternateColor);
+    IsRadBeam = pINI->ReadBool(section, "IsRadBeam", IsRadBeam);
+    IsRadEruption = pINI->ReadBool(section, "IsRadEruption", IsRadEruption);
+    RadLevel = pINI->ReadInteger(section, "RadLevel", RadLevel);
+    IsMagBeam = pINI->ReadBool(section, "IsMagBeam", IsMagBeam);
+
+        return true;
 }
 
 // =============================================================================

@@ -94,6 +94,12 @@ public:
     // Base zone
     bool Base_Is_Area_Occupied(int32 cellIndex, int32 radius) const;
 
+    // DisplayClass::Read_INI / MapClass_SaveMapToINI cell-tag stage.
+    // "CellTags" maps a packed cell index to the name of the tag that owns
+    // it.  NewINIFormat >= 4 splits the index as (index / 1000, index % 1000);
+    // older maps split it as (index / 128, index % 128).
+    void ReadCellTags(CCINIClass* pINI, const char* pSection, int32 newINIFormat);
+
     // Wall
     void Place_Wall(int32 x, int32 y, int32 overlayIndex);
     void Remove_Wall(int32 x, int32 y);

@@ -14,15 +14,22 @@ class CCFileClass;
 // MemoryBuffer - simple buffer used by BufferStraw
 //========================================================================
 
+//========================================================================
+// MemoryBuffer - a non-owning view over a caller-supplied byte range
+//
+// BufferStraw and BufferPipe both point this at memory they do NOT own
+// (a stack buffer, a file-mapping, another object's storage), so the view
+// must never free it.  Freeing Data here would double-free every buffer
+// handed to a BufferStraw/BufferPipe - the original's Buffer is likewise a
+// plain pointer/length pair with no ownership.
+//========================================================================
+
 struct MemoryBuffer {
     uint8* Data;
     int32  Size;
     int32  Position;
 
     MemoryBuffer() : Data(nullptr), Size(0), Position(0) {}
-    ~MemoryBuffer() {
-        if (Data) YRMemory::Deallocate(Data);
-    }
 };
 
 //========================================================================
@@ -129,18 +136,19 @@ public:
     {
         if (Buffer.Data && pBuffer && length > 0)
         {
-            if (Buffer.Size > 0)
-            {
-                int32 residue = static_cast<int32>(Buffer.Size) - Index;
-                if (length > residue)
-                    length = residue;
-            }
+            // Clamp to what is left in the view.  A zero-length view has
+            // nothing left, so the residue is zero and no byte is copied -
+            // the previous `Buffer.Size > 0` guard skipped the clamp for an
+            // empty view and let a byte be read past its end.
+            const int32 residue = static_cast<int32>(Buffer.Size) - Index;
+            if (length > residue)
+                length = residue;
 
-            if (length > 0)
-            {
-                uint8* src = static_cast<uint8*>(Buffer.Data);
-                memcpy(pBuffer, src + Index, static_cast<size_t>(length));
-            }
+            if (length <= 0)
+                return 0;
+
+            uint8* src = static_cast<uint8*>(Buffer.Data);
+            memcpy(pBuffer, src + Index, static_cast<size_t>(length));
 
             Index += length;
             return length;
@@ -153,6 +161,40 @@ public:
 
 private:
     DISABLE_COPY_AND_MOVE(BufferStraw)
+};
+
+//========================================================================
+// Base64Straw - Reads raw data by base64-decoding its source
+//
+// Base64Straw reads base64 text from its chained source, decodes it
+// a 4-character group at a time and hands the decoded bytes back
+// through Get().  It is the mirror of Base64Pipe: where the pipe
+// encodes on the way out, the straw decodes on the way in.
+//
+// The alphabet is the binary's own Base64_EncodeTable
+// (aAbcdefghijklmn: "A-Za-z0-9+/"), and '=' terminates a group.
+//========================================================================
+
+class Base64Straw : public Straw
+{
+public:
+    Base64Straw()
+        : Straw()
+        , DecodeTableBuilt(false)
+    {
+        DecodeTable[0] = '\0';
+    }
+
+    virtual ~Base64Straw() noexcept override {}
+
+    virtual int32 Get(void* pBuffer, int32 length) override;
+
+    // The 256-entry reverse lookup, indexed by the encoded character.
+    char DecodeTable[256];
+    bool DecodeTableBuilt;
+
+private:
+    DISABLE_COPY_AND_MOVE(Base64Straw)
 };
 
 //========================================================================
@@ -378,6 +420,103 @@ public:
 private:
     DISABLE_COPY_AND_MOVE(LCWStraw)
 };
+
+//========================================================================
+// Base64 Decoding Implementation
+//========================================================================
+
+// The binary's Base64_EncodeTable (aAbcdefghijklmn) - the standard RFC 4648
+// alphabet.  Decoding walks the source four characters at a time and emits
+// three bytes; a '=' in the group marks the final, short one.
+static const char s_Base64StrawTable[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+inline int32 Base64Straw::Get(void* pBuffer, int32 length)
+{
+    if (!pBuffer || length <= 0 || !ChainTo)
+        return 0;
+
+    // Build the reverse table lazily (once).  Any character outside the
+    // alphabet maps to -1 and is skipped.
+    if (!DecodeTableBuilt)
+    {
+        for (int32 i = 0; i < 256; ++i)
+            DecodeTable[i] = -1;
+        for (int32 i = 0; i < 64; ++i)
+            DecodeTable[static_cast<uint8>(s_Base64StrawTable[i])] =
+                static_cast<char>(i);
+        DecodeTableBuilt = true;
+    }
+
+    uint8* dest = static_cast<uint8*>(pBuffer);
+    int32 written = 0;
+
+    // Decode one 4-character group at a time.
+    while (written < length)
+    {
+        uint8 sextet[4];
+        int32 have = 0;
+        int32 padChars = 0;   // number of '=' seen in this group
+
+        while (have < 4)
+        {
+            char ch = 0;
+            if (ChainTo->Get(&ch, 1) != 1)
+                break;
+
+            if (ch == '=')
+            {
+                // '=' only ever appears in the final group; count it and keep
+                // pulling so the group is consumed whole.
+                sextet[have++] = 0;
+                ++padChars;
+                continue;
+            }
+
+            const char decoded = DecodeTable[static_cast<uint8>(ch)];
+            if (decoded < 0)
+                continue;   // whitespace / unknown -> skip
+
+            sextet[have++] = static_cast<uint8>(decoded);
+        }
+
+        // Nothing at all was read: genuine end of stream.
+        if (have == 0)
+            break;
+
+        // A partial group (fewer than four characters, no padding) is a
+        // malformed tail; stop rather than fabricate bytes.
+        if (have < 4 && padChars == 0)
+            break;
+
+        const uint32 group =
+            (static_cast<uint32>(sextet[0]) << 18) |
+            (static_cast<uint32>(sextet[1]) << 12) |
+            (static_cast<uint32>(sextet[2]) << 6) |
+            (static_cast<uint32>(sextet[3]));
+
+        // How many output bytes this group is worth: 3 minus one per pad char,
+        // and never more than the space left.
+        int32 emit = 3 - padChars;
+        if (emit > length - written)
+            emit = length - written;
+
+        if (emit > 0) dest[written++] = static_cast<uint8>((group >> 16) & 0xFF);
+        if (emit > 1) dest[written++] = static_cast<uint8>((group >> 8) & 0xFF);
+        if (emit > 2) dest[written++] = static_cast<uint8>(group & 0xFF);
+
+        // Padding always terminates the stream.
+        if (padChars > 0)
+            break;
+
+        // Fewer than four characters with no padding means the source ended
+        // mid-group; stop here.
+        if (have < 4)
+            break;
+    }
+
+    return written;
+}
 
 //========================================================================
 // LCW Decompression Implementation
@@ -936,7 +1075,7 @@ static const uint32 BlowfishSInit[4][256] = {
     }
 };
 
-void BlowStraw::InitializeBlowfish()
+inline void BlowStraw::InitializeBlowfish()
 {
     // Initialize P-array and S-boxes from Pi
     memcpy(P, BlowfishPInit, sizeof(P));
@@ -976,7 +1115,7 @@ void BlowStraw::InitializeBlowfish()
     }
 }
 
-uint32 BlowStraw::F(uint32 x) const
+inline uint32 BlowStraw::F(uint32 x) const
 {
     uint16 a = static_cast<uint16>(x >> 24);
     uint16 b = static_cast<uint16>((x >> 16) & 0xFF);
@@ -986,7 +1125,7 @@ uint32 BlowStraw::F(uint32 x) const
     return ((S[0][a] + S[1][b]) ^ S[2][c]) + S[3][d];
 }
 
-void BlowStraw::EncryptBlock(uint32& left, uint32& right)
+inline void BlowStraw::EncryptBlock(uint32& left, uint32& right)
 {
     for (int32 i = 0; i < 16; ++i)
     {
@@ -1007,7 +1146,7 @@ void BlowStraw::EncryptBlock(uint32& left, uint32& right)
     left ^= P[17];
 }
 
-void BlowStraw::DecryptBlock(uint32& left, uint32& right)
+inline void BlowStraw::DecryptBlock(uint32& left, uint32& right)
 {
     for (int32 i = 17; i > 1; --i)
     {

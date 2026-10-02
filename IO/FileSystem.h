@@ -123,12 +123,20 @@ public:
     void Close();
     const char* GetFileName() const;
 
+    // The attribute predicates the original tests through the
+    // FILE_ATTRIBUTE bits (dwFileAttributes & 0x116): a directory, or a
+    // hidden / system entry, is skipped before the name comparison.
+    bool IsDirectory() const;
+    bool IsHidden() const;
+
     bool IsFindValid;
 
 private:
     void* m_pHandle;
     char m_FindName[MAX_PATH_LEN];
     char m_SearchPath[MAX_PATH_LEN];
+    bool m_IsDirectory;
+    bool m_IsHidden;
 };
 
 // ============================================================================
@@ -141,3 +149,31 @@ public:
     static bool DeleteFile(const char* pFilename);
     static int32 GetFileSize(const char* pFilename);
 };
+
+// ============================================================================
+// CD - the forced-drive selector
+//
+//   CD::Set_Volume (asm 0x47909D) is a two-line setter:
+//
+//       if (CD::CD_Files_Local == 1) { ForcedCDNumber = 0xFFFFFFFE; return; }
+//       if (volume >= 0)             ForcedCDNumber = volume;
+//
+//   The sentinel 0xFFFFFFFE means "the current drive", 0/1 name the two RA2
+//   discs and 2 names Yuri's Revenge.  Game_ParsePKTs forces 0xFFFFFFFE for
+//   the duration of its ".YRO" scan so the archives are read from the working
+//   directory rather than a CD, then restores the previous value.  The
+//   CD::Is_Available predicate (asm 0x4790EA) tests the same selector.
+// ============================================================================
+namespace CD {
+    void Set_Volume(int32 nVolume);
+    int32 Get_Volume();
+    bool Is_Available(int32 nIndex);
+
+    // The "CD files are local" flag the setter short-circuits on.
+    extern bool CD_Files_Local;
+}
+
+// CD::ForceAvailable - the trampoline MixFileClass_CTOR reaches through the
+// CD vtable at construction time.  Returns whether the requested drive is
+// usable; on this platform the working directory always is.
+bool CD_ForceAvailable(int32 nIndex);

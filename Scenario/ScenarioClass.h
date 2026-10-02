@@ -57,11 +57,11 @@ struct ScenarioFlags {
     bool FixedAlliance()        const { return GetBit(10); }
     bool HarvesterImmune()      const { return GetBit(11); }
     bool FogOfWar()             const { return GetBit(12); }
-    bool TiberiumExplosive()    const { return GetBit(15); }
-    bool DestroyableBridges()   const { return GetBit(16); }
-    bool Meteorites()           const { return GetBit(17); }
-    bool IonStorms()            const { return GetBit(18); }
-    bool Visceroids()           const { return GetBit(19); }
+    bool TiberiumExplosive()    const { return GetBit(14); }
+    bool DestroyableBridges()   const { return GetBit(15); }
+    bool Meteorites()           const { return GetBit(16); }
+    bool IonStorms()            const { return GetBit(17); }
+    bool Visceroids()           const { return GetBit(18); }
 };
 
 // ============================================================================
@@ -122,6 +122,24 @@ public:
     void CreateUnits();
     void EndGame();
     void ReadStartPoints(CCINIClass& ini);
+
+    // Reads the [SpecialFlags] section into SpecialFlags.  Every key uses
+    // the bit it currently holds as its fallback, so a partially specified
+    // section preserves the scenario's own settings.
+    void GetGlobalFlags(CCINIClass* pINI);
+
+    // ScenarioClass_ReadLocalVariables - the [VariableNames] pass.  The
+    // section is purely index-keyed: every key parses as an integer slot,
+    // the value splits on ',' into "<name>,<initial value>" and the second
+    // token, when it survives, becomes a boolean stored 0x28 bytes into the
+    // slot.  All 100 slots are cleared first, so a scenario that names no
+    // variables leaves the table empty.
+    void ReadLocalVariables(CCINIClass* pINI);
+
+    // The [Ranking] pass at the tail of Scenario_ReadLightingAndBasic.  The
+    // three par times go through Get_Time ("%02d:%02d:%02d"), while the four
+    // under/over-par captions are ordinary 0x1F-byte string reads.
+    void ReadRanking(CCINIClass* pINI);
 
     // ========================================================================
     // Save / Load

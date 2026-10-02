@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <ctime>
 
 // ============================================================================
@@ -665,11 +666,100 @@ void ScenarioClass::ReadStartPoints(CCINIClass& ini)
         Intro = p;
     }
 
+    // ------------------------------------------------------------------
+    // [Basic] - remaining keys
+    // ------------------------------------------------------------------
+    ini.ReadString(section, "Brief", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        Brief = p;
+    }
+
+    ini.ReadString(section, "Win", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        Win = p;
+    }
+
+    ini.ReadString(section, "Lose", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        Lose = p;
+    }
+
+    ini.ReadString(section, "Action", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        Action = p;
+    }
+
+    ini.ReadString(section, "PostScore", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        PostScore = p;
+    }
+
+    ini.ReadString(section, "PreMapSelect", "", buffer, sizeof(buffer));
+    if (buffer[0]) {
+        char* p = new char[strlen(buffer) + 1];
+        strcpy(p, buffer);
+        PreMapSelect = p;
+    }
+
+    MultiplayerOnly = ini.ReadBool(section, "MultiplayerOnly", MultiplayerOnly);
+    TimerInherit    = ini.ReadBool(section, "TimerInherit",    TimerInherit);
+    EndOfGame       = ini.ReadBool(section, "EndOfGame",       EndOfGame);
+
+    ThemeIndex = ini.ReadInteger(section, "Theme", ThemeIndex);
+
     // Read flags
     FreeRadar = ini.ReadBool(section, "FreeRadar", false);
     TrainCrate = ini.ReadBool(section, "TrainCrate", false);
     PlayerSideIndex = ini.ReadInteger(section, "Player", -1);
     ThemeIndex = ini.ReadInteger(section, "Theme", 0);
+
+    // ------------------------------------------------------------------
+    // [Header] - starting point span and the coop start-spot count.
+    // ------------------------------------------------------------------
+    StartX = ini.ReadInteger("Header", "StartX", StartX);
+    StartY = ini.ReadInteger("Header", "StartY", StartY);
+    Width  = ini.ReadInteger("Header", "Width",  Width);
+    Height = ini.ReadInteger("Header", "Height", Height);
+    NumberStartingPoints     = ini.ReadInteger("Header", "NumberStartingPoints",     NumberStartingPoints);
+    NumCoopHumanStartSpots   = ini.ReadInteger("Header", "NumCoopHumanStartSpots",   NumCoopHumanStartSpots);
+
+    // ------------------------------------------------------------------
+    // [Briefing] - the loading-screen text and its backdrops.
+    // ------------------------------------------------------------------
+    ini.ReadString("Briefing", "LSLoadMessage", "", LSLoadMessage, sizeof(LSLoadMessage));
+    ini.ReadString("Briefing", "LSLoadBriefing", "", LSBrief, sizeof(LSBrief));
+    LS640BriefLocX  = ini.ReadInteger("Briefing", "LS640BriefLocX",  LS640BriefLocX);
+    LS640BriefLocY  = ini.ReadInteger("Briefing", "LS640BriefLocY",  LS640BriefLocY);
+    LS800BriefLocX  = ini.ReadInteger("Briefing", "LS800BriefLocX",  LS800BriefLocX);
+    LS800BriefLocY  = ini.ReadInteger("Briefing", "LS800BriefLocY",  LS800BriefLocY);
+    ini.ReadString("Briefing", "LS640BkgdName", "", LS640BkgdName, sizeof(LS640BkgdName));
+    ini.ReadString("Briefing", "LS800BkgdName", "", LS800BkgdName, sizeof(LS800BkgdName));
+    ini.ReadString("Briefing", "LS800BkgdPal",  "", LS800BkgdPal,  sizeof(LS800BkgdPal));
+
+    // ------------------------------------------------------------------
+    // [VariableNames] - the free-form list of global variable names.
+    // ------------------------------------------------------------------
+    {
+        const int32 varCount = ini.GetKeyCount("VariableNames");
+        for (int32 i = 0; i < varCount && i < MaxGlobalVariables; ++i) {
+            const char* pVarName = ini.GetKeyName("VariableNames", i);
+            if (pVarName == nullptr)
+                continue;
+            std::strncpy(GlobalVariables[i].Name, pVarName,
+                         sizeof(GlobalVariables[i].Name) - 1);
+            GlobalVariables[i].Name[sizeof(GlobalVariables[i].Name) - 1] = '\0';
+        }
+    }
 
     // Read map-specific flags
     section = "Map";
@@ -699,9 +789,14 @@ void ScenarioClass::ReadStartPoints(CCINIClass& ini)
     IonLighting.Tint.Green = ini.ReadInteger(section, "IonGreen", 0);
     IonLighting.Tint.Blue  = ini.ReadInteger(section, "IonBlue", 0);
 
-    // Read special flags
-    section = "SpecialFlags";
-    SpecialFlags.Raw = static_cast<uint32>(ini.ReadInteger(section, "SpecialFlag", 0));
+    // Read special flags - one boolean key per bit.
+    GetGlobalFlags(&ini);
+
+    // [Ranking] - the par times and the under/over-par captions.
+    ReadRanking(&ini);
+
+    // [VariableNames] - the local-variable table of the scenario.
+    ReadLocalVariables(&ini);
 
     // Read starting waypoints
     for (int32 i = 0; i < MaxStartingPoints; ++i) {
@@ -735,4 +830,142 @@ void ScenarioClass::ReadStartPoints(CCINIClass& ini)
     if (timerVal > 0) {
         MissionTimer.Start(timerVal);
     }
+}
+// ============================================================================
+// GetGlobalFlags - ScenarioClass_GetGlobalFlags
+//
+//   [SpecialFlags] of the scenario file.  Every key takes the bit's current
+//   value as its fallback, so a scenario that only mentions a few flags
+//   keeps whatever the map already declared.  Bit assignments follow the
+//   original's ScenarioFlags layout exactly:
+//
+//     5  Inert              11 HarvesterImmune
+//     6  TiberiumGrows      12 FogOfWar
+//     7  TiberiumSpreads    15 TiberiumExplosive
+//     8  MCVDeploy          16 DestroyableBridges
+//     9  InitialVeteran     17 Meteorites
+//    10  FixedAlliance      18 IonStorms
+//                           19 Visceroids
+// ============================================================================
+void ScenarioClass::GetGlobalFlags(CCINIClass* pINI)
+{
+    static const char* const SECTION = "SpecialFlags";
+
+    if (pINI == nullptr)
+        return;
+
+    SpecialFlags.SetBit(5,  pINI->ReadBool(SECTION, "Inert",              SpecialFlags.Inert()));
+    SpecialFlags.SetBit(6,  pINI->ReadBool(SECTION, "TiberiumGrows",      SpecialFlags.TiberiumGrows()));
+    SpecialFlags.SetBit(7,  pINI->ReadBool(SECTION, "TiberiumSpreads",    SpecialFlags.TiberiumSpreads()));
+    SpecialFlags.SetBit(8,  pINI->ReadBool(SECTION, "MCVDeploy",          SpecialFlags.MCVDeploy()));
+    SpecialFlags.SetBit(9,  pINI->ReadBool(SECTION, "InitialVeteran",     SpecialFlags.InitialVeteran()));
+    SpecialFlags.SetBit(10, pINI->ReadBool(SECTION, "FixedAlliance",      SpecialFlags.FixedAlliance()));
+    SpecialFlags.SetBit(11, pINI->ReadBool(SECTION, "HarvesterImmune",    SpecialFlags.HarvesterImmune()));
+    SpecialFlags.SetBit(12, pINI->ReadBool(SECTION, "FogOfWar",           SpecialFlags.FogOfWar()));
+    SpecialFlags.SetBit(14, pINI->ReadBool(SECTION, "TiberiumExplosive",  SpecialFlags.TiberiumExplosive()));
+    SpecialFlags.SetBit(15, pINI->ReadBool(SECTION, "DestroyableBridges", SpecialFlags.DestroyableBridges()));
+    SpecialFlags.SetBit(16, pINI->ReadBool(SECTION, "Meteorites",         SpecialFlags.Meteorites()));
+    SpecialFlags.SetBit(17, pINI->ReadBool(SECTION, "IonStorms",          SpecialFlags.IonStorms()));
+    SpecialFlags.SetBit(18, pINI->ReadBool(SECTION, "Visceroids",         SpecialFlags.Visceroids()));
+}
+
+// ============================================================================
+// ReadLocalVariables - ScenarioClass_ReadLocalVariables
+//
+//   The [VariableNames] pass.  Every one of the 100 slots is wiped first,
+//   then the value count of the section is clamped to 100.  Each key is
+//   itself the slot ordinal (the key text goes through atoi), the value is
+//   split on ',' and the first token is copied verbatim into the slot name
+//   at +0x248A.  A second token, when it survives, is converted with atoi
+//   and stored as a boolean at +0x24B2 - that is the slot's "is a global
+//   variable" marker.
+//
+//   Slot layout, matching the original object:
+//       slot base  = this + 0x248A
+//       slot pitch = 0x29
+//       name       = slot base + 0x00  (0x28 bytes)
+//       flag       = slot base + 0x28
+// ============================================================================
+void ScenarioClass::ReadLocalVariables(CCINIClass* pINI)
+{
+    static const char* const SECTION = "VariableNames";
+
+    if (pINI == nullptr)
+        return;
+
+    for (int32 i = 0; i < MaxLocalVariables; ++i)
+        LocalVariables[i].Name[0] = '\0';
+
+    int32 count = pINI->GetKeyCount(SECTION);
+    if (count >= MaxLocalVariables)
+        count = MaxLocalVariables;
+
+    for (int32 idx = 0; idx < count; ++idx) {
+        const char* pKey = pINI->GetKeyName(SECTION, idx);
+        if (pKey == nullptr)
+            continue;
+
+        const int32 slot = std::atoi(pKey);
+        if (slot < 0 || slot >= MaxLocalVariables)
+            continue;
+
+        char buffer[0x80];
+        buffer[0] = '\0';
+        pINI->ReadString(SECTION, pKey, "", buffer, sizeof(buffer));
+
+        char* pName = std::strtok(buffer, ",");
+        if (pName == nullptr)
+            continue;
+
+        std::strncpy(LocalVariables[slot].Name, pName,
+                     sizeof(LocalVariables[slot].Name) - 1);
+        LocalVariables[slot].Name[sizeof(LocalVariables[slot].Name) - 1] = '\0';
+
+        char* pValue = std::strtok(nullptr, ",");
+        if (pValue != nullptr)
+            LocalVariables[slot].Value = (std::atoi(pValue) != 0) ? 1 : 0;
+    }
+}
+
+// ============================================================================
+// ReadRanking - the [Ranking] tail of Scenario_ReadLightingAndBasic
+//
+//   Runs after ScenarioHeader/ScenarioLocalVariables/Scenario_ReadStartPoints.
+//   The three par times are not plain integers: Get_Time reads the value as a
+//   string and runs sscanf("%02d:%02d:%02d"), then folds the result back into
+//   seconds as ((hours * 60 + minutes) * 60 + seconds) * 1000.  The four
+//   captions are ordinary string reads capped at 0x1F bytes.
+// ============================================================================
+void ScenarioClass::ReadRanking(CCINIClass* pINI)
+{
+    static const char* const SECTION = "Ranking";
+
+    if (pINI == nullptr)
+        return;
+
+    char buffer[0x80];
+    int32 hours, minutes, seconds;
+
+    buffer[0] = '\0';
+    pINI->ReadString(SECTION, "ParTimeEasy", "", buffer, sizeof(buffer));
+    hours = minutes = seconds = 0;
+    std::sscanf(buffer, "%02d:%02d:%02d", &hours, &minutes, &seconds);
+    ParTimeEasy = (((hours * 60) + minutes) * 60 + seconds) * 1000;
+
+    buffer[0] = '\0';
+    pINI->ReadString(SECTION, "ParTimeMedium", "", buffer, sizeof(buffer));
+    hours = minutes = seconds = 0;
+    std::sscanf(buffer, "%02d:%02d:%02d", &hours, &minutes, &seconds);
+    ParTimeMedium = (((hours * 60) + minutes) * 60 + seconds) * 1000;
+
+    buffer[0] = '\0';
+    pINI->ReadString(SECTION, "ParTimeHard", "", buffer, sizeof(buffer));
+    hours = minutes = seconds = 0;
+    std::sscanf(buffer, "%02d:%02d:%02d", &hours, &minutes, &seconds);
+    ParTimeDifficult = (((hours * 60) + minutes) * 60 + seconds) * 1000;
+
+    pINI->ReadString(SECTION, "UnderParTitle", "", UnderParTitle, 0x1F);
+    pINI->ReadString(SECTION, "UnderParMessage", "", UnderParMessage, 0x1F);
+    pINI->ReadString(SECTION, "OverParTitle", "", OverParTitle, 0x1F);
+    pINI->ReadString(SECTION, "OverParMessage", "", OverParMessage, 0x1F);
 }

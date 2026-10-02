@@ -157,6 +157,10 @@ public:
     void Read_Movies(CCINIClass* pINI);
     void Read_AdvancedCommandBar(CCINIClass* pINI);
     void Read_HarvesterRules(CCINIClass* pINI);
+    void Read_Tiberiums(CCINIClass* pINI);
+    void Read_TileTypes(CCINIClass* pINI);
+    void Read_MissionControl(CCINIClass* pINI);
+    void Read_Difficulties(CCINIClass* pINI);
 
     void PointerGotInvalid(AbstractClass* pInvalid, bool removed);
 
@@ -729,7 +733,7 @@ public:
     WarheadTypeClass* MutateWarhead;
     WarheadTypeClass* MutateExplosionWarhead;
     WarheadTypeClass* EMPulseWarhead;
-    WarheadTypeClass* EMPulseProjectile;
+    BulletTypeClass* EMPulseProjectile;
     WarheadTypeClass* C4Warhead;
     WarheadTypeClass* CrushWarhead;
     WarheadTypeClass* V3Warhead;
@@ -1131,6 +1135,77 @@ public:
     int32 GetCloseEnoughSpeed() const { return CloseEnough; }
     int32 GetDropPodImpactDamage() const { return DropPodWeapon ? 100 : 0; }
     int32 GetDropPodImpactRadius() const { return 1; }
+
+    // ========================================================================
+    // Rules INI fields
+    // ========================================================================
+
+    // --- Read_General ---
+    int32                    V3RocketPauseFrames;
+    int32                    V3RocketTiltFrames;
+    double                   V3RocketPitchInitial;
+    double                   V3RocketPitchFinal;
+    double                   V3RocketTurnRate;
+    double                   V3RocketRaiseRate;
+    double                   V3RocketAcceleration;
+    int32                    V3RocketAltitude;
+    int32                    V3RocketDamage;
+    int32                    V3RocketEliteDamage;
+    int32                    V3RocketBodyLength;
+    bool                     V3RocketLazyCurve;
+    AircraftTypeClass*       V3RocketType;
+    int32                    DMislPauseFrames;
+    int32                    DMislTiltFrames;
+    double                   DMislPitchInitial;
+    double                   DMislPitchFinal;
+    double                   DMislTurnRate;
+    double                   DMislRaiseRate;
+    double                   DMislAcceleration;
+    int32                    DMislAltitude;
+    int32                    DMislDamage;
+    int32                    DMislEliteDamage;
+    int32                    DMislBodyLength;
+    bool                     DMislLazyCurve;
+    AircraftTypeClass*       DMislType;
+    int32                    CMislPauseFrames;
+    int32                    CMislTiltFrames;
+    double                   CMislPitchInitial;
+    double                   CMislPitchFinal;
+    double                   CMislTurnRate;
+    double                   CMislRaiseRate;
+    double                   CMislAcceleration;
+    int32                    CMislAltitude;
+    int32                    CMislDamage;
+    int32                    CMislEliteDamage;
+    int32                    CMislBodyLength;
+    bool                     CMislLazyCurve;
+    AircraftTypeClass*       CMislType;
+    double                   TargetEffectivenessCoefficientDefa;
+    double                   TargetSpecialThreatCoefficientDefa;
+
+    // --- Read_Colors ---
+    ColorStruct              NoneValue;
+
+    // --- Read_LandCharacteristics ---
+    double                   Hover;
+    double                   Foot;
+    double                   Track;
+    double                   Wheel;
+    double                   Float;
+    double                   Amphibious;
+    double                   FloatBeach;
+    bool                     Buildable;
+
+    // --- Read_AdvancedCommandBar ---
+    char                     NoneValue2[0x20];
+
+    // --- Read_Difficulty ---
+    double                   FirePower;
+    double                   Groundspeed;
+    double                   Airspeed;
+
+    // --- Read_Difficulties ---
+    DifficultyStruct Difficulties[3];
 };
 
 // Most implementations are in RulesClass.cpp

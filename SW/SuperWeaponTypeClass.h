@@ -63,6 +63,7 @@ public:
     static DynamicVectorClass<SuperWeaponTypeClass*>* Array;
 
     static SuperWeaponTypeClass* Find(const char* pID);
+    static SuperWeaponTypeClass* FindOrAllocate(const char* pID);
     static SuperWeaponTypeClass* FindByIndex(int32 index);
     static SuperWeaponTypeClass* FindByType(SuperWeaponType type);
     static int32 GetCount();
@@ -236,4 +237,7 @@ public:
     char SidebarImageName[0x18];
     SHPStruct* CameoShape;
     SHPStruct* SidebarImage;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
 };

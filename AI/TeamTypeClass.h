@@ -28,6 +28,10 @@ public:
     static DynamicVectorClass<TeamTypeClass*>* Array;
 
     static TeamTypeClass* Find(const char* pID);
+    // TeamTypes_CreateFromINIList: walks [TeamTypes] and builds one team
+    // type per listed name.
+    static void CreateFromINIList(CCINIClass* pINI);
+
     static TeamTypeClass* FindOrAllocate(const char* pID);
     static int32 GetCount();
 

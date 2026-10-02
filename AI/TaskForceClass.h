@@ -35,6 +35,10 @@ public:
 
     static DynamicVectorClass<TaskForceClass*>* Array;
 
+    // TaskForceClass_CreateFromINIList: walks [TaskForces] and builds
+    // one task force per listed name.
+    static void CreateFromINIList(CCINIClass* pINI);
+
     static TaskForceClass* Find(const char* pID);
     static TaskForceClass* FindOrAllocate(const char* pID);
     static int32 GetCount();

@@ -18,6 +18,14 @@ public:
     static WarheadTypeClass* FindOrAllocate(const char* pID);
     static WarheadTypeClass* GetDefault() { return Array && Array->Count > 0 ? (*Array)[0] : nullptr; }
 
+    // The broadcast RulesClass_Addition_SpecialWeapons performs once the
+    // [SpecialWeapons] block has been wired up: every registered warhead type
+    // gets its vtable +0x64 hook called with the rules pointer.
+    static void NotifyAll();
+
+    // The vtable +0x64 hook itself; a type with nothing cached has no work.
+    virtual void OnRulesRefreshed() {}
+
     virtual ~WarheadTypeClass();
 
     virtual HRESULT GetClassID(CLSID* pClassID) override;
@@ -98,10 +106,57 @@ public:
     bool Bright;
     bool PenetratesBunker;
     float Verses[11];
+    bool VersesMediumWoodZero;
     AnimTypeClass* AnimList[MAX_ANIM_LIST];
     int32 AnimListCount;
     int32 DebrisCount;
     int32 DebrisMaximumsCount;
     TechnoTypeClass** DebrisTypes;
     int32* DebrisMaximums;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    double       CellInset;
+    bool         CausesDelayKill;
+    int32        DelayKillFrames;
+    double       DelayKillAtMax;
+    double       CombatLightSize;
+    bool         Conventional;
+    bool         Wall;
+    bool         WallAbsoluteDestroyer;
+    bool         Wood;
+    bool         Tiberium;
+    bool         Sparky;
+    bool         Sonic;
+    bool         Rocker;
+    bool         DirectRocker;
+    bool         Fire;
+    bool         CLDisableRed;
+    bool         CLDisableGreen;
+    bool         CLDisableBlue;
+    double       Deform;
+    int32        DeformThreshhold;
+    bool         EMEffect;
+    bool         MindControl;
+    bool         Poison;
+    bool         IvanBomb;
+    bool         ElectricAssault;
+    char        Locomotor[0x20];
+    bool         Airstrike;
+    bool         Psychedelic;
+    bool         BombDisarm;
+    int32        Paralyzes;
+    bool         Culling;
+    bool         MakesDisguise;
+    bool         NukeMaker;
+    bool         Radiation;
+    bool         PsychicDamage;
+    bool         AffectsAllies;
+    bool         Veinhole;
+    int32        ShakeXlo;
+    int32        ShakeXhi;
+    int32        ShakeYlo;
+    int32        ShakeYhi;
+    int32        MaxDebris;
+    int32        MinDebris;
 };

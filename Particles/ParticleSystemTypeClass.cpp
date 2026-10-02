@@ -1,4 +1,6 @@
 // ============================================================================
+#include <Particles/ParticleTypeClass.h>
+#include <Particles/ParticleSystemTypeClass.h>
 // ParticleSystemTypeClass.cpp
 //
 // Type definition for a particle system ([ParticleSystems] INI block).
@@ -85,13 +87,110 @@ bool ParticleSystemTypeClass::LoadFromINI(CCINIClass* pINI)
         return false;
 
     ParticleTypeIndex = pINI->ReadInteger(ID, "ParticleType", -1);
-    ParticleCount     = pINI->ReadInteger(ID, "ParticleCount", 0);
-    SpawnRate         = pINI->ReadInteger(ID, "SpawnRate", 0);
-    Behavior          = pINI->ReadInteger(ID, "Behavior", 0);
-    MaxLifetime       = pINI->ReadInteger(ID, "MaxLifetime", 0);
-    SortingOrder      = pINI->ReadInteger(ID, "SortingOrder", 0);
-    IsLooping         = pINI->ReadBool(ID, "Looping", false);
-    Enabled           = pINI->ReadBool(ID, "Enabled", true);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    const char* section = this->ID;
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    { char _buf[0x40]; if (pINI->ReadString(section, "HoldsWhat", "", _buf, sizeof(_buf)) > 0) { int32 _i = ParticleTypeClass::FindIndexOrAllocate(_buf); if (_i >= 0) HoldsWhat = _i; } }
+    Spawns = pINI->ReadBool(section, "Spawns", Spawns);
+    SpawnFrames = pINI->ReadInteger(section, "SpawnFrames", SpawnFrames);
+    ParticleCap = pINI->ReadInteger(section, "ParticleCap", ParticleCap);
+    SpawnRadius = pINI->ReadInteger(section, "SpawnRadius", SpawnRadius);
+    Slowdown = pINI->ReadFixed(section, "Slowdown", Slowdown);
+    SpawnCutoff = pINI->ReadFixed(section, "SpawnCutoff", SpawnCutoff);
+    SpawnTranslucencyCutoff = pINI->ReadFixed(section, "SpawnTranslucencyCutoff", SpawnTranslucencyCutoff);
+    Lifetime = pINI->ReadInteger(section, "Lifetime", Lifetime);
+    { char _buf[0x40]; if (pINI->ReadString(section, "BehavesLike", "", _buf, sizeof(_buf)) > 0) BehavesLike = ParticleSystemTypeClass::BehavesLikeFromName(_buf); }
+    { int32 _t[3]; if (pINI->Get3Integers(section, "SpawnDirection", _t)) { for (int32 _i = 0; _i < 3; ++_i) SpawnDirection[_i] = static_cast<double>(_t[_i]); } }
+    ParticlesPerCoord = pINI->ReadFixed(section, "ParticlesPerCoord", ParticlesPerCoord);
+    SpiralDeltaPerCoord = pINI->ReadFixed(section, "SpiralDeltaPerCoord", SpiralDeltaPerCoord);
+    SpiralRadius = pINI->ReadFixed(section, "SpiralRadius", SpiralRadius);
+    PositionPerturbationCoefficient = pINI->ReadFixed(section, "PositionPerturbationCoefficient", PositionPerturbationCoefficient);
+    MovementPerturbationCoefficient = pINI->ReadFixed(section, "MovementPerturbationCoefficient", MovementPerturbationCoefficient);
+    VelocityPerturbationCoefficient = pINI->ReadFixed(section, "VelocityPerturbationCoefficient", VelocityPerturbationCoefficient);
+    Laser = pINI->ReadBool(section, "Laser", Laser);
+    pINI->Get3Bytes(section, "LaserColor", LaserColor);
+    SparkSpawnFrames = pINI->ReadInteger(section, "SparkSpawnFrames", SparkSpawnFrames);
+    LightSize = pINI->ReadInteger(section, "LightSize", LightSize);
+    OneFrameLight = pINI->ReadBool(section, "OneFrameLight", OneFrameLight);
+    SpawnSparkPercentage = pINI->ReadFixed(section, "SpawnSparkPercentage", SpawnSparkPercentage);
+
+        return true;
+}
+
+// ============================================================================
+// ParticleSystemTypeClass - static lookup helpers
+// ============================================================================
+
+ParticleSystemTypeClass* ParticleSystemTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    ParticleSystemTypeClass* found = Find(pID);
+    if (found) return found;
+    ParticleSystemTypeClass* newItem = GameCreate<ParticleSystemTypeClass>();
+    if (newItem)
+    {
+        strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
+        newItem->ID[sizeof(newItem->ID) - 1] = '\0';
+    }
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
+}
+
+
+// ============================================================================
+// ParticleSystemTypeClass - index based lookup (FindIndexOrAllocate)
+// ============================================================================
+int32 ParticleSystemTypeClass::FindIndexOrAllocate(const char* pID)
+{
+    if (!pID || !*pID) return -1;
+
+    if (Array)
+    {
+        for (int32 i = 0; i < Array->Count; ++i)
+        {
+            ParticleSystemTypeClass* item = Array->GetItem(i);
+            if (item && !_strcmpi(item->ID, pID)) return i;
+        }
+    }
+
+    ParticleSystemTypeClass* pNew = FindOrAllocate(pID);
+    if (!pNew || !Array) return -1;
+
+    return Array->Count - 1;
+}
+
+int32 ParticleSystemTypeClass::BehavesLikeFromName(const char* pName)
+{
+    static const char* const names[] = {
+        "Smoke", "Gas", "Fire", "Spark", "Railgun"
+    };
+
+    if (!pName || !*pName) return -1;
+
+    for (int32 i = 0; i < 5; ++i)
+    {
+        if (!_strcmpi(pName, names[i])) return i;
+    }
+
+    return -1;
+}
+
+const char* ParticleSystemTypeClass::BehavesLikeToName(int32 nIndex)
+{
+    static const char* const names[] = {
+        "Smoke", "Gas", "Fire", "Spark", "Railgun"
+    };
+
+    if (nIndex < 0 || nIndex >= 5) return nullptr;
+
+    return names[nIndex];
 }

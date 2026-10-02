@@ -1,4 +1,12 @@
 #include <Abstract/TechnoTypeClass.h>
+#include <Combat/WeaponTypeClass.h>
+#include <Audio/VocClass.h>
+#include <Abstract/UnitTypeClass.h>
+#include <Particles/ParticleSystemTypeClass.h>
+#include <Abstract/BuildingTypeClass.h>
+#include <Animations/AnimTypeClass.h>
+#include <Abstract/AircraftTypeClass.h>
+#include <Abstract/InfantryTypeClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -130,7 +138,7 @@ TechnoTypeClass::TechnoTypeClass() noexcept
 {
     Speed                 = 0;
     ArmorType             = Armor::None;
-    SpeedTypeVal          = SpeedType::Slow;
+    SpeedTypeVal          = SpeedType::Foot;
     MoveZone              = MovementZone::Normal;
     Factory               = AbstractType::None;
     ROT                   = 0;
@@ -154,7 +162,7 @@ TechnoTypeClass::TechnoTypeClass() noexcept
     CrewType              = AbstractType::None;
     Ammo                  = -1;
     NoAmmo                = false;
-    PipScale              = 0;
+    PipScaleValue         = PipScale::None;
     OccupyWeaponCount     = 0;
     OccupyWeaponRangeBonus = 0;
     IsHarvester           = false;
@@ -370,11 +378,15 @@ int32 TechnoTypeClass::Get_Max_Speed() const
 
     switch (SpeedTypeVal)
     {
-        case SpeedType::VeryFast: return 16;
-        case SpeedType::Fast:     return 12;
-        case SpeedType::Medium:   return 8;
-        case SpeedType::Slow:     return 4;
-        default:                  return 0;
+        case SpeedType::Wheel:      return 12;
+        case SpeedType::Track:      return 10;
+        case SpeedType::Hover:      return 14;
+        case SpeedType::Winged:     return 16;
+        case SpeedType::Float:      return 8;
+        case SpeedType::Amphibious: return 8;
+        case SpeedType::FloatBeach: return 6;
+        case SpeedType::Foot:       return 4;
+        default:                    return 0;
     }
 }
 
@@ -453,7 +465,6 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     GuardRange    = pINI->ReadInteger(section, "GuardRange", GuardRange);
     BuildCost     = pINI->ReadInteger(section, "Cost",       BuildCost);
     BuildTime     = pINI->ReadInteger(section, "BuildTime",  BuildTime);
-    RepairCost    = pINI->ReadInteger(section, "RepairCost", RepairCost);
     RefundPercent = pINI->ReadInteger(section, "RefundPercent", RefundPercent);
 
     // Sync the inherited Cost / Sight fields so callers using the parent
@@ -476,7 +487,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (!_strcmpi(armorBuf, "Wood"))    ArmorType = Armor::Wood;
     else if (!_strcmpi(armorBuf, "Steel"))   ArmorType = Armor::Steel;
     else if (!_strcmpi(armorBuf, "Concrete"))ArmorType = Armor::Concrete;
-    else if (!_strcmpi(armorBuf, "Drone"))   ArmorType = Armor::Drone;
+    else if (!_strcmpi(armorBuf, "Special_2")) ArmorType = Armor::Special_2;
     else if (!_strcmpi(armorBuf, "Special_1")) ArmorType = Armor::Special_1;
     else                                     ArmorType = Armor::None;
 
@@ -486,15 +497,8 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     Speed    = pINI->ReadInteger(section, "Speed", Speed);
     ROT      = pINI->ReadInteger(section, "ROT",   ROT);
     TurretROT= pINI->ReadInteger(section, "ROT", TurretROT);
-    IdleTimer= pINI->ReadInteger(section, "IdleTimer", IdleTimer);
 
-    char speedBuf[32];
-    pINI->ReadString(section, "SpeedType", "Slow", speedBuf, sizeof(speedBuf));
-    if (!_strcmpi(speedBuf, "Slow"))         SpeedTypeVal = SpeedType::Slow;
-    else if (!_strcmpi(speedBuf, "Medium"))  SpeedTypeVal = SpeedType::Medium;
-    else if (!_strcmpi(speedBuf, "Fast"))    SpeedTypeVal = SpeedType::Fast;
-    else if (!_strcmpi(speedBuf, "VeryFast"))SpeedTypeVal = SpeedType::VeryFast;
-    else                                     SpeedTypeVal = SpeedType::Slow;
+    SpeedTypeVal = pINI->GetSpeedType(section, "SpeedType", SpeedTypeVal);
 
     char zoneBuf[32];
     pINI->ReadString(section, "MovementZone", "Normal",
@@ -526,25 +530,17 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     }
 
     DeathWeaponIndex = pINI->ReadInteger(section, "DeathWeapon", -1);
-    WeaponCharge     = pINI->ReadInteger(section, "WeaponCharge", 0);
 
     // ------------------------------------------------------------------
     // Veteran / elite abilities
     // ------------------------------------------------------------------
     VeteranRatio     = pINI->ReadInteger(section, "VeteranRatio", 0);
-    InitialVeterancy = pINI->ReadInteger(section, "VeteranAbilities", InitialVeterancy);
 
-    // VeteranAbilities / EliteAbilities are bitfields; the INI uses comma-
-    // separated flag names.  Read each slot individually.
-    for (int32 i = 0; i < 4; ++i)
-    {
-        char key[24];
-        sprintf_s(key, sizeof(key), "VeteranAbilities%d", i);
-        VeteranAbilities[i] = pINI->ReadInteger(section, key, 0);
-
-        sprintf_s(key, sizeof(key), "EliteAbilities%d", i);
-        EliteAbilities[i] = pINI->ReadInteger(section, key, 0);
-    }
+    // VeteranAbilities / EliteAbilities are bitfields; the INI lists the
+    // flag names separated by commas and the parser folds them into the
+    // four ability words.
+    pINI->GetAbilities(section, "VeteranAbilities", VeteranAbilities, 4);
+    pINI->GetAbilities(section, "EliteAbilities",   EliteAbilities,   4);
 
     // ------------------------------------------------------------------
     // Cloak / deploy / firewall / turret / voxel flags
@@ -553,8 +549,6 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     CanCloak_      = pINI->ReadBool(section, "Cloakable",  CanCloak_);
     IsVoxel_       = pINI->ReadBool(section, "Voxel",      IsVoxel_);
     HasDeployer_   = pINI->ReadBool(section, "Deployer",   HasDeployer_);
-    HasUndeployer_ = pINI->ReadBool(section, "Undeployer", HasUndeployer_);
-    HasFirewall_   = pINI->ReadBool(section, "Firewall",   HasFirewall_);
 
     Turret    = HasTurret_;
     Cloak     = CanCloak_;
@@ -584,16 +578,11 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     // Ammo
     // ------------------------------------------------------------------
     Ammo   = pINI->ReadInteger(section, "Ammo",   Ammo);
-    NoAmmo = pINI->ReadBool(section, "NoAmmo", NoAmmo);
-    PipScale = pINI->ReadInteger(section, "PipScale", PipScale);
+    PipScaleValue = pINI->GetPipScale(section, "PipScale", PipScaleValue);
 
     // ------------------------------------------------------------------
     // Occupy weapons (garrison)
     // ------------------------------------------------------------------
-    OccupyWeaponCount      = pINI->ReadInteger(section, "OccupyWeaponCount",
-                                                OccupyWeaponCount);
-    OccupyWeaponRangeBonus = pINI->ReadInteger(section, "OccupyWeaponRangeBonus",
-                                                OccupyWeaponRangeBonus);
 
     // ------------------------------------------------------------------
     // Economy / build flags
@@ -607,15 +596,11 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsLegalDamsel_   = pINI->ReadBool(section, "LegalTarget",   IsLegalDamsel_);
     IsUnsellable     = pINI->ReadBool(section, "Unsellable",    IsUnsellable);
     IsRepairable     = pINI->ReadBool(section, "Repairable",    IsRepairable);
-    IsSellable       = pINI->ReadBool(section, "Sellable",      IsSellable);
     IsPowered        = pINI->ReadBool(section, "Powered",       IsPowered);
 
     // ------------------------------------------------------------------
     // Sensor / detection flags
     // ------------------------------------------------------------------
-    IsScanner  = pINI->ReadBool(section, "Scanner",  IsScanner);
-    IsSensor   = pINI->ReadBool(section, "Sensor",   IsSensor);
-    IsDetector = pINI->ReadBool(section, "Detector", IsDetector);
     IsSensors  = pINI->ReadBool(section, "Sensors",  IsSensors);
     IsSensorsSight = pINI->ReadBool(section, "SensorsSight", IsSensorsSight);
 
@@ -629,7 +614,6 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsPreventAttackMove  = pINI->ReadBool(section, "PreventAttackMove",  IsPreventAttackMove);
     IsBalloonHover       = pINI->ReadBool(section, "BalloonHover",       IsBalloonHover);
     IsConsideredAircraft = pINI->ReadBool(section, "ConsideredAircraft", IsConsideredAircraft);
-    IsConsideredVehicle  = pINI->ReadBool(section, "ConsideredVehicle",  IsConsideredVehicle);
 
     // ------------------------------------------------------------------
     // Combat-immunity flags
@@ -637,8 +621,6 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsImmuneToPsionics  = pINI->ReadBool(section, "ImmuneToPsionics",  IsImmuneToPsionics);
     IsImmuneToPoison    = pINI->ReadBool(section, "ImmuneToPoison",    IsImmuneToPoison);
     IsImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", IsImmuneToRadiation);
-    IsImmuneToBerserk   = pINI->ReadBool(section, "ImmuneToBerserk",   IsImmuneToBerserk);
-    IsImmuneToEMP       = pINI->ReadBool(section, "ImmuneToEMP",       IsImmuneToEMP);
 
     // ------------------------------------------------------------------
     // Crush / teleport / chrono / bomb
@@ -646,28 +628,18 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCrushable   = pINI->ReadBool(section, "Crushable",   IsCrushable);
     IsCrushable2  = pINI->ReadBool(section, "Crushable",  IsCrushable2);
     IsTeleporter  = pINI->ReadBool(section, "Teleporter",  IsTeleporter);
-    IsChrono      = pINI->ReadBool(section, "Chrono",      IsChrono);
     IsBomb        = pINI->ReadBool(section, "Bomb",        IsBomb);
 
     // ------------------------------------------------------------------
     // Special-unit flags
     // ------------------------------------------------------------------
-    IsCow            = pINI->ReadBool(section, "Cow",            IsCow);
-    IsDog            = pINI->ReadBool(section, "Dog",            IsDog);
-    IsBoris          = pINI->ReadBool(section, "Boris",          IsBoris);
-    IsArmed          = pINI->ReadBool(section, "Armed",          IsArmed);
     IsMissileSpawn   = pINI->ReadBool(section, "MissileSpawn",   IsMissileSpawn);
     IsIvan           = pINI->ReadBool(section, "Ivan",           IsIvan);
-    IsLeader         = pINI->ReadBool(section, "Leader",         IsLeader);
     IsCarryall       = pINI->ReadBool(section, "Carryall",       IsCarryall);
-    IsTrain          = pINI->ReadBool(section, "Train",          IsTrain);
     IsSimpleDeployer = pINI->ReadBool(section, "Deployer", IsSimpleDeployer);
-    IsFirebase       = pINI->ReadBool(section, "Firebase",       IsFirebase);
     IsSonic          = pINI->ReadBool(section, "Sonic",          IsSonic);
-    IsVan            = pINI->ReadBool(section, "Van",            IsVan);
     IsCyborg         = pINI->ReadBool(section, "Cyborg",         IsCyborg);
     IsNotHuman       = pINI->ReadBool(section, "NotHuman",       IsNotHuman);
-    IsFake           = pINI->ReadBool(section, "Fake",           IsFake);
     IsDisableable    = pINI->ReadBool(section, "Disableable",    IsDisableable);
 
     // ------------------------------------------------------------------
@@ -680,10 +652,6 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     // Various interaction flags
     // ------------------------------------------------------------------
     IsNeutral         = pINI->ReadBool(section, "Neutral",         IsNeutral);
-    IsInfiltratable   = pINI->ReadBool(section, "Infiltratable",   IsInfiltratable);
-    IsStealthy        = pINI->ReadBool(section, "Stealthy",        IsStealthy);
-    IsHealable        = pINI->ReadBool(section, "Healable",        IsHealable);
-    IsTilter          = pINI->ReadBool(section, "Tilter",          IsTilter);
     IsToProtect       = pINI->ReadBool(section, "ToProtect",       IsToProtect);
     IsNominal         = pINI->ReadBool(section, "Nominal",         IsNominal);
     IsRadarInvisible  = pINI->ReadBool(section, "RadarInvisible",  IsRadarInvisible);
@@ -691,27 +659,16 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     IsNoThreat        = pINI->ReadBool(section, "NoThreat",        IsNoThreat);
     IsHunterSeeker    = pINI->ReadBool(section, "HunterSeeker",    IsHunterSeeker);
 
-    IsCanBeSuppressed  = pINI->ReadBool(section, "CanSuppressed",  IsCanBeSuppressed);
     IsCanBeOccupied    = pINI->ReadBool(section, "CanBeOccupied",  IsCanBeOccupied);
-    IsCanBeDriven      = pINI->ReadBool(section, "CanBeDriven",    IsCanBeDriven);
     IsCanBeCaptured    = pINI->ReadBool(section, "Capturable",  IsCanBeCaptured);
     IsCanBeRepaired    = pINI->ReadBool(section, "Repairable",  IsCanBeRepaired);
-    IsCanBeSold        = pINI->ReadBool(section, "CanBeSold",      IsCanBeSold);
     IsCanBePowered     = pINI->ReadBool(section, "Powered",   IsCanBePowered);
-    IsCanBeDestroyed   = pINI->ReadBool(section, "CanBeDestroyed", IsCanBeDestroyed);
-    IsCanBeDamaged     = pINI->ReadBool(section, "CanBeDamaged",   IsCanBeDamaged);
-    IsCanBeInfiltrated = pINI->ReadBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
     IsCanBeSpied       = pINI->ReadBool(section, "Spyable",     IsCanBeSpied);
-    IsCanBeSabotaged   = pINI->ReadBool(section, "CanBeSabotaged", IsCanBeSabotaged);
-    IsCanBeStolen      = pINI->ReadBool(section, "CanBeStolen",    IsCanBeStolen);
-    IsCanBeHijacked    = pINI->ReadBool(section, "CanBeHijacked",  IsCanBeHijacked);
 
     IsHarvester        = pINI->ReadBool(section, "Harvester",        IsHarvester);
     IsWeeder           = pINI->ReadBool(section, "Weeder",           IsWeeder);
     IsResourceGatherer = pINI->ReadBool(section, "ResourceGatherer", IsResourceGatherer);
-    IsUndeployable     = pINI->ReadBool(section, "Undeployable",     IsUndeployable);
     IsBombable         = pINI->ReadBool(section, "Bombable",         IsBombable);
-    IsAutoFire         = pINI->ReadBool(section, "AutoFire",         IsAutoFire);
     IsGuardRange       = pINI->ReadBool(section, "GuardRange",       IsGuardRange);
     IsAggressive       = pINI->ReadBool(section, "Aggressive",       IsAggressive);
 
@@ -766,7 +723,414 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (!_strcmpi(factoryBuf, "Aircraft")) Factory = AbstractType::Aircraft;
     else                                     Factory = AbstractType::None;
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    LandTargeting = pINI->ReadInteger(section, "LandTargeting", LandTargeting);
+    NavalTargeting = pINI->ReadInteger(section, "NavalTargeting", NavalTargeting);
+    SpeedTypeValue = pINI->GetSpeedType(section, "SpeedType", SpeedTypeValue);
+    TypeImmune = pINI->ReadBool(section, "TypeImmune", TypeImmune);
+    WalkRate = pINI->ReadInteger(section, "WalkRate", WalkRate);
+    IdleRate = pINI->ReadInteger(section, "IdleRate", IdleRate);
+    MoveToShroud = pINI->ReadBool(section, "MoveToShroud", MoveToShroud);
+    IsTrain = pINI->ReadBool(section, "IsTrain", IsTrain);
+    DoubleOwned = pINI->ReadBool(section, "DoubleOwned", DoubleOwned);
+    Explodes = pINI->ReadBool(section, "Explodes", Explodes);
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeathWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) DeathWeapon = _p; } }
+    DeathWeaponDamageModifier = pINI->ReadFixed(section, "DeathWeaponDamageModifier", DeathWeaponDamageModifier);
+    FlightLevel = pINI->ReadInteger(section, "FlightLevel", FlightLevel);
+    IsDropship = pINI->ReadBool(section, "IsDropship", IsDropship);
+    PitchAngle = pINI->ReadFixed(section, "PitchAngle", PitchAngle);
+    RollAngle = pINI->ReadFixed(section, "RollAngle", RollAngle);
+    PitchSpeed = pINI->ReadFixed(section, "PitchSpeed", PitchSpeed);
+    pINI->ReadString(section, "Locomotor", Locomotor, Locomotor, sizeof(Locomotor));
+    CloakingSpeed = pINI->ReadInteger(section, "CloakingSpeed", CloakingSpeed);
+    ThreatAvoidanceCoefficient = pINI->ReadFixed(section, "ThreatAvoidanceCoefficient", ThreatAvoidanceCoefficient);
+    SlowdownDistance = pINI->ReadInteger(section, "SlowdownDistance", SlowdownDistance);
+    DeaccelerationFactor = pINI->ReadFixed(section, "DeaccelerationFactor", DeaccelerationFactor);
+    AccelerationFactor = pINI->ReadFixed(section, "AccelerationFactor", AccelerationFactor);
+    Weight = pINI->ReadFixed(section, "Weight", Weight);
+    PhysicalSize = pINI->ReadFixed(section, "PhysicalSize", PhysicalSize);
+    SizeValue = pINI->ReadFixed(section, "Size", SizeValue);
+    SizeLimit = pINI->ReadFixed(section, "SizeLimit", SizeLimit);
+    HoverAttack = pINI->ReadBool(section, "HoverAttack", HoverAttack);
+    VHPScanValue = pINI->GetVHPScan(section, "VHPScan", VHPScanValue);
+    MaxDebris = pINI->ReadInteger(section, "MaxDebris", MaxDebris);
+    MinDebris = pINI->ReadInteger(section, "MinDebris", MinDebris);
+    pINI->ReadString(section, "DebrisTypes", DebrisTypes, DebrisTypes, sizeof(DebrisTypes));
+    pINI->GetVectorIntegers(section, "DebrisMaximums", DebrisMaximums, 32);
+    pINI->ReadString(section, "DebrisAnims", DebrisAnims, DebrisAnims, sizeof(DebrisAnims));
+    HasTurretTooltips = pINI->ReadBool(section, "HasTurretTooltips", HasTurretTooltips);
+    TurretCount = pINI->ReadInteger(section, "TurretCount", TurretCount);
+    WeaponCount = pINI->ReadInteger(section, "WeaponCount", WeaponCount);
+    IsChargeTurret = pINI->ReadBool(section, "IsChargeTurret", IsChargeTurret);
+    ClearAllWeapons = pINI->ReadBool(section, "ClearAllWeapons", ClearAllWeapons);
+    { char _buf[0x40]; if (pINI->ReadString(section, "Primary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) Primary = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Secondary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) Secondary = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ElitePrimary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) ElitePrimary = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EliteSecondary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) EliteSecondary = _p; } }
+    pINI->ReadString(section, "VoiceMove", VoiceMove, VoiceMove, sizeof(VoiceMove));
+    pINI->ReadString(section, "VoiceSelect", VoiceSelect, VoiceSelect, sizeof(VoiceSelect));
+    pINI->ReadString(section, "VoiceSelectEnslaved", VoiceSelectEnslaved, VoiceSelectEnslaved, sizeof(VoiceSelectEnslaved));
+    pINI->ReadString(section, "VoiceSelectDeactivated", VoiceSelectDeactivated, VoiceSelectDeactivated, sizeof(VoiceSelectDeactivated));
+    pINI->ReadString(section, "VoiceAttack", VoiceAttack, VoiceAttack, sizeof(VoiceAttack));
+    pINI->ReadString(section, "VoiceSpecialAttack", VoiceSpecialAttack, VoiceSpecialAttack, sizeof(VoiceSpecialAttack));
+    pINI->ReadString(section, "VoiceDie", VoiceDie, VoiceDie, sizeof(VoiceDie));
+    pINI->ReadString(section, "VoiceFeedback", VoiceFeedback, VoiceFeedback, sizeof(VoiceFeedback));
+    { char _buf[0x40]; if (pINI->ReadString(section, "AuxSound1", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) AuxSound1 = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "AuxSound2", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) AuxSound2 = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CreateSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) CreateSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DamageSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) DamageSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ImpactWaterSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) ImpactWaterSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ImpactLandSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) ImpactLandSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CrashingSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) CrashingSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "SinkingSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) SinkingSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceFalling", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceFalling = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceCrashing", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceCrashing = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceSinking", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceSinking = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceEnter", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceEnter = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceCapture", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceCapture = _i; } }
+    CloakStop = pINI->ReadBool(section, "CloakStop", CloakStop);
+    Storage = pINI->ReadInteger(section, "Storage", Storage);
+    BuildLimit = pINI->ReadInteger(section, "BuildLimit", BuildLimit);
+    CategoryValue = pINI->GetCategory(section, "Category", CategoryValue);
+    { char _buf[0x40]; if (pINI->ReadString(section, "Dock", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) Dock = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeploysInto", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) DeploysInto = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "UndeploysInto", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) UndeploysInto = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "PowersUnit", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) PowersUnit = _p; } }
+    PoweredUnit = pINI->ReadBool(section, "PoweredUnit", PoweredUnit);
+    LightningRod = pINI->ReadBool(section, "LightningRod", LightningRod);
+    ManualReload = pINI->ReadBool(section, "ManualReload", ManualReload);
+    TurretSpins = pINI->ReadBool(section, "TurretSpins", TurretSpins);
+    TiltCrashJumpjet = pINI->ReadBool(section, "TiltCrashJumpjet", TiltCrashJumpjet);
+    Turret = pINI->ReadBool(section, "Turret", Turret);
+    { char _buf[0x40]; if (pINI->ReadString(section, "TurretRotateSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) TurretRotateSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EnterTransportSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) EnterTransportSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LeaveTransportSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) LeaveTransportSound = _i; } }
+    pINI->ReadString(section, "MoveSound", MoveSound, MoveSound, sizeof(MoveSound));
+    pINI->ReadString(section, "DieSound", DieSound, DieSound, sizeof(DieSound));
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeploySound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) DeploySound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "UndeploySound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) UndeploySound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoInSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) ChronoInSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoOutSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) ChronoOutSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceHarvest", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceHarvest = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoicePrimaryWeaponAttack", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoicePrimaryWeaponAttack = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoicePrimaryEliteWeaponAttack", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoicePrimaryEliteWeaponAttack = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceSecondaryWeaponAttack", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceSecondaryWeaponAttack = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceSecondaryEliteWeaponAttack", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceSecondaryEliteWeaponAttack = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceDeploy", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceDeploy = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "VoiceUndeploy", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) VoiceUndeploy = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EnterGrinderSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) EnterGrinderSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LeaveGrinderSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) LeaveGrinderSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EnterBioReactorSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) EnterBioReactorSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LeaveBioReactorSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) LeaveBioReactorSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ActivateSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) ActivateSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeactivateSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) DeactivateSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "MindClearedSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) MindClearedSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Explosion", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Explosion = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DestroyAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DestroyAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NaturalParticleSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) NaturalParticleSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "RefinerySmokeParticleSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) RefinerySmokeParticleSystem = _p; } }
+    pINI->ReadString(section, "DamageParticleSystems", DamageParticleSystems, DamageParticleSystems, sizeof(DamageParticleSystems));
+    pINI->ReadString(section, "DestroyParticleSystems", DestroyParticleSystems, DestroyParticleSystems, sizeof(DestroyParticleSystems));
+    DamSmkOffScrnRel = pINI->ReadBool(section, "DamSmkOffScrnRel", DamSmkOffScrnRel);
+    Nominal = pINI->ReadBool(section, "Nominal", Nominal);
+    DontScore = pINI->ReadBool(section, "DontScore", DontScore);
+    DamageSelf = pINI->ReadBool(section, "DamageSelf", DamageSelf);
+    Cloakable = pINI->ReadBool(section, "Cloakable", Cloakable);
+    GapGenerator = pINI->ReadBool(section, "GapGenerator", GapGenerator);
+    GapRadiusInCells = pINI->ReadInteger(section, "GapRadiusInCells", GapRadiusInCells);
+    SuperGapRadiusInCells = pINI->ReadInteger(section, "SuperGapRadiusInCells", SuperGapRadiusInCells);
+    Teleporter = pINI->ReadBool(section, "Teleporter", Teleporter);
+    Sensors = pINI->ReadBool(section, "Sensors", Sensors);
+    IsGattling = pINI->ReadBool(section, "IsGattling", IsGattling);
+    WeaponStages = pINI->ReadInteger(section, "WeaponStages", WeaponStages);
+    RateUp = pINI->ReadInteger(section, "RateUp", RateUp);
+    RateDown = pINI->ReadInteger(section, "RateDown", RateDown);
+    PipScaleValue = pINI->GetPipScale(section, "PipScale", PipScaleValue);
+    PipsDrawForAll = pINI->ReadBool(section, "PipsDrawForAll", PipsDrawForAll);
+    LeptonMindControlOffset = pINI->ReadInteger(section, "LeptonMindControlOffset", LeptonMindControlOffset);
+    PixelSelectionBracketDelta = pINI->ReadInteger(section, "PixelSelectionBracketDelta", PixelSelectionBracketDelta);
+    PipWrap = pINI->ReadInteger(section, "PipWrap", PipWrap);
+    Sight = pINI->ReadInteger(section, "Sight", Sight);
+    ReselectIfLimboed = pINI->ReadBool(section, "ReselectIfLimboed", ReselectIfLimboed);
+    RejoinTeamIfLimboed = pINI->ReadBool(section, "RejoinTeamIfLimboed", RejoinTeamIfLimboed);
+    SensorsSight = pINI->ReadInteger(section, "SensorsSight", SensorsSight);
+    DetectDisguiseRange = pINI->ReadInteger(section, "DetectDisguiseRange", DetectDisguiseRange);
+    BombSight = pINI->ReadInteger(section, "BombSight", BombSight);
+    LeadershipRating = pINI->ReadInteger(section, "LeadershipRating", LeadershipRating);
+    MindControlRingOffset = pINI->ReadInteger(section, "MindControlRingOffset", MindControlRingOffset);
+    BuildTimeMultiplier = pINI->ReadFixed(section, "BuildTimeMultiplier", BuildTimeMultiplier);
+    RevealToAll = pINI->ReadBool(section, "RevealToAll", RevealToAll);
+    Drainable = pINI->ReadBool(section, "Drainable", Drainable);
+    OpenTopped = pINI->ReadBool(section, "OpenTopped", OpenTopped);
+    ResourceGatherer = pINI->ReadBool(section, "ResourceGatherer", ResourceGatherer);
+    ResourceDestination = pINI->ReadBool(section, "ResourceDestination", ResourceDestination);
+    CanDisguise = pINI->ReadBool(section, "CanDisguise", CanDisguise);
+    PermaDisguise = pINI->ReadBool(section, "PermaDisguise", PermaDisguise);
+    DetectDisguise = pINI->ReadBool(section, "DetectDisguise", DetectDisguise);
+    DisguiseWhenStill = pINI->ReadBool(section, "DisguiseWhenStill", DisguiseWhenStill);
+    CanPassiveAquire = pINI->ReadBool(section, "CanPassiveAquire", CanPassiveAquire);
+    CanRetaliate = pINI->ReadBool(section, "CanRetaliate", CanRetaliate);
+    CanApproachTarget = pINI->ReadBool(section, "CanApproachTarget", CanApproachTarget);
+    CanRecalcApproachTarget = pINI->ReadBool(section, "CanRecalcApproachTarget", CanRecalcApproachTarget);
+    RequiresStolenThirdTech = pINI->ReadBool(section, "RequiresStolenThirdTech", RequiresStolenThirdTech);
+    RequiresStolenSovietTech = pINI->ReadBool(section, "RequiresStolenSovietTech", RequiresStolenSovietTech);
+    RequiresStolenAlliedTech = pINI->ReadBool(section, "RequiresStolenAlliedTech", RequiresStolenAlliedTech);
+    RequiredHouses = pINI->GetOwners(section, "RequiredHouses", RequiredHouses);
+    SecretHouses = pINI->GetOwners(section, "SecretHouses", SecretHouses);
+    ForbiddenHouses = pINI->GetOwners(section, "ForbiddenHouses", ForbiddenHouses);
+    TechLevel = pINI->ReadInteger(section, "TechLevel", TechLevel);
+    AirstrikeTeam = pINI->ReadInteger(section, "AirstrikeTeam", AirstrikeTeam);
+    EliteAirstrikeTeam = pINI->ReadInteger(section, "EliteAirstrikeTeam", EliteAirstrikeTeam);
+    { char _buf[0x40]; if (pINI->ReadString(section, "AirstrikeTeamType", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) AirstrikeTeamType = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EliteAirstrikeTeamType", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) EliteAirstrikeTeamType = _p; } }
+    AirstrikeRechargeTime = pINI->ReadInteger(section, "AirstrikeRechargeTime", AirstrikeRechargeTime);
+    EliteAirstrikeRechargeTime = pINI->ReadInteger(section, "EliteAirstrikeRechargeTime", EliteAirstrikeRechargeTime);
+    Speed = pINI->ReadInteger(section, "Speed", Speed);
+    Cost = pINI->ReadInteger(section, "Cost", Cost);
+    Soylent = pINI->ReadInteger(section, "Soylent", Soylent);
+    { char _buf[0x40]; if (pINI->ReadString(section, "UnloadingClass", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) UnloadingClass = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeployingAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DeployingAnim = _p; } }
+    InitialAmmo = pINI->ReadInteger(section, "InitialAmmo", InitialAmmo);
+    Ammo = pINI->ReadInteger(section, "Ammo", Ammo);
+    IFVMode = pINI->ReadInteger(section, "IFVMode", IFVMode);
+    RadialFireSegments = pINI->ReadInteger(section, "RadialFireSegments", RadialFireSegments);
+    DeployFireWeapon = pINI->ReadInteger(section, "DeployFireWeapon", DeployFireWeapon);
+    DeployFire = pINI->ReadBool(section, "DeployFire", DeployFire);
+    DeployToLand = pINI->ReadBool(section, "DeployToLand", DeployToLand);
+    MobileFire = pINI->ReadBool(section, "MobileFire", MobileFire);
+    OpportunityFire = pINI->ReadBool(section, "OpportunityFire", OpportunityFire);
+    DistributedFire = pINI->ReadBool(section, "DistributedFire", DistributedFire);
+    Reload = pINI->ReadInteger(section, "Reload", Reload);
+    EmptyReload = pINI->ReadInteger(section, "EmptyReload", EmptyReload);
+    ReloadIncrement = pINI->ReadInteger(section, "ReloadIncrement", ReloadIncrement);
+    DamageReducesReadiness = pINI->ReadBool(section, "DamageReducesReadiness", DamageReducesReadiness);
+    ReadinessReductionMultiplier = pINI->ReadFixed(section, "ReadinessReductionMultiplier", ReadinessReductionMultiplier);
+    BerserkFriendly = pINI->ReadBool(section, "BerserkFriendly", BerserkFriendly);
+    SprayAttack = pINI->ReadBool(section, "SprayAttack", SprayAttack);
+    Pushy = pINI->ReadBool(section, "Pushy", Pushy);
+    Natural = pINI->ReadBool(section, "Natural", Natural);
+    Unnatural = pINI->ReadBool(section, "Unnatural", Unnatural);
+    CloseRange = pINI->ReadBool(section, "CloseRange", CloseRange);
+    PreventAttackMove = pINI->ReadBool(section, "PreventAttackMove", PreventAttackMove);
+    Points = pINI->ReadInteger(section, "Points", Points);
+    ThreatPosed = pINI->ReadInteger(section, "ThreatPosed", ThreatPosed);
+    Owner = pINI->GetOwners(section, "Owner", Owner);
+    AIBasePlanningSide = pINI->ReadInteger(section, "AIBasePlanningSide", AIBasePlanningSide);
+    Trainable = pINI->ReadBool(section, "Trainable", Trainable);
+    Crewed = pINI->ReadBool(section, "Crewed", Crewed);
+    Gunner = pINI->ReadBool(section, "Gunner", Gunner);
+    Naval = pINI->ReadBool(section, "Naval", Naval);
+    Repairable = pINI->ReadBool(section, "Repairable", Repairable);
+    Invisible = pINI->ReadBool(section, "Invisible", Invisible);
+    RadarVisible = pINI->ReadBool(section, "RadarVisible", RadarVisible);
+    SelfHealing = pINI->ReadBool(section, "SelfHealing", SelfHealing);
+    NoAutoFire = pINI->ReadBool(section, "NoAutoFire", NoAutoFire);
+    ROT = pINI->ReadInteger(section, "ROT", ROT);
+    Passengers = pINI->ReadInteger(section, "Passengers", Passengers);
+    FireAngle = pINI->ReadInteger(section, "FireAngle", FireAngle);
+    DeployTime = pINI->ReadFixed(section, "DeployTime", DeployTime);
+    UndeployDelay = pINI->ReadInteger(section, "UndeployDelay", UndeployDelay);
+    Disableable = pINI->ReadBool(section, "Disableable", Disableable);
+    ToProtect = pINI->ReadBool(section, "ToProtect", ToProtect);
+    TiberiumHeal = pINI->ReadBool(section, "TiberiumHeal", TiberiumHeal);
+    ImmuneToVeins = pINI->ReadBool(section, "ImmuneToVeins", ImmuneToVeins);
+    AllowedToStartInMultiplayer = pINI->ReadBool(section, "AllowedToStartInMultiplayer", AllowedToStartInMultiplayer);
+    StupidHunt = pINI->ReadBool(section, "StupidHunt", StupidHunt);
+    TargetLaser = pINI->ReadBool(section, "TargetLaser", TargetLaser);
+    HunterSeeker = pINI->ReadBool(section, "HunterSeeker", HunterSeeker);
+    Crusher = pINI->ReadBool(section, "Crusher", Crusher);
+    OmniCrusher = pINI->ReadBool(section, "OmniCrusher", OmniCrusher);
+    OmniCrushResistant = pINI->ReadBool(section, "OmniCrushResistant", OmniCrushResistant);
+    AutoCrush = pINI->ReadBool(section, "AutoCrush", AutoCrush);
+    ImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", ImmuneToRadiation);
+    Underwater = pINI->ReadBool(section, "Underwater", Underwater);
+    BalloonHover = pINI->ReadBool(section, "BalloonHover", BalloonHover);
+    Slaved = pINI->ReadBool(section, "Slaved", Slaved);
+    SlaveRegenRate = pINI->ReadInteger(section, "SlaveRegenRate", SlaveRegenRate);
+    SlavesNumber = pINI->ReadInteger(section, "SlavesNumber", SlavesNumber);
+    SlaveReloadRate = pINI->ReadInteger(section, "SlaveReloadRate", SlaveReloadRate);
+    OpenTransportWeapon = pINI->ReadInteger(section, "OpenTransportWeapon", OpenTransportWeapon);
+    Spawned = pINI->ReadBool(section, "Spawned", Spawned);
+    SpawnRegenRate = pINI->ReadInteger(section, "SpawnRegenRate", SpawnRegenRate);
+    SpawnsNumber = pINI->ReadInteger(section, "SpawnsNumber", SpawnsNumber);
+    SpawnReloadRate = pINI->ReadInteger(section, "SpawnReloadRate", SpawnReloadRate);
+    MissileSpawn = pINI->ReadBool(section, "MissileSpawn", MissileSpawn);
+    DefaultToGuardArea = pINI->ReadBool(section, "DefaultToGuardArea", DefaultToGuardArea);
+    Warpable = pINI->ReadBool(section, "Warpable", Warpable);
+    Parasiteable = pINI->ReadBool(section, "Parasiteable", Parasiteable);
+    ImmuneToPsionics = pINI->ReadBool(section, "ImmuneToPsionics", ImmuneToPsionics);
+    ImmuneToPsionicWeapons = pINI->ReadBool(section, "ImmuneToPsionicWeapons", ImmuneToPsionicWeapons);
+    ConsideredAircraft = pINI->ReadBool(section, "ConsideredAircraft", ConsideredAircraft);
+    Bunkerable = pINI->ReadBool(section, "Bunkerable", Bunkerable);
+    Organic = pINI->ReadBool(section, "Organic", Organic);
+    ImmuneToPoison = pINI->ReadBool(section, "ImmuneToPoison", ImmuneToPoison);
+    SuppressionThreshold = pINI->ReadInteger(section, "SuppressionThreshold", SuppressionThreshold);
+    NoShadow = pINI->ReadBool(section, "NoShadow", NoShadow);
+    JumpjetTurnRate = pINI->ReadInteger(section, "JumpjetTurnRate", JumpjetTurnRate);
+    JumpjetSpeed = pINI->ReadInteger(section, "JumpjetSpeed", JumpjetSpeed);
+    JumpjetClimb = pINI->ReadFixed(section, "JumpjetClimb", JumpjetClimb);
+    JumpjetCrash = pINI->ReadFixed(section, "JumpjetCrash", JumpjetCrash);
+    JumpjetHeight = pINI->ReadInteger(section, "JumpjetHeight", JumpjetHeight);
+    JumpjetAccel = pINI->ReadFixed(section, "JumpjetAccel", JumpjetAccel);
+    JumpjetWobbles = pINI->ReadFixed(section, "JumpjetWobbles", JumpjetWobbles);
+    JumpjetNoWobbles = pINI->ReadBool(section, "JumpjetNoWobbles", JumpjetNoWobbles);
+    JumpjetDeviation = pINI->ReadInteger(section, "JumpjetDeviation", JumpjetDeviation);
+    JumpJet = pINI->ReadBool(section, "JumpJet", JumpJet);
+    Crashable = pINI->ReadBool(section, "Crashable", Crashable);
+    AttackFriendlies = pINI->ReadBool(section, "AttackFriendlies", AttackFriendlies);
+    AttackCursorOnFriendlies = pINI->ReadBool(section, "AttackCursorOnFriendlies", AttackCursorOnFriendlies);
+    TurretRecoil = pINI->ReadBool(section, "TurretRecoil", TurretRecoil);
+    TurretTravel = pINI->ReadInteger(section, "TurretTravel", TurretTravel);
+    TurretCompressFrames = pINI->ReadInteger(section, "TurretCompressFrames", TurretCompressFrames);
+    TurretHoldFrames = pINI->ReadInteger(section, "TurretHoldFrames", TurretHoldFrames);
+    TurretRecoverFrames = pINI->ReadInteger(section, "TurretRecoverFrames", TurretRecoverFrames);
+    BarrelTravel = pINI->ReadInteger(section, "BarrelTravel", BarrelTravel);
+    BarrelCompressFrames = pINI->ReadInteger(section, "BarrelCompressFrames", BarrelCompressFrames);
+    BarrelHoldFrames = pINI->ReadInteger(section, "BarrelHoldFrames", BarrelHoldFrames);
+    BarrelRecoverFrames = pINI->ReadInteger(section, "BarrelRecoverFrames", BarrelRecoverFrames);
+    TiltsWhenCrushes = pINI->ReadBool(section, "TiltsWhenCrushes", TiltsWhenCrushes);
+    Accelerates = pINI->ReadBool(section, "Accelerates", Accelerates);
+    ZFudgeCliff = pINI->ReadInteger(section, "ZFudgeCliff", ZFudgeCliff);
+    ZFudgeColumn = pINI->ReadInteger(section, "ZFudgeColumn", ZFudgeColumn);
+    ZFudgeTunnel = pINI->ReadInteger(section, "ZFudgeTunnel", ZFudgeTunnel);
+    ZFudgeBridge = pINI->ReadInteger(section, "ZFudgeBridge", ZFudgeBridge);
+    pINI->GetAbilities(section, "VeteranAbilities", VeteranAbilities, 4);
+    pINI->GetAbilities(section, "EliteAbilities", EliteAbilities, 4);
+    MyEffectivenessCoefficient = pINI->ReadFixed(section, "MyEffectivenessCoefficient", MyEffectivenessCoefficient);
+    TargetEffectivenessCoefficient = pINI->ReadFixed(section, "TargetEffectivenessCoefficient", TargetEffectivenessCoefficient);
+    TargetSpecialThreatCoefficient = pINI->ReadFixed(section, "TargetSpecialThreatCoefficient", TargetSpecialThreatCoefficient);
+    TargetStrengthCoefficient = pINI->ReadFixed(section, "TargetStrengthCoefficient", TargetStrengthCoefficient);
+    TargetDistanceCoefficient = pINI->ReadFixed(section, "TargetDistanceCoefficient", TargetDistanceCoefficient);
+    SpecialThreatValue = pINI->ReadFixed(section, "SpecialThreatValue", SpecialThreatValue);
+    IsSelectableCombatant = pINI->ReadBool(section, "IsSelectableCombatant", IsSelectableCombatant);
+    MovementZoneValue = pINI->GetMovementZone(section, "MovementZone", MovementZoneValue);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    CanBeHidden = pArt->ReadBool(section, "CanBeHidden", CanBeHidden);
+    UseBuffer = pArt->ReadBool(section, "UseBuffer", UseBuffer);
+    pArt->ReadString(section, "Palette", Palette, Palette, sizeof(Palette));
+    TurretOffset = pArt->ReadInteger(section, "TurretOffset", TurretOffset);
+    RotCount = pArt->ReadInteger(section, "RotCount", RotCount);
+    Remapable = pArt->ReadBool(section, "Remapable", Remapable);
+    Normalized = pArt->ReadBool(section, "Normalized", Normalized);
+    VisibleLoad = pArt->ReadBool(section, "VisibleLoad", VisibleLoad);
+    ShadowIndex = pArt->ReadInteger(section, "ShadowIndex", ShadowIndex);
+    DisableVoxelCache = pArt->ReadBool(section, "DisableVoxelCache", DisableVoxelCache);
+    DisableShadowCache = pArt->ReadBool(section, "DisableShadowCache", DisableShadowCache);
+    pArt->ReadString(section, "Cameo", Cameo, Cameo, sizeof(Cameo));
+    pArt->ReadString(section, "AltCameo", AltCameo, AltCameo, sizeof(AltCameo));
+    PBarrelLength = pArt->ReadInteger(section, "PBarrelLength", PBarrelLength);
+    PBarrelThickness = pArt->ReadInteger(section, "PBarrelThickness", PBarrelThickness);
+    pArt->Get3Integers(section, "SecondaryFireFLH", SecondaryFireFLH);
+    SBarrelLength = pArt->ReadInteger(section, "SBarrelLength", SBarrelLength);
+    ElitePBarrelLength = pArt->ReadInteger(section, "ElitePBarrelLength", ElitePBarrelLength);
+    ElitePBarrelThickness = pArt->ReadInteger(section, "ElitePBarrelThickness", ElitePBarrelThickness);
+    pArt->Get3Integers(section, "EliteSecondaryFireFLH", EliteSecondaryFireFLH);
+    EliteSBarrelLength = pArt->ReadInteger(section, "EliteSBarrelLength", EliteSBarrelLength);
+    EliteSBarrelThickness = pArt->ReadInteger(section, "EliteSBarrelThickness", EliteSBarrelThickness);
+    TurretNotExportedOnGround = pArt->ReadBool(section, "TurretNotExportedOnGround", TurretNotExportedOnGround);
+    pArt->Get3Integers(section, "SecondSpawnOffset", SecondSpawnOffset);
+
+    // ------------------------------------------------------------------
+    // Indexed key families
+    // ------------------------------------------------------------------
+    // Gattling weapon stages are numbered from one and only read while the
+    // type actually declares more than a single stage.
+    if (TurretCount > 0 && WeaponCount > 0)
+    {
+        for (int32 i = 1; i <= WeaponCount && i <= 18; ++i)
+        {
+            char key[40];
+            sprintf_s(key, sizeof(key), "Weapon%d", i);
+            pINI->ReadString(section, key, Weapon[i], Weapon[i], sizeof(Weapon[i]));
+        }
+    }
+    if (IsGattling && WeaponStages > 1)
+    {
+        for (int32 i = 1; i <= WeaponStages && i <= 10; ++i)
+        {
+            char key[40];
+            sprintf_s(key, sizeof(key), "Stage%d", i);
+            WeaponStage[i - 1] = pINI->ReadInteger(section, key, WeaponStage[i - 1]);
+        }
+    }
+    for (int32 i = 0; i < 10; ++i)
+    {
+        char key[40];
+        sprintf_s(key, sizeof(key), "EliteWeapon%d", i);
+        pINI->ReadString(section, key, EliteWeapon[i], EliteWeapon[i], sizeof(EliteWeapon[i]));
+    }
+    for (int32 i = 0; i < 10; ++i)
+    {
+        char key[40];
+        sprintf_s(key, sizeof(key), "EliteStage%d", i);
+        EliteStage[i] = pINI->ReadInteger(section, key, EliteStage[i]);
+    }
+
+    // ------------------------------------------------------------------
+    // Smoke / particle offsets - three integer triplets each.
+    // ------------------------------------------------------------------
+    pINI->Get3Integers(section, "NaturalParticleLocation", NaturalParticleLocation);
+    pINI->Get3Integers(section, "DamageSmokeOffset",       DamageSmokeOffset);
+    pINI->Get3Integers(section, "DestroySmokeOffset",      DestroySmokeOffset);
+    {
+        static const char* const refineryKeys[4] = {
+            "RefinerySmokeOffsetOne", "RefinerySmokeOffsetTwo",
+            "RefinerySmokeOffsetThree", "RefinerySmokeOffsetFour"
+        };
+        for (int32 i = 0; i < 4; ++i)
+            pINI->Get3Integers(section, refineryKeys[i], RefinerySmokeOffset[i]);
+    }
+
+    // ------------------------------------------------------------------
+    // Remaining rules keys
+    // ------------------------------------------------------------------
+    AirRangeBonus = pINI->ReadInteger(section, "AirRangeBonus", AirRangeBonus);
+    { char _buf[0x40]; if (pINI->ReadString(section, "Spawns", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) Spawns = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Enslaves", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) Enslaves = _p; } }
+    pINI->GetPrerequisiteList(section, "Prerequisite",         Prerequisite);
+    pINI->GetPrerequisiteList(section, "PrerequisiteOverride", PrerequisiteOverride);
+    for (int32 i = 0; i < 8; ++i)
+    {
+        char key[40];
+        sprintf_s(key, sizeof(key), "AlternateFLH%d", i);
+        pArt->Get3Integers(section, key, AlternateFLH[i]);
+    }
+
+    // ------------------------------------------------------------------
+    // Per-weapon art keys ("Weapon%d<...>") - only present on
+    // types whose turret swaps weapons as it fires.
+    // ------------------------------------------------------------------
+    for (int32 i = 1; i <= WeaponCount && i <= 18; ++i)
+    {
+        char wname[32];
+        sprintf_s(wname, sizeof(wname), "Weapon%d", i);
+        char key[48];
+        sprintf_s(key, sizeof(key), "%sFLH", wname);
+        pArt->Get3Integers(section, key, WeaponFLH[i - 1]);
+
+        sprintf_s(key, sizeof(key), "%sBarrelLength", wname);
+        WeaponBarrelLength[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelLength[i - 1]);
+
+        sprintf_s(key, sizeof(key), "%sBarrelThickness", wname);
+        WeaponBarrelThickness[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelThickness[i - 1]);
+
+        sprintf_s(key, sizeof(key), "%sTurretLocked", wname);
+        WeaponTurretLocked[i - 1] = pArt->ReadBool(section, key, WeaponTurretLocked[i - 1]);
+    }
+
+        return true;
 }
 
 // ============================================================================
@@ -798,7 +1162,8 @@ bool TechnoTypeClass::SaveToINI(CCINIClass* pINI) const
     pINI->WriteInteger(section, "WeaponCharge", WeaponCharge);
     pINI->WriteInteger(section, "VeteranRatio", VeteranRatio);
     pINI->WriteInteger(section, "Ammo",         Ammo);
-    pINI->WriteInteger(section, "PipScale",     PipScale);
+    pINI->WriteInteger(section, "PipScale",
+                             static_cast<int32>(PipScaleValue));
     pINI->WriteInteger(section, "OccupyWeaponCount",       OccupyWeaponCount);
     pINI->WriteInteger(section, "OccupyWeaponRangeBonus",  OccupyWeaponRangeBonus);
     pINI->WriteFloat(section,  "CloakSpeed",   CloakSpeed);
@@ -817,22 +1182,16 @@ bool TechnoTypeClass::SaveToINI(CCINIClass* pINI) const
         case Armor::Wood:     armorName = "Wood";     break;
         case Armor::Steel:    armorName = "Steel";    break;
         case Armor::Concrete: armorName = "Concrete"; break;
-        case Armor::Drone:    armorName = "Drone";    break;
+        case Armor::Special_2:armorName = "Special_2";break;
         case Armor::Special_1:armorName = "Special_1";break;
         default:              armorName = "None";     break;
     }
     pINI->WriteString(section, "Armor", armorName);
 
     // SpeedType
-    const char* speedName = "Slow";
-    switch (SpeedTypeVal)
-    {
-        case SpeedType::Medium:   speedName = "Medium";   break;
-        case SpeedType::Fast:     speedName = "Fast";     break;
-        case SpeedType::VeryFast: speedName = "VeryFast"; break;
-        default:                  speedName = "Slow";     break;
-    }
-    pINI->WriteString(section, "SpeedType", speedName);
+    const char* speedName = CCINIClass::SpeedTypeIdxToName(
+        static_cast<int32>(SpeedTypeVal));
+    pINI->WriteString(section, "SpeedType", speedName ? speedName : "Foot");
 
     // MovementZone
     const char* zoneName = "Normal";
@@ -922,7 +1281,7 @@ void TechnoTypeClass::ComputeCRC(CRCEngine& crc) const
     crc.AddData(&CrewType,        sizeof(CrewType));
     crc.AddData(&Ammo,            sizeof(Ammo));
     crc.AddData(&NoAmmo,          sizeof(NoAmmo));
-    crc.AddData(&PipScale,        sizeof(PipScale));
+    crc.AddData(&PipScaleValue,   sizeof(PipScaleValue));
     crc.AddData(&OccupyWeaponCount,      sizeof(OccupyWeaponCount));
     crc.AddData(&OccupyWeaponRangeBonus, sizeof(OccupyWeaponRangeBonus));
     crc.AddData(&IsHarvester,     sizeof(IsHarvester));

@@ -529,7 +529,11 @@ AudioManager::AudioManager() :
     SFXVolume(1.0f),
     MusicVolume(1.0f),
     Muted(false),
-    Initialized(false)
+    Initialized(false),
+    VoiceCount(0),
+    VoiceCapacity(0),
+    StaticSoundCount(0),
+    StaticSoundCapacity(0)
 {}
 
 AudioManager::~AudioManager() {
@@ -617,6 +621,40 @@ void AudioManager::SetMusicVolume(float vol) {
 
 void AudioManager::MuteAll(bool mute) {
     Muted = mute;
+}
+
+// ============================================================================
+// DumpPoolStats - sub_406760 (asm 0x406760)
+//
+//   Gated on the audio event pool actually being live.  Two lines are then
+//   formatted and handed to the caller's callback:
+//
+//     "AudioEvents : %05d - Max: %05d"
+//     "StaticSounds: %05d - Max: %05d"
+//
+//   The counts come from the audio-event and static-sound pools, both
+//   reproduced here as their live count against their capacity.
+// ============================================================================
+void AudioManager::DumpPoolStats(void (*pCallback)(const char*))
+{
+    if (pCallback == nullptr)
+        return;
+
+    // The original bails out when the audio event pool is not initialised;
+    // the shutdown path leaves the sample table empty and that is the
+    // equivalent condition here.
+    if (!Initialized && ActiveSamples.Count == 0)
+        return;
+
+    char buffer[0xC8];
+
+    std::snprintf(buffer, sizeof(buffer), "AudioEvents : %05d - Max: %05d",
+                  VoiceCount, VoiceCapacity);
+    pCallback(buffer);
+
+    std::snprintf(buffer, sizeof(buffer), "StaticSounds: %05d - Max: %05d",
+                  StaticSoundCount, StaticSoundCapacity);
+    pCallback(buffer);
 }
 
 void AudioManager::PlaySample(AudioSample* sample, float volume, int32 panning) {
@@ -794,4 +832,162 @@ bool Audio_ReadWAVFile(CCFileClass* pFile, AudioSampleData* pSampleData) {
 
     YRMemory::Deallocate(fileBuffer);
     return foundData;
+}
+// ============================================================================
+// AudioIndexTable
+// ============================================================================
+
+AudioIndexTable* g_pAudioIndexTable = nullptr;
+
+namespace {
+    constexpr uint32 IDX_VERSION    = 0x00000001;
+    constexpr int32  IDX_ENTRY_SIZE = 0x24;
+
+    int AudioIndexEntryCompare(const void* pA, const void* pB)
+    {
+        const AudioIndexEntry* pEntryA = static_cast<const AudioIndexEntry*>(pA);
+        const AudioIndexEntry* pEntryB = static_cast<const AudioIndexEntry*>(pB);
+        return strcasecmp(pEntryA->Name, pEntryB->Name);
+    }
+}
+
+AudioIndexTable::AudioIndexTable()
+    : Entries(nullptr), Count(0), Capacity(0)
+{
+    Directory[0] = '\0';
+}
+
+AudioIndexTable::~AudioIndexTable()
+{
+    Clear();
+}
+
+void AudioIndexTable::Clear()
+{
+    if (Entries) {
+        delete[] Entries;
+        Entries = nullptr;
+    }
+    Count = 0;
+    Capacity = 0;
+}
+
+// The index file holds a 0xC byte header followed by one 0x24 byte record per
+// sample.  Version 1 records carry a 0x20 byte name that is read verbatim and
+// then zeroed in the trailing dword; any other version leaves the records
+// alone.  The table is sorted afterwards so it can be binary searched.
+bool AudioIndexTable::Load(const char* pFileName, const char* pDirectory)
+{
+    Clear();
+
+    if (!pFileName || !pFileName[0])
+        return false;
+
+    char baseName[0x104];
+    std::strncpy(baseName, pFileName, sizeof(baseName) - 1);
+    baseName[sizeof(baseName) - 1] = '\0';
+
+    char* pExt = std::strrchr(baseName, '.');
+    if (pExt)
+        *pExt = '\0';
+
+    char indexName[0x104];
+    char bagName[0x104];
+
+    std::snprintf(indexName, sizeof(indexName), "%s.idx", baseName);
+    std::snprintf(bagName, sizeof(bagName), "%s.bag", baseName);
+
+    CCFileClass indexFile(indexName);
+    if (!indexFile.IsAvailable())
+        return false;
+
+    CCFileClass bagFile(bagName);
+    if (!bagFile.IsAvailable())
+        return false;
+
+    if (!indexFile.Open(static_cast<int32>(FileAccessMode::Read)))
+        return false;
+
+    bagFile.Open(static_cast<int32>(FileAccessMode::Read));
+
+    uint32 header[3] = { 0, 0, 0 };
+    if (indexFile.Read(header, sizeof(header)) != static_cast<int32>(sizeof(header)))
+        return false;
+
+    Capacity = static_cast<int32>(header[2]);
+    if (Capacity <= 0)
+        return false;
+
+    Entries = new AudioIndexEntry[Capacity];
+    if (!Entries) {
+        Capacity = 0;
+        return false;
+    }
+
+    std::memset(Entries, 0, sizeof(AudioIndexEntry) * static_cast<size_t>(Capacity));
+
+    if (header[1] == IDX_VERSION) {
+        for (int32 i = 0; i < Capacity; ++i) {
+            if (indexFile.Read(Entries[i].Name, 0x20) != 0x20) {
+                Clear();
+                return false;
+            }
+            Entries[i].Name[0x1F] = '\0';
+            Entries[i].Offset = 0;
+        }
+    }
+
+    Count = Capacity;
+
+    std::qsort(Entries, static_cast<size_t>(Count), IDX_ENTRY_SIZE,
+               AudioIndexEntryCompare);
+
+    if (pDirectory && pDirectory[0]) {
+        std::strncpy(Directory, pDirectory, sizeof(Directory) - 1);
+        Directory[sizeof(Directory) - 1] = '\0';
+
+        size_t len = std::strlen(Directory);
+        if (len > 0 && Directory[len - 1] == '\\')
+            Directory[len - 1] = '\0';
+    }
+
+    return true;
+}
+
+int32 AudioIndexTable::FindIndex(const char* pName) const
+{
+    if (!Entries || Count <= 0 || !pName)
+        return -1;
+
+    const void* pFound = bsearch(pName, Entries, static_cast<size_t>(Count),
+                                 IDX_ENTRY_SIZE, AudioIndexEntryCompare);
+    if (!pFound)
+        return -1;
+
+    const AudioIndexEntry* pEntry = static_cast<const AudioIndexEntry*>(pFound);
+    return static_cast<int32>(pEntry - Entries);
+}
+
+const char* AudioIndexTable::GetName(int32 index) const
+{
+    if (!Entries || index < 0 || index >= Count)
+        return "Invalid";
+
+    return Entries[index].Name;
+}
+
+int32 Audio_FindSampleIndex(const char* pName)
+{
+    if (!g_pAudioIndexTable)
+        return -1;
+
+    return g_pAudioIndexTable->FindIndex(pName);
+}
+
+bool Audio_LoadSampleIndex(const char* pFileName, const char* pDirectory)
+{
+    if (!g_pAudioIndexTable)
+        return false;
+
+    return g_pAudioIndexTable->Load(pFileName, pDirectory);
 }

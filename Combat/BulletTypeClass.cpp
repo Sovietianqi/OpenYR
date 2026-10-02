@@ -1,4 +1,6 @@
 #include "BulletTypeClass.h"
+#include <Combat/WeaponTypeClass.h>
+#include <Animations/AnimTypeClass.h>
 #include "../INI/INIClass.h"
 #include "../IO/CRC.h"
 
@@ -236,7 +238,6 @@ bool BulletTypeClass::LoadFromINI(CCINIClass* pINI) {
     ROT = pINI->ReadInteger(sectionName, "ROT", ROT);
     Arm = pINI->ReadInteger(sectionName, "Arm", Arm);
     ProjectileSpeed = pINI->ReadInteger(sectionName, "Speed", ProjectileSpeed);
-    ScaledSpawnDelay = pINI->ReadInteger(sectionName, "ScaledSpawnDelay", ScaledSpawnDelay);
 
     // Read boolean flags
     Arcing = pINI->ReadBool(sectionName, "Arcing", Arcing);
@@ -247,21 +248,74 @@ bool BulletTypeClass::LoadFromINI(CCINIClass* pINI) {
     SubjectToElevation = pINI->ReadBool(sectionName, "SubjectToElevation", SubjectToElevation);
     SubjectToWalls = pINI->ReadBool(sectionName, "SubjectToWalls", SubjectToWalls);
     VeryHigh = pINI->ReadBool(sectionName, "VeryHigh", VeryHigh);
-    High = pINI->ReadBool(sectionName, "High", High);
     Shadow = pINI->ReadBool(sectionName, "Shadow", Shadow);
     AA = pINI->ReadBool(sectionName, "AA", AA);
     AG = pINI->ReadBool(sectionName, "AG", AG);
-    ASW = pINI->ReadBool(sectionName, "ASW", ASW);
-    AN = pINI->ReadBool(sectionName, "AN", AN);
     Inaccurate = pINI->ReadBool(sectionName, "Inaccurate", Inaccurate);
-    NoRotate = pINI->ReadBool(sectionName, "NoRotate", NoRotate);
     Level = pINI->ReadBool(sectionName, "Level", Level);
     Proximity = pINI->ReadBool(sectionName, "Proximity", Proximity);
     Ranged = pINI->ReadBool(sectionName, "Ranged", Ranged);
     Scalable = pINI->ReadBool(sectionName, "Scalable", Scalable);
-    CourseLocked = pINI->ReadBool(sectionName, "CourseLocked", CourseLocked);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    const char* section = sectionName;
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Arm = pINI->ReadInteger(section, "Arm", Arm);
+    ROT = pINI->ReadInteger(section, "ROT", ROT);
+    CourseLockDuration = pINI->ReadInteger(section, "CourseLockDuration", CourseLockDuration);
+    Elasticity = pINI->ReadFixed(section, "Elasticity", Elasticity);
+    Acceleration = pINI->ReadInteger(section, "Acceleration", Acceleration);
+    Color = pINI->ReadInteger(section, "Color", Color);
+    Arcing = pINI->ReadBool(section, "Arcing", Arcing);
+    Floater = pINI->ReadBool(section, "Floater", Floater);
+    SubjectToCliffs = pINI->ReadBool(section, "SubjectToCliffs", SubjectToCliffs);
+    SubjectToElevation = pINI->ReadBool(section, "SubjectToElevation", SubjectToElevation);
+    SubjectToWalls = pINI->ReadBool(section, "SubjectToWalls", SubjectToWalls);
+    VeryHigh = pINI->ReadBool(section, "VeryHigh", VeryHigh);
+    Shadow = pINI->ReadBool(section, "Shadow", Shadow);
+    Dropping = pINI->ReadBool(section, "Dropping", Dropping);
+    Level = pINI->ReadBool(section, "Level", Level);
+    Inviso = pINI->ReadBool(section, "Inviso", Inviso);
+    Proximity = pINI->ReadBool(section, "Proximity", Proximity);
+    Ranged = pINI->ReadBool(section, "Ranged", Ranged);
+    Inaccurate = pINI->ReadBool(section, "Inaccurate", Inaccurate);
+    FlakScatter = pINI->ReadBool(section, "FlakScatter", FlakScatter);
+    AA = pINI->ReadBool(section, "AA", AA);
+    AG = pINI->ReadBool(section, "AG", AG);
+    Degenerates = pINI->ReadBool(section, "Degenerates", Degenerates);
+    Bouncy = pINI->ReadBool(section, "Bouncy", Bouncy);
+    Airburst = pINI->ReadBool(section, "Airburst", Airburst);
+    Cluster = pINI->ReadInteger(section, "Cluster", Cluster);
+    Scalable = pINI->ReadBool(section, "Scalable", Scalable);
+    pINI->ReadString(section, "Image", Image, Image, sizeof(Image));
+    { char _buf[0x40]; if (pINI->ReadString(section, "AirburstWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) AirburstWeapon = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ShrapnelWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) ShrapnelWeapon = _p; } }
+    ShrapnelCount = pINI->ReadInteger(section, "ShrapnelCount", ShrapnelCount);
+    DetonationAltitude = pINI->ReadInteger(section, "DetonationAltitude", DetonationAltitude);
+    Vertical = pINI->ReadBool(section, "Vertical", Vertical);
+    FirersPalette = pINI->ReadBool(section, "FirersPalette", FirersPalette);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    { char _buf[0x40]; if (pArt->ReadString(section, "Trailer", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Trailer = _p; } }
+    SpawnDelay = pArt->ReadInteger(section, "SpawnDelay", SpawnDelay);
+    Rotates = pArt->ReadBool(section, "Rotates", Rotates);
+    Flat = pArt->ReadBool(section, "Flat", Flat);
+    AnimLow = pArt->ReadInteger(section, "AnimLow", AnimLow);
+    AnimHigh = pArt->ReadInteger(section, "AnimHigh", AnimHigh);
+    AnimRate = pArt->ReadInteger(section, "AnimRate", AnimRate);
+    AnimPalette = pArt->ReadBool(section, "AnimPalette", AnimPalette);
+
+        return true;
 }
 
 // ============================================================================

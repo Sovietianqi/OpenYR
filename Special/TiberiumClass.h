@@ -55,6 +55,10 @@ public:
     void SetTintColor(const ColorStruct& color);
     void SetRadarColor(const ColorStruct& color);
 
+    bool LoadFromINI(class CCINIClass* pINI);
+    static void LoadAllFromINI(class CCINIClass* pINI);
+    static TiberiumClass* FindOrAllocate(const char* pName);
+
     TiberiumType GetType() const;
     int32 GetCellLevel() const;
     int32 GetValue() const;
@@ -101,6 +105,17 @@ public:
     bool IsSpecial;
     bool IsWeaponTiberium;
     ColorStruct RadarColor;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    int32        Spread;
+    double       SpreadPercentage;
+    int32        Growth;
+    double       GrowthPercentage;
+    int32        Color;
+    char         Name[0x40];
+    int32        Image;
+    DynamicVectorClass<class AnimTypeClass*> DebrisAnims;
 };
 
 class TiberiumManagerClass {

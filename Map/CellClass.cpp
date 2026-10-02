@@ -84,6 +84,7 @@ void CellClass::Init() {
     SmudgeData = 0;
     Occupier = nullptr;
     Terrain = nullptr;
+    AttachedTag = nullptr;
     CellColor = 0;
     Altitude = 0;
     Slope = 0;
@@ -203,6 +204,7 @@ bool CellClass::Load(IStream* pStm) {
     // Reset transient pointers - these are re-linked by the map loader
     Occupier = nullptr;
     Terrain = nullptr;
+    AttachedTag = nullptr;
     for (int32 i = 0; i < 8; ++i) {
         AdjacentCells[i] = nullptr;
     }

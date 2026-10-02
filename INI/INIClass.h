@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Definitions.h"
+#include "../Containers/DynamicVectorClass.h"
 #include "Core/Macros.h"
 #include "Core/Memory.h"
 #include "Containers/ListClass.h"
@@ -34,6 +35,14 @@
 //========================================================================
 
 class INIClass;
+
+class AircraftTypeClass;
+class BuildingTypeClass;
+class InfantryTypeClass;
+class TerrainTypeClass;
+class UnitTypeClass;
+
+enum class Powerup : uint32;
 
 //========================================================================
 // INIComment - Comment node in a linked list
@@ -189,6 +198,11 @@ public:
     // Write an integer value
     bool WriteInteger(const char* pSection, const char* pKey, int32 nValue, bool bHex = false);
 
+    // Read / write a bare-hex value (INIClass_GetHex / INIClass_WriteHex).
+    // The writer emits "%X" with no "h" suffix; the reader parses base 16.
+    int32 ReadHex(const char* pSection, const char* pKey, int32 nDefault = 0);
+    bool  WriteHex(const char* pSection, const char* pKey, int32 nValue);
+
     //========================================================================
     // Boolean Reading/Writing
     //========================================================================
@@ -231,6 +245,62 @@ public:
     bool WriteDouble(const char* pSection, const char* pKey, double dValue);
 
     //========================================================================
+    // Fixed / Percentage Reading
+    //========================================================================
+
+    double ReadFixed(const char* pSection, const char* pKey, double dDefault);
+
+    void GetFixed(const char* pSection, const char* pKey, double& dValue)
+    {
+        dValue = ReadFixed(pSection, pKey, dValue);
+    }
+
+    bool WriteFixed(const char* pSection, const char* pKey, double dValue);
+
+    int32 ReadIntHundredth(const char* pSection, const char* pKey, int32 nDefault);
+
+    void GetIntHundredth(const char* pSection, const char* pKey, int32& nValue)
+    {
+        nValue = ReadIntHundredth(pSection, pKey, nValue);
+    }
+
+    bool WriteIntHundredth(const char* pSection, const char* pKey, int32 nValue);
+
+    //========================================================================
+    // Lepton (fixed point) Reading/Writing
+    //========================================================================
+
+    // CCINIClass::Get_Lepton (asm 0x47490F) - the stored value is a floating
+    // point fraction of a cell; a missing key yields nDefault.  A stored -1.0
+    // is the "unset" sentinel and is returned as nDefault verbatim; every other
+    // value is scaled by 256.0 and floored to an integer.
+    int32 ReadLepton(const char* pSection, const char* pKey, int32 nDefault);
+
+    void GetLepton(const char* pSection, const char* pKey, int32& nValue)
+    {
+        nValue = ReadLepton(pSection, pKey, nValue);
+    }
+
+    // CCINIClass::Put_Lepton (asm 0x47497A) - writes value / 256.0 through the
+    // "%f" float writer.
+    bool WriteLepton(const char* pSection, const char* pKey, int32 nValue);
+
+    //========================================================================
+    // UU Block Reading/Writing
+    //========================================================================
+
+    // INIClass::Put_UUBlock (asm 0x526E60) - serialise a binary blob into a
+    // section as numbered "1", "2", ... keys, each holding up to 0x46 (70)
+    // base64 characters.  Returns false when pSection / pValue is null or the
+    // size is not positive.
+    bool WriteUUBlock(const char* pSection, const void* pValue, size_t nSize);
+
+    // INIClass::Get_UUBlock (asm 0x526FAA) - the mirror: walk the section's
+    // numbered keys, base64-decode each and pack the bytes back into pBuffer.
+    // Returns the number of decoded bytes, capped at nSize.
+    int32 ReadUUBlock(const char* pSection, void* pBuffer, size_t nSize);
+
+    //========================================================================
     // Multi-Value Reading
     //========================================================================
 
@@ -247,6 +317,40 @@ public:
 
     // Write three integer values
     bool Write3Integers(const char* pSection, const char* pKey, const int32* pValues);
+
+    // Read two word values (e.g., "X,Y")
+    uint16* Read2Words(uint16* pBuffer, const char* pSection, const char* pKey,
+                       const uint16* pDefault);
+
+    // Write two word values
+    bool Write2Words(const char* pSection, const char* pKey, const uint16* pValues);
+
+    // Write an integer scaled by a multiplier (value * multiplier / divisor)
+    bool WriteIntMultiplied(const char* pSection, const char* pKey,
+                            int32 nValue, int32 nMultiplier);
+
+    // Write an integer scaled down by a divisor
+    bool WriteIntDivided(const char* pSection, const char* pKey,
+                         int32 nValue, int32 nDivisor);
+
+    // Read a pip index (stored as a name, resolved to an index)
+    int32 ReadPipIdx(const char* pSection, const char* pKey, int32 nDefault);
+
+    void GetPipIdx(const char* pSection, const char* pKey, int32& nValue)
+    {
+        nValue = ReadPipIdx(pSection, pKey, nValue);
+    }
+
+    // Write a pip index
+    bool WritePipIdx(const char* pSection, const char* pKey, int32 nValue);
+
+    // Read a pip scale index
+    int32 ReadPipscaleIdx(const char* pSection, const char* pKey, int32 nDefault);
+
+    void GetPipscaleIdx(const char* pSection, const char* pKey, int32& nValue)
+    {
+        nValue = ReadPipscaleIdx(pSection, pKey, nValue);
+    }
 
     //========================================================================
     // Color Reading/Writing
@@ -353,6 +457,10 @@ public:
     // File Operations
     //========================================================================
 
+    // The shared artmd.ini instance.  Returns null until the rules loader
+    // has opened it, mirroring the original's ART_INI global.
+    static CCINIClass* GetArtINI();
+
     // Load an INI file
     static CCINIClass* LoadINIFile(const char* pFileName);
 
@@ -372,6 +480,155 @@ public:
     // Read a string table entry
     int32 ReadStringTableEntry(const char* pSection, const char* pKey,
                                char* pBuffer, size_t bufferSize);
+
+    //========================================================================
+    // Movie lookup
+    //========================================================================
+
+    // Resolves a movie name stored under pKey to its index in the global
+    // movie table.  "<none>" and unknown names yield nDefault.
+    int32 FindMovieIndex(const char* pSection, const char* pKey, int32 nDefault);
+
+    //========================================================================
+    // Multi-field slot parsing
+    //========================================================================
+
+    // Reads pKey as a "a,b,c" triple of comma separated integers and stores
+    // each component through the out pointers.  Components that are absent
+    // leave the corresponding output untouched, matching the original's
+    // sequential _strtok loop (asm sub_477440).
+    void ReadSlotTriple(const char* pSection, const char* pKey,
+                        int32* pFirst, int32* pSecond, int32* pThird);
+
+    //========================================================================
+    // Geometry reading
+    //========================================================================
+
+    // INIClass::Get_Point: reads "x,y" into a two-integer point.  Absent
+    // components leave the corresponding output untouched.
+    void ReadPoint(const char* pSection, const char* pKey,
+                   int32* pX, int32* pY);
+
+    // INIClass::Get_Rect: reads "x,y,w,h" into a RectangleStruct.  Absent
+    // components leave the corresponding output untouched.
+    void ReadRect(const char* pSection, const char* pKey,
+                  RectangleStruct* pRect);
+
+    // INIClass::Put_Rect (asm 0x5273DD): writes the rectangle as the
+    // "%d,%d,%d,%d" string via INIClass_WriteString.
+    bool WriteRect(const char* pSection, const char* pKey,
+                   const RectangleStruct* pRect);
+
+
+    //========================================================================
+    // Audio Enumeration Parsing
+    //========================================================================
+
+    static int32 ParseSoundPriority(const char* pValue);
+    static int32 ParseSoundControl(const char* pValue);
+    static int32 ParseSoundType(const char* pValue);
+
+    //========================================================================
+    // Category Index Mapping
+    //========================================================================
+
+    static int32 BuildCatIdxToNameIdx(const char* const* pNames, int32 nCount,
+                                      const char* pValue, int32 nDefault);
+    static const char* BuildCatNameToIdx(const char* const* pNames, int32 nCount,
+                                         int32 nIndex);
+
+    //========================================================================
+    // Game Enumeration Parsing
+    //========================================================================
+
+    static Armor        ParseArmorType(const char* pValue);
+    static Category     ParseCategory(const char* pValue);
+    static VHPScan      ParseVHPScan(const char* pValue);
+    static Foundation   ParseFoundation(const char* pValue);
+    static PipScale     ParsePipScale(const char* pValue);
+    static LandType     ParseLandType(const char* pValue);
+    static MovementZone ParseMovementZone(const char* pValue);
+    static SpeedType    ParseSpeedType(const char* pValue);
+    static Layer        ParseLayer(const char* pValue);
+    static BuildCat     ParseBuildCat(const char* pValue);
+
+    static const char*  CategoryIdxToName(int32 nIndex);
+    static const char*  VHPScanIdxToName(int32 nIndex);
+    static const char*  FoundationIdxToName(int32 nIndex);
+    static const char*  PipScaleIdxToName(int32 nIndex);
+    static const char*  LandTypeIdxToName(int32 nIndex);
+    static const char*  MovementZoneIdxToName(int32 nIndex);
+    static const char*  SpeedTypeIdxToName(int32 nIndex);
+    static const char*  LayerIdxToName(int32 nIndex);
+    static const char*  BuildCatIdxToName(int32 nIndex);
+
+    static void         ParseAbilities(const char* pValue, int32* pOut, int32 nCount);
+
+    //========================================================================
+    // Typed Getters
+    //========================================================================
+
+    Armor        GetArmorType(const char* pSection, const char* pKey, Armor nDefault);
+    Category     GetCategory(const char* pSection, const char* pKey, Category nDefault);
+    VHPScan      GetVHPScan(const char* pSection, const char* pKey, VHPScan nDefault);
+    Foundation   GetFoundation(const char* pSection, const char* pKey, Foundation nDefault);
+    PipScale     GetPipScale(const char* pSection, const char* pKey, PipScale nDefault);
+    LandType     GetLandType(const char* pSection, const char* pKey, LandType nDefault);
+    MovementZone GetMovementZone(const char* pSection, const char* pKey, MovementZone nDefault);
+    SpeedType    GetSpeedType(const char* pSection, const char* pKey, SpeedType nDefault);
+    Layer        GetLayer(const char* pSection, const char* pKey, Layer nDefault);
+    BuildCat     GetBuildCat(const char* pSection, const char* pKey, BuildCat nDefault);
+
+    bool         GetAbilities(const char* pSection, const char* pKey,
+                              int32* pOut, int32 nCount);
+    bool         Get3Integers(const char* pSection, const char* pKey,
+                              int32* pValues);
+    bool         Get3Bytes(const char* pSection, const char* pKey,
+                           uint8* pValues);
+    bool         Get2Integers(const char* pSection, const char* pKey,
+                              int32* pValues);
+    bool         GetVectorIntegers(const char* pSection, const char* pKey,
+                                   int32* pValues, int32 nMax);
+    bool         GetVectorIntegers(const char* pSection, const char* pKey,
+                                   DynamicVectorClass<int32>& rList);
+    bool         GetVectorAircraftType(const char* pSection, const char* pKey,
+                                       DynamicVectorClass<AircraftTypeClass*>& rList);
+    bool         GetVectorUnitType(const char* pSection, const char* pKey,
+                                   DynamicVectorClass<UnitTypeClass*>& rList);
+    bool         GetVectorBuildType(const char* pSection, const char* pKey,
+                                    DynamicVectorClass<BuildingTypeClass*>& rList);
+    bool         GetVectorInfType(const char* pSection, const char* pKey,
+                                  DynamicVectorClass<InfantryTypeClass*>& rList);
+    bool         GetVectorTerrainTypes(const char* pSection, const char* pKey,
+                                       DynamicVectorClass<TerrainTypeClass*>& rList);
+    Powerup      GetPowerup(const char* pSection, const char* pKey, Powerup nDefault);
+
+    int32        ReadColorSchemeIndex(const char* pSection, const char* pKey,
+                                      int32 nDefault);
+
+    // Edge - a map border direction (North/East/South/West/Air).  When the
+    // key is absent the fallback is returned unchanged, mirroring the
+    // original INIClass_GetEdge.
+    int32        GetEdge(const char* pSection, const char* pKey, int32 nDefault);
+
+    // Allies - a comma separated list of house names decoded into a bitfield
+    // indexed by each house's own player number.  Returns nDefault when the
+    // key is missing, otherwise the accumulated mask.
+    uint32       GetAlliesBitfield(const char* pSection, const char* pKey,
+                                   uint32 nDefault);
+
+    int32        GetOwners(const char* pSection, const char* pKey, int32 nDefault);
+    bool         GetVectorColors(const char* pSection, const char* pKey,
+                                 DynamicVectorClass<ColorStruct>& rList);
+
+    // Prerequisites are a comma separated run of techno IDs.  The literal
+    // "POWER" is stored as -1, everything else is resolved through
+    // TechnoTypeClass and stored as its array index.
+    bool         GetPrerequisiteList(const char* pSection, const char* pKey,
+                                     DynamicVectorClass<int32>& rList);
+
+    // Retrieve the 20-byte digest computed when the file was read
+    bool GetDigest(uint8* pDigest, size_t digestSize) const;
 
     //========================================================================
     // CRC Operations

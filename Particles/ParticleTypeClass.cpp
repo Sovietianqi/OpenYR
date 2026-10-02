@@ -1,4 +1,6 @@
 #include "ParticleTypeClass.h"
+#include <Combat/WarheadTypeClass.h>
+#include <Particles/ParticleTypeClass.h>
 #include "../IO/CCFileClass.h"
 #include "../INI/INIClass.h"
 
@@ -39,7 +41,17 @@ ParticleTypeClass::ParticleTypeClass()
     , UseDepthSort(true), RenderOrder(RenderOrderType::BackToFront)
     , IsEnabled(true), IniIndex(-1), ColorGradientKeys(nullptr)
     , ColorGradientKeyCount(0), SizeGradientKeys(nullptr), SizeGradientKeyCount(0)
-    , AlphaGradientKeys(nullptr), AlphaGradientKeyCount(0) {
+    , AlphaGradientKeys(nullptr), AlphaGradientKeyCount(0)
+    , MaxDC(0), MaxEC(0), Damage(0), Warhead(nullptr)
+    , StartFrame(0), NumLoopFrames(1), Translucency(0), WindEffect(0)
+    , Velocity(0.0), Deacc(0.0), Radius(0), DeleteOnStateLimit(false)
+    , EndStateAI(0), StartStateAI(0), StateAIAdvance(0)
+    , Translucent50State(0), Translucent25State(0), Normalized(false)
+    , ColorSpeed(0.0), XVelocity(0), YVelocity(0), MinZVelocity(0)
+    , ZVelocityRange(0), FinalDamageState(0), BehavesLike(-1)
+    , NextParticleIndex(-1)
+    , NextParticleOffset{ 0, 0, 0 }, StartColor1{ 0, 0, 0 }, StartColor2{ 0, 0, 0 } {
+    NextParticle[0] = '\0';
 }
 
 ParticleTypeClass::~ParticleTypeClass() {
@@ -68,12 +80,6 @@ bool ParticleTypeClass::ReadFromINI(INIClass* ini, const char* section) {
     if (MaxLifetime < 1) MaxLifetime = 1;
 
     // Emission
-    EmissionRate = ini->ReadInteger(section, "EmissionRate", 10);
-    MaxParticles = ini->ReadInteger(section, "MaxParticles", 100);
-    EmissionDelay = ini->ReadInteger(section, "EmissionDelay", 0);
-    OneShot = ini->ReadBool(section, "OneShot", false);
-    OneShotCount = ini->ReadInteger(section, "OneShotCount", 0);
-    Prewarm = ini->ReadInteger(section, "Prewarm", 0);
 
     // Velocity
     InitialVelocity.X = ini->ReadFloat(section, "VelocityX", 0.0f);
@@ -101,18 +107,8 @@ bool ParticleTypeClass::ReadFromINI(INIClass* ini, const char* section) {
     RotationVariation = ini->ReadFloat(section, "RotationVariation", 0.0f);
 
     // Color
-    InitialColor.R = static_cast<uint8>(ini->ReadInteger(section, "InitialColorR", 255));
-    InitialColor.G = static_cast<uint8>(ini->ReadInteger(section, "InitialColorG", 255));
-    InitialColor.B = static_cast<uint8>(ini->ReadInteger(section, "InitialColorB", 255));
-    InitialColor.A = static_cast<uint8>(ini->ReadInteger(section, "InitialColorA", 255));
-    FinalColor.R = static_cast<uint8>(ini->ReadInteger(section, "FinalColorR", 255));
-    FinalColor.G = static_cast<uint8>(ini->ReadInteger(section, "FinalColorG", 255));
-    FinalColor.B = static_cast<uint8>(ini->ReadInteger(section, "FinalColorB", 255));
-    FinalColor.A = static_cast<uint8>(ini->ReadInteger(section, "FinalColorA", 0));
-    UseColorGradient = ini->ReadBool(section, "UseColorGradient", false);
 
     // Emit shape
-    EmitShape = static_cast<EmitShapeType>(ini->ReadInteger(section, "EmitShape", 0));
     EmitRadius = ini->ReadFloat(section, "EmitRadius", 0.0f);
     EmitAngle = ini->ReadFloat(section, "EmitAngle", 0.0f);
     EmitAngleVariation = ini->ReadFloat(section, "EmitAngleVariation", 0.0f);
@@ -120,60 +116,31 @@ bool ParticleTypeClass::ReadFromINI(INIClass* ini, const char* section) {
     EmitHeight = ini->ReadFloat(section, "EmitHeight", 0.0f);
 
     // Behavior flags
-    UseWind = ini->ReadBool(section, "UseWind", false);
     WindInfluence = ini->ReadFloat(section, "WindInfluence", 0.0f);
-    UseCollision = ini->ReadBool(section, "UseCollision", false);
     CollisionBounce = ini->ReadFloat(section, "CollisionBounce", 0.5f);
     CollisionFriction = ini->ReadFloat(section, "CollisionFriction", 0.3f);
-    CollisionKill = ini->ReadBool(section, "CollisionKill", false);
 
     // Billboard
-    UseBillboard = ini->ReadBool(section, "UseBillboard", true);
-    BillboardType_ = static_cast<BillboardType>(ini->ReadInteger(section, "BillboardType", 0));
-    UseAlphaBlend = ini->ReadBool(section, "UseAlphaBlend", true);
-    BlendMode = static_cast<AlphaBlendMode>(ini->ReadInteger(section, "BlendMode", 0));
 
     // Texture
-    TextureIndex = ini->ReadInteger(section, "TextureIndex", -1);
-    TextureWidth = ini->ReadInteger(section, "TextureWidth", 0);
-    TextureHeight = ini->ReadInteger(section, "TextureHeight", 0);
-    TextureFrameCount = ini->ReadInteger(section, "TextureFrameCount", 1);
-    TextureFrameRate = ini->ReadInteger(section, "TextureFrameRate", 4);
-    UseTextureAnimation = ini->ReadBool(section, "UseTextureAnimation", false);
 
     // Particle type
     ParticleType = static_cast<ParticleRenderType>(ini->ReadInteger(section, "ParticleType", 0));
 
     // Trail
-    UseTrail = ini->ReadBool(section, "UseTrail", false);
-    TrailLength = ini->ReadInteger(section, "TrailLength", 0);
     TrailWidth = ini->ReadFloat(section, "TrailWidth", 1.0f);
-    TrailColor.R = static_cast<uint8>(ini->ReadInteger(section, "TrailColorR", 255));
-    TrailColor.G = static_cast<uint8>(ini->ReadInteger(section, "TrailColorG", 255));
-    TrailColor.B = static_cast<uint8>(ini->ReadInteger(section, "TrailColorB", 255));
-    TrailColor.A = static_cast<uint8>(ini->ReadInteger(section, "TrailColorA", 128));
 
     // Light
-    UseLight = ini->ReadBool(section, "UseLight", false);
-    LightRadius = ini->ReadInteger(section, "LightRadius", 0);
-    LightColor.R = static_cast<uint8>(ini->ReadInteger(section, "LightColorR", 255));
-    LightColor.G = static_cast<uint8>(ini->ReadInteger(section, "LightColorG", 255));
-    LightColor.B = static_cast<uint8>(ini->ReadInteger(section, "LightColorB", 255));
     LightIntensity = ini->ReadInteger(section, "LightIntensity", 128);
 
     // Sub-emitter
-    UseSubEmitter = ini->ReadBool(section, "UseSubEmitter", false);
-    SubEmitterIndex = ini->ReadInteger(section, "SubEmitterIndex", -1);
-    SubEmitterCount = ini->ReadInteger(section, "SubEmitterCount", 0);
 
     // Noise
-    UseNoise = ini->ReadBool(section, "UseNoise", false);
     NoiseStrength = ini->ReadFloat(section, "NoiseStrength", 0.0f);
     NoiseFrequency = ini->ReadFloat(section, "NoiseFrequency", 0.0f);
     NoiseSpeed = ini->ReadFloat(section, "NoiseSpeed", 0.0f);
 
     // Orbit
-    UseOrbit = ini->ReadBool(section, "UseOrbit", false);
     OrbitRadius = ini->ReadFloat(section, "OrbitRadius", 0.0f);
     OrbitSpeed = ini->ReadFloat(section, "OrbitSpeed", 0.0f);
     OrbitAxis.X = ini->ReadFloat(section, "OrbitAxisX", 0.0f);
@@ -182,14 +149,97 @@ bool ParticleTypeClass::ReadFromINI(INIClass* ini, const char* section) {
 
     // Misc
     InheritVelocity = ini->ReadFloat(section, "InheritVelocity", 0.0f);
-    UseLocalSpace = ini->ReadBool(section, "UseLocalSpace", false);
-    SimulationSpace = static_cast<SimulationSpaceType>(ini->ReadInteger(section, "SimulationSpace", 0));
-    SortingOrder = ini->ReadInteger(section, "SortingOrder", 0);
-    UseDepthSort = ini->ReadBool(section, "UseDepthSort", true);
-    RenderOrder = static_cast<RenderOrderType>(ini->ReadInteger(section, "RenderOrder", 0));
-    IsEnabled = ini->ReadBool(section, "Enabled", true);
+
+    CCINIClass* pINI = static_cast<CCINIClass*>(ini);
+
+    pINI->GetVectorColors(section, "ColorList", ColorList);
+    MaxDC              = pINI->ReadInteger(section, "MaxDC", MaxDC);
+    MaxEC              = pINI->ReadInteger(section, "MaxEC", MaxEC);
+    Damage             = pINI->ReadInteger(section, "Damage", Damage);
+
+    {
+        char name[0x80];
+        name[0] = '\0';
+        if (pINI->ReadString(section, "Warhead", "", name, sizeof(name)) > 0)
+        {
+            WarheadTypeClass* pWarhead = WarheadTypeClass::FindOrAllocate(name);
+            if (pWarhead != nullptr)
+                Warhead = pWarhead;
+        }
+    }
+
+    StartFrame         = pINI->ReadInteger(section, "StartFrame", StartFrame);
+    NumLoopFrames      = pINI->ReadInteger(section, "NumLoopFrames", NumLoopFrames);
+    Translucency       = pINI->ReadInteger(section, "Translucency", Translucency);
+    WindEffect         = pINI->ReadInteger(section, "WindEffect", WindEffect);
+    Velocity           = pINI->ReadFixed(section, "Velocity", Velocity);
+    Deacc              = pINI->ReadFixed(section, "Deacc", Deacc);
+    Radius             = pINI->ReadInteger(section, "Radius", Radius);
+    DeleteOnStateLimit = pINI->ReadBool(section, "DeleteOnStateLimit", DeleteOnStateLimit);
+    EndStateAI         = pINI->ReadInteger(section, "EndStateAI", EndStateAI);
+    StartStateAI       = pINI->ReadInteger(section, "StartStateAI", StartStateAI);
+    StateAIAdvance     = pINI->ReadInteger(section, "StateAIAdvance", StateAIAdvance);
+    Translucent50State = pINI->ReadInteger(section, "Translucent50State", Translucent50State);
+    Translucent25State = pINI->ReadInteger(section, "Translucent25State", Translucent25State);
+    Normalized         = pINI->ReadBool(section, "Normalized", Normalized);
+    ColorSpeed         = pINI->ReadFixed(section, "ColorSpeed", ColorSpeed);
+    XVelocity          = pINI->ReadInteger(section, "XVelocity", XVelocity);
+    YVelocity          = pINI->ReadInteger(section, "YVelocity", YVelocity);
+    MinZVelocity       = pINI->ReadInteger(section, "MinZVelocity", MinZVelocity);
+    ZVelocityRange     = pINI->ReadInteger(section, "ZVelocityRange", ZVelocityRange);
+
+    pINI->Get3Integers(section, "NextParticleOffset", NextParticleOffset);
+    pINI->Get3Bytes(section, "StartColor1", StartColor1);
+    pINI->Get3Bytes(section, "StartColor2", StartColor2);
+
+    FinalDamageState   = pINI->ReadInteger(section, "FinalDamageState", FinalDamageState);
+
+    {
+        char name[0x20];
+        name[0] = '\0';
+        if (pINI->ReadString(section, "NextParticle", "", name, sizeof(name)) > 0)
+        {
+            std::strncpy(NextParticle, name, sizeof(NextParticle) - 1);
+            NextParticle[sizeof(NextParticle) - 1] = '\0';
+            NextParticleIndex = _strcmpi(name, "<none>") == 0
+                              ? -1
+                              : ParticleTypeClass::FindIndexOrAllocate(name);
+        }
+    }
+
+    char behavesBuffer[0x20];
+    behavesBuffer[0] = '\0';
+    ini->ReadString(section, "BehavesLike", "", behavesBuffer, sizeof(behavesBuffer));
+    BehavesLike = BehavesLikeFromName(behavesBuffer);
 
     return true;
+}
+
+int32 ParticleTypeClass::BehavesLikeFromName(const char* pName)
+{
+    static const char* const names[] = {
+        "Gas", "Smoke", "Fire", "Spark", "Railgun"
+    };
+
+    if (!pName || !*pName) return -1;
+
+    for (int32 i = 0; i < 5; ++i)
+    {
+        if (!_strcmpi(pName, names[i])) return i;
+    }
+
+    return -1;
+}
+
+const char* ParticleTypeClass::BehavesLikeToName(int32 nIndex)
+{
+    static const char* const names[] = {
+        "Gas", "Smoke", "Fire", "Spark", "Railgun"
+    };
+
+    if (nIndex < 0 || nIndex >= 5) return nullptr;
+
+    return names[nIndex];
 }
 
 ColorStruct ParticleTypeClass::CalculateColor(float lifetimeT) const {
@@ -416,4 +466,58 @@ int32 ParticleTypeClass::GetEmissionRate() const {
 
 bool ParticleTypeClass::IsEnabledType() const {
     return IsEnabled;
+}
+
+// ============================================================================
+// ParticleTypeClass - static lookup helpers
+// ============================================================================
+
+ParticleTypeClass* ParticleTypeClass::Find(const char* pID)
+{
+    if (!Array) return nullptr;
+    if (!pID) return nullptr;
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        ParticleTypeClass* item = Array->GetItem(i);
+        if (item && !_strcmpi(item->Name, pID)) return item;
+    }
+    return nullptr;
+}
+
+ParticleTypeClass* ParticleTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    ParticleTypeClass* found = Find(pID);
+    if (found) return found;
+    ParticleTypeClass* newItem = GameCreate<ParticleTypeClass>();
+    if (newItem)
+    {
+        strncpy(newItem->Name, pID, sizeof(newItem->Name) - 1);
+        newItem->Name[sizeof(newItem->Name) - 1] = '\0';
+    }
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
+}
+
+
+// ============================================================================
+// ParticleTypeClass - index based lookup (FindIndexOrAllocate)
+// ============================================================================
+int32 ParticleTypeClass::FindIndexOrAllocate(const char* pID)
+{
+    if (!pID || !*pID) return -1;
+
+    if (Array)
+    {
+        for (int32 i = 0; i < Array->Count; ++i)
+        {
+            ParticleTypeClass* item = Array->GetItem(i);
+            if (item && !_strcmpi(item->Name, pID)) return i;
+        }
+    }
+
+    ParticleTypeClass* pNew = FindOrAllocate(pID);
+    if (!pNew || !Array) return -1;
+
+    return Array->Count - 1;
 }

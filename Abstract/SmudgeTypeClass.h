@@ -24,6 +24,7 @@ public:
     static DynamicVectorClass<SmudgeTypeClass*>* Array;
 
     static SmudgeTypeClass* Find(const char* pID);
+    static SmudgeTypeClass* FindOrAllocate(const char* pID);
     static SmudgeTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -59,6 +60,9 @@ public:
     bool       IsBib;
     bool       IsAnimated;
     bool       IsFlat;
+    bool       IsBurn;
+    int32      Width;
+    int32      Height;
     int32      ChainCount;
     int32      ChainSteps;
     char       ArtName[0x20];

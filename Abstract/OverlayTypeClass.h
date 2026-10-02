@@ -26,6 +26,7 @@ public:
     static const AbstractType AbstractDerivationID = AbstractType::OverlayType;
 
     static OverlayTypeClass* Find(const char* pID);
+    static OverlayTypeClass* FindOrAllocate(const char* pID);
     static OverlayTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -78,4 +79,21 @@ public:
     int32       DeathAnim;
     int32       ShapeCount;
     char        ArtName[0x20];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    LandType     LandValue;
+    int32        Strength;
+    bool         Crate;
+    bool         CrateTrigger;
+    bool         Explodes;
+    bool         Overrides;
+    AnimTypeClass* CellAnim;
+    int32        DamageLevels;
+    bool         NoUseTileLandType;
+    bool         IsVeinholeMonster;
+    bool         ChainReaction;
+    bool         DrawFlat;
+    bool         IsARock;
+    bool         IsRubble;
 };

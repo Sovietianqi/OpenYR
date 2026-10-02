@@ -29,7 +29,13 @@ public:
     static DynamicVectorClass<AnimTypeClass*>* Array;
 
     static AnimTypeClass* Find(const char* pID);
+    static AnimTypeClass* FindOrAllocate(const char* pID);
     static AnimTypeClass* FindByIndex(int32 index);
+
+    // AnimClass_FindIndex - the ordinal of the anim type named pID in the
+    // registry, or -1.  RulesClass_Addition_Powerups stores the ordinal in
+    // its anim table rather than the pointer.
+    static int32 FindIndex(const char* pID);
     static int32 GetCount();
 
     AnimTypeClass(const char* pID) noexcept;
@@ -162,4 +168,11 @@ public:
     int32 LightFlashFrames;
     SHPStruct* AnimShape;
     SHPStruct* ShadowShape;
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    bool         Theater;
+    bool         NewTheater;
+    Layer        LayerValue;
+    int32 StartSound;
 };

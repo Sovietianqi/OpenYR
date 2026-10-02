@@ -12,6 +12,7 @@ public:
 
     // Static lookup / array management
     static AircraftTypeClass* Find(const char* pID);
+    static AircraftTypeClass* FindOrAllocate(const char* pID);
     static AircraftTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -132,4 +133,15 @@ public:
     char        VoxelName[0x20];
     char        HVAName[0x20];
     BYTE        padding_AircraftType[4];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    bool         Landable;
+    bool         AirportBound;
+    bool         Rotors;
+    bool         CustomRotor;
+    AnimTypeClass* Trailer;
+    int32        SpawnDelay;
+    bool         FlyBy;
+    bool         FlyBack;
 };

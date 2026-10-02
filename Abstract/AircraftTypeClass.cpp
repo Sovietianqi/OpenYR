@@ -1,4 +1,5 @@
 #include <Abstract/AircraftTypeClass.h>
+#include <Animations/AnimTypeClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -416,14 +417,9 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     // Aircraft classification flags
     // ------------------------------------------------------------------
     Fighter      = pINI->ReadBool(section, "Fighter",      Fighter);
-    Strafe       = pINI->ReadBool(section, "Strafe",       Strafe);
-    Locked       = pINI->ReadBool(section, "Locked",       Locked);
-    Loaded       = pINI->ReadBool(section, "Loaded",       Loaded);
-    Kamikaze     = pINI->ReadBool(section, "Kamikaze",     Kamikaze);
     Spyplane     = pINI->ReadBool(section, "SpyPlane",     Spyplane);
     Paradropping = pINI->ReadBool(section, "Paradrop",     Paradropping);
     Carryall     = pINI->ReadBool(section, "Carryall",     Carryall);
-    AntiAir      = pINI->ReadBool(section, "AntiAir",      AntiAir);
 
     // Sync parent
     TechnoTypeClass::IsCarryall = Carryall;
@@ -432,7 +428,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     // Flight / landing configuration
     // ------------------------------------------------------------------
     FlightLevel  = pINI->ReadInteger(section, "FlightLevel",  FlightLevel);
-    DockOffset   = pINI->ReadInteger(section, "DockOffset",   DockOffset);
     NumberOfDocks= pINI->ReadInteger(section, "NumberOfDocks",NumberOfDocks);
 
     // ------------------------------------------------------------------
@@ -445,8 +440,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     HasTurret     = pINI->ReadBool(section, "Turret",     HasTurret);
     CanCloak      = pINI->ReadBool(section, "Cloakable",  CanCloak);
     HasDeployer   = pINI->ReadBool(section, "Deployer",   HasDeployer);
-    HasUndeployer = pINI->ReadBool(section, "Undeployer", HasUndeployer);
-    HasFirewall   = pINI->ReadBool(section, "Firewall",   HasFirewall);
 
     Turret     = HasTurret;
     Cloak      = CanCloak;
@@ -472,7 +465,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
         std::memset(&Weapons[i], 0, sizeof(WeaponStruct));
     }
 
-    EliteWeaponCount = pINI->ReadInteger(section, "EliteWeaponCount", EliteWeaponCount);
     if (EliteWeaponCount < 0) EliteWeaponCount = 0;
     if (EliteWeaponCount > 2) EliteWeaponCount = 2;
     for (int32 i = 0; i < EliteWeaponCount; ++i)
@@ -481,7 +473,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     }
 
     DeathWeaponIndex = pINI->ReadInteger(section, "DeathWeapon", -1);
-    WeaponCharge     = pINI->ReadInteger(section, "WeaponCharge", 0);
 
     // ------------------------------------------------------------------
     // Threat / score
@@ -506,7 +497,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     }
 
     char hvaBuf[64];
-    pINI->ReadString(section, "HVA", "", hvaBuf, sizeof(hvaBuf));
     if (hvaBuf[0] != '\0')
     {
         int32 j = 0;
@@ -532,15 +522,11 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Special classification flags
     // ------------------------------------------------------------------
-    IsTrain             = pINI->ReadBool(section, "Train",             IsTrain);
     IsSimpleDeployer    = pINI->ReadBool(section, "Deployer",    IsSimpleDeployer);
-    IsFirebase          = pINI->ReadBool(section, "Firebase",          IsFirebase);
     IsSonic             = pINI->ReadBool(section, "Sonic",             IsSonic);
-    IsVan               = pINI->ReadBool(section, "Van",               IsVan);
     IsBalloonHover      = pINI->ReadBool(section, "BalloonHover",      IsBalloonHover);
     IsCyborg            = pINI->ReadBool(section, "Cyborg",            IsCyborg);
     IsConsideredAircraft= pINI->ReadBool(section, "ConsideredAircraft",IsConsideredAircraft);
-    IsConsideredVehicle = pINI->ReadBool(section, "ConsideredVehicle", IsConsideredVehicle);
 
     TechnoTypeClass::IsTrain              = IsTrain;
     TechnoTypeClass::IsSimpleDeployer     = IsSimpleDeployer;
@@ -558,41 +544,26 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCrushable         = pINI->ReadBool(section, "Crushable",         IsCrushable);
     IsCrushable2        = pINI->ReadBool(section, "Crushable",        IsCrushable2);
     IsTeleporter        = pINI->ReadBool(section, "Teleporter",        IsTeleporter);
-    IsChrono            = pINI->ReadBool(section, "Chrono",            IsChrono);
     IsBomb              = pINI->ReadBool(section, "Bomb",              IsBomb);
-    IsArmed             = pINI->ReadBool(section, "Armed",             IsArmed);
     IsMissileSpawn      = pINI->ReadBool(section, "MissileSpawn",      IsMissileSpawn);
-    IsFake              = pINI->ReadBool(section, "Fake",              IsFake);
     IsDisableable       = pINI->ReadBool(section, "Disableable",       IsDisableable);
 
     IsImmuneToPsionics  = pINI->ReadBool(section, "ImmuneToPsionics",  IsImmuneToPsionics);
     IsImmuneToPoison    = pINI->ReadBool(section, "ImmuneToPoison",    IsImmuneToPoison);
     IsImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", IsImmuneToRadiation);
-    IsImmuneToBerserk   = pINI->ReadBool(section, "ImmuneToBerserk",   IsImmuneToBerserk);
-    IsImmuneToEMP       = pINI->ReadBool(section, "ImmuneToEMP",       IsImmuneToEMP);
 
     // ------------------------------------------------------------------
     // CanBeXxx interaction flags
     // ------------------------------------------------------------------
-    IsCanBeSuppressed  = pINI->ReadBool(section, "CanSuppressed",  IsCanBeSuppressed);
     IsCanBeOccupied    = pINI->ReadBool(section, "CanBeOccupied",  IsCanBeOccupied);
-    IsCanBeDriven      = pINI->ReadBool(section, "CanBeDriven",    IsCanBeDriven);
     IsCanBeCaptured    = pINI->ReadBool(section, "Capturable",  IsCanBeCaptured);
     IsCanBeRepaired    = pINI->ReadBool(section, "Repairable",  IsCanBeRepaired);
-    IsCanBeSold        = pINI->ReadBool(section, "CanBeSold",      IsCanBeSold);
     IsCanBePowered     = pINI->ReadBool(section, "Powered",   IsCanBePowered);
-    IsCanBeDestroyed   = pINI->ReadBool(section, "CanBeDestroyed", IsCanBeDestroyed);
-    IsCanBeDamaged     = pINI->ReadBool(section, "CanBeDamaged",   IsCanBeDamaged);
-    IsCanBeInfiltrated = pINI->ReadBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
     IsCanBeSpied       = pINI->ReadBool(section, "Spyable",     IsCanBeSpied);
-    IsCanBeSabotaged   = pINI->ReadBool(section, "CanBeSabotaged", IsCanBeSabotaged);
-    IsCanBeStolen      = pINI->ReadBool(section, "CanBeStolen",    IsCanBeStolen);
-    IsCanBeHijacked    = pINI->ReadBool(section, "CanBeHijacked",  IsCanBeHijacked);
 
     // ------------------------------------------------------------------
     // Misc flags
     // ------------------------------------------------------------------
-    IsTilter          = pINI->ReadBool(section, "Tilter",          IsTilter);
     IsToProtect       = pINI->ReadBool(section, "ToProtect",       IsToProtect);
     IsNominal         = pINI->ReadBool(section, "Nominal",         IsNominal);
     IsRadarInvisible  = pINI->ReadBool(section, "RadarInvisible",  IsRadarInvisible);
@@ -601,7 +572,6 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     IsSensorsSight    = pINI->ReadBool(section, "SensorsSight",    IsSensorsSight);
     IsHunterSeeker    = pINI->ReadBool(section, "HunterSeeker",    IsHunterSeeker);
     IsIvan            = pINI->ReadBool(section, "Ivan",            IsIvan);
-    IsLeader          = pINI->ReadBool(section, "Leader",          IsLeader);
 
     // ------------------------------------------------------------------
     // Factory type
@@ -614,7 +584,32 @@ bool AircraftTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (!_strcmpi(factoryBuf, "Aircraft")) Factory = AbstractType::Aircraft;
     else                                     Factory = AbstractType::Aircraft;
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Landable = pINI->ReadBool(section, "Landable", Landable);
+    AirportBound = pINI->ReadBool(section, "AirportBound", AirportBound);
+    Fighter = pINI->ReadBool(section, "Fighter", Fighter);
+    Carryall = pINI->ReadBool(section, "Carryall", Carryall);
+    FlyBy = pINI->ReadBool(section, "FlyBy", FlyBy);
+    FlyBack = pINI->ReadBool(section, "FlyBack", FlyBack);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    Rotors = pArt->ReadBool(section, "Rotors", Rotors);
+    CustomRotor = pArt->ReadBool(section, "CustomRotor", CustomRotor);
+    { char _buf[0x40]; if (pArt->ReadString(section, "Trailer", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Trailer = _p; } }
+    SpawnDelay = pArt->ReadInteger(section, "SpawnDelay", SpawnDelay);
+
+        return true;
 }
 
 // ============================================================================
@@ -761,4 +756,24 @@ int32 AircraftTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// AircraftTypeClass - static lookup helpers
+// ============================================================================
+
+AircraftTypeClass* AircraftTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    AircraftTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    AircraftTypeClass* newItem = GameCreate<AircraftTypeClass>();
+    if (newItem)
+    {
+        strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
+        newItem->ID[sizeof(newItem->ID) - 1] = '\0';
+    }
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

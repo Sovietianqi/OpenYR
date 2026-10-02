@@ -10,6 +10,8 @@
 #include <Math/Timer.h>
 #include <Rendering/GScreenClass.h>
 #include <Rendering/Surface.h>
+#include <Audio/VocClass.h>
+#include <INI/INIClass.h>
 #include <Game/Externs.h>
 
 #include <cstdlib>
@@ -238,6 +240,16 @@ void Init_Game_Load()
         // CCINIClass rulesINI("rulesmd.ini");
         // RulesClass::Instance->Read_File(&rulesINI);
         // Similarly for artmd.ini, soundmd.ini, aimd.ini
+    }
+
+    // The sound list is built before the rules are read, because every sound
+    // reference in rules(md).ini, art(md).ini and the unit data files is
+    // resolved through the index built here.
+    if (g_SoundINIFile && g_SoundINIFile[0]) {
+        CCINIClass* pSoundINI = CCINIClass::LoadINIFile(g_SoundINIFile);
+        if (pSoundINI != nullptr) {
+            VocClass::CreateFromINIList(pSoundINI);
+        }
     }
 }
 

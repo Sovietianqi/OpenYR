@@ -3,6 +3,9 @@
 #include <Core/Definitions.h>
 #include <Core/Macros.h>
 #include <Core/Memory.h>
+#include <Abstract/InfantryTypeClass.h>
+#include <Abstract/UnitTypeClass.h>
+#include <Abstract/AircraftTypeClass.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -120,6 +123,37 @@ int32 HouseTypeClass::Init_Defaults()
 }
 
 // ============================================================================
+namespace {
+
+// The veteran lists are stored as a comma separated run of type IDs in the
+// INI.  The original reads them into a TypeList which is rebuilt from
+// scratch every time the key is present.
+template <typename T>
+void ReadVeteranList(CCINIClass* pINI, const char* pSection,
+                     const char* pKey, DynamicVectorClass<T*>& rList)
+{
+    char buffer[0x80];
+    buffer[0] = '\0';
+    if (pINI->ReadString(pSection, pKey, "", buffer, sizeof(buffer)) <= 0)
+        return;
+
+    rList.Clear();
+
+    char* pToken = std::strtok(buffer, ",");
+    while (pToken != nullptr)
+    {
+        if (pToken[0] != '\0')
+        {
+            T* pType = T::FindOrAllocate(pToken);
+            if (pType != nullptr)
+                rList.Add(pType);
+        }
+        pToken = std::strtok(nullptr, ",");
+    }
+}
+
+} // namespace
+
 // LoadFromINI - read every HouseTypeClass property from a CCINIClass.
 //
 //  The original binary reads each property with a defensive default that
@@ -208,7 +242,56 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     HouseTypeClass::Parse_Veteran_List(pINI, "VeteranInfantry", VeteranInfantry);
     HouseTypeClass::Parse_Veteran_List(pINI, "VeteranAircraft", VeteranAircraft);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    pINI->ReadString(section, "Suffix", Suffix, Suffix, sizeof(Suffix));
+    pINI->ReadString(section, "ParentCountry", ParentCountry, ParentCountry, sizeof(ParentCountry));
+    Color = pINI->ReadInteger(section, "Color", Color);
+    Groundspeed = pINI->ReadFixed(section, "Groundspeed", Groundspeed);
+    Airspeed = pINI->ReadFixed(section, "Airspeed", Airspeed);
+    ArmorType = pINI->ReadFixed(section, "Armor", ArmorType);
+    ROF = pINI->ReadFixed(section, "ROF", ROF);
+    Cost = pINI->ReadFixed(section, "Cost", Cost);
+    BuildTime = pINI->ReadFixed(section, "BuildTime", BuildTime);
+    Multiplay = pINI->ReadBool(section, "Multiplay", Multiplay);
+    MultiplayPassive = pINI->ReadBool(section, "MultiplayPassive", MultiplayPassive);
+    WallOwner = pINI->ReadBool(section, "WallOwner", WallOwner);
+    SmartAI = pINI->ReadBool(section, "SmartAI", SmartAI);
+    ArmorInfantryMult = pINI->ReadFixed(section, "ArmorInfantryMult", ArmorInfantryMult);
+    ArmorUnitsMult = pINI->ReadFixed(section, "ArmorUnitsMult", ArmorUnitsMult);
+    ArmorAircraftMult = pINI->ReadFixed(section, "ArmorAircraftMult", ArmorAircraftMult);
+    ArmorBuildingsMult = pINI->ReadFixed(section, "ArmorBuildingsMult", ArmorBuildingsMult);
+    ArmorDefensesMult = pINI->ReadFixed(section, "ArmorDefensesMult", ArmorDefensesMult);
+    CostInfantryMult = pINI->ReadFixed(section, "CostInfantryMult", CostInfantryMult);
+    CostUnitsMult = pINI->ReadFixed(section, "CostUnitsMult", CostUnitsMult);
+    CostAircraftMult = pINI->ReadFixed(section, "CostAircraftMult", CostAircraftMult);
+    CostBuildingsMult = pINI->ReadFixed(section, "CostBuildingsMult", CostBuildingsMult);
+    CostDefensesMult = pINI->ReadFixed(section, "CostDefensesMult", CostDefensesMult);
+    SpeedInfantryMult = pINI->ReadFixed(section, "SpeedInfantryMult", SpeedInfantryMult);
+    SpeedUnitsMult = pINI->ReadFixed(section, "SpeedUnitsMult", SpeedUnitsMult);
+    SpeedAircraftMult = pINI->ReadFixed(section, "SpeedAircraftMult", SpeedAircraftMult);
+    BuildTimeInfantryMult = pINI->ReadFixed(section, "BuildTimeInfantryMult", BuildTimeInfantryMult);
+    BuildTimeUnitsMult = pINI->ReadFixed(section, "BuildTimeUnitsMult", BuildTimeUnitsMult);
+    BuildTimeAircraftMult = pINI->ReadFixed(section, "BuildTimeAircraftMult", BuildTimeAircraftMult);
+    BuildTimeBuildingsMult = pINI->ReadFixed(section, "BuildTimeBuildingsMult", BuildTimeBuildingsMult);
+    BuildTimeDefensesMult = pINI->ReadFixed(section, "BuildTimeDefensesMult", BuildTimeDefensesMult);
+    IncomeMult = pINI->ReadFixed(section, "IncomeMult", IncomeMult);
+    Side = pINI->ReadInteger(section, "Side", Side);
+
+    // ── Veteran starting units ──────────────────────────────────────────
+    ReadVeteranList(pINI, section, "VeteranInfantry", VeteranInfantry);
+    ReadVeteranList(pINI, section, "VeteranUnits",    VeteranUnits);
+    ReadVeteranList(pINI, section, "VeteranAircraft", VeteranAircraft);
+
+        return true;
 }
 
 // ============================================================================

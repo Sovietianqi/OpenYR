@@ -30,6 +30,18 @@ WarheadTypeClass* WarheadTypeClass::FindOrAllocate(const char* pID) {
     return newItem;
 }
 
+// WarheadTypeClass::NotifyAll - the tail of RulesClass_Addition_SpecialWeapons.
+// Every registered warhead type is given the rules pointer through its
+// vtable +0x64 entry; the hook is a no-op on a type that has no data to
+// refresh.
+void WarheadTypeClass::NotifyAll() {
+    if (!Array) return;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        WarheadTypeClass* item = Array->GetItem(i);
+        if (item) item->OnRulesRefreshed();
+    }
+}
+
 WarheadTypeClass::WarheadTypeClass(const char* pID) noexcept
     : AbstractTypeClass(pID), ArrayIndex(-1), IsWallDestroyer(false),
       IsWoodDestroyer(false), IsWallAbsoluteDestroyer(false),
@@ -371,7 +383,6 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
     snprintf(sectionName, sizeof(sectionName), "%s", this->ID);
     if (!pINI->SectionExists(sectionName)) return false;
 
-    pINI->GetInteger(sectionName, "ArrayIndex", ArrayIndex);
 
     IsWallDestroyer = pINI->ReadInteger(sectionName, "Wall", 0) > 0;
     IsWoodDestroyer = pINI->ReadInteger(sectionName, "Wood", 0) > 0;
@@ -385,13 +396,11 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
     IsSonic = pINI->ReadBool(sectionName, "IsSonic", IsSonic);
     IsRadiation = pINI->ReadInteger(sectionName, "Radiation", 0) > 0;
     IsPsychic = pINI->ReadInteger(sectionName, "PsychicDamage", 0) > 0;
-    IsMechanical = pINI->ReadBool(sectionName, "IsMechanical", IsMechanical);
     Bullets = pINI->ReadBool(sectionName, "Bullets", Bullets);
     Temporal = pINI->ReadBool(sectionName, "Temporal", Temporal);
     Parasite = pINI->ReadBool(sectionName, "Parasite", Parasite);
     Bright = pINI->ReadBool(sectionName, "Bright", Bright);
     PenetratesBunker = pINI->ReadBool(sectionName, "PenetratesBunker", PenetratesBunker);
-    IsAttachedParticle = pINI->ReadBool(sectionName, "IsAttachedParticle", IsAttachedParticle);
 
     ProneDamage = static_cast<float>(pINI->ReadDouble(sectionName, "ProneDamage", 1.0));
     CellSpread = static_cast<float>(pINI->ReadDouble(sectionName, "CellSpread", 0.0));
@@ -399,13 +408,23 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
 
     pINI->GetInteger(sectionName, "InfDeath", InfDeath);
 
-    static const char* armorNames[] = {"none", "flak", "plate", "light", "medium", "heavy", "wood", "steel", "concrete", "special_1", "special_2"};
-    for (int32 i = 0; i < 11; ++i) {
-        char keyName[32];
-        snprintf(keyName, sizeof(keyName), "Versus.%s", armorNames[i]);
-        double val = pINI->ReadDouble(sectionName, keyName, 1.0);
-        Verses[i] = static_cast<float>(val);
+    char versesBuf[0x80];
+    pINI->ReadString(sectionName, "Verses",
+                     "100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%",
+                     versesBuf, sizeof(versesBuf));
+    {
+        char* pToken = std::strtok(versesBuf, ",");
+        for (int32 i = 0; i < 11 && pToken != nullptr; ++i)
+        {
+            if (std::strchr(pToken, '%') != nullptr)
+                Verses[i] = static_cast<float>(std::atoi(pToken) * 0.01);
+            else
+                Verses[i] = static_cast<float>(std::atof(pToken));
+            pToken = std::strtok(nullptr, ",");
+        }
     }
+    VersesMediumWoodZero = (Verses[static_cast<int32>(Armor::Medium)] == 0.0f
+                         && Verses[static_cast<int32>(Armor::Wood)]   == 0.0f);
 
     char particleName[0x18];
     pINI->ReadString(sectionName, "Particle", "", particleName, sizeof(particleName));
@@ -442,7 +461,94 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
         ParseSplashList(splashList);
     }
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    const char* section = sectionName;
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    CellSpread = pINI->ReadFixed(section, "CellSpread", CellSpread);
+    CellInset = pINI->ReadFixed(section, "CellInset", CellInset);
+    PercentAtMax = pINI->ReadFixed(section, "PercentAtMax", PercentAtMax);
+    CausesDelayKill = pINI->ReadBool(section, "CausesDelayKill", CausesDelayKill);
+    DelayKillFrames = pINI->ReadInteger(section, "DelayKillFrames", DelayKillFrames);
+    DelayKillAtMax = pINI->ReadFixed(section, "DelayKillAtMax", DelayKillAtMax);
+    CombatLightSize = pINI->ReadFixed(section, "CombatLightSize", CombatLightSize);
+    Conventional = pINI->ReadBool(section, "Conventional", Conventional);
+    Wall = pINI->ReadBool(section, "Wall", Wall);
+    WallAbsoluteDestroyer = pINI->ReadBool(section, "WallAbsoluteDestroyer", WallAbsoluteDestroyer);
+    PenetratesBunker = pINI->ReadBool(section, "PenetratesBunker", PenetratesBunker);
+    Wood = pINI->ReadBool(section, "Wood", Wood);
+    Tiberium = pINI->ReadBool(section, "Tiberium", Tiberium);
+    Sparky = pINI->ReadBool(section, "Sparky", Sparky);
+    Sonic = pINI->ReadBool(section, "Sonic", Sonic);
+    Rocker = pINI->ReadBool(section, "Rocker", Rocker);
+    DirectRocker = pINI->ReadBool(section, "DirectRocker", DirectRocker);
+    Fire = pINI->ReadBool(section, "Fire", Fire);
+    Bright = pINI->ReadBool(section, "Bright", Bright);
+    CLDisableRed = pINI->ReadBool(section, "CLDisableRed", CLDisableRed);
+    CLDisableGreen = pINI->ReadBool(section, "CLDisableGreen", CLDisableGreen);
+    CLDisableBlue = pINI->ReadBool(section, "CLDisableBlue", CLDisableBlue);
+    InfDeath = pINI->ReadInteger(section, "InfDeath", InfDeath);
+    Deform = pINI->ReadFixed(section, "Deform", Deform);
+    DeformThreshhold = pINI->ReadInteger(section, "DeformThreshhold", DeformThreshhold);
+    EMEffect = pINI->ReadBool(section, "EMEffect", EMEffect);
+    MindControl = pINI->ReadBool(section, "MindControl", MindControl);
+    Poison = pINI->ReadBool(section, "Poison", Poison);
+    IvanBomb = pINI->ReadBool(section, "IvanBomb", IvanBomb);
+    ElectricAssault = pINI->ReadBool(section, "ElectricAssault", ElectricAssault);
+    Parasite = pINI->ReadBool(section, "Parasite", Parasite);
+    Temporal = pINI->ReadBool(section, "Temporal", Temporal);
+    IsLocomotor = pINI->ReadBool(section, "IsLocomotor", IsLocomotor);
+    pINI->ReadString(section, "Locomotor", Locomotor, Locomotor, sizeof(Locomotor));
+    Airstrike = pINI->ReadBool(section, "Airstrike", Airstrike);
+    Psychedelic = pINI->ReadBool(section, "Psychedelic", Psychedelic);
+    BombDisarm = pINI->ReadBool(section, "BombDisarm", BombDisarm);
+    Paralyzes = pINI->ReadInteger(section, "Paralyzes", Paralyzes);
+    Culling = pINI->ReadBool(section, "Culling", Culling);
+    MakesDisguise = pINI->ReadBool(section, "MakesDisguise", MakesDisguise);
+    NukeMaker = pINI->ReadBool(section, "NukeMaker", NukeMaker);
+    ProneDamage = pINI->ReadFixed(section, "ProneDamage", ProneDamage);
+    Radiation = pINI->ReadBool(section, "Radiation", Radiation);
+    PsychicDamage = pINI->ReadBool(section, "PsychicDamage", PsychicDamage);
+    AffectsAllies = pINI->ReadBool(section, "AffectsAllies", AffectsAllies);
+    Bullets = pINI->ReadBool(section, "Bullets", Bullets);
+    Veinhole = pINI->ReadBool(section, "Veinhole", Veinhole);
+    ShakeXlo = pINI->ReadInteger(section, "ShakeXlo", ShakeXlo);
+    ShakeXhi = pINI->ReadInteger(section, "ShakeXhi", ShakeXhi);
+    ShakeYlo = pINI->ReadInteger(section, "ShakeYlo", ShakeYlo);
+    ShakeYhi = pINI->ReadInteger(section, "ShakeYhi", ShakeYhi);
+    MaxDebris = pINI->ReadInteger(section, "MaxDebris", MaxDebris);
+    MinDebris = pINI->ReadInteger(section, "MinDebris", MinDebris);
+
+    // AnimList is a comma separated run of animation IDs shown when the
+    // warhead detonates; the list is rebuilt whenever the key is present.
+    char animListBuf[0x100];
+    if (pINI->ReadString(section, "AnimList", "", animListBuf,
+                         sizeof(animListBuf)) > 0 && animListBuf[0] != '\0')
+    {
+        AnimListCount = 0;
+        char* pToken = std::strtok(animListBuf, ",");
+        while (pToken != nullptr && AnimListCount < MAX_ANIM_LIST)
+        {
+            if (pToken[0] != '\0')
+            {
+                AnimTypeClass* pAnim = AnimTypeClass::Find(pToken);
+                if (pAnim != nullptr)
+                    AnimList[AnimListCount++] = pAnim;
+            }
+            pToken = std::strtok(nullptr, ",");
+        }
+    }
+
+    pINI->GetVectorIntegers(section, "DebrisMaximums", DebrisMaximums, DebrisMaximumsCount);
+
+        return true;
 }
 
 bool WarheadTypeClass::SaveToINIList(CCINIClass* pINI) {
@@ -465,12 +571,16 @@ bool WarheadTypeClass::SaveToINIList(CCINIClass* pINI) {
     pINI->WriteDouble(sectionName, "CellSpread", CellSpread);
     pINI->WriteDouble(sectionName, "PercentAtMax", PercentAtMax);
 
-    static const char* armorNames[] = {"none", "flak", "plate", "light", "medium", "heavy", "wood", "steel", "concrete", "special_1", "special_2"};
-    for (int32 i = 0; i < 11; ++i) {
-        char keyName[32];
-        snprintf(keyName, sizeof(keyName), "Versus.%s", armorNames[i]);
-        pINI->WriteDouble(sectionName, keyName, Verses[i]);
+    char versesOut[0x80];
+    versesOut[0] = '\0';
+    for (int32 i = 0; i < 11; ++i)
+    {
+        char part[16];
+        std::snprintf(part, sizeof(part), "%s%g%%",
+                      (i == 0) ? "" : ",", static_cast<double>(Verses[i]) * 100.0);
+        std::strncat(versesOut, part, sizeof(versesOut) - std::strlen(versesOut) - 1);
     }
+    pINI->WriteString(sectionName, "Verses", versesOut);
 
     return true;
 }

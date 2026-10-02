@@ -24,6 +24,7 @@ public:
     static DynamicVectorClass<TerrainTypeClass*>* Array;
 
     static TerrainTypeClass* Find(const char* pID);
+    static TerrainTypeClass* FindOrAllocate(const char* pID);
     static TerrainTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -69,4 +70,15 @@ public:
     int32  FrameCount;
     int32  FireAnim;
     char   ArtName[0x20];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    bool         IsVeinhole;
+    bool         WaterBound;
+    Foundation   FoundationValue;
+    uint8        RadarColor[3];
+    int32        AnimationRate;
+    double       AnimationProbability;
+    int32        TemperateOccupationBits;
+    int32        SnowOccupationBits;
 };

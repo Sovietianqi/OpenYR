@@ -1,4 +1,5 @@
 #include "AnimTypeClass.h"
+#include <Audio/VocClass.h>
 #include "AnimClass.h"
 #include "../INI/INIClass.h"
 #include "../Abstract/ObjectClass.h"
@@ -36,6 +37,20 @@ AnimTypeClass* AnimTypeClass::Find(const char* pID) {
 AnimTypeClass* AnimTypeClass::FindByIndex(int32 index) {
     if (!Array || index < 0 || index >= Array->Count) return nullptr;
     return (*Array)[index];
+}
+
+// AnimClass_FindIndex - the ordinal of a named anim type, or -1 when it is
+// not registered.  The lookup is case-insensitive like every other type
+// registry in the engine.
+int32 AnimTypeClass::FindIndex(const char* pID) {
+    if (!Array || !pID) return -1;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        AnimTypeClass* item = (*Array)[i];
+        if (item && !_strcmpi(item->get_ID(), pID)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 int32 AnimTypeClass::GetCount() {
@@ -786,10 +801,6 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     LoopCount = pINI->ReadInteger(section, "LoopCount", 0);
 
     // Random timing
-    RandomLoopDelay.Min = pINI->ReadInteger(section, "RandomLoopDelayMin", 0);
-    RandomLoopDelay.Max = pINI->ReadInteger(section, "RandomLoopDelayMax", 0);
-    RandomRate.Min = pINI->ReadInteger(section, "RandomRateMin", 0);
-    RandomRate.Max = pINI->ReadInteger(section, "RandomRateMax", 0);
 
     // Damage
     Damage = pINI->ReadFloat(section, "Damage", 0.0);
@@ -820,7 +831,6 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
 
     // Infantry spawn
     MakeInfantry = pINI->ReadInteger(section, "MakeInfantry", 0);
-    MakeInfantryOwner = pINI->ReadInteger(section, "MakeInfantryOwner", -1);
 
     // Sound
     Report = pINI->ReadInteger(section, "Report", -1);
@@ -864,7 +874,7 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
 
     // Trailer animation
     char trailerBuf[64];
-    pINI->ReadString(section, "Trailer", "", trailerBuf, sizeof(trailerBuf));
+    pINI->ReadString(section, "TrailerAnim", "", trailerBuf, sizeof(trailerBuf));
     if (trailerBuf[0]) {
         TrailerAnim = AnimTypeClass::Find(trailerBuf);
     }
@@ -874,6 +884,28 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     pINI->ReadString(section, "Spawns", "", spawnsBuf, sizeof(spawnsBuf));
     if (spawnsBuf[0]) {
         Spawns = AnimTypeClass::Find(spawnsBuf);
+    }
+
+    // The overlay left behind when the animation finishes over tiberium.
+    char tiberiumSpawnBuf[64];
+    pINI->ReadString(section, "TiberiumSpawnType", "", tiberiumSpawnBuf,
+                     sizeof(tiberiumSpawnBuf));
+    if (tiberiumSpawnBuf[0]) {
+        TiberiumSpawnType = OverlayTypeClass::Find(tiberiumSpawnBuf);
+    }
+
+    // Randomised timing - both keys are "min,max" pairs.
+    {
+        int32 pair[2] = { RandomLoopDelay.Min, RandomLoopDelay.Max };
+        pINI->Get2Integers(section, "RandomLoopDelay", pair);
+        RandomLoopDelay.Min = pair[0];
+        RandomLoopDelay.Max = pair[1];
+
+        pair[0] = RandomRate.Min;
+        pair[1] = RandomRate.Max;
+        pINI->Get2Integers(section, "RandomRate", pair);
+        RandomRate.Min = pair[0];
+        RandomRate.Max = pair[1];
     }
 
     // Read bool flags
@@ -905,14 +937,7 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     ShouldFogRemove = pINI->ReadBool(section, "ShouldFogRemove", false);
     IsLooping = pINI->ReadBool(section, "Loop", false);
     IsInvisible = pINI->ReadBool(section, "Invisible", false);
-    IsFlameThrower = pINI->ReadBool(section, "IsFlameThrower", false);
-    IsBigGrey = pINI->ReadBool(section, "BigGrey", false);
-    IsParticle = pINI->ReadBool(section, "IsParticle", false);
     IsRailgun = pINI->ReadBool(section, "IsRailgun", false);
-    IsNuke = pINI->ReadBool(section, "IsNuke", false);
-    IsIonCannon = pINI->ReadBool(section, "IsIonCannon", false);
-    DemandLoad = pINI->ReadBool(section, "DemandLoad", false);
-    FreeLoad = pINI->ReadBool(section, "FreeLoad", false);
 
     // Light settings
     LightSize = pINI->ReadInteger(section, "LightSize", 0);
@@ -921,9 +946,76 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     LightRedTint = pINI->ReadFloat(section, "LightRedTint", 0.0);
     LightGreenTint = pINI->ReadFloat(section, "LightGreenTint", 0.0);
     LightBlueTint = pINI->ReadFloat(section, "LightBlueTint", 0.0);
-    LightFlashFrames = pINI->ReadInteger(section, "LightFlashFrames", 0);
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Shadow = pINI->ReadBool(section, "Shadow", Shadow);
+    LayerValue = pINI->GetLayer(section, "Layer", LayerValue);
+    DoubleThick = pINI->ReadBool(section, "DoubleThick", DoubleThick);
+    Flat = pINI->ReadBool(section, "Flat", Flat);
+    Flamer = pINI->ReadBool(section, "Flamer", Flamer);
+    Normalized = pINI->ReadBool(section, "Normalized", Normalized);
+    Translucent = pINI->ReadBool(section, "Translucent", Translucent);
+    Scorch = pINI->ReadBool(section, "Scorch", Scorch);
+    Crater = pINI->ReadBool(section, "Crater", Crater);
+    ForceBigCraters = pINI->ReadBool(section, "ForceBigCraters", ForceBigCraters);
+    Sticky = pINI->ReadBool(section, "Sticky", Sticky);
+    PingPong = pINI->ReadBool(section, "PingPong", PingPong);
+    Reverse = pINI->ReadBool(section, "Reverse", Reverse);
+    PsiWarning = pINI->ReadBool(section, "PsiWarning", PsiWarning);
+    TiberiumChainReaction = pINI->ReadBool(section, "TiberiumChainReaction", TiberiumChainReaction);
+    Rate = pINI->ReadInteger(section, "Rate", Rate);
+    Damage = pINI->ReadFixed(section, "Damage", Damage);
+    Start = pINI->ReadInteger(section, "Start", Start);
+    End = pINI->ReadInteger(section, "End", End);
+    LoopStart = pINI->ReadInteger(section, "LoopStart", LoopStart);
+    LoopEnd = pINI->ReadInteger(section, "LoopEnd", LoopEnd);
+    LoopCount = pINI->ReadInteger(section, "LoopCount", LoopCount);
+    DetailLevel = pINI->ReadInteger(section, "DetailLevel", DetailLevel);
+    TranslucencyDetailLevel = pINI->ReadInteger(section, "TranslucencyDetailLevel", TranslucencyDetailLevel);
+    Translucency = pINI->ReadInteger(section, "Translucency", Translucency);
+    IsTiberium = pINI->ReadBool(section, "IsTiberium", IsTiberium);
+    HideIfNoOre = pINI->ReadBool(section, "HideIfNoOre", HideIfNoOre);
+    YSortAdjust = pINI->ReadInteger(section, "YSortAdjust", YSortAdjust);
+    Elasticity = pINI->ReadFixed(section, "Elasticity", Elasticity);
+    MaxXYVel = pINI->ReadFixed(section, "MaxXYVel", MaxXYVel);
+    MinZVel = pINI->ReadFixed(section, "MinZVel", MinZVel);
+    MakeInfantry = pINI->ReadInteger(section, "MakeInfantry", MakeInfantry);
+    SpawnCount = pINI->ReadInteger(section, "SpawnCount", SpawnCount);
+    IsMeteor = pINI->ReadBool(section, "IsMeteor", IsMeteor);
+    IsVeins = pINI->ReadBool(section, "IsVeins", IsVeins);
+    TiberiumSpreadRadius = pINI->ReadInteger(section, "TiberiumSpreadRadius", TiberiumSpreadRadius);
+    IsAnimatedTiberium = pINI->ReadBool(section, "IsAnimatedTiberium", IsAnimatedTiberium);
+    ShouldFogRemove = pINI->ReadBool(section, "ShouldFogRemove", ShouldFogRemove);
+    IsFlamingGuy = pINI->ReadBool(section, "IsFlamingGuy", IsFlamingGuy);
+    RunningFrames = pINI->ReadInteger(section, "RunningFrames", RunningFrames);
+    YDrawOffset = pINI->ReadInteger(section, "YDrawOffset", YDrawOffset);
+    ZAdjust = pINI->ReadInteger(section, "ZAdjust", ZAdjust);
+    { char _buf[0x40]; if (pINI->ReadString(section, "StartSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) StartSound = _i; } }
+    TrailerSeperation = pINI->ReadInteger(section, "TrailerSeperation", TrailerSeperation);
+    DamageRadius = pINI->ReadInteger(section, "DamageRadius", DamageRadius);
+    Bouncer = pINI->ReadBool(section, "Bouncer", Bouncer);
+    Tiled = pINI->ReadBool(section, "Tiled", Tiled);
+    ShouldUseCellDrawer = pINI->ReadBool(section, "ShouldUseCellDrawer", ShouldUseCellDrawer);
+    UseNormalLight = pINI->ReadBool(section, "UseNormalLight", UseNormalLight);
+    NumParticles = pINI->ReadInteger(section, "NumParticles", NumParticles);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    Theater = pArt->ReadBool(section, "Theater", Theater);
+    NewTheater = pArt->ReadBool(section, "NewTheater", NewTheater);
+    AltPalette = pArt->ReadBool(section, "AltPalette", AltPalette);
+
+        return true;
 }
 
 ObjectClass* AnimTypeClass::CreateAnim() {
@@ -1174,4 +1266,18 @@ void AnimTypeClass::RegisterAll() {
 
         Array->Add(at);
     }
+}
+
+// ============================================================================
+// AnimTypeClass - static lookup helpers
+// ============================================================================
+
+AnimTypeClass* AnimTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    AnimTypeClass* found = Find(pID);
+    if (found) return found;
+    AnimTypeClass* newItem = GameCreate<AnimTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

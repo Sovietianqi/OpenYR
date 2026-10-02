@@ -207,8 +207,8 @@ const char* const SuperTypeNames[] = {
 const char* const SuperActionNames[] = {
     "None", "Move", "NoMove", "Enter", "Self", "Attack", "Harvest", "Select",
     "ToggleSelect", "Capture", "Eaten", "Repair", "Sell", "SellUnit", "NoSell",
-    "NoRepair", "Sabotage", "ToTe", "DoNotUse2", "DoNotUse3", "Nuke",
-    "DoNotUse4", "DoNotUse5", "DoNotUse6", "DoNotUse7", "DoNotUse8",
+    "NoRepair", "Sabotage", "Tote", "DontUse2", "DontUse3", "Nuke",
+    "DontUse4", "DontUse5", "DontUse6", "DontUse7", "DontUse8",
     "GuardArea", "Heal", "Damage", "GRepair", "NoDeploy", "NoEnter",
     "NoGRepair", "TogglePower", "NoTogglePower", "EnterTunnel", "NoEnterTunnel",
     "IronCurtain", "LightningStorm", "ChronoSphere", "ChronoWarp", "ParaDrop",
@@ -343,7 +343,31 @@ bool SuperWeaponTypeClass::LoadFromINI(CCINIClass* pINI) {
         SidebarImageName[0] = '\0';
     }
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Action = pINI->ReadInteger(section, "Action", Action);
+    IsPowered = pINI->ReadBool(section, "IsPowered", IsPowered);
+    DisableableFromShell = pINI->ReadBool(section, "DisableableFromShell", DisableableFromShell);
+    FlashSidebarTabFrames = pINI->ReadInteger(section, "FlashSidebarTabFrames", FlashSidebarTabFrames);
+    AIDefendAgainst = pINI->ReadBool(section, "AIDefendAgainst", AIDefendAgainst);
+    PreClick = pINI->ReadBool(section, "PreClick", PreClick);
+    PostClick = pINI->ReadBool(section, "PostClick", PostClick);
+    ShowTimer = pINI->ReadBool(section, "ShowTimer", ShowTimer);
+    Range = pINI->ReadFixed(section, "Range", Range);
+    LineMultiplier = pINI->ReadInteger(section, "LineMultiplier", LineMultiplier);
+    UseChargeDrain = pINI->ReadBool(section, "UseChargeDrain", UseChargeDrain);
+    ManualControl = pINI->ReadBool(section, "ManualControl", ManualControl);
+    RechargeTime = pINI->ReadFixed(section, "RechargeTime", RechargeTime);
+
+        return true;
 }
 
 // ============================================================================
@@ -406,3 +430,16 @@ int32 SuperWeaponTypeClass::GetCost() const {
     return Cost;
 }
 
+// ============================================================================
+// SuperWeaponTypeClass - static lookup helpers
+// ============================================================================
+
+SuperWeaponTypeClass* SuperWeaponTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    SuperWeaponTypeClass* found = Find(pID);
+    if (found) return found;
+    SuperWeaponTypeClass* newItem = GameCreate<SuperWeaponTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
+}

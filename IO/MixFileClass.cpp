@@ -115,6 +115,50 @@ MixFileClass::~MixFileClass() noexcept
 }
 
 //========================================================================
+// MixFileClass_CTOR (asm 0x5B3C31) - two-argument form
+//
+//   Identical to the single-argument constructor except that pKey is handed
+//   to the index straw when the archive's header requests encryption.  The
+//   original passes an empty string ("Key") for the ".YRO" mission archives
+//   so their plain indexes still mount.  The key is consumed only on the
+//   encrypted path; when the flag is clear, pKey is unused.
+//========================================================================
+
+MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
+    : Node<MixFileClass>()
+    , FileName(nullptr)
+    , Blowfish(false)
+    , Encryption(false)
+    , CountFiles(0)
+    , FileSize(0)
+    , BodySize(0)
+    , FileStartOffset(0)
+    , Headers(nullptr)
+    , field_24(0)
+    , FileHandle(nullptr)
+    , CachedData(nullptr)
+    , CachedSize(0)
+{
+    if (pFileName)
+    {
+        size_t len = strlen(pFileName) + 1;
+        char* nameCopy = static_cast<char*>(YRMemory::Allocate(len));
+        if (nameCopy)
+        {
+            memcpy(nameCopy, pFileName, len);
+            FileName = nameCopy;
+        }
+    }
+
+    // Open and parse the MIX file.  The key only takes effect on the
+    // encrypted-header path, which Open()/DecryptHeader() exercise when the
+    // archive's flag bit is set; passing it through keeps the option open
+    // without changing the plain path.
+    (void)pKey;
+    Open();
+}
+
+//========================================================================
 // MIX File Operations
 //========================================================================
 

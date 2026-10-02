@@ -12,6 +12,7 @@ public:
 
     // Static lookup / array management
     static UnitTypeClass* Find(const char* pID);
+    static UnitTypeClass* FindOrAllocate(const char* pID);
     static UnitTypeClass* FindByIndex(int32 index);
     static int32 GetCount();
     static void Init_Array();
@@ -129,4 +130,68 @@ public:
     char        VoxelName[0x20];
     char        HVAName[0x20];
     BYTE        padding_UnitType[4];
+    // ------------------------------------------------------------------
+    // Rules / Art INI fields
+    // ------------------------------------------------------------------
+    bool         CrateGoodie;
+    bool         DeployToFire;
+    SpeedType    SpeedTypeValue;
+    bool         CarriesCrate;
+    bool         TooBigToFitUnderBridge;
+    int32        HalfDamageSmokeLocation[3];
+    bool         UseTurretShadow;
+    int32        WalkFrames;
+    int32        FiringFrames;
+    bool         Passive;
+    LandType     MovementRestrictedTo;
+    bool         CanBeach;
+    bool         SmallVisceroid;
+    bool         LargeVisceroid;
+    bool         NonVehicle;
+    int32        StandingFrames;
+    int32        DeathFrames;
+    int32        DeathFrameRate;
+    int32        Facings;
+    int32        StartStandFrame;
+    int32        StartWalkFrame;
+    int32        StartFiringFrame;
+    int32        StartDeathFrame;
+    int32        MaxDeathCounter;
+    UnitTypeClass* AltImage;
+    int32        NormalTurretIndex;
+    int32        NormalTurretWeapon;
+    int32        RepairTurretIndex;
+    int32        RepairTurretWeapon;
+    int32        MachineGunTurretIndex;
+    int32        MachineGunTurretWeapon;
+    int32        FlakTurretIndex;
+    int32        FlakTurretWeapon;
+    int32        PistolTurretIndex;
+    int32        PistolTurretWeapon;
+    int32        SniperTurretIndex;
+    int32        SniperTurretWeapon;
+    int32        ShockTurretIndex;
+    int32        ShockTurretWeapon;
+    int32        ExplodeTurretIndex;
+    int32        ExplodeTurretWeapon;
+    int32        BrainBlastTurretIndex;
+    int32        BrainBlastTurretWeapon;
+    int32        RadCannonTurretIndex;
+    int32        RadCannonTurretWeapon;
+    int32        ChronoTurretIndex;
+    int32        ChronoTurretWeapon;
+    int32        TerroristExplodeTurretIndex;
+    int32        TerroristExplodeTurretWeapon;
+    int32        CowTurretIndex;
+    int32        CowTurretWeapon;
+    int32        InitiateTurretIndex;
+    int32        InitiateTurretWeapon;
+    int32        VirusTurretIndex;
+    int32        VirusTurretWeapon;
+    int32        YuriPrimeTurretIndex;
+    int32        YuriPrimeTurretWeapon;
+    int32        GuardianTurretIndex;
+    int32        GuardianTurretWeapon;
+    int32        FiringSyncFrame[10];
+    int32        BurstDelay[10];
 };

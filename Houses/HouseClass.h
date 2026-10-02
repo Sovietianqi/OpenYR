@@ -145,6 +145,11 @@ public:
     void Init();
     void Update();
 
+    // INI
+    bool InitFromINI(class CCINIClass* pINI);
+    static bool LoadFromINIList(class CCINIClass* pINI);
+    static int32 FindIndexByName(const char* pName);
+
     // Alliance
     void MakeAlly(HouseClass* pHouse);
     void MakeEnemy(HouseClass* pHouse);
@@ -210,6 +215,10 @@ public:
     // Members
     // ========================================================================
     HouseTypeClass*     Type;
+    char                InitialName[21];
+    uint8               pad_InitialName[3];
+    wchar_t             CSFName[21];
+    uint8               pad_CSFName[6];
     int32               TimesDefeated;
     int32               TimesWon;
     int32               Credits;
@@ -251,6 +260,11 @@ public:
     uint32              ActiveSuperWeapons;
     uint32              AvailableSuperWeapons;
     uint32              UsedSuperWeapons;
+    char                UIName[0x40];
+    int32               RatioAITriggerTeam;
+    int32               RatioTeamAircraft;
+    int32               RatioTeamInfantry;
+    int32               RatioTeamUnits;
     int32               TechLevel;
     int32               DifficultyLevel;
     int32               IQLevel;

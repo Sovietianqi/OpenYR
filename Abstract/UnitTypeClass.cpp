@@ -413,11 +413,35 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     Harvester        = pINI->ReadBool(section, "Harvester",        Harvester);
     Weeder           = pINI->ReadBool(section, "Weeder",           Weeder);
     ResourceGatherer = pINI->ReadBool(section, "ResourceGatherer", ResourceGatherer);
-    Undeployable     = pINI->ReadBool(section, "Undeployable",     Undeployable);
     Bombable         = pINI->ReadBool(section, "Bombable",         Bombable);
-    AutoFire         = pINI->ReadBool(section, "AutoFire",         AutoFire);
     GuardRange       = pINI->ReadBool(section, "GuardRange",       GuardRange);
     Aggressive       = pINI->ReadBool(section, "Aggressive",       Aggressive);
+
+    // ------------------------------------------------------------------
+    // Movement restriction
+    // ------------------------------------------------------------------
+    MovementRestrictedTo = pINI->GetLandType(section, "MovementRestrictedTo",
+                                             MovementRestrictedTo);
+
+    // ------------------------------------------------------------------
+    // Art driven firing sequence - FiringSyncFrame0..1 and BurstDelay0..3
+    // live in artmd.ini, not in rulesmd.ini.
+    // ------------------------------------------------------------------
+    {
+        CCINIClass* pArt = &CCINIClass::INI_Art;
+        for (int32 i = 0; i < 2; ++i)
+        {
+            char key[32];
+            std::sprintf(key, "FiringSyncFrame%d", i);
+            FiringSyncFrame[i] = pArt->ReadInteger(section, key, FiringSyncFrame[i]);
+        }
+        for (int32 i = 0; i < 4; ++i)
+        {
+            char key[32];
+            std::sprintf(key, "BurstDelay%d", i);
+            BurstDelay[i] = pArt->ReadInteger(section, key, BurstDelay[i]);
+        }
+    }
 
     // Sync with parent fields - use TechnoTypeClass:: qualifier to
     // disambiguate from the virtual accessor methods.
@@ -440,8 +464,6 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     HasTurret     = pINI->ReadBool(section, "Turret",     HasTurret);
     CanCloak      = pINI->ReadBool(section, "Cloakable",  CanCloak);
     HasDeployer   = pINI->ReadBool(section, "Deployer",   HasDeployer);
-    HasUndeployer = pINI->ReadBool(section, "Undeployer", HasUndeployer);
-    HasFirewall   = pINI->ReadBool(section, "Firewall",   HasFirewall);
 
     Turret        = HasTurret;
     Cloak         = CanCloak;
@@ -467,7 +489,6 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
         std::memset(&Weapons[i], 0, sizeof(WeaponStruct));
     }
 
-    EliteWeaponCount = pINI->ReadInteger(section, "EliteWeaponCount", EliteWeaponCount);
     if (EliteWeaponCount < 0) EliteWeaponCount = 0;
     if (EliteWeaponCount > 2) EliteWeaponCount = 2;
     for (int32 i = 0; i < EliteWeaponCount; ++i)
@@ -476,7 +497,6 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     }
 
     DeathWeaponIndex = pINI->ReadInteger(section, "DeathWeapon", -1);
-    WeaponCharge     = pINI->ReadInteger(section, "WeaponCharge", 0);
 
     // ------------------------------------------------------------------
     // Threat / score
@@ -500,17 +520,21 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
         VoxelName[j] = '\0';
     }
 
-    char hvaBuf[64];
-    pINI->ReadString(section, "HVA", "", hvaBuf, sizeof(hvaBuf));
-    if (hvaBuf[0] != '\0')
+    // The HVA model is not named in the INI - it is derived from the VXL
+    // name by swapping the extension, exactly like the art loader does.
     {
         int32 j = 0;
-        while (hvaBuf[j] != '\0' && j < static_cast<int32>(sizeof(HVAName) - 1))
+        while (VoxelName[j] != '\0' && VoxelName[j] != '.'
+               && j < static_cast<int32>(sizeof(HVAName) - 4))
         {
-            HVAName[j] = hvaBuf[j];
+            HVAName[j] = VoxelName[j];
             ++j;
         }
-        HVAName[j] = '\0';
+        HVAName[j++] = '.';
+        HVAName[j++] = 'h';
+        HVAName[j++] = 'v';
+        HVAName[j++] = 'a';
+        HVAName[j]   = '\0';
     }
 
     // ------------------------------------------------------------------
@@ -525,15 +549,11 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     // Special unit classification flags
     // ------------------------------------------------------------------
     IsCarryall          = pINI->ReadBool(section, "Carryall",          IsCarryall);
-    IsTrain             = pINI->ReadBool(section, "Train",             IsTrain);
     IsSimpleDeployer    = pINI->ReadBool(section, "Deployer",    IsSimpleDeployer);
-    IsFirebase          = pINI->ReadBool(section, "Firebase",          IsFirebase);
     IsSonic             = pINI->ReadBool(section, "Sonic",             IsSonic);
-    IsVan               = pINI->ReadBool(section, "Van",               IsVan);
     IsBalloonHover      = pINI->ReadBool(section, "BalloonHover",      IsBalloonHover);
     IsCyborg            = pINI->ReadBool(section, "Cyborg",            IsCyborg);
     IsConsideredAircraft= pINI->ReadBool(section, "ConsideredAircraft",IsConsideredAircraft);
-    IsConsideredVehicle = pINI->ReadBool(section, "ConsideredVehicle", IsConsideredVehicle);
 
     // Sync parent mirror fields using TechnoTypeClass:: qualifier.
     TechnoTypeClass::IsCarryall           = IsCarryall;
@@ -553,44 +573,26 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     IsCrushable         = pINI->ReadBool(section, "Crushable",         IsCrushable);
     IsCrushable2        = pINI->ReadBool(section, "Crushable",        IsCrushable2);
     IsTeleporter        = pINI->ReadBool(section, "Teleporter",        IsTeleporter);
-    IsChrono            = pINI->ReadBool(section, "Chrono",            IsChrono);
     IsBomb              = pINI->ReadBool(section, "Bomb",              IsBomb);
-    IsCow               = pINI->ReadBool(section, "Cow",               IsCow);
-    IsDog               = pINI->ReadBool(section, "Dog",               IsDog);
-    IsBoris             = pINI->ReadBool(section, "Boris",             IsBoris);
-    IsArmed             = pINI->ReadBool(section, "Armed",             IsArmed);
     IsMissileSpawn      = pINI->ReadBool(section, "MissileSpawn",      IsMissileSpawn);
-    IsFake              = pINI->ReadBool(section, "Fake",              IsFake);
     IsDisableable       = pINI->ReadBool(section, "Disableable",       IsDisableable);
 
     IsImmuneToPsionics  = pINI->ReadBool(section, "ImmuneToPsionics",  IsImmuneToPsionics);
     IsImmuneToPoison    = pINI->ReadBool(section, "ImmuneToPoison",    IsImmuneToPoison);
     IsImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", IsImmuneToRadiation);
-    IsImmuneToBerserk   = pINI->ReadBool(section, "ImmuneToBerserk",   IsImmuneToBerserk);
-    IsImmuneToEMP       = pINI->ReadBool(section, "ImmuneToEMP",       IsImmuneToEMP);
 
     // ------------------------------------------------------------------
     // CanBeXxx interaction flags
     // ------------------------------------------------------------------
-    IsCanBeSuppressed  = pINI->ReadBool(section, "CanSuppressed",  IsCanBeSuppressed);
     IsCanBeOccupied    = pINI->ReadBool(section, "CanBeOccupied",  IsCanBeOccupied);
-    IsCanBeDriven      = pINI->ReadBool(section, "CanBeDriven",    IsCanBeDriven);
     IsCanBeCaptured    = pINI->ReadBool(section, "Capturable",  IsCanBeCaptured);
     IsCanBeRepaired    = pINI->ReadBool(section, "Repairable",  IsCanBeRepaired);
-    IsCanBeSold        = pINI->ReadBool(section, "CanBeSold",      IsCanBeSold);
     IsCanBePowered     = pINI->ReadBool(section, "Powered",   IsCanBePowered);
-    IsCanBeDestroyed   = pINI->ReadBool(section, "CanBeDestroyed", IsCanBeDestroyed);
-    IsCanBeDamaged     = pINI->ReadBool(section, "CanBeDamaged",   IsCanBeDamaged);
-    IsCanBeInfiltrated = pINI->ReadBool(section, "CanBeInfiltrated", IsCanBeInfiltrated);
     IsCanBeSpied       = pINI->ReadBool(section, "Spyable",     IsCanBeSpied);
-    IsCanBeSabotaged   = pINI->ReadBool(section, "CanBeSabotaged", IsCanBeSabotaged);
-    IsCanBeStolen      = pINI->ReadBool(section, "CanBeStolen",    IsCanBeStolen);
-    IsCanBeHijacked    = pINI->ReadBool(section, "CanBeHijacked",  IsCanBeHijacked);
 
     // ------------------------------------------------------------------
     // Misc flags
     // ------------------------------------------------------------------
-    IsTilter          = pINI->ReadBool(section, "Tilter",          IsTilter);
     IsToProtect       = pINI->ReadBool(section, "ToProtect",       IsToProtect);
     IsNominal         = pINI->ReadBool(section, "Nominal",         IsNominal);
     IsRadarInvisible  = pINI->ReadBool(section, "RadarInvisible",  IsRadarInvisible);
@@ -599,16 +601,12 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     IsSensorsSight    = pINI->ReadBool(section, "SensorsSight",    IsSensorsSight);
     IsHunterSeeker    = pINI->ReadBool(section, "HunterSeeker",    IsHunterSeeker);
     IsIvan            = pINI->ReadBool(section, "Ivan",            IsIvan);
-    IsLeader          = pINI->ReadBool(section, "Leader",          IsLeader);
 
     IsNaval            = pINI->ReadBool(section, "Naval",            IsNaval);
     IsLand             = pINI->ReadBool(section, "Land",             IsLand);
     IsAir              = pINI->ReadBool(section, "Air",              IsAir);
     IsOrganic          = pINI->ReadBool(section, "Organic",          IsOrganic);
     IsNeutral          = pINI->ReadBool(section, "Neutral",          IsNeutral);
-    IsInfiltratable    = pINI->ReadBool(section, "Infiltratable",    IsInfiltratable);
-    IsStealthy         = pINI->ReadBool(section, "Stealthy",         IsStealthy);
-    IsHealable         = pINI->ReadBool(section, "Healable",         IsHealable);
 
     // ------------------------------------------------------------------
     // Factory type (what producer builds this unit)
@@ -621,7 +619,101 @@ bool UnitTypeClass::LoadFromINI(CCINIClass* pINI)
     else if (!_strcmpi(factoryBuf, "Aircraft")) Factory = AbstractType::Aircraft;
     else                                     Factory = AbstractType::Unit;
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    CrateGoodie = pINI->ReadBool(section, "CrateGoodie", CrateGoodie);
+    DeployToFire = pINI->ReadBool(section, "DeployToFire", DeployToFire);
+    IsSimpleDeployer = pINI->ReadBool(section, "IsSimpleDeployer", IsSimpleDeployer);
+    Harvester = pINI->ReadBool(section, "Harvester", Harvester);
+    Weeder = pINI->ReadBool(section, "Weeder", Weeder);
+    SpeedTypeValue = pINI->GetSpeedType(section, "SpeedType", SpeedTypeValue);
+    IsTilter = pINI->ReadBool(section, "IsTilter", IsTilter);
+    CarriesCrate = pINI->ReadBool(section, "CarriesCrate", CarriesCrate);
+    TooBigToFitUnderBridge = pINI->ReadBool(section, "TooBigToFitUnderBridge", TooBigToFitUnderBridge);
+    pINI->Get3Integers(section, "HalfDamageSmokeLocation", HalfDamageSmokeLocation);
+    Passive = pINI->ReadBool(section, "Passive", Passive);
+    MovementRestrictedTo = pINI->GetLandType(section, "MovementRestrictedTo", MovementRestrictedTo);
+    CanBeach = pINI->ReadBool(section, "CanBeach", CanBeach);
+    SmallVisceroid = pINI->ReadBool(section, "SmallVisceroid", SmallVisceroid);
+    LargeVisceroid = pINI->ReadBool(section, "LargeVisceroid", LargeVisceroid);
+    NonVehicle = pINI->ReadBool(section, "NonVehicle", NonVehicle);
+    { char _buf[0x40]; if (pINI->ReadString(section, "AltImage", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) AltImage = _p; } }
+    NormalTurretIndex = pINI->ReadInteger(section, "NormalTurretIndex", NormalTurretIndex);
+    NormalTurretWeapon = pINI->ReadInteger(section, "NormalTurretWeapon", NormalTurretWeapon);
+    RepairTurretIndex = pINI->ReadInteger(section, "RepairTurretIndex", RepairTurretIndex);
+    RepairTurretWeapon = pINI->ReadInteger(section, "RepairTurretWeapon", RepairTurretWeapon);
+    MachineGunTurretIndex = pINI->ReadInteger(section, "MachineGunTurretIndex", MachineGunTurretIndex);
+    MachineGunTurretWeapon = pINI->ReadInteger(section, "MachineGunTurretWeapon", MachineGunTurretWeapon);
+    FlakTurretIndex = pINI->ReadInteger(section, "FlakTurretIndex", FlakTurretIndex);
+    FlakTurretWeapon = pINI->ReadInteger(section, "FlakTurretWeapon", FlakTurretWeapon);
+    PistolTurretIndex = pINI->ReadInteger(section, "PistolTurretIndex", PistolTurretIndex);
+    PistolTurretWeapon = pINI->ReadInteger(section, "PistolTurretWeapon", PistolTurretWeapon);
+    SniperTurretIndex = pINI->ReadInteger(section, "SniperTurretIndex", SniperTurretIndex);
+    SniperTurretWeapon = pINI->ReadInteger(section, "SniperTurretWeapon", SniperTurretWeapon);
+    ShockTurretIndex = pINI->ReadInteger(section, "ShockTurretIndex", ShockTurretIndex);
+    ShockTurretWeapon = pINI->ReadInteger(section, "ShockTurretWeapon", ShockTurretWeapon);
+    ExplodeTurretIndex = pINI->ReadInteger(section, "ExplodeTurretIndex", ExplodeTurretIndex);
+    ExplodeTurretWeapon = pINI->ReadInteger(section, "ExplodeTurretWeapon", ExplodeTurretWeapon);
+    BrainBlastTurretIndex = pINI->ReadInteger(section, "BrainBlastTurretIndex", BrainBlastTurretIndex);
+    BrainBlastTurretWeapon = pINI->ReadInteger(section, "BrainBlastTurretWeapon", BrainBlastTurretWeapon);
+    RadCannonTurretIndex = pINI->ReadInteger(section, "RadCannonTurretIndex", RadCannonTurretIndex);
+    RadCannonTurretWeapon = pINI->ReadInteger(section, "RadCannonTurretWeapon", RadCannonTurretWeapon);
+    ChronoTurretIndex = pINI->ReadInteger(section, "ChronoTurretIndex", ChronoTurretIndex);
+    ChronoTurretWeapon = pINI->ReadInteger(section, "ChronoTurretWeapon", ChronoTurretWeapon);
+    TerroristExplodeTurretIndex = pINI->ReadInteger(section, "TerroristExplodeTurretIndex", TerroristExplodeTurretIndex);
+    TerroristExplodeTurretWeapon = pINI->ReadInteger(section, "TerroristExplodeTurretWeapon", TerroristExplodeTurretWeapon);
+    CowTurretIndex = pINI->ReadInteger(section, "CowTurretIndex", CowTurretIndex);
+    CowTurretWeapon = pINI->ReadInteger(section, "CowTurretWeapon", CowTurretWeapon);
+    InitiateTurretIndex = pINI->ReadInteger(section, "InitiateTurretIndex", InitiateTurretIndex);
+    InitiateTurretWeapon = pINI->ReadInteger(section, "InitiateTurretWeapon", InitiateTurretWeapon);
+    VirusTurretIndex = pINI->ReadInteger(section, "VirusTurretIndex", VirusTurretIndex);
+    VirusTurretWeapon = pINI->ReadInteger(section, "VirusTurretWeapon", VirusTurretWeapon);
+    YuriPrimeTurretIndex = pINI->ReadInteger(section, "YuriPrimeTurretIndex", YuriPrimeTurretIndex);
+    YuriPrimeTurretWeapon = pINI->ReadInteger(section, "YuriPrimeTurretWeapon", YuriPrimeTurretWeapon);
+    GuardianTurretIndex = pINI->ReadInteger(section, "GuardianTurretIndex", GuardianTurretIndex);
+    GuardianTurretWeapon = pINI->ReadInteger(section, "GuardianTurretWeapon", GuardianTurretWeapon);
+
+    // ------------------------------------------------------------------
+    // artmd.ini fields
+    // ------------------------------------------------------------------
+    UseTurretShadow = pArt->ReadBool(section, "UseTurretShadow", UseTurretShadow);
+    WalkFrames = pArt->ReadInteger(section, "WalkFrames", WalkFrames);
+    FiringFrames = pArt->ReadInteger(section, "FiringFrames", FiringFrames);
+    StandingFrames = pArt->ReadInteger(section, "StandingFrames", StandingFrames);
+    DeathFrames = pArt->ReadInteger(section, "DeathFrames", DeathFrames);
+    DeathFrameRate = pArt->ReadInteger(section, "DeathFrameRate", DeathFrameRate);
+    Facings = pArt->ReadInteger(section, "Facings", Facings);
+    StartStandFrame = pArt->ReadInteger(section, "StartStandFrame", StartStandFrame);
+    StartWalkFrame = pArt->ReadInteger(section, "StartWalkFrame", StartWalkFrame);
+    StartFiringFrame = pArt->ReadInteger(section, "StartFiringFrame", StartFiringFrame);
+    StartDeathFrame = pArt->ReadInteger(section, "StartDeathFrame", StartDeathFrame);
+    MaxDeathCounter = pArt->ReadInteger(section, "MaxDeathCounter", MaxDeathCounter);
+
+    // ------------------------------------------------------------------
+    // Indexed key families
+    // ------------------------------------------------------------------
+    for (int32 i = 0; i < 10; ++i)
+    {
+        char key[40];
+        sprintf_s(key, sizeof(key), "FiringSyncFrame%d", i);
+        FiringSyncFrame[i] = pArt->ReadInteger(section, key, FiringSyncFrame[i]);
+    }
+    for (int32 i = 0; i < 10; ++i)
+    {
+        char key[40];
+        sprintf_s(key, sizeof(key), "BurstDelay%d", i);
+        BurstDelay[i] = pINI->ReadInteger(section, key, BurstDelay[i]);
+    }
+
+        return true;
 }
 
 // ============================================================================
@@ -791,4 +883,24 @@ int32 UnitTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// UnitTypeClass - static lookup helpers
+// ============================================================================
+
+UnitTypeClass* UnitTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    UnitTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    UnitTypeClass* newItem = GameCreate<UnitTypeClass>();
+    if (newItem)
+    {
+        strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
+        newItem->ID[sizeof(newItem->ID) - 1] = '\0';
+    }
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }

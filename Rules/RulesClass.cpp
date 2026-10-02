@@ -1,4 +1,7 @@
 #include <Rules/RulesClass.h>
+#include <IO/MovieClass.h>
+#include <Audio/VocClass.h>
+#include <Combat/BulletTypeClass.h>
 #include <Core/Definitions.h>
 #include <INI/INIClass.h>
 
@@ -10,16 +13,61 @@
 #include <Abstract/UnitTypeClass.h>
 #include <Abstract/AircraftTypeClass.h>
 #include <Abstract/BuildingTypeClass.h>
+#include <Abstract/MissionClass.h>
+#include <Special/TiberiumClass.h>
+#include <Objects/IsometricTile.h>
 #include <Abstract/TerrainTypeClass.h>
 #include <Abstract/SmudgeTypeClass.h>
 #include <Abstract/OverlayTypeClass.h>
 #include <Abstract/VoxelAnimTypeClass.h>
 #include <Animations/AnimTypeClass.h>
 #include <Houses/HouseTypeClass.h>
+#include <Houses/SideClass.h>
 #include <Combat/WarheadTypeClass.h>
+#include <Combat/WeaponTypeClass.h>
 #include <SW/SuperWeaponTypeClass.h>
 #include <Particles/ParticleTypeClass.h>
 #include <Particles/ParticleSystemTypeClass.h>
+#include <Helpers/StringHelpers.h>
+
+
+// ============================================================================
+// SplitCommaList - 原地切分逗号分隔的名字列表（去首尾空白）
+//
+// 原版 rules 里大量键（DamageFireTypes、BaseUnit、SplashList ...）是逗号分隔的
+// 类型名列表，读入后逐个 FindOrAllocate 填入 DynamicVectorClass。
+// ============================================================================
+namespace
+{
+    int32 SplitCommaList(char* pBuffer, char* pTokens[], int32 maxTokens)
+    {
+        int32 count = 0;
+        char* p = pBuffer;
+
+        while (*p)
+        {
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+            if (!*p) break;
+
+            char* start = p;
+            while (*p && *p != ',') ++p;
+
+            char* end = p;
+            while (end > start &&
+                   (*(end - 1) == ' ' || *(end - 1) == '\t' ||
+                    *(end - 1) == '\r' || *(end - 1) == '\n')) --end;
+            *end = '\0';
+
+            if (count < maxTokens)
+                pTokens[count] = start;
+            ++count;
+
+            if (*p == ',') ++p;
+        }
+
+        return count < maxTokens ? count : maxTokens;
+    }
+}
 
 // ============================================================================
 // RulesClass.cpp - Rules class implementation
@@ -351,6 +399,8 @@ void RulesClass::Read_File(CCINIClass* pINI)
     Read_WallModel(pINI);
     Read_Colors(pINI);
     Read_ColorAdd(pINI);
+    Read_Tiberiums(pINI);
+    Read_TileTypes(pINI);
     Read_General(pINI);
     Read_MultiplayerDialogSettings(pINI);
     Read_Maximums(pINI);
@@ -377,19 +427,53 @@ void RulesClass::Read_File(CCINIClass* pINI)
     Read_Movies(pINI);
     Read_AdvancedCommandBar(pINI);
     Read_HarvesterRules(pINI);
+    Read_MissionControl(pINI);
 }
 
 // ============================================================================
-// Read_SpecialWeapons - [SpecialWeapons] section
+// Read_MissionControl - per-mission control sections ( [Sleep], [Guard], ... )
+// ============================================================================
+
+void RulesClass::Read_MissionControl(CCINIClass* pINI)
+{
+    if (!pINI) return;
+
+    MissionControlClass::LoadAllFromINI(pINI);
+}
+
+// ============================================================================
+// ============================================================================
+// Read_SpecialWeapons - RulesClass_Addition_SpecialWeapons (asm 0x668FB0)
+//
+//   Gated on the [SpecialWeapons] section actually existing: when it is
+//   absent the call answers false and every pointer keeps its value.  Each
+//   key resolves through the type registry with FindOrAllocate - a key that
+//   is missing or empty leaves the previous pointer alone rather than
+//   clearing it.  The tail walk notifies every registered warhead type once
+//   the block has been read.
 // ============================================================================
 
 void RulesClass::Read_SpecialWeapons(CCINIClass* pINI)
 {
     if (!pINI) return;
+    if (!pINI->SectionExists("SpecialWeapons")) return;
+
     const char* section = "SpecialWeapons";
 
-    // These are type references - they would be resolved by the type system
-    // In the standalone engine, we store the INI keys for later resolution
+    // These are type references resolved through the type registries; an
+    // empty or absent key leaves the pointer the rules already carried.
+
+    { char _buf[0x80]; if (pINI->ReadString(section, "NukeWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) NukeWarhead = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "NukeProjectile", "", _buf, sizeof(_buf)) > 0) { BulletTypeClass* _p = BulletTypeClass::FindOrAllocate(_buf); if (_p) NukeProjectile = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "NukeDown", "", _buf, sizeof(_buf)) > 0) { BulletTypeClass* _p = BulletTypeClass::FindOrAllocate(_buf); if (_p) NukeDown = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "MutateWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) MutateWarhead = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "MutateExplosionWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) MutateExplosionWarhead = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "EMPulseWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) EMPulseWarhead = _p; } }
+    { char _buf[0x80]; if (pINI->ReadString(section, "EMPulseProjectile", "", _buf, sizeof(_buf)) > 0) { BulletTypeClass* _p = BulletTypeClass::FindOrAllocate(_buf); if (_p) EMPulseProjectile = _p; } }
+
+    // The block closes by notifying every warhead type (vtable +0x64) - the
+    // original's broadcast hook after the special weapons have been wired up.
+    WarheadTypeClass::NotifyAll();
 }
 
 // ============================================================================
@@ -518,6 +602,63 @@ void RulesClass::Read_AudioVisual(CCINIClass* pINI)
     PlayerJoined                = pINI->ReadInteger(section, "PlayerJoined", PlayerJoined);
     MessageCharTyped            = pINI->ReadInteger(section, "MessageCharTyped", MessageCharTyped);
     Construction                = pINI->ReadInteger(section, "Construction", Construction);
+
+    // ---- rules keys ----
+    DetailMinFrameRateNormal         = pINI->ReadInteger(section, "DetailMinFrameRateNormal", DetailMinFrameRateNormal);
+    DetailMinFrameRateMovie          = pINI->ReadInteger(section, "DetailMinFrameRateMovie", DetailMinFrameRateMovie);
+    DetailBufferZoneWidth            = pINI->ReadInteger(section, "DetailBufferZoneWidth", DetailBufferZoneWidth);
+    PoseDir                          = pINI->ReadInteger(section, "PoseDir", PoseDir);
+    DeployDir                        = pINI->ReadInteger(section, "DeployDir", DeployDir);
+    { char _buf[0x40]; if (pINI->ReadString(section, "DropPodPuff", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DropPodPuff = _p; } }
+    WaypointAnimationSpeed           = pINI->ReadInteger(section, "WaypointAnimationSpeed", WaypointAnimationSpeed);
+    { char _buf[0x40]; if (pINI->ReadString(section, "VeinAttack", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) VeinAttack = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Dig", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Dig = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "AtmosphereEntry", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) AtmosphereEntry = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "GateUp", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) GateUp = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "GateDown", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) GateDown = _i; } }
+    ShroudGrow                       = pINI->ReadBool(section, "ShroudGrow", ShroudGrow);
+    ScrollMultiplier                 = pINI->ReadDouble(section, "ScrollMultiplier", ScrollMultiplier);
+    ShakeScreen                      = pINI->ReadInteger(section, "ShakeScreen", ShakeScreen);
+    { char _buf[0x40]; if (pINI->ReadString(section, "BuildingDrop", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) BuildingDrop = _i; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "TreeFire", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); TreeFire.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) TreeFire.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "OnFire", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); OnFire.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) OnFire.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Smoke", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Smoke = _p; } }
+    EliteFlashTimer                  = pINI->ReadInteger(section, "EliteFlashTimer", EliteFlashTimer);
+    { char _buf[0x40]; if (pINI->ReadString(section, "SmallFire", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) SmallFire = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LargeFire", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) LargeFire = _p; } }
+    AllyReveal                       = pINI->ReadBool(section, "AllyReveal", AllyReveal);
+    ConditionRed                     = pINI->ReadDouble(section, "ConditionRed", ConditionRed);
+    ConditionYellow                  = pINI->ReadDouble(section, "ConditionYellow", ConditionYellow);
+    EnemyHealth                      = pINI->ReadBool(section, "EnemyHealth", EnemyHealth);
+    Gravity                          = pINI->ReadInteger(section, "Gravity", Gravity);
+    IdleActionFrequency              = pINI->ReadDouble(section, "IdleActionFrequency", IdleActionFrequency);
+    MessageDelay                     = pINI->ReadDouble(section, "MessageDelay", MessageDelay);
+    MovieTime                        = pINI->ReadDouble(section, "MovieTime", MovieTime);
+    NamedCivilians                   = pINI->ReadBool(section, "NamedCivilians", NamedCivilians);
+    SavourDelay                      = pINI->ReadDouble(section, "SavourDelay", SavourDelay);
+    ShroudRate                       = pINI->ReadDouble(section, "ShroudRate", ShroudRate);
+    FogRate                          = pINI->ReadDouble(section, "FogRate", FogRate);
+    VeinGrowthRate                   = pINI->ReadDouble(section, "VeinGrowthRate", VeinGrowthRate);
+    IceGrowthRate                    = pINI->ReadDouble(section, "IceGrowthRate", IceGrowthRate);
+    IceSolidifyFrameTime             = pINI->ReadInteger(section, "IceSolidifyFrameTime", IceSolidifyFrameTime);
+    AmbientChangeRate                = pINI->ReadDouble(section, "AmbientChangeRate", AmbientChangeRate);
+    AmbientChangeStep                = pINI->ReadDouble(section, "AmbientChangeStep", AmbientChangeStep);
+    SpeakDelay                       = pINI->ReadDouble(section, "SpeakDelay", SpeakDelay);
+    TimerWarning                     = pINI->ReadDouble(section, "TimerWarning", TimerWarning);
+    ExtraUnitLight                   = static_cast<float>(pINI->ReadDouble(section, "ExtraUnitLight", ExtraUnitLight));
+    ExtraInfantryLight               = static_cast<float>(pINI->ReadDouble(section, "ExtraInfantryLight", ExtraInfantryLight));
+    ExtraAircraftLight               = static_cast<float>(pINI->ReadDouble(section, "ExtraAircraftLight", ExtraAircraftLight));
+    pINI->Get3Bytes(section, "LocalRadarColor", reinterpret_cast<uint8*>(&LocalRadarColor));
+    pINI->Get3Bytes(section, "LineTrailColorOverride", reinterpret_cast<uint8*>(&LineTrailColorOverride));
+    pINI->Get3Bytes(section, "ChronoBeamColor", reinterpret_cast<uint8*>(&ChronoBeamColor));
+    pINI->Get3Bytes(section, "MagnaBeamColor", reinterpret_cast<uint8*>(&MagnaBeamColor));
+    OreTwinkleChance                 = pINI->ReadInteger(section, "OreTwinkleChance", OreTwinkleChance);
+    LaserTargetColor                 = pINI->ReadInteger(section, "LaserTargetColor", LaserTargetColor);
+    IronCurtainColor                 = pINI->ReadInteger(section, "IronCurtainColor", IronCurtainColor);
+    BerserkColor                     = pINI->ReadInteger(section, "BerserkColor", BerserkColor);
+    ForceShieldColor                 = pINI->ReadInteger(section, "ForceShieldColor", ForceShieldColor);
+    DirectRockingCoefficient         = static_cast<float>(pINI->ReadDouble(section, "DirectRockingCoefficient", DirectRockingCoefficient));
+    FallBackCoefficient              = static_cast<float>(pINI->ReadDouble(section, "FallBackCoefficient", FallBackCoefficient));
 }
 
 // ============================================================================
@@ -535,6 +676,17 @@ void RulesClass::Read_CrateRules(CCINIClass* pINI)
     SoloCrateMoney  = pINI->ReadInteger(section, "SoloCrateMoney", SoloCrateMoney);
     AmmoCrateDamage = pINI->ReadInteger(section, "AmmoCrateDamage", AmmoCrateDamage);
     CrateRegen      = pINI->ReadDouble(section, "CrateRegen", CrateRegen);
+
+    // ---- rules keys ----
+    FreeMCV                          = pINI->ReadBool(section, "FreeMCV", FreeMCV);
+    { char _buf[0x40]; if (pINI->ReadString(section, "WoodCrateImg", "", _buf, sizeof(_buf)) > 0) { OverlayTypeClass* _p = OverlayTypeClass::FindOrAllocate(_buf); if (_p) WoodCrateImg = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CrateImg", "", _buf, sizeof(_buf)) > 0) { OverlayTypeClass* _p = OverlayTypeClass::FindOrAllocate(_buf); if (_p) CrateImg = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WaterCrateImg", "", _buf, sizeof(_buf)) > 0) { OverlayTypeClass* _p = OverlayTypeClass::FindOrAllocate(_buf); if (_p) WaterCrateImg = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "HealCrateSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) HealCrateSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "UnitCrateType", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) UnitCrateType = _p; } }
+    SilverCrate.Type = pINI->GetPowerup(section, "SilverCrate", SilverCrate.Type);
+    WoodCrate.Type   = pINI->GetPowerup(section, "WoodCrate",   WoodCrate.Type);
+    WaterCrate.Type  = pINI->GetPowerup(section, "WaterCrate",  WaterCrate.Type);
 }
 
 // ============================================================================
@@ -572,6 +724,74 @@ void RulesClass::Read_CombatDamage(CCINIClass* pINI)
     BallisticScatter     = pINI->ReadInteger(section, "BallisticScatter", BallisticScatter);
     CollapseChance       = pINI->ReadInteger(section, "CollapseChance", CollapseChance);
     BridgeStrength       = pINI->ReadInteger(section, "BridgeStrength", BridgeStrength);
+
+    // ---- rules keys ----
+    AmmoCrateDamage                  = pINI->ReadInteger(section, "AmmoCrateDamage", AmmoCrateDamage);
+    IonCannonDamage                  = pINI->ReadInteger(section, "IonCannonDamage", IonCannonDamage);
+    RailgunDamageRadius              = pINI->ReadInteger(section, "RailgunDamageRadius", RailgunDamageRadius);
+    { char _buf[0x400]; if (pINI->ReadString(section, "Scorches", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Scorches.Clear(); for (int32 _t = 0; _t < _n; ++_t) { SmudgeTypeClass* _p = SmudgeTypeClass::FindOrAllocate(_tok[_t]); if (_p) Scorches.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "Scorches1", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Scorches1.Clear(); for (int32 _t = 0; _t < _n; ++_t) { SmudgeTypeClass* _p = SmudgeTypeClass::FindOrAllocate(_tok[_t]); if (_p) Scorches1.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "Scorches2", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Scorches2.Clear(); for (int32 _t = 0; _t < _n; ++_t) { SmudgeTypeClass* _p = SmudgeTypeClass::FindOrAllocate(_tok[_t]); if (_p) Scorches2.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "Scorches3", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Scorches3.Clear(); for (int32 _t = 0; _t < _n; ++_t) { SmudgeTypeClass* _p = SmudgeTypeClass::FindOrAllocate(_tok[_t]); if (_p) Scorches3.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "Scorches4", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Scorches4.Clear(); for (int32 _t = 0; _t < _n; ++_t) { SmudgeTypeClass* _p = SmudgeTypeClass::FindOrAllocate(_tok[_t]); if (_p) Scorches4.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "SplashList", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); SplashList.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) SplashList.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "FlameDamage", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) FlameDamage = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "FlameDamage2", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) FlameDamage2 = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "C4Warhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) C4Warhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CrushWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) CrushWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "V3Warhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) V3Warhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DMislWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) DMislWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "V3EliteWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) V3EliteWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DMislEliteWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) DMislEliteWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CMislWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) CMislWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "CMislEliteWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) CMislEliteWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "IvanWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) IvanWarhead = _p; } }
+    CanDetonateTimeBomb              = pINI->ReadBool(section, "CanDetonateTimeBomb", CanDetonateTimeBomb);
+    CanDetonateDeathBomb             = pINI->ReadBool(section, "CanDetonateDeathBomb", CanDetonateDeathBomb);
+    { char _buf[0x40]; if (pINI->ReadString(section, "DeathWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) DeathWeapon = _p; } }
+    IvanDamage                       = pINI->ReadInteger(section, "IvanDamage", IvanDamage);
+    IvanTimedDelay                   = pINI->ReadInteger(section, "IvanTimedDelay", IvanTimedDelay);
+    IvanIconFlickerRate              = pINI->ReadInteger(section, "IvanIconFlickerRate", IvanIconFlickerRate);
+    IronCurtainDuration              = pINI->ReadInteger(section, "IronCurtainDuration", IronCurtainDuration);
+    PsychicRevealRadius              = pINI->ReadInteger(section, "PsychicRevealRadius", PsychicRevealRadius);
+    OccupyDamageMultiplier           = static_cast<float>(pINI->ReadDouble(section, "OccupyDamageMultiplier", OccupyDamageMultiplier));
+    OccupyROFMultiplier              = static_cast<float>(pINI->ReadDouble(section, "OccupyROFMultiplier", OccupyROFMultiplier));
+    OccupyWeaponRange                = pINI->ReadInteger(section, "OccupyWeaponRange", OccupyWeaponRange);
+    BunkerROFMultiplier              = static_cast<float>(pINI->ReadDouble(section, "BunkerROFMultiplier", BunkerROFMultiplier));
+    BunkerWeaponRangeBonus           = pINI->ReadInteger(section, "BunkerWeaponRangeBonus", BunkerWeaponRangeBonus);
+    OpenToppedDamageMultiplier       = static_cast<float>(pINI->ReadDouble(section, "OpenToppedDamageMultiplier", OpenToppedDamageMultiplier));
+    OpenToppedRangeBonus             = pINI->ReadInteger(section, "OpenToppedRangeBonus", OpenToppedRangeBonus);
+    OpenToppedWarpDistance           = pINI->ReadInteger(section, "OpenToppedWarpDistance", OpenToppedWarpDistance);
+    MindControlAttackLineFrames      = pINI->ReadInteger(section, "MindControlAttackLineFrames", MindControlAttackLineFrames);
+    { char _buf[0x40]; if (pINI->ReadString(section, "DrainAnimationType", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DrainAnimationType = _p; } }
+    DrainMoneyFrameDelay             = pINI->ReadInteger(section, "DrainMoneyFrameDelay", DrainMoneyFrameDelay);
+    DrainMoneyAmount                 = pINI->ReadInteger(section, "DrainMoneyAmount", DrainMoneyAmount);
+    FallingDamageMultiplier          = static_cast<float>(pINI->ReadDouble(section, "FallingDamageMultiplier", FallingDamageMultiplier));
+    CurrentStrengthDamage            = pINI->ReadBool(section, "CurrentStrengthDamage", CurrentStrengthDamage);
+    { char _buf[0x40]; if (pINI->ReadString(section, "ControlledAnimationType", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ControlledAnimationType = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "PermaControlledAnimationType", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) PermaControlledAnimationType = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "IonCannonWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) IonCannonWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultLargeGreySmokeSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultLargeGreySmokeSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultSmallGreySmokeSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultSmallGreySmokeSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultSparkSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultSparkSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultLargeRedSmokeSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultLargeRedSmokeSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultSmallRedSmokeSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultSmallRedSmokeSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultDebrisSmokeSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultDebrisSmokeSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultFireStreamSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultFireStreamSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultTestParticleSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultTestParticleSystem = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DefaultRepairParticleSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) DefaultRepairParticleSystem = _p; } }
+    BerzerkAllowed                   = pINI->ReadBool(section, "BerzerkAllowed", BerzerkAllowed);
+    TurboBoost                       = pINI->ReadDouble(section, "TurboBoost", TurboBoost);
+    C4Delay                          = pINI->ReadDouble(section, "C4Delay", C4Delay);
+    ExpSpread                        = pINI->ReadDouble(section, "ExpSpread", ExpSpread);
+    TiberiumExplosive                = pINI->ReadBool(section, "TiberiumExplosive", TiberiumExplosive);
+    PlayerAutoCrush                  = pINI->ReadBool(section, "PlayerAutoCrush", PlayerAutoCrush);
+    PlayerReturnFire                 = pINI->ReadBool(section, "PlayerReturnFire", PlayerReturnFire);
+    PlayerScatter                    = pINI->ReadBool(section, "PlayerScatter", PlayerScatter);
+    TreeTargeting                    = pINI->ReadBool(section, "TreeTargeting", TreeTargeting);
+    pINI->GetVectorIntegers(section, "OverloadCount",  OverloadCount);
+    pINI->GetVectorIntegers(section, "OverloadDamage", OverloadDamage);
+    pINI->GetVectorIntegers(section, "OverloadFrames", OverloadFrames);
 }
 
 // ============================================================================
@@ -591,6 +811,10 @@ void RulesClass::Read_Radiation(CCINIClass* pINI)
     RadLevelFactor         = pINI->ReadDouble(section, "RadLevelFactor", RadLevelFactor);
     RadLightFactor         = pINI->ReadDouble(section, "RadLightFactor", RadLightFactor);
     RadTintFactor          = pINI->ReadDouble(section, "RadTintFactor", RadTintFactor);
+
+    // ---- rules keys ----
+    pINI->Get3Bytes(section, "RadColor", reinterpret_cast<uint8*>(&RadColor));
+    { char _buf[0x40]; if (pINI->ReadString(section, "RadSiteWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) RadSiteWarhead = _p; } }
 }
 
 // ============================================================================
@@ -619,8 +843,34 @@ void RulesClass::Read_WallModel(CCINIClass* pINI)
     const char* section = "WallModel";
 
     WallBuildSpeedCoefficient = pINI->ReadDouble(section, "WallBuildSpeedCoefficient", WallBuildSpeedCoefficient);
+
+    // ---- rules keys ----
+    AlliedWallTransparency           = pINI->ReadBool(section, "AlliedWallTransparency", AlliedWallTransparency);
+    WallPenetratorThreshold          = pINI->ReadDouble(section, "WallPenetratorThreshold", WallPenetratorThreshold);
 }
 
+
+// ============================================================================
+// Read_TileTypes - the [TileSet####] blocks of isometr(md).ini
+// ============================================================================
+
+void RulesClass::Read_TileTypes(CCINIClass* pINI)
+{
+    if (!pINI) return;
+
+    IsometricTileType::CreateFromINIList(pINI, false);
+}
+
+// ============================================================================
+// Read_Tiberiums - [Tiberiums] section
+// ============================================================================
+
+void RulesClass::Read_Tiberiums(CCINIClass* pINI)
+{
+    if (!pINI) return;
+
+    TiberiumClass::LoadAllFromINI(pINI);
+}
 
 // ============================================================================
 // Read_Colors - [Colors] section
@@ -658,6 +908,9 @@ void RulesClass::Read_Colors(CCINIClass* pINI)
     IronCurtainColor = pINI->ReadInteger(section, "IronCurtainColor", IronCurtainColor);
     BerserkColor     = pINI->ReadInteger(section, "BerserkColor", BerserkColor);
     ForceShieldColor = pINI->ReadInteger(section, "ForceShieldColor", ForceShieldColor);
+
+    // ---- rules keys ----
+    pINI->Get3Bytes(section, "None", reinterpret_cast<uint8*>(&NoneValue));
 }
 
 // ============================================================================
@@ -686,6 +939,9 @@ void RulesClass::Read_ColorAdd(CCINIClass* pINI)
         ColorAdd[i].G = rgb[1];
         ColorAdd[i].B = rgb[2];
     }
+
+    // ---- rules keys ----
+    pINI->Get3Bytes(section, "None", reinterpret_cast<uint8*>(&NoneValue));
 }
 
 // ============================================================================
@@ -869,6 +1125,273 @@ void RulesClass::Read_General(CCINIClass* pINI)
     PrismSupportDuration           = pINI->ReadInteger(section, "PrismSupportDuration", PrismSupportDuration);
     PrismSupportHeight             = pINI->ReadInteger(section, "PrismSupportHeight", PrismSupportHeight);
     ParadropRadius                 = pINI->ReadInteger(section, "ParadropRadius", ParadropRadius);
+
+    // ---- rules keys ----
+    { char _buf[0x400]; if (pINI->ReadString(section, "DamageFireTypes", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); DamageFireTypes.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) DamageFireTypes.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "OreTwinkle", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) OreTwinkle = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "BarrelExplode", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) BarrelExplode = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BarrelDebris", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BarrelDebris.Clear(); for (int32 _t = 0; _t < _n; ++_t) { VoxelAnimTypeClass* _p = VoxelAnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) BarrelDebris.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "BarrelParticle", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) BarrelParticle = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NukeTakeOff", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) NukeTakeOff = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Wake", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Wake = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "DropPod", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); DropPod.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) DropPod.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "DeadBodies", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); DeadBodies.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) DeadBodies.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "MetallicDebris", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); MetallicDebris.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) MetallicDebris.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BridgeExplosions", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BridgeExplosions.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) BridgeExplosions.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "IonBlast", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) IonBlast = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "IonBeam", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) IonBeam = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "WeatherConClouds", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); WeatherConClouds.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) WeatherConClouds.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "WeatherConBolts", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); WeatherConBolts.Clear(); for (int32 _t = 0; _t < _n; ++_t) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) WeatherConBolts.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WeatherConBoltExplosion", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) WeatherConBoltExplosion = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DominatorWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) DominatorWarhead = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DominatorFirstAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DominatorFirstAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DominatorSecondAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DominatorSecondAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoPlacement", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ChronoPlacement = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoBeam", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ChronoBeam = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoBlast", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ChronoBlast = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoBlastDest", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ChronoBlastDest = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WarpIn", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) WarpIn = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WarpOut", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) WarpOut = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WarpAway", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) WarpAway = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "IronCurtainInvokeAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) IronCurtainInvokeAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ForceShieldInvokeAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ForceShieldInvokeAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WeaponNullifyAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) WeaponNullifyAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ChronoSparkle1", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ChronoSparkle1 = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryExplode", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryExplode = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "FlamingInfantry", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) FlamingInfantry = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryHeadPop", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryHeadPop = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryNuked", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryNuked = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryVirus", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryVirus = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryBrute", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryBrute = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "InfantryMutate", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) InfantryMutate = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Behind", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Behind = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "MoveFlash", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) MoveFlash = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Parachute", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) Parachute = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "BombParachute", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) BombParachute = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DropZoneAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DropZoneAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "EMPulseSparkles", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) EMPulseSparkles = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "LargeVisceroid", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) LargeVisceroid = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "SmallVisceroid", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) SmallVisceroid = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "DropPodWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) DropPodWeapon = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "ExplosiveVoxelDebris", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); ExplosiveVoxelDebris.Clear(); for (int32 _t = 0; _t < _n; ++_t) { VoxelAnimTypeClass* _p = VoxelAnimTypeClass::FindOrAllocate(_tok[_t]); if (_p) ExplosiveVoxelDebris.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "TireVoxelDebris", "", _buf, sizeof(_buf)) > 0) { VoxelAnimTypeClass* _p = VoxelAnimTypeClass::FindOrAllocate(_buf); if (_p) TireVoxelDebris = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ScrapVoxelDebris", "", _buf, sizeof(_buf)) > 0) { VoxelAnimTypeClass* _p = VoxelAnimTypeClass::FindOrAllocate(_buf); if (_p) ScrapVoxelDebris = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "RepairBay", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); RepairBay.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) RepairBay.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "GDIGateOne", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) GDIGateOne = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "GDIGateTwo", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) GDIGateTwo = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NodGateOne", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) NodGateOne = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NodGateTwo", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) NodGateTwo = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "WallTower", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) WallTower = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "Shipyard", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); Shipyard.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) Shipyard.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "GDIPowerPlant", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) GDIPowerPlant = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NodRegularPower", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) NodRegularPower = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "NodAdvancedPower", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) NodAdvancedPower = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ThirdPowerPlant", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) ThirdPowerPlant = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "PrerequisiteProcAlternate", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) PrerequisiteProcAlternate = _p; } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BaseUnit", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BaseUnit.Clear(); for (int32 _t = 0; _t < _n; ++_t) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_tok[_t]); if (_p) BaseUnit.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "HarvesterUnit", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); HarvesterUnit.Clear(); for (int32 _t = 0; _t < _n; ++_t) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_tok[_t]); if (_p) HarvesterUnit.Add(_p); } } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Paratrooper", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) Paratrooper = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "AlliedDisguise", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) AlliedDisguise = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "SovietDisguise", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) SovietDisguise = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ThirdDisguise", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) ThirdDisguise = _p; } }
+    SpyPowerBlackout                 = pINI->ReadInteger(section, "SpyPowerBlackout", SpyPowerBlackout);
+    SpyMoneyStealPercent             = static_cast<float>(pINI->ReadDouble(section, "SpyMoneyStealPercent", SpyMoneyStealPercent));
+    AttackCursorOnDisguise           = pINI->ReadBool(section, "AttackCursorOnDisguise", AttackCursorOnDisguise);
+    PurifierBonus                    = static_cast<float>(pINI->ReadDouble(section, "PurifierBonus", PurifierBonus));
+    { char _buf[0x40]; if (pINI->ReadString(section, "Engineer", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) Engineer = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Technician", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) Technician = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "Pilot", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) Pilot = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "AlliedCrew", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) AlliedCrew = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "SovietCrew", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) SovietCrew = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ThirdCrew", "", _buf, sizeof(_buf)) > 0) { InfantryTypeClass* _p = InfantryTypeClass::FindOrAllocate(_buf); if (_p) ThirdCrew = _p; } }
+    AIAlternateProductionCreditCutoff = pINI->ReadInteger(section, "AIAlternateProductionCreditCutoff", AIAlternateProductionCreditCutoff);
+    AIUseTurbineUpgradeProbability   = pINI->ReadDouble(section, "AIUseTurbineUpgradeProbability", AIUseTurbineUpgradeProbability);
+    DissolveUnfilledTeamDelay        = pINI->ReadInteger(section, "DissolveUnfilledTeamDelay", DissolveUnfilledTeamDelay);
+    AISafeDistance                   = pINI->ReadInteger(section, "AISafeDistance", AISafeDistance);
+    AIMinorSuperReadyPercent         = static_cast<float>(pINI->ReadDouble(section, "AIMinorSuperReadyPercent", AIMinorSuperReadyPercent));
+    HarvesterTooFarDistance          = pINI->ReadInteger(section, "HarvesterTooFarDistance", HarvesterTooFarDistance);
+    ChronoHarvTooFarDistance         = pINI->ReadInteger(section, "ChronoHarvTooFarDistance", ChronoHarvTooFarDistance);
+    AIRestrictReplaceTime            = pINI->ReadInteger(section, "AIRestrictReplaceTime", AIRestrictReplaceTime);
+    ThreatPerOccupant                = pINI->ReadInteger(section, "ThreatPerOccupant", ThreatPerOccupant);
+    ApproachTargetResetMultiplier    = pINI->ReadInteger(section, "ApproachTargetResetMultiplier", ApproachTargetResetMultiplier);
+    CampaignMoneyDeltaEasy           = pINI->ReadInteger(section, "CampaignMoneyDeltaEasy", CampaignMoneyDeltaEasy);
+    CampaignMoneyDeltaHard           = pINI->ReadInteger(section, "CampaignMoneyDeltaHard", CampaignMoneyDeltaHard);
+    GuardAreaTargetingDelay          = pINI->ReadInteger(section, "GuardAreaTargetingDelay", GuardAreaTargetingDelay);
+    NormalTargetingDelay             = pINI->ReadInteger(section, "NormalTargetingDelay", NormalTargetingDelay);
+    AINavalYardAdjacency             = pINI->ReadInteger(section, "AINavalYardAdjacency", AINavalYardAdjacency);
+    MaximumBuildingPlacementFailures = pINI->ReadInteger(section, "MaximumBuildingPlacementFailures", MaximumBuildingPlacementFailures);
+    SlaveMinerKickFrameDelay         = pINI->ReadInteger(section, "SlaveMinerKickFrameDelay", SlaveMinerKickFrameDelay);
+    AISuperDefenseFrames             = pINI->ReadInteger(section, "AISuperDefenseFrames", AISuperDefenseFrames);
+    AICaptureLowMoneyMark            = pINI->ReadInteger(section, "AICaptureLowMoneyMark", AICaptureLowMoneyMark);
+    BaseDefenseDelay                 = pINI->ReadDouble(section, "BaseDefenseDelay", BaseDefenseDelay);
+    SuspendPriority                  = pINI->ReadInteger(section, "SuspendPriority", SuspendPriority);
+    SuspendDelay                     = pINI->ReadDouble(section, "SuspendDelay", SuspendDelay);
+    SurvivorRate                     = pINI->ReadDouble(section, "SurvivorRate", SurvivorRate);
+    AlliedSurvivorDivisor            = pINI->ReadInteger(section, "AlliedSurvivorDivisor", AlliedSurvivorDivisor);
+    SovietSurvivorDivisor            = pINI->ReadInteger(section, "SovietSurvivorDivisor", SovietSurvivorDivisor);
+    ThirdSurvivorDivisor             = pINI->ReadInteger(section, "ThirdSurvivorDivisor", ThirdSurvivorDivisor);
+    ReloadRate                       = pINI->ReadDouble(section, "ReloadRate", ReloadRate);
+    BuildupTime                      = pINI->ReadDouble(section, "BuildupTime", BuildupTime);
+    HarvesterDumpRate                = pINI->ReadDouble(section, "HarvesterDumpRate", HarvesterDumpRate);
+    HarvesterLoadRate                = pINI->ReadInteger(section, "HarvesterLoadRate", HarvesterLoadRate);
+    DamageDelay                      = pINI->ReadDouble(section, "DamageDelay", DamageDelay);
+    GrowthRate                       = pINI->ReadDouble(section, "GrowthRate", GrowthRate);
+    RepairPercent                    = pINI->ReadDouble(section, "RepairPercent", RepairPercent);
+    RepairStep                       = pINI->ReadInteger(section, "RepairStep", RepairStep);
+    IRepairStep                      = pINI->ReadInteger(section, "IRepairStep", IRepairStep);
+    RepairRate                       = pINI->ReadDouble(section, "RepairRate", RepairRate);
+    URepairRate                      = pINI->ReadDouble(section, "URepairRate", URepairRate);
+    IRepairRate                      = pINI->ReadDouble(section, "IRepairRate", IRepairRate);
+    TiberiumTransmogrify             = pINI->ReadInteger(section, "TiberiumTransmogrify", TiberiumTransmogrify);
+    LightningDeferment               = pINI->ReadInteger(section, "LightningDeferment", LightningDeferment);
+    LightningDamage                  = pINI->ReadInteger(section, "LightningDamage", LightningDamage);
+    LightningStormDuration           = pINI->ReadInteger(section, "LightningStormDuration", LightningStormDuration);
+    LightningHitDelay                = pINI->ReadInteger(section, "LightningHitDelay", LightningHitDelay);
+    LightningScatterDelay            = pINI->ReadInteger(section, "LightningScatterDelay", LightningScatterDelay);
+    LightningCellSpread              = pINI->ReadInteger(section, "LightningCellSpread", LightningCellSpread);
+    LightningSeparation              = pINI->ReadInteger(section, "LightningSeparation", LightningSeparation);
+    { char _buf[0x40]; if (pINI->ReadString(section, "LightningWarhead", "", _buf, sizeof(_buf)) > 0) { WarheadTypeClass* _p = WarheadTypeClass::FindOrAllocate(_buf); if (_p) LightningWarhead = _p; } }
+    LightningPrintText               = pINI->ReadBool(section, "LightningPrintText", LightningPrintText);
+    ForceShieldRadius                = pINI->ReadInteger(section, "ForceShieldRadius", ForceShieldRadius);
+    ForceShieldDuration              = pINI->ReadInteger(section, "ForceShieldDuration", ForceShieldDuration);
+    ForceShieldBlackoutDuration      = pINI->ReadInteger(section, "ForceShieldBlackoutDuration", ForceShieldBlackoutDuration);
+    ForceShieldPlayFadeSoundTime     = pINI->ReadInteger(section, "ForceShieldPlayFadeSoundTime", ForceShieldPlayFadeSoundTime);
+    MutateExplosion                  = pINI->ReadBool(section, "MutateExplosion", MutateExplosion);
+    { char _buf[0x40]; if (pINI->ReadString(section, "PrismType", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) PrismType = _p; } }
+    V3RocketPauseFrames              = pINI->ReadInteger(section, "V3RocketPauseFrames", V3RocketPauseFrames);
+    V3RocketTiltFrames               = pINI->ReadInteger(section, "V3RocketTiltFrames", V3RocketTiltFrames);
+    V3RocketPitchInitial             = pINI->ReadDouble(section, "V3RocketPitchInitial", V3RocketPitchInitial);
+    V3RocketPitchFinal               = pINI->ReadDouble(section, "V3RocketPitchFinal", V3RocketPitchFinal);
+    V3RocketTurnRate                 = pINI->ReadDouble(section, "V3RocketTurnRate", V3RocketTurnRate);
+    V3RocketRaiseRate                = pINI->ReadDouble(section, "V3RocketRaiseRate", V3RocketRaiseRate);
+    V3RocketAcceleration             = pINI->ReadDouble(section, "V3RocketAcceleration", V3RocketAcceleration);
+    V3RocketAltitude                 = pINI->ReadInteger(section, "V3RocketAltitude", V3RocketAltitude);
+    V3RocketDamage                   = pINI->ReadInteger(section, "V3RocketDamage", V3RocketDamage);
+    V3RocketEliteDamage              = pINI->ReadInteger(section, "V3RocketEliteDamage", V3RocketEliteDamage);
+    V3RocketBodyLength               = pINI->ReadInteger(section, "V3RocketBodyLength", V3RocketBodyLength);
+    V3RocketLazyCurve                = pINI->ReadBool(section, "V3RocketLazyCurve", V3RocketLazyCurve);
+    { char _buf[0x40]; if (pINI->ReadString(section, "V3RocketType", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) V3RocketType = _p; } }
+    DMislPauseFrames                 = pINI->ReadInteger(section, "DMislPauseFrames", DMislPauseFrames);
+    DMislTiltFrames                  = pINI->ReadInteger(section, "DMislTiltFrames", DMislTiltFrames);
+    DMislPitchInitial                = pINI->ReadDouble(section, "DMislPitchInitial", DMislPitchInitial);
+    DMislPitchFinal                  = pINI->ReadDouble(section, "DMislPitchFinal", DMislPitchFinal);
+    DMislTurnRate                    = pINI->ReadDouble(section, "DMislTurnRate", DMislTurnRate);
+    DMislRaiseRate                   = pINI->ReadDouble(section, "DMislRaiseRate", DMislRaiseRate);
+    DMislAcceleration                = pINI->ReadDouble(section, "DMislAcceleration", DMislAcceleration);
+    DMislAltitude                    = pINI->ReadInteger(section, "DMislAltitude", DMislAltitude);
+    DMislDamage                      = pINI->ReadInteger(section, "DMislDamage", DMislDamage);
+    DMislEliteDamage                 = pINI->ReadInteger(section, "DMislEliteDamage", DMislEliteDamage);
+    DMislBodyLength                  = pINI->ReadInteger(section, "DMislBodyLength", DMislBodyLength);
+    DMislLazyCurve                   = pINI->ReadBool(section, "DMislLazyCurve", DMislLazyCurve);
+    { char _buf[0x40]; if (pINI->ReadString(section, "DMislType", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) DMislType = _p; } }
+    CMislPauseFrames                 = pINI->ReadInteger(section, "CMislPauseFrames", CMislPauseFrames);
+    CMislTiltFrames                  = pINI->ReadInteger(section, "CMislTiltFrames", CMislTiltFrames);
+    CMislPitchInitial                = pINI->ReadDouble(section, "CMislPitchInitial", CMislPitchInitial);
+    CMislPitchFinal                  = pINI->ReadDouble(section, "CMislPitchFinal", CMislPitchFinal);
+    CMislTurnRate                    = pINI->ReadDouble(section, "CMislTurnRate", CMislTurnRate);
+    CMislRaiseRate                   = pINI->ReadDouble(section, "CMislRaiseRate", CMislRaiseRate);
+    CMislAcceleration                = pINI->ReadDouble(section, "CMislAcceleration", CMislAcceleration);
+    CMislAltitude                    = pINI->ReadInteger(section, "CMislAltitude", CMislAltitude);
+    CMislDamage                      = pINI->ReadInteger(section, "CMislDamage", CMislDamage);
+    CMislEliteDamage                 = pINI->ReadInteger(section, "CMislEliteDamage", CMislEliteDamage);
+    CMislBodyLength                  = pINI->ReadInteger(section, "CMislBodyLength", CMislBodyLength);
+    CMislLazyCurve                   = pINI->ReadBool(section, "CMislLazyCurve", CMislLazyCurve);
+    { char _buf[0x40]; if (pINI->ReadString(section, "CMislType", "", _buf, sizeof(_buf)) > 0) { AircraftTypeClass* _p = AircraftTypeClass::FindOrAllocate(_buf); if (_p) CMislType = _p; } }
+    WallBuildSpeedCoefficient        = pINI->ReadDouble(section, "WallBuildSpeedCoefficient", WallBuildSpeedCoefficient);
+    ConditionYellowSparkingProbability = pINI->ReadDouble(section, "ConditionYellowSparkingProbability", ConditionYellowSparkingProbability);
+    ConditionRedSparkingProbability  = pINI->ReadDouble(section, "ConditionRedSparkingProbability", ConditionRedSparkingProbability);
+    AITriggerSuccessWeightDelta      = pINI->ReadDouble(section, "AITriggerSuccessWeightDelta", AITriggerSuccessWeightDelta);
+    AITriggerFailureWeightDelta      = pINI->ReadDouble(section, "AITriggerFailureWeightDelta", AITriggerFailureWeightDelta);
+    AITriggerTrackRecordCoefficient  = pINI->ReadDouble(section, "AITriggerTrackRecordCoefficient", AITriggerTrackRecordCoefficient);
+    FlashFrameTime                   = pINI->ReadInteger(section, "FlashFrameTime", FlashFrameTime);
+    RadarCombatFlashTime             = pINI->ReadInteger(section, "RadarCombatFlashTime", RadarCombatFlashTime);
+    RadarEventSpeed                  = static_cast<float>(pINI->ReadDouble(section, "RadarEventSpeed", RadarEventSpeed));
+    RadarEventRotationSpeed          = static_cast<float>(pINI->ReadDouble(section, "RadarEventRotationSpeed", RadarEventRotationSpeed));
+    RadarEventMinRadius              = pINI->ReadInteger(section, "RadarEventMinRadius", RadarEventMinRadius);
+    RadarEventColorSpeed             = static_cast<float>(pINI->ReadDouble(section, "RadarEventColorSpeed", RadarEventColorSpeed));
+    MyEffectivenessCoefficientDefault = pINI->ReadDouble(section, "MyEffectivenessCoefficientDefault", MyEffectivenessCoefficientDefault);
+    TargetEffectivenessCoefficientDefa = pINI->ReadDouble(section, "TargetEffectivenessCoefficientDefa", TargetEffectivenessCoefficientDefa);
+    TargetSpecialThreatCoefficientDefa = pINI->ReadDouble(section, "TargetSpecialThreatCoefficientDefa", TargetSpecialThreatCoefficientDefa);
+    TargetStrengthCoefficientDefault = pINI->ReadDouble(section, "TargetStrengthCoefficientDefault", TargetStrengthCoefficientDefault);
+    TargetDistanceCoefficientDefault = pINI->ReadDouble(section, "TargetDistanceCoefficientDefault", TargetDistanceCoefficientDefault);
+    DumbMyEffectivenessCoefficient   = pINI->ReadDouble(section, "DumbMyEffectivenessCoefficient", DumbMyEffectivenessCoefficient);
+    DumbTargetEffectivenessCoefficient = pINI->ReadDouble(section, "DumbTargetEffectivenessCoefficient", DumbTargetEffectivenessCoefficient);
+    DumbTargetSpecialThreatCoefficient = pINI->ReadDouble(section, "DumbTargetSpecialThreatCoefficient", DumbTargetSpecialThreatCoefficient);
+    DumbTargetStrengthCoefficient    = pINI->ReadDouble(section, "DumbTargetStrengthCoefficient", DumbTargetStrengthCoefficient);
+    DumbTargetDistanceCoefficient    = pINI->ReadDouble(section, "DumbTargetDistanceCoefficient", DumbTargetDistanceCoefficient);
+    EnemyHouseThreatBonus            = pINI->ReadDouble(section, "EnemyHouseThreatBonus", EnemyHouseThreatBonus);
+    VeinholeMonsterStrength          = pINI->ReadInteger(section, "VeinholeMonsterStrength", VeinholeMonsterStrength);
+    MaxVeinholeGrowth                = pINI->ReadInteger(section, "MaxVeinholeGrowth", MaxVeinholeGrowth);
+    VeinholeGrowthRate               = pINI->ReadInteger(section, "VeinholeGrowthRate", VeinholeGrowthRate);
+    VeinholeShrinkRate               = pINI->ReadInteger(section, "VeinholeShrinkRate", VeinholeShrinkRate);
+    VeinDamage                       = pINI->ReadInteger(section, "VeinDamage", VeinDamage);
+    { char _buf[0x40]; if (pINI->ReadString(section, "VeinholeTypeClass", "", _buf, sizeof(_buf)) > 0) { TerrainTypeClass* _p = TerrainTypeClass::FindOrAllocate(_buf); if (_p) VeinholeTypeClass = _p; } }
+    MaxWaypointPathLength            = pINI->ReadInteger(section, "MaxWaypointPathLength", MaxWaypointPathLength);
+    TreeStrength                     = pINI->ReadInteger(section, "TreeStrength", TreeStrength);
+
+    pINI->GetPrerequisiteList(section, "PrerequisitePower",    PrerequisitePower);
+    pINI->GetPrerequisiteList(section, "PrerequisiteFactory",  PrerequisiteFactory);
+    pINI->GetPrerequisiteList(section, "PrerequisiteBarracks", PrerequisiteBarracks);
+    pINI->GetPrerequisiteList(section, "PrerequisiteRadar",    PrerequisiteRadar);
+    pINI->GetPrerequisiteList(section, "PrerequisiteTech",     PrerequisiteTech);
+    pINI->GetPrerequisiteList(section, "PrerequisiteProc",     PrerequisiteProc);
+
+    pINI->GetVectorAircraftType(section, "PadAircraft", PadAircraft);
+    pINI->GetVectorUnitType(section, "SecretUnits", SecretUnits);
+    pINI->GetVectorBuildType(section, "SecretBuildings", SecretBuildings);
+
+    pINI->GetVectorIntegers(section, "TeamDelays",                      TeamDelays);
+    pINI->GetVectorIntegers(section, "AIHateDelays",                    AIHateDelays);
+    pINI->GetVectorIntegers(section, "FillEarliestTeamProbability",     FillEarliestTeamProbability);
+    pINI->GetVectorIntegers(section, "MinimumAIDefensiveTeams",         MinimumAIDefensiveTeams);
+    pINI->GetVectorIntegers(section, "MaximumAIDefensiveTeams",         MaximumAIDefensiveTeams);
+    pINI->GetVectorIntegers(section, "TotalAITeamCap",                  TotalAITeamCap);
+    pINI->GetVectorIntegers(section, "AlliedBaseDefenseCounts",         AlliedBaseDefenseCounts);
+    pINI->GetVectorIntegers(section, "SovietBaseDefenseCounts",         SovietBaseDefenseCounts);
+    pINI->GetVectorIntegers(section, "ThirdBaseDefenseCounts",          ThirdBaseDefenseCounts);
+    pINI->GetVectorIntegers(section, "AIPickWallDefensePercent",        AIPickWallDefensePercent);
+    pINI->GetVectorIntegers(section, "DisabledDisguiseDetectionPercent", DisabledDisguiseDetectionPercent);
+    pINI->GetVectorIntegers(section, "AIAutoDeployFrameDelay",          AIAutoDeployFrameDelay);
+    pINI->GetVectorIntegers(section, "AISuperDefenseProbability",       AISuperDefenseProbability);
+    pINI->GetVectorIntegers(section, "AICaptureNormal",                 AICaptureNormal);
+    pINI->GetVectorIntegers(section, "AICaptureWounded",                AICaptureWounded);
+    pINI->GetVectorIntegers(section, "AICaptureLowPower",               AICaptureLowPower);
+    pINI->GetVectorIntegers(section, "AICaptureLowMoney",               AICaptureLowMoney);
+    pINI->GetVectorIntegers(section, "MultiplayerAICM",                 MultiplayerAICM);
+    pINI->GetVectorIntegers(section, "AIVirtualPurifiers",              AIVirtualPurifiers);
+    pINI->GetVectorIntegers(section, "AISlaveMinerNumber",              AISlaveMinerNumber);
+    pINI->GetVectorIntegers(section, "HarvestersPerRefinery",           HarvestersPerRefinery);
+    pINI->GetVectorIntegers(section, "AIExtraRefineries",               AIExtraRefineries);
+
+    pINI->GetVectorInfType(section, "AmerParaDropInf",  AmerParaDropInf);
+    pINI->GetVectorIntegers(section, "AmerParaDropNum", AmerParaDropNum);
+    pINI->GetVectorInfType(section, "AllyParaDropInf",  AllyParaDropInf);
+    pINI->GetVectorIntegers(section, "AllyParaDropNum", AllyParaDropNum);
+    pINI->GetVectorInfType(section, "SovParaDropInf",   SovParaDropInf);
+    pINI->GetVectorIntegers(section, "SovParaDropNum",  SovParaDropNum);
+    pINI->GetVectorInfType(section, "YuriParaDropInf",  YuriParaDropInf);
+    pINI->GetVectorIntegers(section, "YuriParaDropNum", YuriParaDropNum);
+    pINI->GetVectorInfType(section, "AnimToInfantry",   AnimToInfantry);
+
+    pINI->GetVectorIntegers(section, "AIIonCannonConYardValue",     AIIonCannonConYardValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonWarFactoryValue",  AIIonCannonWarFactoryValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonPowerValue",       AIIonCannonPowerValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonTechCenterValue",  AIIonCannonTechCenterValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonEngineerValue",    AIIonCannonEngineerValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonThiefValue",       AIIonCannonThiefValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonHarvesterValue",   AIIonCannonHarvesterValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonMCVValue",         AIIonCannonMCVValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonAPCValue",         AIIonCannonAPCValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonBaseDefenseValue", AIIonCannonBaseDefenseValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonPlugValue",        AIIonCannonPlugValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonHelipadValue",     AIIonCannonHelipadValue);
+    pINI->GetVectorIntegers(section, "AIIonCannonTempleValue",      AIIonCannonTempleValue);
+
+    pINI->GetVectorIntegers(section, "RadarEventSuppressionDistances",  RadarEventSuppressionDistances);
+    pINI->GetVectorIntegers(section, "RadarEventVisibilityDurations",   RadarEventVisibilityDurations);
+    pINI->GetVectorIntegers(section, "RadarEventDurations",             RadarEventDurations);
+
+    pINI->GetVectorTerrainTypes(section, "DefaultMirageDisguises", DefaultMirageDisguises);
 }
 
 // ============================================================================
@@ -920,11 +1443,15 @@ void RulesClass::Read_MultiplayerDialogSettings(CCINIClass* pINI)
 
 void RulesClass::Read_Maximums(CCINIClass* pINI)
 {
+    const char* section = "Maximums";
     if (!pINI) return;
     // [Maximums] section: per-type object count caps (Infantry, Units,
     // Building, Aircraft, Vessel, InfantryType, UnitType, BuildingType,
     // AircraftType, VesselType).  These limits are enforced by the
     // type-class Array containers and do not require RulesClass members.
+
+    // ---- rules keys ----
+    Players                          = pINI->ReadInteger(section, "Players", Players);
 }
 
 // ----------------------------------------------------------------------------
@@ -1056,15 +1583,21 @@ void RulesClass::Read_AircraftTypes(CCINIClass* pINI)
 }
 
 // ----------------------------------------------------------------------------
-// Read_Sides - [Sides] section
+// ----------------------------------------------------------------------------
+// Read_Sides - RulesClass_Addition_Sides (asm 0x6723BE)
+//
+//   Every [Sides] key names a side.  One that vec_Sides already carries is
+//   reused, otherwise a new SideClass is registered.  The key's value is then
+//   re-parsed as the side's comma separated house list through
+//   INIClass_ParseSideHouses, and every house that came back stores the
+//   side's ordinal in its own Side field.
 // ----------------------------------------------------------------------------
 
 void RulesClass::Read_Sides(CCINIClass* pINI)
 {
     if (!pINI) return;
-    // [Sides] section: side display names (GDI, Nod, ThirdSide, Civilian).
-    // Side names are resolved at runtime from the HouseType registry and
-    // do not require dedicated RulesClass members.
+
+    SideClass::ReadSides(pINI);
 }
 
 // ----------------------------------------------------------------------------
@@ -1427,11 +1960,67 @@ void RulesClass::Read_AI(CCINIClass* pINI)
     PowerSurplus                      = pINI->ReadInteger(section, "PowerSurplus", PowerSurplus);
     InfantryReserve                   = pINI->ReadInteger(section, "InfantryReserve", InfantryReserve);
     InfantryBaseMult                  = pINI->ReadInteger(section, "InfantryBaseMult", InfantryBaseMult);
+
+    // ---- rules keys ----
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildConst", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildConst.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildConst.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildPower", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildPower.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildPower.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildRefinery", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildRefinery.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildRefinery.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildBarracks", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildBarracks.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildBarracks.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildTech", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildTech.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildTech.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildWeapons", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildWeapons.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildWeapons.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "AlliedBaseDefenses", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); AlliedBaseDefenses.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) AlliedBaseDefenses.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "SovietBaseDefenses", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); SovietBaseDefenses.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) SovietBaseDefenses.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "ThirdBaseDefenses", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); ThirdBaseDefenses.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) ThirdBaseDefenses.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildDefense", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildDefense.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildDefense.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildPDefense", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildPDefense.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildPDefense.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildAA", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildAA.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildAA.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildHelipad", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildHelipad.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildHelipad.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "BuildRadar", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); BuildRadar.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) BuildRadar.Add(_p); } } }
+    { char _buf[0x400]; if (pINI->ReadString(section, "ConcreteWalls", "", _buf, sizeof(_buf)) > 0) { char* _tok[64]; int32 _n = SplitCommaList(_buf, _tok, 64); ConcreteWalls.Clear(); for (int32 _t = 0; _t < _n; ++_t) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok[_t]); if (_p) ConcreteWalls.Add(_p); } } }
+    CreditReserve                    = pINI->ReadInteger(section, "CreditReserve", CreditReserve);
+    PathDelay                        = pINI->ReadDouble(section, "PathDelay", PathDelay);
+    BlockagePathDelay                = pINI->ReadInteger(section, "BlockagePathDelay", BlockagePathDelay);
+    AutocreateTime                   = pINI->ReadDouble(section, "AutocreateTime", AutocreateTime);
+    CompEasyBonus                    = pINI->ReadBool(section, "CompEasyBonus", CompEasyBonus);
+    Paranoid                         = pINI->ReadBool(section, "Paranoid", Paranoid);
+    AIBaseSpacing                    = pINI->ReadInteger(section, "AIBaseSpacing", AIBaseSpacing);
+
+    pINI->GetVectorIntegers(section, "AIForcePredictionFudge", AIForcePredictionFudge);
+    pINI->GetVectorBuildType(section, "NSGates",              NSGates);
+    pINI->GetVectorBuildType(section, "EWGates",              EWGates);
+    pINI->GetVectorBuildType(section, "BuildNavalYard",       BuildNavalYard);
+    pINI->GetVectorBuildType(section, "BuildDummy",           BuildDummy);
+    pINI->GetVectorBuildType(section, "NeutralTechBuildings", NeutralTechBuildings);
 }
 
 // ----------------------------------------------------------------------------
-// Read_Powerups - [Powerups] section
+// Read_Powerups - RulesClass_Addition_Powerups (asm 0x673E60)
+//
+//   Gated on the [Powerups] section existing.  For every one of the 19 crate
+//   types in strlist_CrateTypes the value is read with the original's
+//   "0,NONE" fallback and split on ',' into four fields:
+//
+//     <weight>,<anim>,<naval:yes|no>,<multiplier[%]>
+//
+//   Weight becomes an integer, the anim name resolves through
+//   AnimClass_FindIndex, naval is a case-insensitive "yes"/"no" toggle and
+//   the multiplier is parsed as a float with a trailing '%' dividing by 100.
+//   A section that is absent leaves the whole table untouched.
 // ----------------------------------------------------------------------------
+
+// The 19 crate names, in the order strlist_CrateTypes stores them.
+static const char* const CrateTypeNames[19] = {
+    "Money", "Unit", "HealBase", "Cloak", "Explosion", "Napalm", "Squad",
+    "Darkness", "Reveal", "Armor", "Speed", "Firepower", "ICBM",
+    "Invulnerability", "Veteran", "IonStorm", "Gas", "Tiberium", "Pod"
+};
+
+// RulesClass::PowerupWeights / ::PowerupAnims / ::PowerupNaval /
+// ::PowerupMultipliers - the four parallel tables the reader fills.
+double  PowerupWeights[19];
+int32   PowerupAnims[19];
+bool    PowerupNaval[19];
+double  PowerupMultipliers[19];
 
 void RulesClass::Read_Powerups(CCINIClass* pINI)
 {
@@ -1459,6 +2048,56 @@ void RulesClass::Read_Powerups(CCINIClass* pINI)
             DropZoneAnim = pAnimType;
         }
     }
+
+    // The per-crate table.  Gated on the section existing, exactly as the
+    // original checks Find_Section before it walks strlist_CrateTypes.
+    if (!pINI->SectionExists(section))
+        return;
+
+    for (int32 i = 0; i < 19; ++i) {
+        char dest[0x80];
+        dest[0] = '\0';
+
+        if (pINI->ReadString(section, CrateTypeNames[i], "0,NONE", dest,
+                             sizeof(dest)) <= 0) {
+            continue;
+        }
+
+        // Field 1 - weight.
+        char* pToken = std::strtok(dest, ",");
+        if (pToken != nullptr) {
+            StringHelpers::Trim(pToken);
+            PowerupWeights[i] = std::atoi(pToken);
+        }
+
+        // Field 2 - the anim, resolved by name against the anim type list.
+        pToken = std::strtok(nullptr, ",");
+        if (pToken != nullptr) {
+            StringHelpers::Trim(pToken);
+            PowerupAnims[i] = AnimTypeClass::FindIndex(pToken);
+        }
+
+        // Field 3 - the naval flag, "yes" / "no".
+        pToken = std::strtok(nullptr, ",");
+        if (pToken != nullptr) {
+            StringHelpers::Trim(pToken);
+            if (_strcmpi(pToken, "yes") == 0)
+                PowerupNaval[i] = 1;
+            else if (_strcmpi(pToken, "no") == 0)
+                PowerupNaval[i] = 0;
+        }
+
+        // Field 4 - the multiplier, optionally suffixed with '%'.
+        pToken = std::strtok(nullptr, ",");
+        if (pToken != nullptr) {
+            if (std::strchr(pToken, '%') != nullptr) {
+                PowerupMultipliers[i] = std::atof(pToken) * 1.0e-2;
+            } else {
+                StringHelpers::Trim(pToken);
+                PowerupMultipliers[i] = std::atof(pToken);
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1467,11 +2106,22 @@ void RulesClass::Read_Powerups(CCINIClass* pINI)
 
 void RulesClass::Read_LandCharacteristics(CCINIClass* pINI)
 {
+    const char* section = "LandCharacteristics";
     if (!pINI) return;
     // [LandCharacteristics] section: per-LandType Speed, Buildable, Passable
     // values.  Land movement characteristics are handled by the SpeedType /
     // MovementZone systems in TechnoTypeClass and do not require RulesClass
     // members.
+
+    // ---- rules keys ----
+    Hover                            = pINI->ReadDouble(section, "Hover", Hover);
+    Foot                             = pINI->ReadDouble(section, "Foot", Foot);
+    Track                            = pINI->ReadDouble(section, "Track", Track);
+    Wheel                            = pINI->ReadDouble(section, "Wheel", Wheel);
+    Float                            = pINI->ReadDouble(section, "Float", Float);
+    Amphibious                       = pINI->ReadDouble(section, "Amphibious", Amphibious);
+    FloatBeach                       = pINI->ReadDouble(section, "FloatBeach", FloatBeach);
+    Buildable                        = pINI->ReadBool(section, "Buildable", Buildable);
 }
 
 // ----------------------------------------------------------------------------
@@ -1517,7 +2167,31 @@ void RulesClass::Read_JumpjetControls(CCINIClass* pINI)
 }
 
 // ----------------------------------------------------------------------------
-// Read_Difficulties - [Difficulties] section
+void RulesClass::Read_Difficulties(CCINIClass* pINI)
+{
+    if (!pINI) return;
+
+    static const char* sections[3] = { "Easy", "Normal", "Difficult" };
+
+    for (int32 d = 0; d < 3; ++d)
+    {
+        const char* section = sections[d];
+        DifficultyStruct& diff = Difficulties[d];
+
+        diff.Firepower     = pINI->ReadDouble(section, "FirePower", diff.Firepower);
+        diff.GroundSpeed   = pINI->ReadDouble(section, "Groundspeed", diff.GroundSpeed);
+        diff.AirSpeed      = pINI->ReadDouble(section, "Airspeed", diff.AirSpeed);
+        diff.Armor         = pINI->ReadDouble(section, "Armor", diff.Armor);
+        diff.ROF           = pINI->ReadDouble(section, "ROF", diff.ROF);
+        diff.Cost          = pINI->ReadDouble(section, "Cost", diff.Cost);
+        diff.RepairDelay   = pINI->ReadDouble(section, "RepairDelay", diff.RepairDelay);
+        diff.BuildDelay    = pINI->ReadDouble(section, "BuildDelay", diff.BuildDelay);
+        diff.BuildSlowdown = pINI->ReadBool(section, "BuildSlowdown", diff.BuildSlowdown);
+        diff.BuildTime     = pINI->ReadDouble(section, "BuildTime", diff.BuildTime);
+        diff.DestroyWalls  = pINI->ReadBool(section, "DestroyWalls", diff.DestroyWalls);
+        diff.ContentScan   = pINI->ReadBool(section, "ContentScan", diff.ContentScan);
+    }
+}
 // ----------------------------------------------------------------------------
 
 
@@ -1529,10 +2203,18 @@ void RulesClass::Read_JumpjetControls(CCINIClass* pINI)
 void RulesClass::Read_Movies(CCINIClass* pINI)
 {
     if (!pINI) return;
-    // [Movies] section: campaign movie filenames for victory/defeat events
-    // (AlliedVictory, SovietVictory, IntroMovie, etc.).  Movie playback is
-    // handled by the campaign/mission system and does not require RulesClass
-    // members.
+
+    // [Movies] section: one key per campaign movie.  Registering the names
+    // builds the movie table that the campaign and mission files index into
+    // with their Intro / Brief / Win / Lose keys.
+    const int32 count = pINI->GetKeyCount("Movies");
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* pKeyName = pINI->GetKeyName("Movies", i);
+        if (pKeyName == nullptr)
+            continue;
+        MovieClass::Register(pKeyName);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1541,10 +2223,14 @@ void RulesClass::Read_Movies(CCINIClass* pINI)
 
 void RulesClass::Read_AdvancedCommandBar(CCINIClass* pINI)
 {
+    const char* section = "AdvancedCommandBar";
     if (!pINI) return;
     // [AdvancedCommandBar] section: command bar UI configuration.  These
     // settings are consumed directly by the UI system and do not require
     // RulesClass members.
+
+    // ---- rules keys ----
+    pINI->ReadString(section, "None", "", NoneValue2, sizeof(NoneValue2));
 }
 
 // ----------------------------------------------------------------------------

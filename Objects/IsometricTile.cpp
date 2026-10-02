@@ -5,8 +5,11 @@
 #include <Core/Memory.h>
 #include <COM/IUnknown.h>
 #include <IO/CRC.h>
+#include <INI/INIClass.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 // ============================================================================
 // IsometricTile.cpp - Isometric tile implementation
@@ -557,4 +560,199 @@ bool IsometricTile::Load(IStream* pStm)
     TileType = nullptr;
 
     return true;
+}
+
+// ============================================================================
+// IsometricTileType
+// ============================================================================
+
+DynamicVectorClass<IsometricTileType*>* TileTypeClass_Array = nullptr;
+int32                                   TileSet_TotalTileCount = 0;
+
+IsometricTileType::IsometricTileType() noexcept
+    : TilesInSet(0), LastTilesInSet(0)
+    , MarbleMadness(0xFFFF), NonMarbleMadness(0xFFFF)
+    , Morphable(false), AllowToPlace(true), AllowBurrowing(true)
+    , AllowTiberium(false), RequiredForRMG(false)
+    , ToSnowTheater(0), ToTemperateTheater(0)
+    , ShadowCaster(false), ShadowTiles(0)
+    , TileXOffset(nullptr), TileYOffset(nullptr)
+    , TileAttachesTo(nullptr), TileZAdjust(nullptr)
+    , ArrayIndex(0)
+{
+    SetName[0] = '\0';
+    FileName[0] = '\0';
+}
+
+IsometricTileType::~IsometricTileType() noexcept
+{
+    delete[] TileXOffset;
+    delete[] TileYOffset;
+    delete[] TileAttachesTo;
+    delete[] TileZAdjust;
+
+    TileXOffset = nullptr;
+    TileYOffset = nullptr;
+    TileAttachesTo = nullptr;
+    TileZAdjust = nullptr;
+}
+
+int32 IsometricTileType::GetTileSetCount()
+{
+    return TileTypeClass_Array ? TileTypeClass_Array->Count : 0;
+}
+
+IsometricTileType* IsometricTileType::GetTileSet(int32 index)
+{
+    if (!TileTypeClass_Array || index < 0 || index >= TileTypeClass_Array->Count)
+        return nullptr;
+
+    return (*TileTypeClass_Array)[index];
+}
+
+// IsometricTileTypeClass_FindIndex - looks a tile set up by its SetName.
+// The original runs a case-insensitive compare over the registered sets and
+// answers -1 when nothing matches, which is what BuildingTypeClass::ToTile
+// guards against before it stores the pointer.
+int32 IsometricTileType::FindIndex(const char* pID)
+{
+    if (pID == nullptr || pID[0] == '\0')
+        return -1;
+
+    if (!TileTypeClass_Array)
+        return -1;
+
+    for (int32 i = 0; i < TileTypeClass_Array->Count; ++i) {
+        IsometricTileType* pTileSet = (*TileTypeClass_Array)[i];
+        if (pTileSet == nullptr)
+            continue;
+
+        if (_strcmpi(pTileSet->SetName, pID) == 0)
+            return i;
+    }
+
+    return -1;
+}
+
+// Reads one [TileSet%04d] block.  The per tile arrays are sized from
+// TilesInSet and every element defaults to zero; LastTilesInSet, when it is
+// set and differs from TilesInSet, describes a second run of tiles that
+// shares the same art file.
+bool IsometricTileType::LoadFromINI(CCINIClass* pINI)
+{
+    if (!pINI)
+        return false;
+
+    char section[0x40];
+    std::sprintf(section, "TileSet%04d", ArrayIndex);
+
+    if (pINI->GetSection(section) == nullptr)
+        return false;
+
+    TilesInSet = pINI->ReadInteger(section, "TilesInSet", 0);
+    if (TilesInSet == 0)
+        return false;
+
+    LastTilesInSet = pINI->ReadInteger(section, "LastTilesInSet", 0);
+    if (LastTilesInSet == TilesInSet)
+        LastTilesInSet = 0;
+
+    pINI->ReadString(section, "SetName", "No Name", SetName, sizeof(SetName));
+    pINI->ReadString(section, "FileName", "TILE", FileName, sizeof(FileName));
+    SetName[sizeof(SetName) - 1] = '\0';
+    FileName[sizeof(FileName) - 1] = '\0';
+
+    MarbleMadness      = pINI->ReadInteger(section, "MarbleMadness", 0xFFFF);
+    NonMarbleMadness   = pINI->ReadInteger(section, "NonMarbleMadness", 0xFFFF);
+    Morphable          = pINI->ReadBool(section, "Morphable", false);
+    AllowToPlace       = pINI->ReadBool(section, "AllowToPlace", true);
+    AllowBurrowing     = pINI->ReadBool(section, "AllowBurrowing", true);
+    AllowTiberium      = pINI->ReadBool(section, "AllowTiberium", false);
+    RequiredForRMG     = pINI->ReadBool(section, "RequiredForRMG", false);
+    ToSnowTheater      = pINI->ReadInteger(section, "ToSnowTheater", 0);
+    ToTemperateTheater = pINI->ReadInteger(section, "ToTemperateTheater", 0);
+    ShadowCaster       = pINI->ReadBool(section, "ShadowCaster", false);
+    ShadowTiles        = pINI->ReadInteger(section, "ShadowTiles", 0);
+
+    TileXOffset    = new int32[TilesInSet]();
+    TileYOffset    = new int32[TilesInSet]();
+    TileAttachesTo = new int32[TilesInSet]();
+    TileZAdjust    = new int32[TilesInSet]();
+
+    if (!TileXOffset || !TileYOffset || !TileAttachesTo || !TileZAdjust)
+        return false;
+
+    for (int32 i = 0; i < TilesInSet; ++i) {
+        char key[0x20];
+
+        // The original folds the ordinal and the field name into a single
+        // format string - "Tile%02dXOffset" and friends - so the literal
+        // forms below are the ones the binary carries.
+        std::sprintf(key, "Tile%02dXOffset", i + 1);
+        TileXOffset[i] = pINI->ReadInteger(section, key, 0);
+
+        std::sprintf(key, "Tile%02dYOffset", i + 1);
+        TileYOffset[i] = pINI->ReadInteger(section, key, 0);
+
+        std::sprintf(key, "Tile%02dAttachesTo", i + 1);
+        TileAttachesTo[i] = pINI->ReadInteger(section, key, 0);
+
+        std::sprintf(key, "Tile%02dZAdjust", i + 1);
+        TileZAdjust[i] = pINI->ReadInteger(section, key, 0);
+    }
+
+    return true;
+}
+
+// Walks TileSet0000, TileSet0001, ... until a number is missing and creates one
+// type per set.  The flag selects the theater: a set is kept only when its
+// theater key is non-zero, and only the sets that are kept contribute to the
+// global tile count.
+void IsometricTileType::CreateFromINIList(CCINIClass* pINI, bool bTheater)
+{
+    if (!pINI)
+        return;
+
+    if (!TileTypeClass_Array)
+        TileTypeClass_Array = new DynamicVectorClass<IsometricTileType*>();
+
+    TileSet_TotalTileCount = 0;
+
+    for (int32 i = 0; i < 0x10000; ++i) {
+        char section[0x40];
+        std::sprintf(section, "TileSet%04d", i);
+
+        if (pINI->GetSection(section) == nullptr)
+            break;
+
+        IsometricTileType* pTileSet = new IsometricTileType();
+        if (!pTileSet)
+            break;
+
+        pTileSet->ArrayIndex = i;
+
+        if (!pTileSet->LoadFromINI(pINI)) {
+            delete pTileSet;
+            continue;
+        }
+
+        if (bTheater) {
+            if (pTileSet->ToSnowTheater == 0) {
+                delete pTileSet;
+                continue;
+            }
+        } else {
+            if (pTileSet->ToTemperateTheater == 0) {
+                delete pTileSet;
+                continue;
+            }
+        }
+
+        if (!TileTypeClass_Array->Add(pTileSet)) {
+            delete pTileSet;
+            continue;
+        }
+
+        TileSet_TotalTileCount += pTileSet->TilesInSet;
+    }
 }

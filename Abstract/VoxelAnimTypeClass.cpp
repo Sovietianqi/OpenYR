@@ -1,4 +1,7 @@
 #include <Abstract/VoxelAnimTypeClass.h>
+#include <Audio/VocClass.h>
+#include <Particles/ParticleSystemTypeClass.h>
+#include <Animations/AnimTypeClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -132,6 +135,7 @@ VoxelAnimTypeClass::VoxelAnimTypeClass(const char* pID) noexcept
     IsFlat         = false;
     IsAnimated     = false;
     SpawnsAnim     = false;
+    Spawns         = nullptr;
     SpawnAnimIndex = -1;
     StartAnimIndex = 0;
     WillBounce     = false;
@@ -363,13 +367,8 @@ bool VoxelAnimTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Classification flags
     // ------------------------------------------------------------------
-    IsMeteor   = pINI->ReadBool(section, "Meteor",   IsMeteor);
     IsDebris   = pINI->ReadBool(section, "Debris",   IsDebris);
     IsFlat     = pINI->ReadBool(section, "Flat",     IsFlat);
-    IsAnimated = pINI->ReadBool(section, "Animated", IsAnimated);
-    SpawnsAnim = pINI->ReadBool(section, "SpawnsAnim", SpawnsAnim);
-    WillBounce = pINI->ReadBool(section, "Bouncing", WillBounce);
-    UseLight   = pINI->ReadBool(section, "UseLight", UseLight);
 
     // ------------------------------------------------------------------
     // Combat properties
@@ -397,8 +396,6 @@ bool VoxelAnimTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Spawned animation references
     // ------------------------------------------------------------------
-    SpawnAnimIndex = pINI->ReadInteger(section, "SpawnAnim", SpawnAnimIndex);
-    StartAnimIndex = pINI->ReadInteger(section, "StartAnim", StartAnimIndex);
 
     // ------------------------------------------------------------------
     // Lighting parameters
@@ -442,20 +439,61 @@ bool VoxelAnimTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // HVA model art reference - optional; falls back to the VXL name.
     // ------------------------------------------------------------------
-    char hvaBuf[64];
-    pINI->ReadString(section, "HVA", "", hvaBuf, sizeof(hvaBuf));
-    if (hvaBuf[0] != '\0')
+    // HVA model art reference - not named in the INI; derived from the VXL
+    // name by swapping the extension.
     {
         int32 j = 0;
-        while (hvaBuf[j] != '\0' && j < static_cast<int32>(sizeof(HVAName) - 1))
+        while (VoxelName[j] != '\0' && VoxelName[j] != '.'
+               && j < static_cast<int32>(sizeof(HVAName) - 4))
         {
-            HVAName[j] = hvaBuf[j];
+            HVAName[j] = VoxelName[j];
             ++j;
         }
-        HVAName[j] = '\0';
+        HVAName[j++] = '.';
+        HVAName[j++] = 'h';
+        HVAName[j++] = 'v';
+        HVAName[j++] = 'a';
+        HVAName[j]   = '\0';
     }
 
-    return true;
+
+    // generated-ini-reads
+    // ------------------------------------------------------------------
+    // Full key set - every field keeps its current value when the key
+    // is absent, so partially specified sections stay valid.
+    // ------------------------------------------------------------------
+    CCINIClass* pArt = &CCINIClass::INI_Art;
+    if (pArt == nullptr)
+        pArt = pINI;
+
+    Normalized = pINI->ReadBool(section, "Normalized", Normalized);
+    Translucent = pINI->ReadBool(section, "Translucent", Translucent);
+    IsTiberium = pINI->ReadBool(section, "IsTiberium", IsTiberium);
+    IsMeteor = pINI->ReadBool(section, "IsMeteor", IsMeteor);
+    Elasticity = pINI->ReadFixed(section, "Elasticity", Elasticity);
+    MinAngularVelocity = pINI->ReadFixed(section, "MinAngularVelocity", MinAngularVelocity);
+    MaxAngularVelocity = pINI->ReadFixed(section, "MaxAngularVelocity", MaxAngularVelocity);
+    Duration = pINI->ReadInteger(section, "Duration", Duration);
+    MinZVel = pINI->ReadFixed(section, "MinZVel", MinZVel);
+    MaxZVel = pINI->ReadFixed(section, "MaxZVel", MaxZVel);
+    MaxXYVel = pINI->ReadFixed(section, "MaxXYVel", MaxXYVel);
+    { char _buf[0x40]; if (pINI->ReadString(section, "Spawns", "", _buf, sizeof(_buf)) > 0) { VoxelAnimTypeClass* _p = VoxelAnimTypeClass::FindOrAllocate(_buf); if (_p) Spawns = _p; } }
+    SpawnCount = pINI->ReadInteger(section, "SpawnCount", SpawnCount);
+    ShareBodyData = pINI->ReadBool(section, "ShareBodyData", ShareBodyData);
+    ShareTurretData = pINI->ReadBool(section, "ShareTurretData", ShareTurretData);
+    ShareBarrelData = pINI->ReadBool(section, "ShareBarrelData", ShareBarrelData);
+    VoxelIndex = pINI->ReadInteger(section, "VoxelIndex", VoxelIndex);
+    { char _buf[0x40]; if (pINI->ReadString(section, "StartSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) StartSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "StopSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) StopSound = _i; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "BounceAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) BounceAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "ExpireAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) ExpireAnim = _p; } }
+    { char _buf[0x40]; if (pINI->ReadString(section, "TrailerAnim", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) TrailerAnim = _p; } }
+    Damage = pINI->ReadInteger(section, "Damage", Damage);
+    DamageRadius = pINI->ReadInteger(section, "DamageRadius", DamageRadius);
+    { char _buf[0x40]; if (pINI->ReadString(section, "AttachedSystem", "", _buf, sizeof(_buf)) > 0) { ParticleSystemTypeClass* _p = ParticleSystemTypeClass::FindOrAllocate(_buf); if (_p) AttachedSystem = _p; } }
+    ShareSource = pINI->ReadInteger(section, "ShareSource", ShareSource);
+
+        return true;
 }
 
 // ============================================================================
@@ -495,4 +533,19 @@ int32 VoxelAnimTypeClass::GetCRC() const
     CRCEngine crc;
     ComputeCRC(crc);
     return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// VoxelAnimTypeClass - static lookup helpers
+// ============================================================================
+
+VoxelAnimTypeClass* VoxelAnimTypeClass::FindOrAllocate(const char* pID)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+    VoxelAnimTypeClass* found = Find(pID);
+    if (found) return found;
+    if (!Array) Init_Array();
+    VoxelAnimTypeClass* newItem = GameCreate<VoxelAnimTypeClass>(pID);
+    if (newItem && Array) Array->Add(newItem);
+    return newItem;
 }
