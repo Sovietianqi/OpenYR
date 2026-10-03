@@ -270,6 +270,14 @@ public:
     // resolve the "ToTile" key of a building section.
     static int32 FindIndex(const char* pID);
 
+    // IsometricTileTypeClass_CreateFromINIList - the tail of the walk: after a
+    // tile set has been created, every [General] special-tile key whose value
+    // equals this set's SetName has its ordinal updated to the running tile
+    // count.  bTheater selects the [General] block that was read (the snow
+    // theater fills from the MD.INI, the temperate one from the main INI).
+    static void Apply_Special_Tile_Indices(CCINIClass* pINI, bool bTheater,
+                                           const char* pSetName, int32 ordinal);
+
     // ---- [TileSet%04d] scalars ----
     int32       TilesInSet;
     int32       LastTilesInSet;

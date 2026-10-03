@@ -160,6 +160,7 @@ ObjectTypeClass::ObjectTypeClass() noexcept
     IsTheater      = false;
     IdleLayer      = Layer::Ground;
     Land           = LandType::Clear;
+    ImageSHP       = nullptr;
 }
 
 ObjectTypeClass::ObjectTypeClass(const char* pID) noexcept
@@ -186,6 +187,7 @@ ObjectTypeClass::ObjectTypeClass(const char* pID) noexcept
     IsTheater      = false;
     IdleLayer      = Layer::Ground;
     Land           = LandType::Clear;
+    ImageSHP       = nullptr;
 }
 
 ObjectTypeClass::ObjectTypeClass(noinit_t) noexcept
@@ -855,4 +857,61 @@ void ObjectTypeClass::Resolve_SHP_References()
     // The IsTheater flag indicates whether the art varies by theater.
     // Theater-specific art resolution is performed by the subclass override
     // via LoadTheaterSpecificArt(); the base has nothing to resolve.
+}
+
+// ============================================================================
+// ObjectTypeClass vtable probes
+// ============================================================================
+
+// ObjectTypeClass_GetImage (asm: mov eax, [ecx+ObjectTypeClass.ImageSHP] ; retn).
+//
+//  The cached SHP handle for the type's art.  Resolve_SHP_References fills the
+//  slot once the art INI has been read; before that it is null.
+SHPStruct* ObjectTypeClass::GetImage() const
+{
+    return ImageSHP;
+}
+
+// ObjectTypeClass_GetPipMax (asm: xor eax, eax ; retn).
+//
+//  At the base level a type renders no pips; the types that do (buildings
+//  showing a production queue, harvesters showing a fill) override this.
+int32 ObjectTypeClass::GetPipMax() const
+{
+    return 0;
+}
+
+// ObjectTypeClass_GetActualCost (asm: xor eax, eax ; retn 4).
+//
+//  The cost after every owning-house modifier.  The type layer has no owner
+//  to consult, so it reports nothing.
+int32 ObjectTypeClass::GetActualCost(HouseClass* /*pOwner*/) const
+{
+    return 0;
+}
+
+// ObjectTypeClass_GetBuildSpeed (asm: xor eax, eax ; retn).
+//
+//  Build-speed factor used by the factory timing code; the concrete type
+//  classes supply their real value.
+int32 ObjectTypeClass::GetBuildSpeed() const
+{
+    return 0;
+}
+
+// ObjectTypeClass_GetCameo (asm: xor eax, eax ; retn).
+//
+//  Sidebar cameo index.  The base type has no cameo, so it reports index 0.
+int32 ObjectTypeClass::GetCameo() const
+{
+    return 0;
+}
+
+// ObjectTypeClass_Generic (asm: mov byte ptr [ecx+1], 'G' ; retn).
+//
+//  The sidebar marks generic (non-faction-specific) cameos with a 'G' in the
+//  second byte of the type record.
+void ObjectTypeClass::Generic()
+{
+    reinterpret_cast<uint8*>(this)[1] = 'G';
 }

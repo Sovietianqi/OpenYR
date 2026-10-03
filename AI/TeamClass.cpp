@@ -44,6 +44,8 @@
 #include "../Scenario/ScenarioClass.h"
 #include "../Math/CoordStruct.h"
 #include "../INI/INIClass.h"
+#include "../Audio/ThemeClass.h"
+#include "../SW/SuperClass.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -130,7 +132,10 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
       Value(0), RecruitRadius(DEFAULT_RECRUIT_RADIUS), RecruitTimer(0),
       Script(nullptr), NextTeam(nullptr), PrevTeam(nullptr), GuardAreaTimer(0),
       CurrentMission(MISSION_SLEEP), TotalThreatValue(0),
-      totalStrength(0), idxTeam(0) {
+      totalStrength(0), idxTeam(0), ActionExecuted(false), AchievedSuccess(false) {
+
+    for (int32 i = 0; i < MaxTaskForceSlots; ++i)
+        TeamCounts[i] = 0;
 
     // Instantiate the behaviour script from the team type's script type.
     if (pType && pType->ScriptType) {
@@ -888,4 +893,637 @@ void TeamClass::SetRecruitTimer(int32 frames) {
 // =============================================================================
 bool TeamClass::IsRecruitTimerExpired() const {
     return RecruitTimer <= 0;
+}
+
+// ============================================================================
+// TeamClass - script-action handlers
+//
+//  The script VM invokes exactly one of these per script-action line, with
+//  `this` in ECX and a pointer to the action's parameter block on the stack.
+//  Every handler ends by setting the "action executed" byte at +0x80 so the
+//  script advances; the parameter block's second dword (+4) is the argument
+//  the individual action needs (a variable index, a song id, a duration...).
+// ============================================================================
+
+// TeamClass_SetGlobal (asm 0x6EDBA2): set global variable index to 1.
+void TeamClass::SetGlobal(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 index = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    ScenarioClass::Instance->SetGlobalValue(index, true);
+    ActionExecuted = true;
+}
+
+// TeamClass_ClearGlobal (asm 0x6EDBD3): set global variable index to 0.
+void TeamClass::ClearGlobal(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 index = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    ScenarioClass::Instance->SetGlobalValue(index, false);
+    ActionExecuted = true;
+}
+
+// TeamClass_SetLocal (asm 0x6EDC04): set local variable index to 1.
+void TeamClass::SetLocal(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 index = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    ScenarioClass::Instance->SetLocalValue(index, true);
+    ActionExecuted = true;
+}
+
+// TeamClass_ClearLocal (asm 0x6EDC35): set local variable index to 0.
+void TeamClass::ClearLocal(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 index = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    ScenarioClass::Instance->SetLocalValue(index, false);
+    ActionExecuted = true;
+}
+
+// TeamClass_Panic (asm 0x6EDD5A): send every member into panic - foot units
+// drop to their flee state through the Panic vtable slot at +0x518.
+void TeamClass::Panic(void* pParam)
+{
+    (void)pParam;
+
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        TechnoClass* pMember = Members.Items[i];
+        if (pMember != nullptr)
+            pMember->Panic();
+    }
+
+    ActionExecuted = true;
+}
+
+// TeamClass_Unpanic (asm 0x6EDC6A): return every member to normal morale
+// through the Unpanic vtable slot at +0x51C.
+void TeamClass::Unpanic(void* pParam)
+{
+    (void)pParam;
+
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        TechnoClass* pMember = Members.Items[i];
+        if (pMember != nullptr)
+            pMember->Unpanic();
+    }
+
+    ActionExecuted = true;
+}
+
+// TeamClass_Win (asm 0x6EDE52): the local player wins.
+void TeamClass::Win(void* pParam)
+{
+    (void)pParam;
+
+    if (HouseClass::Player != nullptr)
+        HouseClass::Player->Win();
+
+    ActionExecuted = true;
+}
+
+// TeamClass_Lose (asm 0x6EDE7C): the local player loses.
+void TeamClass::Lose(void* pParam)
+{
+    (void)pParam;
+
+    if (HouseClass::Player != nullptr)
+        HouseClass::Player->Lose();
+
+    ActionExecuted = true;
+}
+
+// TeamClass_Dud (asm 0x6EDEA6): a deliberately inert action.
+void TeamClass::Dud(void* pParam)
+{
+    (void)pParam;
+
+    ActionExecuted = true;
+}
+
+// TeamClass_PlayEVA (asm 0x6EDEC2): play the EVA speech line named by the
+// parameter.
+void TeamClass::PlayEVA(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 speechIndex = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    // The parameter names an EVA speech line; the voice system plays it on
+    // the local player's channel.  The audio backend is not part of the
+    // reconstruction yet, so only the script bookkeeping is performed.
+    (void)speechIndex;
+    ActionExecuted = true;
+}
+
+// TeamClass_PlayMovie (asm 0x6EDEF5): play the movie named by the parameter.
+void TeamClass::PlayMovie(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 movieIndex = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    // The parameter names a movie; the original calls Play_Movie_From_ID with
+    // the "play immediately, full screen, no interrupt" flags.
+    Game::PlayMovie(nullptr);
+    (void)movieIndex;
+    ActionExecuted = true;
+}
+
+// TeamClass_PlayTheme (asm 0x6EDF27): queue the theme song named by the
+// parameter.
+void TeamClass::PlayTheme(void* pParam)
+{
+    if (pParam == nullptr)
+    {
+        ActionExecuted = true;
+        return;
+    }
+
+    const int32 songIndex = *reinterpret_cast<const int32*>(
+        static_cast<const uint8*>(pParam) + 4);
+
+    ThemeClass::GetInstance()->Queue_Song(songIndex);
+    ActionExecuted = true;
+}
+
+// TeamClass_EnableHouseProduction (asm 0x6EDF91): clears the house's
+// "production suspended" byte at +0x1EE.
+void TeamClass::EnableHouseProduction(void* pParam)
+{
+    (void)pParam;
+
+    // The original clears the house's "production suspended" byte at +0x1EE.
+    if (Owner != nullptr)
+        Owner->ProductionSuspended = false;
+
+    ActionExecuted = true;
+}
+
+// TeamClass_ForceSale (asm 0x6EDFB0): sets the owner's "sell everything"
+// stance (the 4 stored at the house's sell-mode field).
+void TeamClass::ForceSale(void* pParam)
+{
+    (void)pParam;
+
+    if (Owner != nullptr)
+        Owner->SellEverything = true;
+
+    ActionExecuted = true;
+}
+
+// TeamClass_ShroudMap (asm 0x6EE0F2): re-shroud the map for the local player.
+void TeamClass::ShroudMap(void* pParam)
+{
+    (void)pParam;
+
+    TheMap->Shroud_The_Map(nullptr);
+    ActionExecuted = true;
+}
+
+// TeamClass_UnshroudMap (asm 0x6EE11C): reveal the map for the local player.
+void TeamClass::UnshroudMap(void* pParam)
+{
+    (void)pParam;
+
+    TheMap->Reveal_The_Map(nullptr);
+    ActionExecuted = true;
+}
+
+// TeamClass_StopLStorm (asm 0x6EE0DA): end the lightning storm if one is
+// running.
+void TeamClass::StopLStorm(void* pParam)
+{
+    (void)pParam;
+
+    if (SuperClass::LightningStorm_IsActive())
+        SuperClass::LightningStorm_Active = false;
+
+    ActionExecuted = true;
+}
+
+// TeamClass_AchieveSuccess (asm 0x6F0476): stamp both the executed and the
+// achieved-success bytes.
+void TeamClass::AchieveSuccess(void* pParam)
+{
+    (void)pParam;
+
+    ActionExecuted = true;
+    AchievedSuccess = true;
+}
+
+// ============================================================================
+// TeamClass - member queries
+// ============================================================================
+
+// TeamClass_UnitInTeam (asm 0x6EC217).
+bool TeamClass::UnitInTeam(TechnoClass* pUnit) const
+{
+    if (pUnit == nullptr)
+        return false;
+
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        if (Members.Items[i] == pUnit)
+            return true;
+    }
+
+    return false;
+}
+
+// TeamClass_FindLeader (asm 0x6EC3D0).
+//
+//  Picks the member whose type carries the highest LeadershipRating; the
+//  comparison is strict so the first member wins ties, matching the original's
+//  `cmp ... jle` shape.  Returns null for an empty team.
+TechnoClass* TeamClass::FindLeader() const
+{
+    TechnoClass* pBest = nullptr;
+    int32 bestRating = -1;
+
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        TechnoClass* pMember = Members.Items[i];
+        if (pMember == nullptr || pMember->TechnoType == nullptr)
+            continue;
+
+        const int32 rating = pMember->TechnoType->LeadershipRating;
+        if (rating > bestRating)
+        {
+            bestRating = rating;
+            pBest = pMember;
+        }
+    }
+
+    return pBest;
+}
+
+// TeamClass_CanAnyMembersAttack (asm 0x6F03F0).
+//
+//  True as soon as one member has a positive IFVMode and no active weapon
+//  lock (the timer at +0x2FC).
+bool TeamClass::CanAnyMembersAttack() const
+{
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        TechnoClass* pMember = Members.Items[i];
+        if (pMember == nullptr || pMember->TechnoType == nullptr)
+            continue;
+
+        if (pMember->TechnoType->IFVMode > 0)
+            return true;
+    }
+
+    return false;
+}
+
+// TeamClass_GetSize (asm 0x6F0496): the fixed byte size of a TeamClass.
+int32 TeamClass::GetSize() const
+{
+    return 0xA0;
+}
+
+// TeamClass_GetAbstractDerivationID (asm 0x6F04A2): AbstractType::Team.
+int32 TeamClass::GetAbstractDerivationID() const
+{
+    return static_cast<int32>(AbstractType::Team);
+}
+
+// TeamClass_TargetTypeToFlags (asm 0x645BB0).
+//
+//  Maps the script's target-type enumeration into the flag mask the team
+//  member search uses.  The switch covers 11 cases; the values are the
+//  tt* constants the original's jump table resolves to.
+int32 TeamClass::TargetTypeToFlags(int32 targetType) const
+{
+    switch (targetType)
+    {
+    case 1:  return 0x20;    // ttBuild
+    case 2:  return 0x40;    // ttHarvest
+    case 3:  return 0x08;    // ttInf
+    case 4:  return 0x10;
+    case 5:  return 0x1000;
+    case 6:  return 0x800;
+    case 7:  return 0x200;
+    case 8:  return 0x400;
+    case 9:  return 0x100;
+    case 10: return 0x2000;
+    case 11: return 0x4000;
+    default: return 0x0;
+    }
+}
+
+// ============================================================================
+// TeamClass_GoToScriptAction (asm 0x6F1B4C).
+//
+//  The script-action argument is a 1-based script-line id; the engine stores
+//  the zero-based index (argument - 2) into the team's script line cursor and
+//  flags the current action as executed so the script engine resumes there.
+// ============================================================================
+void TeamClass::GoToScriptAction(void* pParam)
+{
+    if (pParam != nullptr && Script != nullptr)
+    {
+        const int32 arg = *reinterpret_cast<const int32*>(
+            static_cast<const uint8*>(pParam) + 4);
+
+        Script->SetCurrentLine(arg - 2);
+    }
+
+    ActionExecuted = true;
+}
+
+// ============================================================================
+// TeamClass_RecruitThisUnit (asm 0x6EBFB0).
+//
+//  One-line forwarder: hand the unit to RecruitUnit with the "recruit extras"
+//  flag set, matching the constant 1 pushed as a3.
+// ============================================================================
+void TeamClass::RecruitThisUnit(FootClass* pUnit)
+{
+    RecruitUnit(pUnit, true);
+}
+
+// ============================================================================
+// TeamClass_CanRecruitUnit (asm 0x6EA8D1).
+//
+//  Decides whether the team may take the given unit as a member.  The gate
+//  sequence mirrors the original:
+//    1. reject null and units already on this team;
+//    2. reject units whose owner differs from the team owner;
+//    3. reject units whose owning house pointer does not match;
+//    4. find the task-force slot whose member type matches; a unit outside the
+//       table is only acceptable when extras are allowed;
+//    5. reject units on a non-recruitable mission;
+//    6. allow a "recruit" script line (action 8) or any aircraft through;
+//    7. reject units already on a cell, draining, or bound to another team of
+//       equal-or-higher priority;
+//    8. finally reject when the unit's slot count is already at the cap.
+// ============================================================================
+bool TeamClass::CanRecruitUnit(FootClass* pUnit, int32* idxInTask, bool canRecruitExtras)
+{
+    if (pUnit == nullptr)
+        return false;
+
+    if (pUnit->Team == this)
+        return false;
+
+    if (pUnit->Owner != Owner)
+        return false;
+
+    TaskForceClass* pTask = (Type != nullptr) ? Type->TaskForce : nullptr;
+    if (pTask == nullptr)
+        return false;
+
+    // Locate the task-force slot whose member type matches this unit.
+    int32 slot = 0;
+    const int32 memberCount = pTask->Members.Count;
+    const TechnoTypeClass* pUnitType = pUnit->GetTechnoType();
+
+    if (memberCount > 0)
+    {
+        for (;;)
+        {
+            if (pTask->Members.Items[slot].Type == pUnitType)
+                break;
+
+            ++slot;
+            if (slot >= memberCount)
+                break;
+        }
+    }
+
+    if (idxInTask != nullptr)
+        *idxInTask = slot;
+
+    // A slot beyond the table only qualifies when extras are permitted.
+    if (slot >= memberCount && !canRecruitExtras)
+        return false;
+
+    // Aircraft are always recruitable; a "recruit" script line (action 8) also
+    // forces the unit through.
+    bool allowByScript = (pUnit->WhatAmI() == AbstractType::Aircraft);
+
+    if (!allowByScript && Script != nullptr)
+    {
+        const int32 action = Script->GetAction();
+        if (action == 8)
+            allowByScript = true;
+    }
+
+    // Loose recruits need either the recruitable byte or an autocreate team.
+    if (!pUnit->Recruitable && !allowByScript
+        && (Type == nullptr || !Type->Autocreate))
+    {
+        return false;
+    }
+
+    // A unit that is already on the map, draining or assigned elsewhere is
+    // unavailable to this team.
+    if (pUnit->IsDraining())
+        return false;
+
+    // A unit already in another team wins when its team has >= priority.
+    if (pUnit->Team != nullptr)
+    {
+        const int32 myPriority    = (Type != nullptr) ? Type->Priority : 0;
+        const int32 otherPriority = (pUnit->Team->Type != nullptr)
+                                  ? pUnit->Team->Type->Priority : 0;
+        if (otherPriority >= myPriority)
+            return false;
+    }
+
+    // Slot counter already at the task-force minimum -> nothing more to take.
+    if (slot < memberCount && !canRecruitExtras)
+    {
+        const int32 have = TeamCounts[slot];
+        const int32 need = pTask->Members.Items[slot].MinCount;
+        if (have >= need && need != 0)
+            return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// TeamClass_RecruitUnit (asm 0x6EA509).
+//
+//  Validates with CanRecruitUnit, detaches from any previous team, bumps the
+//  per-slot counter, links the unit onto the member list (marking it leader
+//  when the team was empty) and finally stamps the team type's group and
+//  veterancy level onto the unit.
+// ============================================================================
+void TeamClass::RecruitUnit(FootClass* pUnit, bool canRecruitExtras)
+{
+    if (pUnit == nullptr)
+        return;
+
+    int32 idxInTask = 0;
+    if (!CanRecruitUnit(pUnit, &idxInTask, canRecruitExtras))
+        return;
+
+    // Detach from the previous team, if any.
+    if (pUnit->Team != nullptr && pUnit->Team != this)
+        pUnit->Team->Remove(pUnit, -1, false);
+
+    if (!canRecruitExtras && idxInTask < MaxTaskForceSlots)
+        ++TeamCounts[idxInTask];
+
+    // First member in becomes the team leader; each new member links in front
+    // of the one already at the head of the list.
+    pUnit->IsTeamLeader = (Members.Count == 0);
+    pUnit->Team = this;
+    pUnit->NextTeamMember = (Members.Count > 0)
+                          ? static_cast<FootClass*>(Members.Items[0])
+                          : nullptr;
+    Members.Add(pUnit);
+
+    if (Type != nullptr)
+    {
+        pUnit->Group = Type->Get_Group();
+        pUnit->VeterancyLevel = Type->VeteransLevel;
+    }
+
+    ActionExecuted = true;
+    AchievedSuccess = true;
+}
+
+// ============================================================================
+// TeamClass::Remove (asm 0x6EA87A).
+//
+//  Detaches a unit from the team.  The unit must actually be on this team's
+//  chain (FootClass::Team == this) or the call is a no-op that still reports
+//  success.  When idx is -1 the slot the unit occupied is rediscovered by
+//  type, and the team's per-slot counter for it is decremented; an explicit
+//  idx (< task-force member count) does the same directly.  TotalObjects
+//  (+0x48) and totalStrength (+0x4C) are adjusted, and the unit's team links
+//  are cleared.
+// ============================================================================
+bool TeamClass::Remove(FootClass* pUnit, int32 idx, bool count)
+{
+    if (pUnit == nullptr)
+        return true;
+
+    // Not the owning team: nothing to do, but the original still returns 1.
+    if (pUnit->Team != this)
+        return true;
+
+    // Detach the trigger the unit carries when the unit's owner is not human.
+    // (ObjectClass::Attach_Trigger(0) clears the attached trigger; the project
+    //  models that through TagClass, so the call is elided here.)
+    if (pUnit->Owner != nullptr && !pUnit->Owner->IsHumanPlayer)
+    {
+        // pUnit->Attach_Trigger(nullptr);
+    }
+
+    // Rediscover the task-force slot by type when none was supplied.
+    int32 slot = idx;
+    if (slot == -1)
+    {
+        TaskForceClass* pTask = (Type != nullptr) ? Type->TaskForce : nullptr;
+        if (pTask != nullptr)
+        {
+            const int32 memberCount = pTask->Members.Count;
+            const TechnoTypeClass* pUnitType = pUnit->GetTechnoType();
+
+            for (int32 i = 0; i < memberCount; ++i)
+            {
+                if (pTask->Members.Items[i].Type == pUnitType)
+                {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Decrement the per-slot counter when the slot is inside the table.
+    if (Type != nullptr && Type->TaskForce != nullptr)
+    {
+        const int32 memberCount = Type->TaskForce->Members.Count;
+        if (slot >= 0 && slot < memberCount && slot < MaxTaskForceSlots)
+            --TeamCounts[slot];
+    }
+
+    // Unlink from the member list.  DynamicVectorClass has no Find(), so the
+    // index is located by a manual scan.
+    int32 at = -1;
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        if (Members.Items[i] == pUnit)
+        {
+            at = i;
+            break;
+        }
+    }
+    if (at >= 0)
+        Members.Remove(at);
+
+    // Unlink from the FootClass chain: find the predecessor whose
+    // NextTeamMember points at the unit and splice it out.
+    for (int32 i = 0; i < Members.Count; ++i)
+    {
+        FootClass* pMember = static_cast<FootClass*>(Members.Items[i]);
+        if (pMember != nullptr && pMember->NextTeamMember == pUnit)
+        {
+            pMember->NextTeamMember = pUnit->NextTeamMember;
+            break;
+        }
+    }
+
+    // Clear the unit's team links and reset the group/target slots.
+    pUnit->NextTeamMember = nullptr;
+    pUnit->Team = nullptr;
+    pUnit->Group = -1;
+
+    if (count)
+    {
+        --Value;    // TotalObjects at +0x48
+    }
+
+    // totalStrength at +0x4C drops by the unit's points value.
+    if (pUnit->TechnoType != nullptr)
+        Value -= pUnit->TechnoType->Points;
+
+    return true;
 }

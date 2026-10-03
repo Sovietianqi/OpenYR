@@ -74,9 +74,77 @@ public:
     void SetTrigger(TriggerClass* pTrigger);
     TriggerClass* GetTrigger() const;
 
+    // ========================================================================
+    // Scripted action helpers (asm 0x6E42C3..0x6E460E)
+    //
+    //  The original binary implements these as standalone ActionClass_*
+    //  functions despatched from TActionClass::Execute with `this` already in
+    //  ECX, so they behave as member functions.  Each returns true when it
+    //  applied the action and false when a precondition (usually the target
+    //  house or the waypoint) was not met.
+    // ========================================================================
+    bool SetTargetCell(TriggerClass* pTrigger);
+    bool ClearTargetCell(TriggerClass* pTrigger);
+    bool SetDefensiveCell(TriggerClass* pTrigger);
+    bool ClearDefensiveCell(TriggerClass* pTrigger);
+    bool SetBaseCenter(TriggerClass* pTrigger);
+    bool ClearBaseCenter(TriggerClass* pTrigger);
+    bool SetSWCharge(TriggerClass* pTrigger);
+    bool SetSWRecharge(TriggerClass* pTrigger);
+    bool ResetSWRecharge(TriggerClass* pTrigger);
+    bool ResetSW(TriggerClass* pTrigger);
+    HouseClass* FindHouseByIdx(TriggerClass* pTrigger, int32 idx);
+
+    // ========================================================================
+    // Special strike actions (asm 0x6E35F0 / 0x6E38C0 / 0x6E33A0)
+    // ========================================================================
+    bool FireChemLauncher(HouseClass* pOwner, int32 a3, TriggerClass* pTrigger, int32 a5);
+    bool TriggerNukeStrike(HouseClass* pOwner, int32 a3, TriggerClass* pTrigger, int32 a5);
+
+    // ========================================================================
+    // ActionClass_* handlers (asm 0x6E1xxx..0x6E4xxx).  The binary implements
+    // these as free functions called with `this` already loaded into ECX, so
+    // they are modelled as members here.
+    // ========================================================================
+    bool ClearSmudges();
+    bool RetintRed();
+    bool RetintGreen();
+    bool RetintBlue();
+    bool RadarBlackout(HouseClass* pHouse);
+    bool TeleportAllTo(HouseClass* pHouse);
+    bool ReshroudMap();
+    bool DropFlare(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool StopSoundsAt(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool WakeupAttachedObjects(HouseClass* pHouse, int32 a3,
+                               TriggerClass* pTrigger, int32 a5);
+    bool MindControlHouseBuildings(HouseClass* pNewOwner, TriggerClass* pTrigger);
+    bool ReturnControlHouseBuildings(HouseClass* pOwner, TriggerClass* pTrigger);
+    bool ResizePlayerView();
+    bool EnableTrigger(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool FlashCameo(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool CreateBuilding(int32 a1, int32 a3, int32 a4, int32 a5);
+    bool FlashBuildingsOfType(HouseClass* pHouse);
+
+    // The recurring house-resolution helper every ActionClass handler uses:
+    // index 0x2325 means "the house related to the calling trigger", -1 means
+    // "no house", and anything else is looked up in the house array - through
+    // the MP-aware variant for the seven special multiplayer country slots.
+    static HouseClass* Resolve_Action_House(int32 idx, TriggerClass* pTrigger);
+
+    bool AttachedTagSwitchHouse(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool FireIronCurtain(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool DestroyAllOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool DestroyAllBuildingsOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool DestroyAllLandUnitsOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool DestroyAllNavalOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool RestoreStartingTechnoOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool RestoreStartingBuildingsOf(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool SetTab(int32 tabIndex);
+    bool SetHouseTargetCell(HouseClass* pHouse);
+    bool ClearHouseTargetCell(HouseClass* pHouse);
+
 private:
-    void Action_WinGame();
-    void Action_LoseGame();
+    void Action_WinGame();    void Action_LoseGame();
     void Action_Production();
     void Action_CreateTeam();
     void Action_ReinforceTeam();

@@ -43,6 +43,7 @@ public:
     virtual bool IsHarvesting() const;
     virtual int32 GetTiberiumLoad() const;
     virtual float GetTiberiumValue() const;
+    virtual double Get_Tiberium() const override;
     virtual bool IsHarvestingTooMuch() const;
     virtual void StartHarvesting();
     virtual void StopHarvesting();
@@ -206,6 +207,25 @@ public:
     virtual int32 Size() const;
 
     // ========================================================================
+    // Type-flag probes
+    // ========================================================================
+    // UnitClass_IsARealVehicle (asm 0x6F2E4D): true when the unit type is not
+    // flagged IsConsideredVehicle (UnitTypeClass+0xE1B == 0).
+    bool IsARealVehicle() const;
+    // UnitClass_IsDeployer (asm 0x6F2E58): the unit type's IsSimpleDeployer
+    // byte (UnitTypeClass+0x6AC).
+    bool IsDeployable() const;
+    // UnitClass_GetCrewCount (asm 0x6E7F3D): thunk to TechnoClass::Crew_Type -
+    // the infantry type this unit leaves behind when destroyed.
+    InfantryTypeClass* GetCrewCount() const;
+    // UnitClass_CalcPipPercentage (asm 0x6E7F38): the percentage of the
+    // unit's pip bar that is filled, used for the passenger/ammo pip display.
+    int32 CalcPipPercentage() const;
+    // UnitClass_ClearSomeVec (asm 0x6F2E80): clears the object's attached
+    // abstract vector (FootClass vec_Abs).
+    void ClearSomeVec();
+
+    // ========================================================================
     // Constructor
     // ========================================================================
     UnitClass(HouseClass* pOwner) noexcept;
@@ -254,6 +274,16 @@ public:
     int32 DeathFrameCounter;
     int32 NonPassengerCount;
     bool HasFollowerCar;
+
+    // ── Carried flag identity (+0x6CC) ──────────────────────────────────────
+    // House index of the rally/capture flag this unit currently carries, or -1
+    // when it carries none.  UnitClass_DropFlag/PickUpFlag own this slot, and
+    // both re-broadcast ownership through the object's vtable slot (+0x124).
+    int32 CarriesFlagOfHouse;
+
+    bool IsBusy() const;
+    bool DropFlag();
+    bool PickUpFlag(int32 houseIndex);
 
     // Per-instance serialization for the save-game stream (base + derived).
     void Save(class SaveGameClass& saver) const;

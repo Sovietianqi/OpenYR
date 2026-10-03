@@ -30,6 +30,12 @@
 
 DynamicVectorClass<SuperClass*>* SuperClass::Array = nullptr;
 
+// Global weather / global-effect state.  These live in the scene globals in
+// the original (LightningStorm_Active / PsyDom_Status) and are read through
+// the LightningStorm_IsActive / PsyDom_IsActive accessors.
+bool  SuperClass::LightningStorm_Active = false;
+int32 SuperClass::PsyDom_Status = 0;
+
 // ============================================================================
 // Static lookup
 // ============================================================================
@@ -66,6 +72,7 @@ SuperClass::SuperClass(SuperWeaponTypeClass* pType, HouseClass* pOwner) noexcept
     State(SWState::Idle),
     ChargeDrain(0),
     next(nullptr),
+    CustomChargeTime(-1),
     IsGranted(false),
     IsAnimationPlaying(false),
     IsAlreadyActivated(false),
@@ -1586,4 +1593,144 @@ int32 SuperClass::GetReadyCount(HouseClass* pOwner) {
         }
     }
     return count;
+}
+// ============================================================================
+// Click-through pairing
+// ============================================================================
+
+// SuperClass_StopPreclickAnim (asm 0x6CB8A5).  When a pre-click animation is
+// playing it is finished off (zeroed remaining loops) and the instance is
+// unlinked from the abstract registry before the animation reference is
+// dropped.  The player-owned path additionally clears the pending click.
+void SuperClass::StopPreclickAnim(bool isPlayer)
+{
+    // The pre-click animation handle lives alongside the deferred state; when
+    // it is live the instance is registered in the abstract list.
+    if (IsAnimationPlaying)
+    {
+        IsAnimationPlaying = false;
+
+        if (AbstractClass::Array != nullptr)
+        {
+            AbstractClass* self = this;
+            for (int32 i = 0; i < AbstractClass::Array->Count; ++i)
+            {
+                if (AbstractClass::Array->GetItem(i) == self)
+                {
+                    AbstractClass::Array->Remove(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (isPlayer)
+        PreClick = false;
+}
+
+// SuperClass::Discharged (asm 0x6CB920).  Consume the weapon's charge.
+// `coords` is the cell the weapon was aimed at, `ignoreRecharge` is the
+// "don't start the recharge timer" flag the AI passes.  A human owner with the
+// weapon already queued advances its deferred state; otherwise the recharge
+// timer is restarted from the type's RechargeTime.
+void SuperClass::Discharged(const CellStruct& coords, bool ignoreRecharge)
+{
+    if (Type == nullptr)
+        return;
+
+    TargetCell = coords;
+
+    // The binary only does the deferred-state bookkeeping for powered types
+    // when the owner is human; the AI path skips straight to the recharge.
+    const bool isHuman = (Owner != nullptr && Owner->IsHumanPlayer);
+
+    if (isHuman && State == SWState::Idle)
+    {
+        State = SWState::Ready;
+        deferredCell = coords;
+
+        // Recompute the remaining charge so a follow-up click resumes the
+        // countdown where it left off.
+        if (RechargeTimer > 0)
+        {
+            // The binary divides the elapsed charge by the rules-side scale
+            // (RulesClass +0x760) and floors the result.
+            const double scale = RulesClass::Instance->ChargeToDrainRatio;
+            if (scale > 0.0)
+            {
+                int32 remaining = static_cast<int32>(RechargeTimer - (RechargeTimer / scale));
+                if (remaining < 0)
+                    remaining = 0;
+                RechargeTimer = remaining;
+            }
+        }
+    }
+
+    if (ignoreRecharge)
+        return;
+
+    // Restart the recharge countdown; the weapon is no longer ready.
+    RechargeTimer = Type->RechargeTime;
+    State = SWState::Idle;
+    IsCharged_ = false;
+
+    // Hand the shot to the type-specific launch handler.
+    Launch(coords);
+}
+
+// ============================================================================
+// SuperClass - scripted charge manipulation
+//
+//  These are the three entry points the trigger-action family drives.  They
+//  are the scripted counterparts of the automatic bookkeeping UpdateRecharge
+//  performs.
+// ============================================================================
+
+// SuperClass_SetSWCharge (asm 0x6CC1E3).
+//
+//  Refuses to run unless the weapon is present (the "exists" byte at +0x6D)
+//  and the requested percentage lies in 0..100.  The remaining recharge frames
+//  are then `RechargeTime - floor(percent * 0.01 * RechargeTime)`; when that
+//  difference is exactly zero the weapon is marked ready (+0x6F = 1).  The
+//  recharge timer at +0x30 is re-armed, lazily stamping the current frame as
+//  its start time when the timer was idle.
+void SuperClass::SetCharge(int32 percent)
+{
+    if (!IsPresent())
+        return;
+
+    if (percent < 0 || percent > 100)
+        return;
+
+    // An explicit scripted recharge time overrides the type's nominal one.
+    int32 rechargeTime = CustomChargeTime;
+    if (rechargeTime == -1)
+        rechargeTime = (Type != nullptr) ? Type->RechargeTime : 0;
+
+    const int32 elapsed = static_cast<int32>(
+        static_cast<double>(percent) * 0.01 * static_cast<double>(rechargeTime));
+
+    const int32 remaining = rechargeTime - elapsed;
+
+    if (remaining == 0)
+        IsReady_ = true;
+
+    RechargeTimer = remaining;
+}
+
+// SuperClass_SetSWRecharge (asm 0x6CBF54).
+//
+//  `mov [ecx+24h], eax` - stores the frame count straight into the scripted
+//  recharge override slot.  The next recharge computation picks it up.
+void SuperClass::SetRecharge(int32 frames)
+{
+    CustomChargeTime = frames;
+}
+
+// SuperClass_ResetSWRecharge (asm 0x6CBF5E).
+//
+//  Restores the -1 sentinel so the type's own RechargeTime is used again.
+void SuperClass::ResetRecharge()
+{
+    CustomChargeTime = -1;
 }

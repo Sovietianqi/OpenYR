@@ -6,9 +6,11 @@
 #include <Abstract/AbstractClass.h>
 #include <Math/CoordStruct.h>
 #include <Map/CellClass.h>
+#include <Map/CrateClass.h>
 
 class CRCEngine;
 class IStream;
+class TechnoTypeClass;
 
 // ============================================================================
 // MapClass - The game map manager, singleton
@@ -39,6 +41,32 @@ public:
     void Init_Cells();
     void Init_Waypoints();
     void Init_Shroud();
+
+    // MapClass::Shroud_The_Map (asm 0x56C3E0).  Pushes every cell back into
+    // the shrouded state for the given house, then re-reveals whatever that
+    // house is legitimately allowed to see.
+    void Shroud_The_Map(HouseClass* pHouse);
+
+    // MapClass_Clear_Smudges (asm 0x588AC0).  Wipes every smudge / crater
+    // decal placed on the map and asks the display to repaint.
+    void Clear_Smudges();
+
+    // MapClass_FlashCameo (asm 0x4E3xx0).  Lights up the sidebar cameo for
+    // `pType` so the player notices a newly available build option.
+    void Flash_Cameo(TechnoTypeClass* pType);
+
+    // MapClass_Init_CellSpread (asm 0x561910).  Builds the flat (dx, dy) offset
+    // table that every area-of-effect action walks: `CellSpreads` holds the
+    // number of live entries and CellSpreadTable[2*i] / [2*i+1] the X / Y cell
+    // delta of entry i, ordered so that expanding the walk grows a diamond.
+    void Init_CellSpread();
+
+    // MapClass_SetTab (asm 0x4E4xx0).  Switches the sidebar's active tab.
+    void Set_Tab(int32 tabIndex);
+
+    // MapClass_Reveal_The_Map (asm 0x56Cxxx): the inverse of Shroud_The_Map -
+    // marks every cell as revealed for the given house (null = all houses).
+    void Reveal_The_Map(HouseClass* pHouse);
     bool Allocate_Cells(int32 maxX, int32 maxY);
     void Free_Cells();
 
@@ -107,21 +135,201 @@ public:
     // Tiberium
     void Update_Tiberium_Spread();
 
+    // Logic - MapClass::Logic (asm 0x56BBF4).  The map's per-frame tick; the
+    // only work it does is expiry-driven crate respawn, gated on a live
+    // session and on crates being enabled.
+    void Logic();
+
     // Crate
     void Update_Crate_Respawn();
+
+    // Remove_Crate - MapClass::Remove_Crate (asm 0x56BFB4).  Finds the crate
+    // occupying a cell and harvests it.  With a live session the crate table
+    // is searched for a matching slot; without one the cell's overlay is
+    // checked directly.  The cell must carry a crate overlay, and the overlay
+    // must be marked as one the map owns (its Crushable-equivalent "crate"
+    // byte).
+    bool Remove_Crate(const CellStruct& coords);
+
+    // Place_Random_Crate - MapClass::Place_Random_Crate (asm 0x56BD2C): pick a
+    // random valid cell within the map's crate radius and spawn a crate there.
+    bool Place_Random_Crate();
+
+    // Nearby_Location - MapClass::Nearby_Location (asm 0x56DD8A): the general
+    // "find a free cell around this position" search used by crate spawning,
+    // unit placement and start-location scans.
+    //
+    //   position      - the centre of the search.
+    //   SpeedType     - the mover's speed class (SpeedType::Foot ..).
+    //   a5            - the expected zone index, or -1 to ignore.
+    //   MovementZone  - the mover's movement zone (default Normal).
+    //   InAir         - the mover is airborne, so only the X/Y ring is checked.
+    //   a8, a9        - extra flags forwarded to the cell test.
+    //   a10           - forwarded to the cell test.
+    //   a11 / a12 / a13 - cell-test options (see CellClass::Is_Clear_To_Move).
+    //   a14           - optional output list (up to 24 candidates).
+    //   a15           - restrict the search to a single axis.
+    //   a16           - require the candidate to be on screen.
+    //
+    // Points are returned in cell coordinates.
+    CellStruct Nearby_Location(const CellStruct& position, int32 SpeedType,
+                               int32 a5, MovementZone zone, bool InAir,
+                               int32 a8, int32 a9, int32 a10,
+                               bool a11, bool a12, bool a13, bool a15, bool a16);
+
+    // Convenience overload mirroring the binary's most common call shape.
+    CellStruct Nearby_Location(const CellStruct& position, int32 SpeedType,
+                               MovementZone zone);
+
+    // Pick_Random_Location - MapClass::Pick_Random_Location (asm 0x577A4A):
+    // draw a cell uniformly from the published local rect.
+    CellStruct Pick_Random_Location();
+
+    // CellInVisibleArea - MapClass_CellInVisibleArea (asm 0x56832A): isometric
+    // visible-region test.  A cell is on screen when it falls inside the
+    // diamond formed by the viewport's horizontal and vertical extents:
+    //
+    //     x + y  <= Right        and   |x - y| < Right
+    //     x + y  <= Right + 2*Bottom
+    bool IsCellInVisibleArea(int32 cellX, int32 cellY) const;
+
+    // Cell_Region - MapClass::Cell_Region (asm 0x56BC40).  Maps a cell to the
+    // coarse 4x4 "region" identifier used by the threat grid.  Cells are
+    // grouped in blocks of four; the identifier is
+    //
+    //     region = (y / 4) * 66 + (x / 4) * 2 + 0x83
+    //
+    // where the flooring divide is the arithmetic shift the binary uses.
+    static int32 Cell_Region(const CellStruct& cell);
+
+    // In_Radar - MapClass::In_Radar (asm 0x568326 / 0x56BC40 family).  Tests
+    // whether a cell falls inside the radar diamond.  With the local extents
+    // R = +0xF4 and B = +0xF8 and cell (x, y):
+    //
+    //     x + y <= R   and   x - y < R   and   y - x < R
+    //     x + y <= R + 2*B
+    //
+    // `skipRange` is accepted and ignored by this variant (the binary's
+    // parameter is unused), matching the original signature.
+    bool In_Radar(const CellStruct& cell, bool skipRange) const;
+
+    // Cell_Threat - MapClass::Cell_Threat (asm 0x56BCC0).  Reads the threat
+    // value a given house holds for a cell, out of that house's threat grid.
+    // The grid is indexed by the same region math as Cell_Region.
+    int32 Cell_Threat(const CellStruct& cell, HouseClass* who) const;
+
+    // ========================================================================
+    // Visibility / radar / planning probes
+    // ========================================================================
+
+    // MapClass_CellExists (asm 0x4AC6xx): true when the cell slot the packed
+    // coordinate addresses holds a live CellClass pointer.
+    bool CellExists(const CellStruct& cell) const;
+    // MapClass_CellInVisibleArea (asm 0x577E5x): true when the world position
+    // lies inside the current visible rectangle.
+    bool CellInVisibleArea(const CoordStruct& xyz) const;
+    // MapClass_IsCellUsable (asm 0x5785xx): the radar-visibility + passability
+    // test the cursor code performs before it accepts a click.  `skipRange`
+    // short-circuits the range part of MapClass::In_Radar.
+    bool IsCellUsable(const CoordStruct& where) const;
+    // MapClass_IsCellShrouded (asm 0x5863xx): the base map never reports a
+    // shrouded cell; scenario/multiplayer overrides refine this.
+    bool IsCellShrouded(const CoordStruct& loc) const;
+    // MapClass_IsCellTainted (asm 0x5785xx): true when the cell the coordinate
+    // falls in carries the "tainted" (revealed-by-something) marker.
+    bool IsCellTainted(const CoordStruct& loc, bool a3) const;
+    // MapClass_GetArea (asm 0x5D26C0): (MapWidth + 4) * MapHeight * 2 - the
+    // size of the per-cell threat grids, in int32 slots.
+    int32 GetArea() const;
+
+    // MapClass_IsRadarAvailable (asm 0x656Bxx): the cached radar-ready byte at
+    // +0x14D8.
+    bool IsRadarAvailable() const;
+
+    // MapClass_IsPlanningModeActive / NoCanDoInPlanningMode / the cursor
+    // predicate (asm 0x637DB6 / 0x63A11E / 0x637DB0): the planning-mode state
+    // byte the waypoint planner toggles.
+    bool IsPlanningModeActive() const;
+    bool Cursor_IsNotPlanningDeploy(int32 cursorType) const;
+    void NoCanDoInPlanningMode();
+
+    // ========================================================================
+    // Cell iterator
+    //
+    //  MapClass_CellIterator_Reset (asm 0x578260) primes the iterator over the
+    //  whole map; MapClass_CellIterator_NextCell (asm 0x578290) advances to the
+    //  next cell and returns it, or null once the walk is exhausted.  The
+    //  iterator is a raw pointer walk, not an index walk, so the returned
+    //  CellClass* is the live object.
+    // ========================================================================
+    void       CellIterator_Reset();
+    CellClass* CellIterator_NextCell();
+
+    // ========================================================================
+    // Follow-camera state (asm 0x4AEB1C / 0x4AEB28)
+    // ========================================================================
+    ObjectClass* FollowingWhat() const;
+    bool FollowThis(ObjectClass* what);
+
+    // ========================================================================
+    // Mission timer (asm 0x5E9xxx)
+    // ========================================================================
+    // MapClass_TimerPinged: marks the mission timer as "pinged" so the UI
+    // stops flashing it, without touching the countdown itself.
+    void TimerPinged();
+    // MapClass_StopTimerWQ: records the "stopped" flag, clears the pinged
+    // state and snapshots the current frame into the timer's stop slot.
+    void StopTimerWQ();
 
     // Members
     int32       MapWidth;
     int32       MapHeight;
     int32       MapSize;
     int32       CellCount;
+
+    // ── CellSpread table (asm CellSpreads / CellSpread_Table) ─────────────
+    // CellSpreads is the number of live cells in the spread; the table is a
+    // flat run of int16 (dx, dy) pairs, 369 entries in the original.
+    int32       CellSpreads;
+    int16       CellSpreadTable[369 * 2];
     CellClass*  CellArray;
+
+    // ── Cell iterator state (asm +0xF4, +0x10C, +0x110, +0x114, +0x118) ──
+    // CellIterator_Reset primes these and CellIterator_NextCell walks them:
+    // CellIterWidth (+0xF4) is the row stride, CellIterIndex (+0x10C) the
+    // 1-based walk counter, CellIterRemaining (+0x114) counts cells left to
+    // visit and CellIterPtr (+0x118) is the current cell pointer.
+    int32       CellIterWidth;
+    int32       CellIterIndex;
+    int32       CellIterRemaining;
+    CellClass*  CellIterPtr;
+    int32       CellIterBase;
     int32       MaxWaypoints;
     CoordStruct Waypoints[702];
     int32       CrateCount;
+    CrateClass  Crate;
     int32       TotalValue;
     int32       VisibleRectX, VisibleRectY, VisibleRectWidth, VisibleRectHeight;
     TheaterType CurrentTheater;
+
+    // The "follow camera" target and its active flag (asm +0x.../anonymous_56
+    // and +FollowSomething).
+    ObjectClass* FollowSomething;
+    bool         FollowingFlag;
+
+    // Cached radar readiness (asm +0x14D8).
+    bool         RadarReady;
+
+    // Mission-timer state: the "pinged" latch and the frame the timer was
+    // stopped at (asm +MissionTimerIsSomething and +TimerWQ).
+    bool         MissionTimerPinged;
+    int32        MissionTimerStopFrame;
+
+    // Planning (waypoint) mode latch shared with the cursor code, plus the
+    // one-shot warning latch used by NoCanDoInPlanningMode (asm +0xAC4C08).
+    bool         PlanningModeActive;
+    bool         PlanningNoCanDoLatched;
+
     uint8*      Tilesets;
     int32       TilesetCount;
     int32       unknown_0x1EF8;
@@ -299,3 +507,5 @@ public:
     // The original MapClass has a large gap of unknown members
     uint8       _unused_padding[0x456C - 0x21A0];
 };
+// The single global map instance, mirroring `Map` in the original binary.
+extern MapClass* TheMap;

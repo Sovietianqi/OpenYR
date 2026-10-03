@@ -457,6 +457,59 @@ int32 BuildingTypeClass::Get_Height() const
     return BuildingFoundation & 0xFFFF;
 }
 
+// ============================================================================
+// X_Foundation_Value / Y_Foundation_Value
+//
+//  asm 0x45EC8F / 0x45ECAA
+//
+//  Both index the table of per-foundation cell spans with the Foundation
+//  enumerator stored at +0xEF0.  X_Foundation_Value takes no argument;
+//  Y_Foundation_Value optionally adds one extra row when the caller passes
+//  bib = true AND the building type itself declares a bib, which is how the
+//  game accounts for the strip of ground a bibb'ed structure occupies in
+//  front of its body.
+// ============================================================================
+int32 BuildingTypeClass::X_Foundation_Value() const
+{
+    //  Foundation_CellsX: number of cells spanned along X for each enum value
+    //  (Foundation::_1x1 .. Foundation::_0x0).
+    static const int32 Foundation_CellsX[] = {
+        1, 2, 1, 2, 2,   // _1x1 _2x1 _1x2 _2x2 _2x3
+        3, 3, 4, 3, 1,   // _3x2 _3x3 _3x5 _4x2 _3x3Refinery
+        1, 3, 4, 1, 1,   // _1x3 _3x1 _4x3 _1x4 _1x5
+        2, 2, 5, 4, 3,   // _2x6 _2x5 _5x3 _4x4 _3x4
+        6, 2, 0          // _6x4 _0x0
+    };
+
+    const int32 fdn = static_cast<int32>(FoundationValue);
+    if (fdn < 0 || fdn >= static_cast<int32>(Foundation::Count))
+        return 0;
+
+    return Foundation_CellsX[fdn];
+}
+
+int32 BuildingTypeClass::Y_Foundation_Value(bool bib) const
+{
+    static const int32 Foundation_CellsY[] = {
+        1, 1, 2, 2, 3,   // _1x1 _2x1 _1x2 _2x2 _2x3
+        2, 3, 5, 2, 3,   // _3x2 _3x3 _3x5 _4x2 _3x3Refinery
+        3, 1, 3, 4, 5,   // _1x3 _3x1 _4x3 _1x4 _1x5
+        6, 5, 3, 4, 4,   // _2x6 _2x5 _5x3 _4x4 _3x4
+        4, 2, 0          // _6x4 _0x0
+    };
+
+    const int32 fdn = static_cast<int32>(FoundationValue);
+    if (fdn < 0 || fdn >= static_cast<int32>(Foundation::Count))
+        return 0;
+
+    int32 rows = Foundation_CellsY[fdn];
+
+    if (bib && Bib != 0)
+        ++rows;
+
+    return rows;
+}
+
 RectangleStruct BuildingTypeClass::Get_Occupy_Rect() const
 {
     return RectangleStruct(0, 0, Get_Width(), Get_Height());

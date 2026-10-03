@@ -1,4 +1,5 @@
 #include <Objects/IsometricTile.h>
+#include <Objects/IsometricTileGlobals.h>
 
 #include <Core/Definitions.h>
 #include <Core/Macros.h>
@@ -753,6 +754,105 @@ void IsometricTileType::CreateFromINIList(CCINIClass* pINI, bool bTheater)
             continue;
         }
 
+        Apply_Special_Tile_Indices(pINI, bTheater, pTileSet->SetName, i);
+
         TileSet_TotalTileCount += pTileSet->TilesInSet;
+    }
+}
+
+// The [General] block of the tileset INI names, one by one, which SetName
+// belongs to each special tile-set slot.  The order and spelling below is the
+// order the binary reads them in IsometricTileTypeClass_CreateFromINIList, and
+// every key is compared against the tile set's SetName before the running
+// ordinal is stored.
+//
+// The table drives both the initial read (which fills a local per key) and the
+// store (which happens while the tile sets are walked).  Re-reading the key
+// here keeps the two in lockstep without duplicating the ~56 locals the
+// original keeps on the stack.
+void IsometricTileType::Apply_Special_Tile_Indices(CCINIClass* pINI, bool bTheater,
+                                                   const char* pSetName, int32 ordinal)
+{
+    if (pINI == nullptr || pSetName == nullptr || pSetName[0] == '\0')
+        return;
+
+    // The snow theater reads the MD.INI copy of [General]; the temperate one
+    // reads the theater INI that was handed in.  Both carry the same keys.
+    struct SpecialTileKey {
+        const char* Key;
+        int32*      Target;
+    };
+
+    static const SpecialTileKey SpecialKeys[] = {
+        { "RampBase",          &tile_RampBase },
+        { "RampSmooth",        &tile_RampSmooth },
+        { "MMRampBase",        &tile_MMRampBase },
+        { "ClearTile",         &tile_ClearTile },
+        { "RoughTile",         &tile_RoughTile },
+        { "SandTile",          &tile_SandTile },
+        { "GreenTile",         &tile_GreenTile },
+        { "PaveTile",          &tile_PaveTile },
+        { "MiscPaveTile",      &tile_MiscPaveTile },
+        { "ClearToRoughLat",   &tile_ClearToRoughLat },
+        { "ClearToSandLat",    &tile_ClearToSandLat },
+        { "ClearToGreenLat",   &tile_ClearToGreenLat },
+        { "ClearToPaveLat",    &tile_ClearToPaveLat },
+        { "HeightBase",        &tile_HeightBase },
+        { "BlackTile",         &tile_BlackTile },
+        { "BridgeSet",         &tile_BridgeSet },
+        { "WoodBridgeSet",     &tile_WoodBridgeSet },
+        { "CliffSet",          &tile_CliffSet },
+        { "ShorePieces",       &tile_ShorePieces },
+        { "WaterSet",          &tile_WaterSet },
+        { "SlopeSetPieces",    &tile_SlopeSetPieces },
+        { "SlopeSetPieces2",   &tile_SlopeSetPieces2 },
+        { "MonorailSlopes",    &tile_MonorailSlopes },
+        { "Tunnels",           &tile_Tunnels },
+        { "TrackTunnels",      &tile_TrackTunnels },
+        { "DirtTunnels",       &tile_DirtTunnels },
+        { "DirtTrackTunnels",  &tile_DirtTrackTunnels },
+        { "WaterfallEast",     &tile_WaterfallEast },
+        { "WaterfallWest",     &tile_WaterfallWest },
+        { "WaterfallNorth",    &tile_WaterfallNorth },
+        { "WaterfallSouth",    &tile_WaterfallSouth },
+        { "CliffRamps",        &tile_CliffRamps },
+        { "PavedRoads",        &tile_PavedRoads },
+        { "PavedRoadEnds",     &tile_PavedRoadEnds },
+        { "Medians",           &tile_Medians },
+        { "RoughGround",       &tile_RoughGround },
+        { "DirtRoadJunction",  &tile_DirtRoadJunction },
+        { "DirtRoadCurve",     &tile_DirtRoadCurve },
+        { "DirtRoadStraight",  &tile_DirtRoadStraight },
+        { "DestroyableCliffs", &tile_DestroyableCliffs },
+        { "WaterCaves",        &tile_WaterCaves },
+        { "WaterCliffs",       &tile_WaterCliffs },
+        { "PavedRoadSlopes",   &tile_PavedRoadSlopes },
+        { "DirtRoadSlopes",    &tile_DirtRoadSlopes },
+        { "Rocks",             &tile_Rocks },
+        { "WaterBridge",       &tile_WaterBridge },
+        { "BridgeTopLeft1",    &tile_BridgeTopLeft1 },
+        { "BridgeTopLeft2",    &tile_BridgeTopLeft2 },
+        { "BridgeBottomRight1", &tile_BridgeBottomRight1 },
+        { "BridgeBottomRight2", &tile_BridgeBottomRight2 },
+        { "BridgeTopRight1",   &tile_BridgeTopRight1 },
+        { "BridgeTopRight2",   &tile_BridgeTopRight2 },
+        { "BridgeBottomLeft1", &tile_BridgeBottomLeft1 },
+        { "BridgeBottomLeft2", &tile_BridgeBottomLeft2 },
+        { "BridgeMiddle1",     &tile_BridgeMiddle1 },
+        { "BridgeMiddle2",     &tile_BridgeMiddle2 },
+    };
+
+    const char* pSection = bTheater ? "General" : "General";
+
+    for (const SpecialTileKey& entry : SpecialKeys) {
+        char buffer[0x40];
+        pINI->ReadString(pSection, entry.Key, "", buffer, sizeof(buffer));
+        buffer[sizeof(buffer) - 1] = '\0';
+
+        if (buffer[0] == '\0')
+            continue;
+
+        if (_strcmpi(buffer, pSetName) == 0)
+            *entry.Target = ordinal;
     }
 }

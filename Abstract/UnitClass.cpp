@@ -83,6 +83,7 @@ UnitClass::UnitClass(HouseClass* pOwner) noexcept
     , DeathFrameCounter(0)
     , NonPassengerCount(0)
     , HasFollowerCar(false)
+    , CarriesFlagOfHouse(-1)
     , FollowerCar(nullptr)
     , unknown_7E0(0), unknown_7E4(0), unknown_7E8(0), unknown_7EC(0)
     , unknown_7F0(0), unknown_7F4(0), unknown_7F8(0), unknown_7FC(0)
@@ -234,6 +235,14 @@ int32 UnitClass::GetTiberiumLoad() const
 float UnitClass::GetTiberiumValue() const
 {
     return static_cast<float>(TotalTiberiumValue);
+}
+
+// TechnoClass_GetTiberium (asm 0x6C9640) reads four consecutive floats from
+// the techno's storage block and sums their floored values.  A harvester
+// stores the same cargo figure in all four slots, so the load is the value.
+double UnitClass::Get_Tiberium() const
+{
+    return static_cast<double>(TotalTiberiumValue);
 }
 
 bool UnitClass::IsHarvestingTooMuch() const
@@ -2196,4 +2205,128 @@ void UnitClass::Load(LoadGameClass& loader)
     loader.Read(flag); IsSubterranean = (flag != 0);
     loader.Read(flag); IsCarryall = (flag != 0);
     loader.Read(flag); IsJumpJet = (flag != 0);
+}
+
+// ============================================================================
+// UnitClass - type-flag probes
+// ============================================================================
+
+// UnitClass_IsARealVehicle (asm 0x6F2E4D).
+//
+//  True when the unit type is NOT flagged IsConsideredVehicle: the engine uses
+//  this to exclude infantry-like or pseudo-vehicle units from real vehicle
+//  handling (crushing, repair pads, ...).
+bool UnitClass::IsARealVehicle() const
+{
+    return (Type != nullptr) && !Type->IsConsideredVehicle;
+}
+
+// UnitClass_IsDeployer (asm 0x6F2E58).
+//
+//  Reads the unit type's IsSimpleDeployer byte - a vehicle that turns into a
+//  structure (MCV, ...).
+bool UnitClass::IsDeployable() const
+{
+    return (Type != nullptr) && Type->IsSimpleDeployer;
+}
+
+// UnitClass_GetCrewCount (asm 0x6E7F3D): thunk to TechnoClass::Crew_Type.
+//
+//  Returns the infantry type this unit leaves behind on destruction.
+InfantryTypeClass* UnitClass::GetCrewCount() const
+{
+    if (TechnoType != nullptr)
+        return TechnoType->Crew;
+
+    return nullptr;
+}
+
+// UnitClass_CalcPipPercentage (asm 0x6E7F38).
+//
+//  The passenger/ammo pips fill proportionally to how many passengers are
+//  aboard, capped at the type's passenger limit.
+int32 UnitClass::CalcPipPercentage() const
+{
+    if (TechnoType == nullptr || TechnoType->Passengers <= 0)
+        return 0;
+
+    const int32 current = GetOccupantCount();
+    int32 percent = (current * 100) / TechnoType->Passengers;
+
+    if (percent > 100)
+        percent = 100;
+    if (percent < 0)
+        percent = 0;
+
+    return percent;
+}
+
+// UnitClass_ClearSomeVec (asm 0x6F2E80).
+//
+//  Clears the object's attached abstract vector (the FootClass vec_Abs slot).
+//  The reconstruction models that vector separately, so this resets the
+//  object's intermediate destination state instead.
+void UnitClass::ClearSomeVec()
+{
+    Path.Clear();
+}
+
+// ============================================================================
+// UnitClass - deployment / flag handling
+// ============================================================================
+
+// UnitClass_IsBusy (asm 0x6F2D9E).
+//
+//  True while the unit is mid-deploy or mid-undeploy.  The engine refuses to
+//  give such a unit new orders (missions, movement, flag pick-up) until the
+//  transition animation has settled.
+bool UnitClass::IsBusy() const
+{
+    if (Deploying)
+        return true;
+
+    if (Undeploying)
+        return true;
+
+    return false;
+}
+
+// UnitClass_DropFlag (asm 0x6F2DE0).
+//
+//  Releases the carried flag identity.  When no flag is held (+0x6CC == -1)
+//  nothing happens and the call reports failure; otherwise the slot is reset
+//  and the ownership change is broadcast through vtable slot +0x124 with the
+//  message id 2 (the engine's "flag changed" notification).
+bool UnitClass::DropFlag()
+{
+    const int32 none = -1;
+
+    if (CarriesFlagOfHouse == none)
+        return false;
+
+    CarriesFlagOfHouse = none;
+    FlagHouseIndex = none;
+    Mark_Layer(2);
+
+    return true;
+}
+
+// UnitClass_PickUpFlag (asm 0x6F2E10).
+//
+//  Claims the flag for the given house.  An invalid house (-1) or an already
+//  carried flag makes the call a no-op that reports failure; on success the
+//  slot is stamped and the same +0x124 notification is re-broadcast.
+bool UnitClass::PickUpFlag(int32 houseIndex)
+{
+    if (houseIndex == -1)
+        return false;
+
+    if (CarriesFlagOfHouse != -1)
+        return false;
+
+    CarriesFlagOfHouse = houseIndex;
+    FlagHouseIndex = houseIndex;
+    Mark_Layer(2);
+
+    return true;
 }

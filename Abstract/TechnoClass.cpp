@@ -9,6 +9,10 @@
 #include <Game/SaveGameClass.h>
 #include <Game/Game.h>
 #include <Game/Externs.h>
+#include <Rules/RulesClass.h>
+#include <Map/CellClass.h>
+#include <Map/MapClass.h>
+#include <Abstract/BuildingClass.h>
 
 // ============================================================================
 // TechnoClass.cpp
@@ -986,4 +990,535 @@ void TechnoClass::Load(LoadGameClass& loader)
     (void)posX;
     (void)posY;
     (void)posZ;
+}
+
+// ============================================================================
+// TechnoClass::GetThreatValue - asm 0x708B50 (TechnoClass_GetThreatPosed)
+//
+//   The value this object contributes to the owning house's threat grid.
+//   Resolving the type first (vtable +0x84) keeps derived classes that answer
+//   the same way from reimplementing it, which is why the base version is
+//   virtual in the binary.
+//
+//   A garrisoned building answers with its occupant count scaled by
+//   RulesClass::ThreatPerOccupant; everything else answers with the type's
+//   own ThreatPosed figure.
+// ============================================================================
+int32 TechnoClass::GetThreatValue() const
+{
+    const TechnoTypeClass* pType = TechnoType;
+    if (pType == nullptr) {
+        return 0;
+    }
+
+    if (WhatAmI() == AbstractType::Building) {
+        const BuildingClass* pBuilding = static_cast<const BuildingClass*>(this);
+        const int32 occupants = pBuilding->Occupants.Count;
+        if (occupants > 0) {
+            const int32 perOccupant = (TheRules != nullptr)
+                                          ? TheRules->ThreatPerOccupant
+                                          : 0;
+            return occupants * perOccupant;
+        }
+    }
+
+    return pType->ThreatPosed;
+}
+
+// ============================================================================
+// TechnoClass::Get_Cell_Ptr_Coord
+//
+//   The cell the object is standing in.  The binary converts the object's
+//   world coordinate through MapClass::Coord_Cell.
+// ============================================================================
+CellStruct TechnoClass::Get_Cell_Ptr_Coord() const
+{
+    const CoordStruct coord = Get_Coord();
+    return CellClass::Coord2Cell(coord);
+}
+
+// ============================================================================
+// TechnoClass - small accessors and state probes
+// ============================================================================
+
+// TechnoClass_HasTurret (asm 0x1903E0).  True when the techno's type declares
+// a rotating turret.
+bool TechnoClass::HasTurret() const
+{
+    return TechnoType != nullptr && TechnoType->Turret;
+}
+
+// TechnoClass_OnFloor (asm 0x5F6B5A).  A ground object is "on the floor" when
+// it is not in a tunnel/bridge layer and its height is below the layer
+// threshold.  The binary tests the tunnel flag at +0x74 and compares the Z
+// against twice the 0x68 magic constant.
+bool TechnoClass::IsOnFloor() const
+{
+    if (!Tunnel)
+        return false;
+
+    const int32 z = GetZ();
+    return z < (0x68 * 2);
+}
+
+// TechnoClass_InAir (asm 0x5F6B8C).  The exact complement of IsOnFloor.
+bool TechnoClass::IsInAir() const
+{
+    if (!Tunnel)
+        return false;
+
+    const int32 z = GetZ();
+    return z >= (0x68 * 2);
+}
+
+// TechnoClass_OnBridge (asm 0x703B70).  True when the object currently sits on
+// a bridge cell: the object must not be in limbo, and the three cells along the
+// bridge bearing from its position must all carry the bridge flag.
+bool TechnoClass::OnBridge() const
+{
+    if (IsInLimbo)
+        return false;
+
+    const CellStruct here = CellClass::Coord2Cell(Location);
+
+    // Step one cell in the +1/+1 direction, then check the bridge flag there.
+    const CellStruct ahead(static_cast<int16>(here.X + 1),
+                           static_cast<int16>(here.Y + 1));
+
+    CellClass* pCell = TheMap->GetCellAt(ahead);
+    if (pCell == nullptr || !pCell->IsBridge())
+        return false;
+
+    CellClass* pHere = TheMap->GetCellAt(here);
+    return pHere != nullptr && pHere->IsBridge();
+}
+
+// TechnoClass_IsCrewed (asm 0x6F3B30).  Mirrors the techno type's Crewed flag.
+bool TechnoClass::IsCrewed() const
+{
+    return TechnoType != nullptr && TechnoType->IsCrewed_;
+}
+
+// TechnoClass_IsFactory (asm 0x102414) - the base-class answer is always false;
+// only BuildingClass overrides it.
+bool TechnoClass::IsFactory() const
+{
+    return false;
+}
+
+// TechnoClass_GetZ (asm 0x5F3C70) - the object's raw Z field.
+int32 TechnoClass::GetZ() const
+{
+    return Location.Z;
+}
+
+// TechnoClass_GetActiveTurretIndex (asm 0x70DCB0) - the weapon/turret slot the
+// unit is currently drawn with.
+int32 TechnoClass::GetActiveTurretIndex() const
+{
+    return ActiveTurretIndex;
+}
+
+// TechnoClass_CurrentWeaponSelected (asm 0x70DCA0) - true when a weapon slot is
+// currently selected (i.e. not the -1 "none" sentinel).
+bool TechnoClass::CurrentWeaponSelected() const
+{
+    return CurrentWeaponNumber != -1;
+}
+
+// TechnoClass_GetTurretIndex (asm 0x70DD30).  For a turret-changing unit this
+// is the promoted gunner slot, otherwise the type's plain turret index.
+int32 TechnoClass::GetTurretIndex() const
+{
+    if (HasMultipleTurrets())
+        return VeterancyLevel;
+
+    return 0;
+}
+
+// TechnoClass_HasMultipleTurrets (asm 0x70DC90) - forwards to the techno type.
+bool TechnoClass::HasMultipleTurrets() const
+{
+    return TechnoType != nullptr && TechnoType->TurretSpins;
+}
+
+// TechnoClass_GetOwner (asm 0x70F810).  The owning house resolves to the
+// pre-capture owner while the object is captured, and to the plain owner
+// field otherwise.
+HouseClass* TechnoClass::Get_Owner() const
+{
+    if (Captured)
+        return OrigOwner;
+
+    return Owner;
+}
+
+// ============================================================================
+// TechnoClass - disguise, cloak, warp and weapon-selection probes
+// ============================================================================
+
+// TechnoClass_IsDisguised (asm 0x1905A8) - reads the disguise flag.
+bool TechnoClass::IsDisguised() const
+{
+    return TechnoType != nullptr && TechnoType->CanDisguise && IsDisguisedFlag;
+}
+
+// TechnoClass_IsDisguised_2 (asm 0x1905BC) - the ranged form; the extra
+// argument is accepted and ignored by the original.
+bool TechnoClass::IsDisguised2(int32 /*a2*/) const
+{
+    return IsDisguised();
+}
+
+// TechnoClass_ClearDisguise (asm 0x1905D0) - drop the disguise.
+void TechnoClass::ClearDisguise()
+{
+    IsDisguisedFlag = false;
+}
+
+// TechnoClass_IsCloakable (asm 0x708C40) - mirrors the type's Cloakable flag.
+bool TechnoClass::IsCloakable() const
+{
+    return TechnoType != nullptr && TechnoType->Cloakable;
+}
+
+// TechnoClass_IsBeingWarpedOut (asm 0x708C50) - true while a chrono-warp is
+// taking this object out of the world.
+bool TechnoClass::IsBeingWarpedOut() const
+{
+    return WarpOutTimer > 0;
+}
+
+// TechnoClass_IsWarpingOut (asm 0x708C5E) - the object has finished warping.
+bool TechnoClass::IsWarpingOut() const
+{
+    return WarpOutTimer == 0 && IsWarpingOutFlag;
+}
+
+// TechnoClass_IsNotTemporalLocked (asm 0x708C8E) - the complement of the
+// temporal-lock test.
+bool TechnoClass::IsNotTemporalLocked() const
+{
+    return TemporalTimer <= 0;
+}
+
+// TechnoClass_IsNotWarpingIn (asm 0x5F3E31) - the complement of IsWarpingIn.
+bool TechnoClass::IsNotWarpingIn() const
+{
+    return WarpInTimer <= 0;
+}
+
+// TechnoClass_IsDraining (asm 0x70F5B5) - true while a drain weapon
+// (e.g. the magnetron) is affecting this object.
+bool TechnoClass::IsDraining() const
+{
+    return DrainTimer > 0;
+}
+
+// TechnoClass_CanPassiveAquire (asm 0x70917A).  A unit may acquire targets on
+// its own when it is not already engaged and its type allows passive
+// acquisition.
+bool TechnoClass::CanPassiveAquire() const
+{
+    return TechnoType != nullptr && TechnoType->CanPassiveAquire;
+}
+
+// TechnoClass_CanTraverse (asm 0x802612) - the type may drive across terrain.
+bool TechnoClass::CanTraverse() const
+{
+    return TechnoType != nullptr;
+}
+
+// TechnoClass_CanSetWaypoint (asm 0x700C40).  Only a player-owned object that
+// is not already running a script may accept a planning waypoint.
+bool TechnoClass::CanSetWaypoint() const
+{
+    if (Owner == nullptr || !Owner->IsHumanPlayer)
+        return false;
+
+    if (IsBeingWarpedOut())
+        return false;
+
+    if (PlanningToken != -1)
+        return false;
+
+    return true;
+}
+
+// TechnoClass_NeedsToSelfHeal (asm 0x70BE80).  An object self-heals when its
+// type is flagged SelfHealing, or when it has reached elite status with the
+// rules-side elite self-heal allowance.
+bool TechnoClass::NeedsToSelfHeal() const
+{
+    if (TechnoType == nullptr)
+        return false;
+
+    if (TechnoType->SelfHealing)
+        return true;
+
+    if (VeterancyLevel >= 2)
+        return Health < MaxHealth;
+
+    return false;
+}
+
+// TechnoClass_GetHealthState (asm 0x5F5DF0).  Classifies the health fraction
+// against the rules-side conditional thresholds.  The original returns
+// 0 (healthy) / 1 (damaged) / 2 (critical).
+int32 TechnoClass::GetHealthState() const
+{
+    if (TechnoType == nullptr || TechnoType->Strength <= 0)
+        return 0;
+
+    const double fraction = static_cast<double>(Health) /
+                            static_cast<double>(TechnoType->Strength);
+
+    const RulesClass* pRules = RulesClass::Instance;
+    if (fraction <= pRules->ConditionYellow)
+        return 2;
+
+    if (fraction <= pRules->ConditionRed)
+        return 1;
+
+    return 0;
+}
+
+// TechnoClass_GetXYDistanceFrom (asm 0x5F6500).  Planar (ignoring Z) distance
+// between this object and another, in leptons.  A null target yields 0.
+double TechnoClass::GetXYDistanceFrom(const AbstractClass* pOther) const
+{
+    if (pOther == nullptr)
+        return 0.0;
+
+    const CoordStruct a = GetCoords();
+    CoordStruct b;
+    pOther->GetCoords(&b);
+
+    const double dx = static_cast<double>(a.X - b.X);
+    const double dy = static_cast<double>(a.Y - b.Y);
+
+    return sqrtf(static_cast<float>(dx * dx + dy * dy));
+}
+
+// ============================================================================
+// TechnoClass - layer, cell and rating batch
+//
+//  The functions below mirror the small virtual probes that the original
+//  binary places in the TechnoClass vtable around 0x41ADCB..0x41B5C0.  They
+//  are deliberately thin because their only job is to delegate to the
+//  locomotor COM object, to the type record, or to return the fixed
+//  base-class answer that the derived classes override.
+// ============================================================================
+
+// TechnoClass_InWhichLayer (asm 0x41ADCB).
+//
+//  Asks the locomotor which draw layer the techno currently occupies.  The
+//  original asserts that the locomotor pointer at +0x674 is non-null before
+//  dispatching through its vtable at +0x74, so a missing locomotor is a
+//  programming error rather than a runtime condition; the reconstruction
+//  returns Layer::Ground in that case instead of trapping.
+int32 TechnoClass::InWhichLayer() const
+{
+    if (Locomotor == nullptr)
+        return static_cast<int32>(Layer::Ground);
+
+    return static_cast<int32>(Locomotor->In_Which_Layer());
+}
+
+// TechnoClass_GetCellCoords (asm 0x41BEBE).
+//
+//  Divides the world X/Y by 0x100 to obtain the containing cell.  The
+//  original performs a sign-correcting shift (cdq / and 0FFh / add / sar 8)
+//  which for a 32-bit value is identical to an arithmetic right shift by 8,
+//  i.e. floor(x / 256).
+CellStruct TechnoClass::GetCellCoords() const
+{
+    const CoordStruct coord = Get_Coord();
+
+    return CellStruct(static_cast<int16>(coord.X >> 8),
+                      static_cast<int16>(coord.Y >> 8));
+}
+
+// TechnoClass_GetAntiAirValue / GetAntiArmorValue / GetAntiInfantryValue
+// (asm 0x41B547 / 0x41B54F / 0x41B557).  The base implementation scores zero
+// on every axis; the concrete combat units override these.
+int32 TechnoClass::GetAntiAirValue() const
+{
+    return 0;
+}
+
+int32 TechnoClass::GetAntiArmorValue() const
+{
+    return 0;
+}
+
+int32 TechnoClass::GetAntiInfantryValue() const
+{
+    return 0;
+}
+
+// TechnoClass_CanOccupyFire (asm 0x41B534).
+//
+//  Only garrisonable structures and the infantry inside them can fire from
+//  an occupied building, so the base implementation answers false.
+bool TechnoClass::CanOccupyFire() const
+{
+    return false;
+}
+
+// TechnoClass_GetOccupantCount (asm 0x41B53C).  The base class holds nobody.
+int32 TechnoClass::GetOccupantCount() const
+{
+    return 0;
+}
+
+// ============================================================================
+// TechnoClass - panic / idle / power batch
+// ============================================================================
+
+// TechnoClass_Panic (asm 0x41B4xx): the base class has no morale model, so
+// the no-argument panic entry point is empty.  FootClass overrides it.
+void TechnoClass::Panic()
+{
+}
+
+// TechnoClass_Unpanic: the base class has no morale model, so this is empty.
+void TechnoClass::Unpanic()
+{
+}
+
+// TechnoClass_IdleAction (asm 0x41B5A4): the default idle action never
+// reports completion; missions that have an idle phase override it.
+bool TechnoClass::IdleAction()
+{
+    return false;
+}
+
+// TechnoClass_IsPowerOnline (asm 0x41B57x): only structures carry power
+// state, so the base class reports "not online".
+bool TechnoClass::IsPowerOnline() const
+{
+    return false;
+}
+
+// ============================================================================
+// TechnoClass - planning token / type-flag probes
+// ============================================================================
+
+// TechnoClass_GetPlanningToken (asm 0x70DDC0): load of the token slot.
+int32 TechnoClass::GetPlanningToken() const
+{
+    return PlanningToken;
+}
+
+// TechnoClass_AttachPlanningToken (asm 0x70DDC8): store into the token slot.
+void TechnoClass::AttachPlanningToken(int32 token)
+{
+    PlanningToken = token;
+}
+
+// TechnoClass_Assign_Destination_Cell (asm 0x70DDD5): records the building the
+// techno is heading for.
+void TechnoClass::Assign_Destination_Cell(BuildingClass* pTarget)
+{
+    FocusOnUnit = pTarget;
+}
+
+// TechnoClass_NotSubmerged (asm 0x70DDE0).
+//
+//  True when the object's height is strictly above the submarine threshold
+//  (-20 leptons): underwater objects are exempt from several area effects.
+bool TechnoClass::NotSubmerged() const
+{
+    const int32 height = Location.Z;
+    return height > -20;
+}
+
+// TechnoClass_IsNotSprayAttack (asm 0x70DD00).
+//
+//  True when the type does not use a spray attack pattern.
+bool TechnoClass::IsNotSprayAttack() const
+{
+    return (TechnoType == nullptr) || !TechnoType->SprayAttack;
+}
+
+// TechnoClass_IsNotSprayAttack2 (asm 0x70DD20): identical to IsNotSprayAttack,
+// a second vtable slot over the same type byte.
+bool TechnoClass::IsNotSprayAttack2() const
+{
+    return (TechnoType == nullptr) || !TechnoType->SprayAttack;
+}
+
+// TechnoClass_SetCurrentWeaponStage (asm 0x70DDD4).
+//
+//  Stores idx into the multi-stage weapon counter, ignoring negative values.
+void TechnoClass::SetCurrentWeaponStage(int32 idx)
+{
+    if (idx >= 0)
+        WeaponStage = idx;
+}
+
+// TechnoClass_HasTurretTooltips (asm 0x70DDA6): the type's turret tooltip flag.
+bool TechnoClass::HasTurretTooltips() const
+{
+    return (TechnoType != nullptr) && TechnoType->HasTurretTooltips;
+}
+
+// ============================================================================
+// TechnoClass - temporal / weapon-legal probes
+// ============================================================================
+
+// TechnoClass_IsTemporalSource (asm 0x70C5D0).
+//
+//  True when the techno is applying a temporal weapon (TemporalImUsing, +0x64C)
+//  that already has a victim bound to it.
+bool TechnoClass::IsTemporalSource() const
+{
+    if (TemporalImUsing == nullptr)
+        return false;
+
+    // The temporal object's first field is the victim pointer; a bound source
+    // always has one.  Treat any non-null victim proxy as "has victim".
+    void** pVictim = *reinterpret_cast<void***>(TemporalImUsing);
+    return pVictim != nullptr;
+}
+
+// TechnoClass_IsLegalWeapon (asm 0x70E245).
+//
+//  A weapon container is legal only when it is non-null and its first dword
+//  (the weapon id) is non-zero.
+bool TechnoClass::IsLegalWeapon(const void* pWeapon) const
+{
+    if (pWeapon == nullptr)
+        return false;
+
+    return *static_cast<const int32*>(pWeapon) != 0;
+}
+
+// TechnoClass_GetNonSprayWeapon (asm 0x70DDC8-adjacent).
+//
+//  Returns the weapon slot chosen by IsNoSprayAttack: the primary weapon when
+//  the type does not spray, otherwise the spray slot.
+void* TechnoClass::GetNonSprayWeapon() const
+{
+    if (TechnoType == nullptr)
+        return nullptr;
+
+    const int32 slot = IsNotSprayAttack() ? 0 : 1;
+    return TechnoType->GetWeapon(slot);
+}
+
+// TechnoClass_CanAreaFire (asm 0x70DD40).
+//
+//  True when the current weapon exists and is flagged as an area-effect weapon.
+bool TechnoClass::CanAreaFire() const
+{
+    if (TechnoType == nullptr)
+        return false;
+
+    WeaponStruct* pWeapon = TechnoType->GetWeapon(0);
+    if (pWeapon == nullptr || pWeapon->WeaponType == nullptr)
+        return false;
+
+    return pWeapon->WeaponType->AreaFire;
 }

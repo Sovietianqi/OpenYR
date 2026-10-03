@@ -167,6 +167,12 @@ public:
     BYTE TranslucencyLevel;
     bool TimeToDie;
     BulletClass* AttachedBullet;
+
+    // AnimClass_SetBullet (asm 0x421xxx).
+    //   Links the anim to the bullet that spawned it so AnimClass_DTOR can
+    //   clear the back-reference when either side dies.  The original stores
+    //   the raw pointer into the AttachedBullet slot.
+    void SetBullet(BulletClass* pBullet) { AttachedBullet = pBullet; }
     HouseClass* Owner;
     int32 LoopDelay;
     double Accum;

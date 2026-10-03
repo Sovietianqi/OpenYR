@@ -75,6 +75,11 @@ public:
     virtual void Berzerk();
     virtual void UnBerzerk();
     virtual bool IsBerzerk() const;
+    // InfantryClass_GoBerzerk (asm 0x5226E8): sets the berzerk flag directly.
+    void GoBerzerk();
+    // InfantryClass_IsDeployer (asm 0x5226F0): the infantry type's Deployer
+    // byte (InfantryTypeClass+0xEC8).
+    bool IsDeployer() const;
     virtual void Stun();
     virtual void UnStun();
     virtual bool IsStunned() const;

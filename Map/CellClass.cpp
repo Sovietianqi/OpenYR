@@ -8,10 +8,16 @@
 #include "../Abstract/InfantryClass.h"
 #include "../Abstract/TerrainClass.h"
 #include "../Abstract/OverlayClass.h"
+#include "../Abstract/OverlayTypeClass.h"
+#include "../Rules/RulesClass.h"
+#include "../Game/Externs.h"
+#include "../Objects/IsometricTileGlobals.h"
+#include "../Special/TiberiumClass.h"
 #include "../Abstract/SmudgeClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Map/MapClass.h"
 #include "../Game/Game.h"
+#include "../Game/GameInit.h"
 #include "../IO/CRC.h"
 #include "../COM/IUnknown.h"
 
@@ -91,6 +97,9 @@ void CellClass::Init() {
     TiberiumValue = 0;
     WallOwner = -1;
     CrateType = 0;
+    IsUnderShroud = false;
+    GapsCoveringCell = 0;
+    Field_12C = 0;
     unknown_38 = 0;
     unknown_3C = 0;
     unknown_40 = 0;
@@ -357,11 +366,13 @@ bool CellClass::Is_Discovered() const {
 // ============================================================================
 
 int32 CellClass::Get_Tiberium_Type() const {
-    // The tiberium type is encoded in the OverlayData field when the cell
-    // contains a tiberium overlay. In the original game, overlay indices
-    // 0x01-0x04 correspond to the four tiberium types.
-    if (Overlay < 0 || TiberiumValue <= 0) return -1;
-    return OverlayData & 0xFF;
+    // CellClass_GetContainedTiberiumIndex: the cell's overlay index is resolved
+    // through the tiberium registry into the ore type ordinal, or -1.
+    return Is_Overlay_Idx_Tiberium(Overlay);
+}
+
+int32 CellClass::Get_Contained_Tiberium_Index() const {
+    return Is_Overlay_Idx_Tiberium(Overlay);
 }
 
 int32 CellClass::Get_Tiberium_Value() const {
@@ -420,6 +431,22 @@ void CellClass::Set_Smudge(int32 smudgeIndex, int32 smudgeData) {
     SmudgeData = smudgeData;
 }
 
+// CellClass_StopAmbientSound (asm 0x5F6CB0).
+//
+//   Silences the ambient sound attached to this cell.  The original prefers
+//   the building occupying the cell and only falls back to the terrain object
+//   when the cell holds no building.  Both are asked to stop their ambient
+//   loop with the "-1" flag.
+void CellClass::Silence_Attached_Ambient() {
+    ObjectClass* pObject = First_Object(false);
+    if (pObject == nullptr) {
+        pObject = Terrain;
+    }
+    if (pObject != nullptr) {
+        pObject->StopAmbientSound(-1);
+    }
+}
+
 // ============================================================================
 // Terrain object management
 // ============================================================================
@@ -475,12 +502,34 @@ ObjectClass* CellClass::Get_Occupier() const {
 
 void CellClass::Add_Occupier(ObjectClass* pObj) {
     if (!pObj) return;
+
+    // Thread onto the ground occupancy chain unless it is already linked.
+    if (pObj->NextObject == nullptr && FirstObject != pObj) {
+        pObj->NextObject = FirstObject;
+        FirstObject = pObj;
+    }
+
     Occupier = pObj;
     SetAltFlag(AltCellFlags::ContainsBuilding, true);
 }
 
 void CellClass::Remove_Occupier(ObjectClass* pObj) {
     if (!pObj) return;
+
+    // Unlink from the ground occupancy chain.
+    if (FirstObject == pObj) {
+        FirstObject = pObj->NextObject;
+        pObj->NextObject = nullptr;
+    } else {
+        for (ObjectClass* pPrev = FirstObject; pPrev; pPrev = pPrev->NextObject) {
+            if (pPrev->NextObject == pObj) {
+                pPrev->NextObject = pObj->NextObject;
+                pObj->NextObject = nullptr;
+                break;
+            }
+        }
+    }
+
     if (Occupier == pObj) {
         Occupier = nullptr;
         SetAltFlag(AltCellFlags::ContainsBuilding, false);
@@ -699,6 +748,41 @@ void CellClass::Unshroud() {
     SetFlag(CellFlags::Fogged, false);
 }
 
+// CellClass_Setup (asm 0x4CC180).
+//
+//   Re-derives this cell's shroud/fog state against the map's current view
+//   rectangle.  A negative `flag` means "re-shroud if the cell has fallen
+//   outside the visible rect"; the cell is also fogged whenever it is not
+//   within the visible area.  Called for every cell by
+//   ActionClass_ResizePlayerView after the view rectangle has been rewritten.
+void CellClass::Setup(int32 flag)
+{
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr)
+        return;
+
+    const int32 cx = static_cast<int32>(MapCoords.X);
+    const int32 cy = static_cast<int32>(MapCoords.Y);
+
+    const bool inside =
+        cx >= pMap->VisibleRectX &&
+        cy >= pMap->VisibleRectY &&
+        cx <  pMap->VisibleRectX + pMap->VisibleRectWidth &&
+        cy <  pMap->VisibleRectY + pMap->VisibleRectHeight;
+
+    if (!inside)
+    {
+        if (flag < 0)
+        {
+            Set_Shrouded(true);
+        }
+        SetFlag(CellFlags::Fogged, true);
+        return;
+    }
+
+    SetFlag(CellFlags::Fogged, false);
+}
+
 // ============================================================================
 // Hierarchical pathfinding
 // ============================================================================
@@ -871,6 +955,708 @@ bool CellClass::Pathfinding_Hierarchical(const CellStruct& from, const CellStruc
         outPath.Add(CellStruct(static_cast<int16>(n.RepX), static_cast<int16>(n.RepY)));
     }
     outPath.Add(to);
+
+    return true;
+}
+
+// ============================================================================
+// CellClass::Get_Movement_Cost - asm `LandCharacteristics.Foot[land*9 + speed]`
+//
+//   The cell's own land type selects the row and the mover's speed class the
+//   column.  A zero entry means "this combination cannot traverse the cell at
+//   all"; the callers treat that as an outright rejection.
+// ============================================================================
+
+int32 CellClass::Get_Movement_Cost(int32 SpeedType) const
+{
+    const int32 landIndex = static_cast<int32>(Land);
+    if (landIndex < 0 || landIndex >= RulesClass::LAND_TYPE_COUNT) {
+        return 1;
+    }
+    if (SpeedType < 0 || SpeedType >= 9) {
+        return 1;
+    }
+
+    if (TheRules == nullptr) {
+        return 1;
+    }
+
+    const RulesClass::LandTypeCharacteristics& row =
+        TheRules->LandCharacteristics[landIndex];
+
+    // The seven named floats are immediately followed by the Buildable flag,
+    // so walking the struct as a float array reproduces the binary's flat
+    // indexing exactly.
+    const float* values = &row.Hover;
+    return static_cast<int32>(values[SpeedType]);
+}
+
+// ============================================================================
+// CellClass::Is_Clear_To_Move - asm 0x4834DA
+//
+//   The movement-legal test used when the map searches for a nearby free spot
+//   and when a unit is placed.  It is a sequence of cheap rejections followed
+//   by the land-characteristics lookup:
+//
+//     * SpeedType 4 (Winged) always passes - aircraft ignore the ground.
+//     * When a5 is not -1 the cell's zone must equal it.
+//     * The cell's "land" byte must match a7, except that a bridge cell also
+//       accepts a7 == land + 4.
+//     * The movement field must be empty after applying the a3 / a4 masks.
+//     * A crushable overlay rejects every zone except the crushers.
+//     * Finally the land/speed movement cost must be non-zero.
+// ============================================================================
+
+bool CellClass::Is_Clear_To_Move(int32 SpeedType, bool a3, bool a4, int32 a5,
+                                 MovementZone zone, int32 a7, bool boo) const
+{
+    // Aircraft never need a ground path.
+    if (SpeedType == 4) {
+        return true;
+    }
+
+    // Zone check (the binary compares against MapClass_CanLocationBeReached,
+    // whose result is the cell's zone index).
+    if (a5 != -1) {
+        if (ZoneIndex != a5) {
+            return false;
+        }
+    }
+
+    // Expected land byte, with the bridge adjustment.
+    const bool onBridge = IsBridge();
+    if (a7 != -1) {
+        const int32 landByte = Get_Land_Byte();
+        if (a7 != landByte) {
+            if (!(onBridge && a7 == landByte + 4)) {
+                return false;
+            }
+        }
+    } else if (onBridge && !boo) {
+        // A bridge cell that the caller did not mark as a bridge-layer mover.
+        // (The binary checks this against the *requested* land; with a7 == -1
+        // it only rejects when the mover is not bridge-aware.)
+    }
+
+    // Movement field: pick the bridge or the ground variant, then apply the
+    // caller's masks and require the result to be empty.
+    uint8 movement = 0;
+    const bool wantBridgeVariant = (a7 == -1) ||
+                                   (onBridge && a7 != Get_Land_Byte());
+    if (onBridge && wantBridgeVariant) {
+        movement = Get_Movement_Field_Bridge();
+    } else {
+        movement = Get_Movement_Field();
+    }
+
+    uint32 bits = movement;
+    if (a3) {
+        bits &= 0xE0u;      // keep only the high three bits
+    }
+    if (a4) {
+        bits &= 0x5Fu;      // drop the "crushable" bit
+    }
+    if (bits != 0) {
+        return false;
+    }
+
+    // A crushable overlay narrows the set of zones that may enter.
+    //
+    // The binary loads the overlay type and bails straight to the cost test
+    // when either the overlay or its Crushable byte is absent.  Otherwise it
+    // dispatches on the movement zone:
+    //
+    //   Destroyer / AmphibiousDestroyer / InfantryDestroyer  -> allowed
+    //   Crusher / AmphibiousCrusher                          -> allowed only
+    //                                                           when the
+    //                                                           overlay is not
+    //                                                           Crushable
+    //   CrusherAll                                           -> allowed
+    //   anything else                                        -> rejected
+    bool overlayCleared = false;
+
+    if (Overlay != -1) {
+        OverlayTypeClass* pOverlayType = OverlayTypeClass::FindByIndex(Overlay);
+        if (pOverlayType != nullptr && pOverlayType->Crushable) {
+            const bool destroyerZone =
+                zone == MovementZone::Destroyer ||               // 2
+                zone == MovementZone::AmphibiousDestroyer ||     // 3
+                zone == MovementZone::InfantryDestroyer;         // 8
+
+            const bool crusherZone =
+                zone == MovementZone::Crusher ||                 // 1
+                zone == MovementZone::AmphibiousCrusher;         // 4
+
+            if (destroyerZone || zone == MovementZone::CrusherAll) {
+                overlayCleared = true;
+            } else if (crusherZone) {
+                // A crusher may only flatten a non-crushable wall.
+                if (!pOverlayType->Crushable) {
+                    overlayCleared = true;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    // Land / speed movement cost.  Zero means the mover cannot traverse this
+    // land type at all; the overlay note above is the only way past it.
+    const int32 cost = Get_Movement_Cost(SpeedType);
+    if (cost == 0 && !overlayCleared) {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// CellClass::Get_Land_Byte
+//
+//   The original keeps a small integer at +0x11B that groups the twelve land
+//   types into the coarse classes the movement table is indexed by.  The
+//   caller-side comparisons (a7 == land, a7 == land + 4 for bridges) work on
+//   this value, so it is exposed directly from the land type.
+// ============================================================================
+
+int32 CellClass::Get_Land_Byte() const
+{
+    return static_cast<int32>(Land);
+}
+
+// ============================================================================
+// CellClass::Get_Movement_Field / Get_Movement_Field_Bridge
+//
+//   Two per-cell bytes the assembly tests after masking.  A non-zero result
+//   means the cell carries some movement restriction that the requesting mover
+//   did not opt out of.
+// ============================================================================
+
+uint8 CellClass::Get_Movement_Field() const
+{
+    return MovementField;
+}
+
+uint8 CellClass::Get_Movement_Field_Bridge() const
+{
+    return MovementFieldBridge;
+}
+
+// ============================================================================
+// CellClass::Tile_Is*  - the tile-classification predicates
+//
+//   Every entry reads the cell's isometric tile type index (+0x38) and tests
+//   it against the special tile-set ordinals that the tileset INI published
+//   through IsometricTileType::Apply_Special_Tile_Indices.  A range test is
+//   written as "ordinal <= index < ordinal + count"; the guard on the ordinal
+//   being -1 (tile set missing from this theater) makes the whole range test
+//   fall through to false, which is why the assembly compares against
+//   0FFFFFFFFh first.
+//
+//   Tile_IsCliff is the big one: it accepts the cliff set, all four waterfalls
+//   (with a directional face test on the passability byte at +0x11A), the
+//   cliff ramps, the water caves, both bridge sets and finally the destroyable
+//   and water cliff ranges.
+// ============================================================================
+
+int32                                   TubeCount = 0;
+DynamicVectorClass<CellClass*>*         vec_Tubes = nullptr;
+
+namespace {
+
+// The index ranges the binary compares against are always "ordinal .. ordinal
+// + span".  A missing tile set publishes -1, and the assembly tests that up
+// front, so a negative ordinal can never match a non-negative index.
+inline bool TileRange(int32 index, int32 ordinal, int32 span)
+{
+    return ordinal != -1 && index >= ordinal && index < ordinal + span;
+}
+
+} // namespace
+
+bool CellClass::Tile_IsWater() const
+{
+    return TileRange(TileType, tile_WaterSet, 0x0E);
+}
+
+bool CellClass::Tile_IsNotWater() const
+{
+    return !TileRange(TileType, tile_WaterSet, 0x0E);
+}
+
+bool CellClass::Tile_IsBridge() const
+{
+    return TileRange(TileType, tile_BridgeSet, 0x10);
+}
+
+bool CellClass::Tile_IsWoodBridge() const
+{
+    return TileRange(TileType, tile_WoodBridgeSet, 0x10);
+}
+
+bool CellClass::Tile_IsDestroyableCliff() const
+{
+    // Two adjacent tiles: the base and the base + 1.
+    return TileType == tile_DestroyableCliffs
+        || TileType == tile_DestroyableCliffs + 1;
+}
+
+bool CellClass::Tile_IsRamp() const
+{
+    if (TileType >= tile_RampBase && TileType < tile_RampBase + 0x14)
+        return true;
+
+    return TileType >= tile_RampSmooth && TileType < tile_RampSmooth + 0x0C;
+}
+
+bool CellClass::Tile_IsGreen() const
+{
+    if (TileType == tile_GreenTile)
+        return true;
+
+    return TileRange(TileType, tile_ClearToGreenLat, 0x10);
+}
+
+bool CellClass::Tile_IsBlank() const
+{
+    return TileType == 0xFFFF || TileType == 0;
+}
+
+bool CellClass::Tile_IsShorePieces() const
+{
+    return TileRange(TileType, tile_ShorePieces, 0x2A);
+}
+
+bool CellClass::Tile_IsWet() const
+{
+    if (TileRange(TileType, tile_ShorePieces, 0x2A))
+        return true;
+
+    if (TileRange(TileType, tile_WaterSet, 0x0E))
+        return true;
+
+    if (TileRange(TileType, tile_WaterfallEast, 4))
+        return true;
+
+    if (TileRange(TileType, tile_WaterfallWest, 4))
+        return true;
+
+    if (TileRange(TileType, tile_WaterfallSouth, 4))
+        return true;
+
+    return TileRange(TileType, tile_WaterfallNorth, 4);
+}
+
+bool CellClass::Tile_IsMiscPave() const
+{
+    return TileRange(TileType, tile_MiscPaveTile, 0x0E);
+}
+
+bool CellClass::Tile_IsPave() const
+{
+    return TileRange(TileType, tile_PaveTile, 0x10);
+}
+
+bool CellClass::Tile_IsDirtRoad() const
+{
+    if (TileRange(TileType, tile_DirtRoadJunction, 0x0B))
+        return true;
+
+    if (TileRange(TileType, tile_DirtRoadCurve, 0x18))
+        return true;
+
+    return TileRange(TileType, tile_DirtRoadStraight, 0x42);
+}
+
+bool CellClass::Tile_IsPavedRoad() const
+{
+    return TileRange(TileType, tile_PavedRoads, 0x0F);
+}
+
+bool CellClass::Tile_IsPavedRoadEnd() const
+{
+    return TileRange(TileType, tile_PavedRoadEnds, 4);
+}
+
+bool CellClass::Tile_IsPavedRoadSlope() const
+{
+    return TileRange(TileType, tile_PavedRoadSlopes, 4);
+}
+
+bool CellClass::Tile_IsMedian() const
+{
+    return TileRange(TileType, tile_Medians, 0x0E);
+}
+
+bool CellClass::Tile_IsClearToSandLat() const
+{
+    return TileRange(TileType, tile_ClearToSandLat, 0x10);
+}
+
+bool CellClass::Tile_IsATunnel() const
+{
+    // A tunnel tile is one whose tube index (+0x118) is a live index into
+    // vec_Tubes *and* whose land type is the Tunnel classification.
+    if (TubeIndex < 0)
+        return false;
+
+    if (TubeIndex >= TubeCount)
+        return false;
+
+    return Land == ::LandType::Tunnel;
+}
+
+bool CellClass::Tile_IsCliff() const
+{
+    if (TileRange(TileType, tile_CliffSet, 0x28))
+        return true;
+
+    // Each waterfall is a run of four tiles.  The first and the fourth of the
+    // run are the two "faces" the cliff test rejects when the cell's
+    // passability byte names that same face; the middle two always count.
+    if (TileRange(TileType, tile_WaterfallEast, 4)) {
+        if (TileType == tile_WaterfallEast)
+            return Passability != 0 && Passability != 4;
+        if (TileType != tile_WaterfallEast + 3)
+            return true;
+    }
+
+    if (TileRange(TileType, tile_WaterfallWest, 4)) {
+        if (TileType == tile_WaterfallWest)
+            return Passability != 1 && Passability != 3;
+        if (TileType != tile_WaterfallWest + 3)
+            return true;
+    }
+
+    if (TileRange(TileType, tile_WaterfallSouth, 4)) {
+        if (TileType == tile_WaterfallSouth)
+            return Passability != 0 && Passability != 1;
+        if (TileType != tile_WaterfallSouth + 3)
+            return true;
+    }
+
+    if (TileRange(TileType, tile_WaterfallNorth, 4)) {
+        if (TileType == tile_WaterfallNorth)
+            return Passability != 2 && Passability != 3;
+        if (TileType != tile_WaterfallNorth + 3)
+            return true;
+    }
+
+    if (TileRange(TileType, tile_CliffRamps, 0x14))
+        return true;
+
+    if (TileRange(TileType, tile_WaterCaves, 4))
+        return true;
+
+    if (TileRange(TileType, tile_BridgeSet, 0x10))
+        return true;
+
+    if (TileRange(TileType, tile_WoodBridgeSet, 0x10))
+        return true;
+
+    if (TileRange(TileType, tile_DestroyableCliffs, 2))
+        return true;
+
+    return TileRange(TileType, tile_WaterCliffs, 0x1C);
+}
+
+// ============================================================================
+// CellClass radiation
+//
+//   RadLevel is a double the RadSiteClass update loop accumulates into each
+//   cell it covers.  The four small predicates here are the ones the rest of
+//   the engine asks for: Is_Radiated (anything above 1.0), and Get_RadLevel
+//   (the level clamped to RulesData->RadLevelMax and then floored to an int,
+//   which is the value FootClass::AI feeds into the damage roll).
+// ============================================================================
+
+void CellClass::RadLevel_Increase(double amount)
+{
+    RadLevel += amount;
+}
+
+void CellClass::RadLevel_Decrease(double amount)
+{
+    RadLevel -= amount;
+
+    // The original tests the result against zero and stores a hard zero when
+    // it went negative, so a cell never retains a negative dose.
+    if (RadLevel < 0.0)
+        RadLevel = 0.0;
+}
+
+void CellClass::Set_Rad_Site(void* pRadSite)
+{
+    RadSite = pRadSite;
+}
+
+bool CellClass::Is_Radiated() const
+{
+    return RadLevel > 1.0;
+}
+
+int32 CellClass::Get_RadLevel() const
+{
+    // fld maxLevel / fld RadLevel / fcomp st(1) / test ah,1 / jz floor.
+    // The compare only branches on the unordered flag; for every ordered pair
+    // the value left on the FPU stack is the RadLevel pushed second and the
+    // max level is simply dropped.  The result is therefore the floor of the
+    // cell's dose with no clamp, which is what is reproduced here.
+    const int32 maxLevel = TheRules->RadLevelMax;
+    (void)maxLevel;
+
+    return static_cast<int32>(RadLevel);
+}
+
+// ============================================================================
+// CellClass::Tiberium_In_Cell / Contains_Tiberium
+//
+//   TiberiumInCell resolves the cell's overlay into an ore type and answers
+//   that type's Value multiplied by (growth stage + 1), where the growth stage
+//   is the byte the overlay bookkeeping keeps at +0x11E.  An overlay that is
+//   not ore, or a cell with no overlay, yields zero.
+//
+//   ContainsTiberium is the bare land-type test the harvest code uses first.
+// ============================================================================
+
+int32 CellClass::Tiberium_In_Cell() const
+{
+    const int32 typeIndex = Is_Overlay_Idx_Tiberium(Overlay);
+    if (typeIndex == -1)
+        return 0;
+
+    TiberiumClass* pType = TiberiumClass::FindByIndex(typeIndex);
+    if (pType == nullptr)
+        return 0;
+
+    return pType->Value * (static_cast<int32>(OverlayFrame) + 1);
+}
+
+bool CellClass::Contains_Tiberium() const
+{
+    return Land == ::LandType::Tiberium;
+}
+
+// ============================================================================
+// CellClass - per-house sensor / cloak-generator bookkeeping
+//
+//  every accessor below is a literal transcription of the assembly.
+//  CloakGen stores a bit per house index in a 32-bit mask at +0x78; the
+//  sensor and disguise-sensor counters are 16-bit words indexed by the house
+//  ordinal at +0x7C and +0xAC respectively.  The building update code calls
+//  Add/Rem as cloaking and sensor structures power on and off.
+// ============================================================================
+
+// CellClass_CloakGen_AddHouse (asm 0x4879xx): set bit idxHouse of the mask.
+void CellClass::CloakGen_AddHouse(int32 idxHouse)
+{
+    CloakGenMask |= (1u << idxHouse);
+}
+
+// CellClass_CloakGen_RemHouse (asm 0x4879xx): clear bit idxHouse of the mask.
+void CellClass::CloakGen_RemHouse(int32 idxHouse)
+{
+    CloakGenMask &= ~(1u << idxHouse);
+}
+
+// CellClass_CloakGen_HasHouse (asm 0x4879xx): test bit idxHouse of the mask.
+bool CellClass::CloakGen_HasHouse(int32 idxHouse) const
+{
+    return (CloakGenMask & (1u << idxHouse)) != 0;
+}
+
+// CellClass_Sensors_AddHouse (asm 0x4878xx): one more of this house's sensors
+// now reveals the cell.
+void CellClass::Sensors_AddHouse(int32 idxHouse)
+{
+    ++SensedByHouses[idxHouse];
+}
+
+// CellClass_Sensors_RemHouse (asm 0x4878xx): one fewer.
+void CellClass::Sensors_RemHouse(int32 idxHouse)
+{
+    --SensedByHouses[idxHouse];
+}
+
+// CellClass_Sensors_HasHouse (asm 0x4878xx): `setnle` on the 16-bit counter
+// means "true when the count is strictly greater than zero".
+bool CellClass::Sensors_HasHouse(int32 idxHouse) const
+{
+    return SensedByHouses[idxHouse] > 0;
+}
+
+// CellClass_DisguiseSensors_AddHouse (asm 0x4879xx).
+void CellClass::DisguiseSensors_AddHouse(int32 idxHouse)
+{
+    ++DisguiseSensedByHouses[idxHouse];
+}
+
+// CellClass_DisguiseSensors_RemHouse (asm 0x4879xx).
+void CellClass::DisguiseSensors_RemHouse(int32 idxHouse)
+{
+    --DisguiseSensedByHouses[idxHouse];
+}
+
+// CellClass_DisguiseSensors_HasHouse (asm 0x4879xx).
+bool CellClass::DisguiseSensors_HasHouse(int32 idxHouse) const
+{
+    return DisguiseSensedByHouses[idxHouse] > 0;
+}
+
+// ============================================================================
+// CellClass - tunnel / coordinate / identity / flag batch
+// ============================================================================
+
+// CellClass_GetTunnel (asm 0x484F2B).
+//
+//  Validates the 16-bit tube index at +0x118 against the tunnel table length
+//  and returns the cell the table holds; a negative index or an out-of-range
+//  one yields null.
+CellClass* CellClass::Get_Tunnel() const
+{
+    if (TubeIndex < 0)
+        return nullptr;
+
+    if (vec_Tubes == nullptr)
+        return nullptr;
+
+    if (TubeIndex >= vec_Tubes->Count)
+        return nullptr;
+
+    return vec_Tubes->Items[TubeIndex];
+}
+
+// CellClass_SetMapCoords (asm 0x47D3B8).
+//
+//  The original copies the four packed bytes of the MapCellExClass X/Y pair
+//  straight into +0x24; storing the CellStruct produces the identical bytes.
+void CellClass::Set_Map_Coords(const CellStruct& coords)
+{
+    MapCoords = coords;
+}
+
+// CellClass_GetAbstractID (asm 0x482Axx).  Every cell reports the fixed
+// AbstractType::Cell ordinal.
+int32 CellClass::Get_AbstractID() const
+{
+    return static_cast<int32>(AbstractType::Cell);
+}
+
+// CellClass_FlagPickedUp (asm 0x4834A0).
+//
+//  Clears the "flag is planted" bit (0x10) from the flag word at +0x140 and
+//  resets the attached-object index at +0x50 to -1.  Returns true only when
+//  the bit had actually been set.
+bool CellClass::Flag_Picked_Up()
+{
+    if ((Field_140 & 0x10u) == 0)
+        return false;
+
+    Field_140 &= ~0x10u;
+    Field_50 = -1;
+    return true;
+}
+
+// CellClass_Smth0 (asm 0x487635).
+//
+//  Decrements the gap counter at +0x130, but a count of exactly 1 first
+//  collapses to 0 so that the subsequent decrement wraps it to -1; the net
+//  effect is that a single remaining gap generator takes the counter to -1
+//  rather than 0.
+void CellClass::Smth0()
+{
+    if (GapsCoveringCell == 1)
+        GapsCoveringCell = 0;
+
+    --GapsCoveringCell;
+}
+
+// CellClass_Smth2 (asm 0x4876xx).
+//
+//  Sets the shroud flag bits 0x18 on +0x12C and, while the gap counter is
+//  still positive, tags 0x20 onto the flag word at +0x140.
+void CellClass::Smth2()
+{
+    Field_12C |= 0x18u;
+
+    if (GapsCoveringCell > 0)
+        Field_140 |= 0x20u;
+}
+
+// ============================================================================
+// Occupancy-list lookups
+//
+//  The binary keeps two singly-linked lists per cell, threaded through
+//  ObjectClass::NextObject (+0x30): the ground list (+0xE4) and the altitude
+//  ("flying") list (+0xE8).  Every lookup picks one of the two with its bool
+//  argument, then walks the chain comparing WhatAmI() against the requested
+//  abstract type.  A null head yields null immediately.
+// ============================================================================
+
+ObjectClass* CellClass::First_Object(bool alt) const {
+    return alt ? AltObject : FirstObject;
+}
+
+ObjectClass* CellClass::GetUnit(bool alt) const {
+    if (!GameActive) return nullptr;
+
+    ObjectClass* pObj = First_Object(alt);
+    while (pObj) {
+        if (pObj->WhatAmI() == AbstractType::Unit)
+            return pObj;
+        pObj = pObj->NextObject;
+    }
+    return nullptr;
+}
+
+ObjectClass* CellClass::GetAircraft(bool alt) const {
+    if (!GameActive) return nullptr;
+
+    ObjectClass* pObj = First_Object(alt);
+    while (pObj) {
+        if (pObj->WhatAmI() == AbstractType::Aircraft)
+            return pObj;
+        pObj = pObj->NextObject;
+    }
+    return nullptr;
+}
+
+ObjectClass* CellClass::GetInfantry(bool alt) const {
+    if (!GameActive) return nullptr;
+
+    ObjectClass* pObj = First_Object(alt);
+    while (pObj) {
+        if (pObj->WhatAmI() == AbstractType::Infantry)
+            return pObj;
+        pObj = pObj->NextObject;
+    }
+    return nullptr;
+}
+
+// CellClass_CanAddTiberium (asm 0x4838F0).
+//
+//  A cell may receive new tiberium only when it is inside the radar range,
+//  its flag word does not already carry the growth-suppressing bits 0x500,
+//  and it holds no building.  (The trailing refinement in the original also
+//  rejects cells whose tiberium value would exceed the type's cap, which is
+//  folded into the caller.)
+bool CellClass::CanAddTiberium() const {
+    if (!MapClass::Instance || !MapClass::Instance->In_Radar(MapCoords, true))
+        return false;
+
+    if (Field_140 & 0x500u)
+        return false;
+
+    if (GameActive) {
+        ObjectClass* pObj = FirstObject;
+        while (pObj) {
+            if (pObj->WhatAmI() == AbstractType::Building)
+                return false;
+            pObj = pObj->NextObject;
+        }
+    }
 
     return true;
 }

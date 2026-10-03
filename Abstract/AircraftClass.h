@@ -50,6 +50,12 @@ public:
     // AircraftClass virtuals
     // ========================================================================
     virtual bool IsFlying() const;
+    // AircraftClass_GetPoseDir (asm 0x4163C8): the shared RulesData pose
+    // direction used to orient parked aircraft.
+    int32 GetPoseDir() const;
+    // AircraftClass_IsGroundUnit (asm 0x4163D0): forwards to the OnFloor
+    // vtable slot so the aircraft reports as grounded while parked.
+    bool IsGroundUnit() const;
     virtual bool IsLandingNow() const;
     virtual bool IsTakingOffNow() const;
     virtual void Fly();

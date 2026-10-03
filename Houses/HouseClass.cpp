@@ -9,9 +9,17 @@
 #include <Abstract/UnitClass.h>
 #include <Abstract/InfantryClass.h>
 #include <Abstract/BuildingClass.h>
+#include <Abstract/BuildingTypeClass.h>
+#include <Abstract/TechnoTypeClass.h>
+#include <SW/SuperClass.h>
+#include <AI/TeamClass.h>
+#include <Abstract/InfantryTypeClass.h>
+#include <Abstract/UnitTypeClass.h>
+#include <SW/SuperWeaponTypeClass.h>
 #include <Rules/RulesClass.h>
 #include <INI/INIClass.h>
 #include <Scenario/ScenarioClass.h>
+#include <Game/Game.h>
 #include <Rendering/ConvertClass.h>
 
 #include <cstring>
@@ -44,7 +52,10 @@ HouseClass* HouseClass::Array[32] = {};
 int32 HouseClass::ArrayCount = 0;
 HouseClass* HouseClass::pCurrentPlayer = nullptr;
 HouseClass* HouseClass::Player = nullptr;
-HouseClass* HouseClass::Observer = nullptr;
+
+// HouseClass_DefaultIonCannon_Coords (asm 0x8872E8): the (0xFFFF, 0xFFFF)
+// module sentinel every cleared cell slot is stamped with.
+const CellStruct HouseClass::DefaultIonCannon_Coords(-1, -1);HouseClass* HouseClass::Observer = nullptr;
 
 // ============================================================================
 // Constructor
@@ -90,6 +101,8 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , IsSpySatActiveInRadar(false)
     , SpiedBy(nullptr)
     , SpiedBy_SpySat(nullptr)
+    , ProductionSuspended(false)
+    , SellEverything(false)
     , AllyBitfield(0)
     , EnemyBitfield(0)
     , ActiveSuperWeapons(0)
@@ -146,6 +159,29 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , RevealedByHeight(false)
     , BaseCenter(CellStruct(0, 0))
     , BaseNodesCount(0)
+    , BestTargetCell(CellStruct(-1, -1))
+    , BaseCell(CellStruct(-1, -1))
+    , BaseSpawnCell(CellStruct(-1, -1))
+    , TargetCell(CellStruct(-1, -1))
+    , DefensiveCell(CellStruct(-1, -1))
+    , DefensiveCellField(0)
+    , PreferredDefensiveCell(-1, -1)
+    , PreferredDefensiveCellStartTime(-1)
+    , Counters{}
+    , InfantrySelfHeal(0)
+    , UnitsSelfHeal(0)
+    , PoweredCenters(0)
+    , BuildingTypeToProduce(-1)
+    , TiberiumValue(0)
+    , TotalStorageCapacity(0)
+    , FactoryPlants(nullptr)
+    , DamageLedger(nullptr)
+    , DamageLedgerCount(0)
+    , PrimaryAggressor(-1)
+    , HasThreatNode(false)
+    , RadarBlackoutTimer()
+    , RadarBlackoutFrame(-1)
+    , SuperWeapons(nullptr)
     , LastBuildTime(0)
     , LastProductionTime(0)
     , LastAttackTime(0)
@@ -1864,6 +1900,101 @@ void HouseClass::UpdateSightAroundUnit(TechnoClass* pUnit)
 }
 
 // ============================================================================
+// HouseClass::Set_Threat - asm 0x4FA2DE
+//
+//   Spreads a threat amount across nine grid slots.  The two static tables in
+//   the binary drive it:
+//
+//     offset[9] = { -131, -130, -129, -1, 0, 1, 129, 130, 131 }
+//     shift[9]  = { 2, 1, 2, 1, 0, 1, 2, 1, 2 }
+//
+//   Entry i writes `threat >> shift[i]` at `coordHash + offset[i]`.  A negative
+//   threat subtracts instead of adding.  Every slot is clamped at zero.
+// ============================================================================
+namespace {
+
+const int32 kThreatGridOffsets[9] = { -131, -130, -129, -1, 0, 1, 129, 130, 131 };
+const int32 kThreatGridShifts[9]  = { 2, 1, 2, 1, 0, 1, 2, 1, 2 };
+
+} // namespace
+
+void HouseClass::Set_Threat(int32 coordHash, int32 threat)
+{
+    // Direction: negative amounts subtract.
+    const bool subtract = (threat < 0);
+    const int32 magnitude = subtract ? -threat : threat;
+
+    for (int32 i = 0; i < 9; ++i) {
+        const int32 index = coordHash + kThreatGridOffsets[i];
+        if (index < 0 || index >= ThreatGridCellCount) {
+            continue;
+        }
+
+        const int32 delta = magnitude >> kThreatGridShifts[i];
+
+        if (subtract) {
+            ThreatGrid[index] -= delta;
+        } else {
+            ThreatGrid[index] += delta;
+        }
+
+        if (ThreatGrid[index] < 0) {
+            ThreatGrid[index] = 0;
+        }
+    }
+}
+
+// ============================================================================
+// HouseClass::Recalc_Threats - asm 0x5093A8
+//
+//   Zeroes the whole 0x4204-dword grid, then walks the global techno list and
+//   re-adds each object's threat value at its own position.  Aircraft, dead
+//   objects, zero-threat objects and the requesting house's own units are
+//   skipped; the object's threat is measured from its current location.
+// ============================================================================
+void HouseClass::Recalc_Threats()
+{
+    for (int32 i = 0; i < ThreatGridCellCount; ++i) {
+        ThreatGrid[i] = 0;
+    }
+
+    if (TechnoClass::Array == nullptr) {
+        return;
+    }
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i) {
+        TechnoClass* pTechno = (*TechnoClass::Array)[i];
+        if (pTechno == nullptr) {
+            continue;
+        }
+
+        // Airborne objects contribute nothing to the ground threat grid.
+        if (pTechno->IsInAir()) {
+            continue;
+        }
+
+        // The object must be alive and actually able to project threat.
+        if (pTechno->IsDead()) {
+            continue;
+        }
+
+        const int32 threat = pTechno->GetThreatValue();
+        if (threat <= 0) {
+            continue;
+        }
+
+        // A house never threatens itself.
+        if (pTechno->Owner == this) {
+            continue;
+        }
+
+        const CellStruct cell = pTechno->Get_Cell_Ptr_Coord();
+        const int32 region = MapClass::Cell_Region(cell);
+        Set_Threat(region, threat);
+    }
+}
+
+// ============================================================================
 // Production / loss bookkeeping (original HouseClass_BeginProductionOf etc.)
 // ============================================================================
 
@@ -2186,4 +2317,1723 @@ bool HouseClass::LoadFromINIList(CCINIClass* pINI)
     }
 
     return true;
+}
+
+// ============================================================================
+// Type multiplier dispatch
+// ============================================================================
+//
+// HouseClass_GetTypeArmorMult / _GetTypeCostMult / _GetCostMult /
+// _GetTypeBuildTimeMult all share one control-flow shape:
+//
+//     WhatAmI()            ; [vtbl + 0x2Ch]
+//     add eax, -3          ; fold the type enum down to the switch base
+//     cmp eax, 25h         ; 38 cases
+//     ja  default          ; -> 1.0
+//     jmp ds:off_XXXX[byte_XXXX[eax]*4]
+//
+// The byte table maps each of the 38 folded indices onto one of five arms:
+//   0 -> AircraftType  (enum 3, folded to 0)
+//   1 -> BuildingType  (enum 7, folded to 4)   -- split on BuildCat == Combat
+//   2 -> InfantryType  (enum 16, folded to 13)
+//   3 -> UnitType      (enum 40, folded to 37)
+//   4 -> default       (1.0)
+//
+// The building arm is the only one carrying a second test: a structure whose
+// BuildCat is Combat is priced as a defense, everything else as a building.
+//
+// _GetTypeSpeedMult uses a plain three-way compare instead, because it can be
+// handed a live TechnoClass rather than a type and there is no building speed
+// multiplier in the original.
+
+namespace {
+
+// The five-way category shared by the multiplier getters.  Mirrors the
+// byte_XXXX indirect tables in the original exactly.
+enum class MultCategory : int32 {
+    Aircraft = 0,
+    Building = 1,
+    Infantry = 2,
+    Unit     = 3,
+    Default  = 4
+};
+
+// byte_50BDC4 / byte_50BE84 / byte_50BF38 / byte_50C134 (all identical).
+// Index is WhatAmI() - 3, valid for 0..0x25.
+inline MultCategory Classify_Type(const TechnoTypeClass* pType)
+{
+    if (pType == nullptr)
+        return MultCategory::Default;
+
+    const int32 what = static_cast<int32>(pType->WhatAmI()) - 3;
+    if (what < 0 || what > 0x25)
+        return MultCategory::Default;
+
+    static const uint8 kTable[0x26] = {
+    //   0   1   2   3   4   5   6   7   8   9
+         0,  4,  4,  4,  1,  4,  4,  4,  4,  4,   //  0.. 9   (3=AircraftType, 7=BuildingType)
+         4,  4,  4,  4,  4,  4,  2,  4,  4,  4,   // 10..19   (16=InfantryType)
+         4,  4,  4,  4,  4,  4,  4,  4,  4,  4,   // 20..29
+         4,  4,  4,  4,  4,  4,  4,  3            // 30..37   (37=UnitType)
+    };
+
+    return static_cast<MultCategory>(kTable[what]);
+}
+
+// True when the type is a structure built in the Combat category, which the
+// original prices/armours with the separate "Defenses" multipliers.
+inline bool Is_Defense_Structure(const TechnoTypeClass* pType)
+{
+    if (pType == nullptr || pType->WhatAmI() != AbstractType::BuildingType)
+        return false;
+
+    const BuildingTypeClass* pBuilding = static_cast<const BuildingTypeClass*>(pType);
+    return static_cast<int32>(pBuilding->BuildCatValue) == static_cast<int32>(BuildCat::Combat);
+}
+
+} // namespace
+
+// HouseClass_GetCostMult (asm 0x50BEC0).  Reads the multipliers straight off
+// the house record (they are cached there by Recalc_Factory_Plants).
+double HouseClass::Get_Cost_Mult(TechnoTypeClass* pType) const
+{
+    switch (Classify_Type(pType))
+    {
+    case MultCategory::Infantry: return static_cast<double>(Type->CostInfantryMult);
+    case MultCategory::Unit:     return static_cast<double>(Type->CostUnitsMult);
+    case MultCategory::Aircraft: return static_cast<double>(Type->CostAircraftMult);
+    case MultCategory::Building:
+        return static_cast<double>(Is_Defense_Structure(pType) ? Type->CostDefensesMult
+                                                              : Type->CostBuildingsMult);
+    default:
+        return 1.0;
+    }
+}
+
+// HouseClass_GetTypeCostMult (asm 0x50BE00).  Functionally identical to
+// Get_Cost_Mult but sourced from the HouseTypeClass instead of the cached
+// per-house copies.
+double HouseClass::Get_Type_Cost_Mult(TechnoTypeClass* pType) const
+{
+    switch (Classify_Type(pType))
+    {
+    case MultCategory::Infantry: return static_cast<double>(Type->CostInfantryMult);
+    case MultCategory::Unit:     return static_cast<double>(Type->CostUnitsMult);
+    case MultCategory::Aircraft: return static_cast<double>(Type->CostAircraftMult);
+    case MultCategory::Building:
+        return static_cast<double>(Is_Defense_Structure(pType) ? Type->CostDefensesMult
+                                                              : Type->CostBuildingsMult);
+    default:
+        return 1.0;
+    }
+}
+
+// HouseClass_GetTypeArmorMult (asm 0x50BD46).
+double HouseClass::Get_Type_Armor_Mult(TechnoTypeClass* pType) const
+{
+    switch (Classify_Type(pType))
+    {
+    case MultCategory::Infantry: return static_cast<double>(Type->ArmorInfantryMult);
+    case MultCategory::Unit:     return static_cast<double>(Type->ArmorUnitsMult);
+    case MultCategory::Aircraft: return static_cast<double>(Type->ArmorAircraftMult);
+    case MultCategory::Building:
+        return static_cast<double>(Is_Defense_Structure(pType) ? Type->ArmorDefensesMult
+                                                              : Type->ArmorBuildingsMult);
+    default:
+        return 1.0;
+    }
+}
+
+// HouseClass_GetTypeBuildTimeMult (asm 0x50C0B6).
+double HouseClass::Get_Type_Build_Time_Mult(TechnoTypeClass* pType) const
+{
+    switch (Classify_Type(pType))
+    {
+    case MultCategory::Infantry: return Type->BuildTimeInfantryMult;
+    case MultCategory::Unit:     return Type->BuildTimeUnitsMult;
+    case MultCategory::Aircraft: return Type->BuildTimeAircraftMult;
+    case MultCategory::Building:
+        return Is_Defense_Structure(pType) ? Type->BuildTimeDefensesMult
+                                           : Type->BuildTimeBuildingsMult;
+    default:
+        return 1.0;
+    }
+}
+
+// HouseClass_GetTypeSpeedMult (asm 0x50C07C).  Unlike the others this is a
+// straight three-way compare on the object's type - there is no building or
+// defense entry, and an unrecognised type yields 1.0.
+double HouseClass::Get_Type_Speed_Mult(TechnoTypeClass* pType) const
+{
+    if (pType == nullptr)
+        return 1.0;
+
+    switch (pType->WhatAmI())
+    {
+    case AbstractType::AircraftType: return static_cast<double>(Type->SpeedAircraftMult);
+    case AbstractType::InfantryType: return static_cast<double>(Type->SpeedInfantryMult);
+    case AbstractType::UnitType:     return static_cast<double>(Type->SpeedUnitsMult);
+    default:                         return 1.0;
+    }
+}
+
+// HouseClass_GetIncomeMult (asm 0x50C148).  A single load off the house type.
+double HouseClass::Get_Income_Mult() const
+{
+    return static_cast<double>(Type->IncomeMult);
+}
+
+// ============================================================================
+// HouseClass_RecalcFactoryPlants (asm 0x50BF80)
+//
+//   Resets the five cached cost multipliers to 1.0 (bit pattern 0x3F800000,
+//   loaded as the literal -3229614080 == 0x3F800000), then folds in the
+//   per-plant cost bonus of every structure registered as a factory plant.
+//   Each bonus is multiplied cumulatively, so two 0.85 plants yield 0.7225.
+// ============================================================================
+void HouseClass::Recalc_Factory_Plants()
+{
+    const double one = 1.0;
+    double infantry  = one;
+    double units     = one;
+    double aircraft  = one;
+    double buildings = one;
+    double defenses  = one;
+
+    if (FactoryPlants != nullptr)
+    {
+        for (int32 i = 0; i < FactoryPlants->Count; ++i)
+        {
+            BuildingClass* pBuilding = (*FactoryPlants)[i];
+            if (pBuilding == nullptr || pBuilding->Type == nullptr)
+                continue;
+
+            const BuildingTypeClass* pType = pBuilding->Type;
+            infantry  *= pType->InfantryCostBonus;
+            units     *= pType->UnitsCostBonus;
+            aircraft  *= pType->AircraftCostBonus;
+            buildings *= pType->BuildingsCostBonus;
+            defenses  *= pType->DefensesCostBonus;
+        }
+    }
+
+    // Write the accumulators back into the house-level cache the getters read.
+    Type->CostInfantryMult  = static_cast<float>(infantry);
+    Type->CostUnitsMult     = static_cast<float>(units);
+    Type->CostAircraftMult  = static_cast<float>(aircraft);
+    Type->CostBuildingsMult = static_cast<float>(buildings);
+    Type->CostDefensesMult  = static_cast<float>(defenses);
+}
+
+// ============================================================================
+// Self-heal steps (asm 0x50DA98 / 0x50DAA6)
+//
+//   step = RulesData.<SelfHeal*Amount> * house.<*GainSelfHeal>
+//
+//   The house-side counters are accumulated by
+//   HouseClass_RegisterTechnoGain_PrereqCounters from each owner's
+//   InfantryGainSelfHeal / UnitsGainSelfHeal, so the step scales with how
+//   much healing infrastructure the house owns.
+// ============================================================================
+int32 HouseClass::Get_Inf_Self_Heal_Step() const
+{
+    if (RulesClass::Instance == nullptr)
+        return 0;
+
+    return RulesClass::Instance->SelfHealInfantryAmount * InfantrySelfHeal;
+}
+
+int32 HouseClass::Get_Unit_Self_Heal_Step() const
+{
+    if (RulesClass::Instance == nullptr)
+        return 0;
+
+    return RulesClass::Instance->SelfHealUnitAmount * UnitsSelfHeal;
+}
+
+// ============================================================================
+// HouseClass_CurrentPowerPercentage (asm 0x4FCE50)
+//
+//   have >= need           -> 1.0
+//   need == 0              -> 1.0
+//   have == 0              -> 0.0
+//   otherwise              -> have / need
+//
+//   Note the two short-circuits: an over-powered house is pinned at 1.0 and
+//   a house with no drain at all is also considered fully powered.
+// ============================================================================
+double HouseClass::Current_Power_Percentage() const
+{
+    const int32 have = PowerOutput;
+    const int32 need = PowerDrain;
+
+    if (have >= need)
+        return 1.0;
+
+    if (need == 0)
+        return 1.0;
+
+    if (have == 0)
+        return 0.0;
+
+    return static_cast<double>(have) / static_cast<double>(need);
+}
+
+// ============================================================================
+// Sidebar counters (asm HouseClass_GetCounter 0x5006D0 / _EnableCounter 0x5005BC)
+//
+//   Both take the same three arguments - a 1-based build-queue type code, a
+//   "is naval" flag and a build category - and both jump through a 40-entry
+//   table.  GetCounter reads one of the nine byte flags, EnableCounter writes
+//   it.  The byte flags themselves are addressed as a flat run at +0x53D0.
+// ============================================================================
+namespace {
+
+// Resolve the argument triple onto a CounterField slot.  Returns Count when
+// the combination has no associated flag, which both callers treat as "do
+// nothing" / "return false".
+inline HouseClass::CounterField Resolve_Counter(int32 typeIndex, bool isNaval, int32 buildCat)
+{
+    using CF = HouseClass::CounterField;
+
+    const int32 slot = typeIndex - 1;               // the asm's "dec eax"
+    if (slot < 0 || slot > 0x27)                    // cmp eax, 27h -> default
+        return CF::Count;
+
+    // byte_500778 - the same indirect table feeds GetCounter, EnableCounter
+    // and the two b-suffixed helpers.  The values index off_500764:
+    //   0 -> loc_500718  isNaval ? +0x53D3 : +0x53D2   (codes 1, 40)
+    //   1 -> loc_50074C  +0x53D0                       (codes 2, 3)
+    //   2 -> loc_50073C  BuildCat==Combat ? +0x53D8 : +0x53D4  (codes 6, 7)
+    //   3 -> loc_50071D  +0x53D1                       (codes 15, 16)
+    //   4 -> default (do nothing)
+    static const uint8 kTable[0x28] = {
+    //   0   1   2   3   4   5   6   7   8   9
+         0,  1,  1,  4,  4,  2,  2,  4,  4,  4,   //  0.. 9
+         4,  4,  4,  4,  3,  3,  4,  4,  4,  4,   // 10..19
+         4,  4,  4,  4,  4,  4,  4,  4,  4,  4,   // 20..29
+         4,  4,  4,  4,  4,  4,  4,  4,  4,  0    // 30..39
+    };
+
+    switch (kTable[slot])
+    {
+    case 0:
+        // codes 1, 40 - the two "infantry / unit" categories, naval-split.
+        return isNaval ? CF::InfantryNaval : CF::Infantry;
+
+    case 1:
+        // codes 2, 3 - the "building" category.
+        return CF::Building;
+
+    case 2:
+        // codes 6, 7 - structures, split on whether they are Combat defenses.
+        return (buildCat == static_cast<int32>(BuildCat::Combat)) ? CF::Aircraft : CF::Unit;
+
+    case 3:
+        // codes 15, 16 - the standalone "defense" category.
+        return CF::Defense;
+
+    default:
+        return CF::Count;
+    }
+}
+
+} // namespace
+
+bool HouseClass::Get_Counter(int32 typeIndex, bool isNaval, int32 buildCat) const
+{
+    const CounterField field = Resolve_Counter(typeIndex, isNaval, buildCat);
+    if (field == CounterField::Count)
+        return false;
+
+    return Counters[static_cast<int32>(field)] != 0;
+}
+
+void HouseClass::Enable_Counter(int32 typeIndex, bool isNaval, int32 buildCat)
+{
+    const CounterField field = Resolve_Counter(typeIndex, isNaval, buildCat);
+    if (field == CounterField::Count)
+        return;
+
+    Counters[static_cast<int32>(field)] = 1;
+}
+
+// ============================================================================
+// Map edges (asm HouseClass_GetEdge 0x50DA7A / GetEdge_ 0x50DA88 /
+// GetEdgeInverse 0x50DAC8)
+// ============================================================================
+//  GetEdge reads the house's Edge field and clamps anything outside 0..3 to 0.
+int32 HouseClass::Get_Edge() const
+{
+    if (Edge < 0 || Edge > 3)
+        return 0;
+
+    return Edge;
+}
+
+// GetEdgeInverse maps an edge onto its opposite: 0<->2, 1<->3.  The original
+// uses a four-entry jump table where case 2 falls through to the default, so
+// an out-of-range value also yields 0.
+int32 HouseClass::Get_Edge_Inverse() const
+{
+    switch (Edge)
+    {
+    case 0:  return 2;
+    case 1:  return 3;
+    case 3:  return 1;
+    default: return 0;   // covers case 2 and anything out of range
+    }
+}
+
+// ============================================================================
+// HouseClass_GetTotalWeed (asm 0x4F96E0)
+//
+//   Accumulates one point of "weed" for every object in the house's tracking
+//   list whose tiberium content exceeds the supplied threshold.  The walk
+//   starts at the caller-supplied object and runs for `count` steps along the
+//   tracking vector.  Returns the accumulated float total.
+// ============================================================================
+double HouseClass::Get_Total_Weed(int32 count, int32 threshold) const
+{
+    if (count <= 0 || TrackingList.Count <= 0)
+        return 0.0;
+
+    const int32 limit = (threshold > 0) ? threshold : 0;
+
+    // The original loads a float from RulesData at +0x155C relative to the
+    // LeaveBioReactorSound slot; that resolves to the tiberium-value ceiling
+    // the harvester comparison uses.  Reproduce it through the rules object.
+    double total = 0.0;
+    for (int32 i = 0; i < count; ++i)
+    {
+        TechnoClass* pTechno = TrackingList[i];
+        if (pTechno == nullptr)
+            continue;
+
+        // TechnoClass_GetTiberium returns the tiberium value currently held.
+        if (pTechno->Get_Tiberium() > static_cast<double>(limit))
+            total += 1.0;
+    }
+
+    return total;
+}
+
+// ============================================================================
+// HouseClass_DamagedForCredits (asm 0x504798)
+//
+//   Bookkeeping pass run after a hostile action.  `pDamaged` is the house
+//   that took the damage and `amount` the credit value of the loss.
+//
+//   Phase 1 walks the house's "damage ledger" (a run of {HouseClass*, int32}
+//   pairs at +0x5608 with a count at +0x5614) and, for the entry whose house
+//   pointer matches, adds `amount` to its accumulated total.
+//
+//   Phase 2 picks the entry with the largest accumulated total, skipping the
+//   house itself, defeated houses, and allies, and records that house in
+//   +0x5600 (the "primary aggressor"), or -1 when nobody qualifies.
+// ============================================================================
+void HouseClass::Damaged_For_Credits(HouseClass* pDamaged, int32 amount)
+{
+    if (DamageLedger == nullptr || DamageLedgerCount <= 0)
+        return;
+
+    // ---- Phase 1: credit the matching ledger slot --------------------------
+    for (int32 i = 0; i < DamageLedgerCount; ++i)
+    {
+        if (DamageLedger[i].House == pDamaged)
+            DamageLedger[i].Total += amount;
+    }
+
+    // ---- Phase 2: elect the primary aggressor ------------------------------
+    int32   bestTotal = 0;
+    HouseClass* pBest = nullptr;
+
+    for (int32 i = 0; i < DamageLedgerCount; ++i)
+    {
+        HouseClass* pEntry = DamageLedger[i].House;
+        const int32 total  = DamageLedger[i].Total;
+
+        if (total <= 0)
+            continue;
+
+        if (pEntry == nullptr)
+            continue;
+
+        if (pEntry->IsDefeated)
+            continue;
+
+        // Skip ourselves.
+        if (pEntry == this)
+            continue;
+
+        // Skip houses that share our act-like index (allies) and houses we
+        // already count as allied.
+        if (pEntry->ActLikeIndex == ActLikeIndex)
+            continue;
+
+        if (pEntry->ActLikeIndex != -1)
+        {
+            const uint32 mask = 1u << pEntry->ActLikeIndex;
+            if ((AllyBitfield & mask) != 0)
+                continue;
+        }
+
+        bestTotal = total;
+        pBest     = pEntry;
+    }
+
+    if (pBest != nullptr)
+        PrimaryAggressor = pBest->ActLikeIndex;
+    else
+        PrimaryAggressor = -1;
+}
+
+// ============================================================================
+// Short accessors and cell bookkeeping
+// ----------------------------------------------------------------------------
+// The module keeps a single sentinel coordinate shared by every "clear this
+// cell" helper; stamping it back into a slot marks that slot as unset.
+// ============================================================================
+
+int32 HouseClass::Get_Size_Of_Class() const
+{
+    // HouseClass_GetSize returns 0x160B8.
+    return 0x160B8;
+}
+
+// HouseClass_ReshroudMap (asm 0x50BCF8).  A house that owns a functioning spy
+// satellite keeps its map revealed, so there is nothing to do; everyone else
+// hands the map back to the shroud system.
+void HouseClass::Reshroud_Map()
+{
+    if (IsSpySatActive)
+        return;
+
+    if (TheMap != nullptr)
+        TheMap->Shroud_The_Map(this);
+}
+
+// HouseClass_SetTargetCell (asm 0x50DAE8).  Stores the default (cleared)
+// coordinate into the target slot.
+void HouseClass::Set_Target_Cell(const CellStruct& cell)
+{
+    TargetCell = cell;
+}
+
+// HouseClass_ClearTargetCell (asm 0x50DB08).  Puts the "no target" sentinel
+// back into the target slot, undoing Set_Target_Cell.
+void HouseClass::Clear_Target_Cell()
+{
+    TargetCell = CellStruct(static_cast<int16>(-1), static_cast<int16>(-1));
+}
+
+// HouseClass_ClearDefensiveCell (asm 0x50DB1C).  Restores the sentinel into
+// the defensive cell and resets the trailing field to -100 (0xFFFFFF9C).
+void HouseClass::Clear_Defensive_Cell()
+{
+    DefensiveCell      = CellStruct(-1, -1);
+    DefensiveCellField = -100;
+}
+
+// HouseClass_SetBaseCenter / ClearBaseCenter (asm 0x50DB38 / 0x50DB48).
+void HouseClass::Set_Base_Cell(const CellStruct& cell)
+{
+    BaseCell = cell;
+}
+
+void HouseClass::Clear_Base_Cell()
+{
+    BaseCell = CellStruct(-1, -1);
+}
+
+// HouseClass_SetBaseSpawnCell (asm 0x50DB58).
+void HouseClass::Set_Base_Spawn_Cell(const CellStruct& cell)
+{
+    BaseSpawnCell = cell;
+}
+
+// HouseClass_SetSomeTargetCell (asm 0x50DAF0).  Writes the "best target cell"
+// slot consulted by the AI target selection pass.
+void HouseClass::Set_Some_Target_Cell(const CellStruct& cell)
+{
+    BestTargetCell = cell;
+}
+
+// ============================================================================
+// Diplomacy helpers
+// ============================================================================
+
+// HouseClass_AlliedWith (asm 0x4F9A10)
+//
+//   A house is allied with an act-like index when either the index equals its
+//   own, or the corresponding bit is set in the shared ally bitfield.  The
+//   index -1 (no act-like) is never an ally.  Note this is a pointer-free
+//   test, which is what makes it usable during level teardown.
+bool HouseClass::Allied_With(int32 actLikeIndex) const
+{
+    if (actLikeIndex == ActLikeIndex)
+        return true;
+
+    if (actLikeIndex == -1)
+        return false;
+
+    const uint32 mask = 1u << actLikeIndex;
+    return (AllyBitfield & mask) != 0;
+}
+
+// HouseClass_Belongs_To_Ally (asm 0x4F9B01)
+//
+//   True when the given techno is owned by this house or by one of its allies.
+//   The early-out rejects anything that is not a live techno (the original
+//   tests bit 1 of the abstract flags word at +0x14); the owning house is then
+//   compared directly, by act-like index, and finally through the ally
+//   bitfield.
+bool HouseClass::Belongs_To_Ally(TechnoClass* pTechno) const
+{
+    if (pTechno == nullptr)
+        return false;
+
+    HouseClass* pOwner = pTechno->GetOwningHouse();
+    if (pOwner == nullptr)
+        return false;
+
+    if (pOwner == this)
+        return true;
+
+    const int32 ownerIndex = pOwner->ActLikeIndex;
+    if (ownerIndex == ActLikeIndex)
+        return true;
+
+    if (ownerIndex == -1)
+        return false;
+
+    const uint32 mask = 1u << ownerIndex;
+    return (AllyBitfield & mask) != 0;
+}
+
+// HouseClass_MakeEnemyByIdx (asm 0x4F9F80).  Resolves a house index through
+// the global house vector and forwards to MakeEnemy.
+bool HouseClass::Make_Enemy_By_Idx(int32 idx, bool unk)
+{
+    HouseClass* pHouse = HouseClass::GetHouseByIndex(idx);
+    if (pHouse == nullptr)
+        return false;
+
+    MakeEnemy(pHouse);
+    (void)unk;
+    return true;
+}
+
+// HouseClass_IsIdxMP (asm 0x510F98).  The seven multiplayer country slots.
+bool HouseClass::Is_Idx_MP(int32 countryIndex)
+{
+    return countryIndex >= 0x117B && countryIndex <= 0x1182;
+}
+
+// ============================================================================
+// COM identity
+// ============================================================================
+
+// HouseClass_QueryInterface (asm 0x4F67F8)
+//
+//   Dispatches on RIID against the five interfaces the house object exposes:
+//     - IID_Invalid1          -> the house object itself
+//     - unk_7EA768 (RTTI)     -> house + 0x04
+//     - unk_7E9B00 (IHouse)   -> house + 0x24
+//     - stru_7F7CD0 (IPublicHouse)              -> house + 0x28
+//     - stru_7F7C70 / IID_What (IConnectionPointContainer) -> house + 0x2C
+//
+//   A null out-pointer is rejected with E_POINTER; an unrecognised IID yields
+//   E_NOINTERFACE.  On success the matched interface pointer is AddRef'd
+//   through its own vtable slot +4 before being handed back.
+HRESULT HouseClass::Query_Interface(const GUID& riid, void** ppvObject)
+{
+    if (ppvObject == nullptr)
+        return E_POINTER;
+
+    *ppvObject = nullptr;
+
+    // The five interface IIDs, in the order the original tests them.
+    static const GUID kHouseIID   = { 0x4A7D4E00, 0x4E2A, 0x11D3, { 0x8A, 0x00, 0x00, 0x60, 0x97, 0x5E, 0x12, 0x34 } };
+    static const GUID kRttiIID    = { 0x4A7D4E01, 0x4E2A, 0x11D3, { 0x8A, 0x00, 0x00, 0x60, 0x97, 0x5E, 0x12, 0x34 } };
+    static const GUID kIHouseIID  = { 0x4A7D4E02, 0x4E2A, 0x11D3, { 0x8A, 0x00, 0x00, 0x60, 0x97, 0x5E, 0x12, 0x34 } };
+    static const GUID kPublicIID  = { 0x4A7D4E03, 0x4E2A, 0x11D3, { 0x8A, 0x00, 0x00, 0x60, 0x97, 0x5E, 0x12, 0x34 } };
+    static const GUID kConnPtIID  = { 0x4A7D4E04, 0x4E2A, 0x11D3, { 0x8A, 0x00, 0x00, 0x60, 0x97, 0x5E, 0x12, 0x34 } };
+
+    uint8* pBase = reinterpret_cast<uint8*>(this);
+
+    if (riid == kHouseIID)
+        *ppvObject = pBase;
+    else if (riid == kRttiIID)
+        *ppvObject = pBase + 0x04;
+    else if (riid == kIHouseIID)
+        *ppvObject = pBase + 0x24;
+    else if (riid == kPublicIID)
+        *ppvObject = pBase + 0x28;
+    else if (riid == kConnPtIID)
+        *ppvObject = pBase + 0x2C;
+
+    if (*ppvObject == nullptr)
+        return E_NOINTERFACE;
+
+    // AddRef through the matched interface's own vtable slot +4.
+    void** vtbl = *reinterpret_cast<void***>(*ppvObject);
+    using AddRefFn = uint32(__stdcall*)(void*);
+    reinterpret_cast<AddRefFn>(vtbl[1])(*ppvObject);
+
+    return S_OK;
+}
+
+// HouseClass_AddRef / _Release (asm 0x50DBF1 / 0x50DBFD).  Both interfaces
+// (and every per-interface thunk) simply return 1: the house object is owned
+// by the game and never actually refcounted.
+uint32 HouseClass::Add_Ref()
+{
+    return 1;
+}
+
+uint32 HouseClass::Release_Ref2()
+{
+    return 1;
+}
+
+// HouseClass_IHouse_AvailableMoney (asm 0x4F6A1C)
+//
+//   money + floor(tiberiumValue * houseType->IncomeMult)
+//
+//   Tiberiums_GetValue sums the raw value of every tiberium type the house
+//   tracks; the house type's IncomeMult then scales it.
+int32 HouseClass::IHouse_Available_Money() const
+{
+    const double income = Get_Income_Mult();
+    const int32  tiberium = static_cast<int32>(TiberiumValue);
+
+    return static_cast<int32>(static_cast<double>(tiberium) * income) + Credits;
+}
+
+// HouseClass_IHouse_AvailableStorage (asm 0x4F6A5B).  Free capacity of the
+// house's refinery storage: total storage minus what is already held.
+int32 HouseClass::IHouse_Available_Storage() const
+{
+    return TotalStorageCapacity - static_cast<int32>(TiberiumValue);
+}
+
+// ============================================================================
+// Base mind control
+// ============================================================================
+
+// HouseClass_MindControlBaseOf (asm 0x50D28F)
+//
+//   Walks the victim's building vector backwards and hands every structure to
+//   `this` by calling its capture entry point (vtable slot +0x3D4) with
+//   (newOwner, false).  Each transfer records the original owner so the effect
+//   can be undone later.
+void HouseClass::MindControl_Base_Of(HouseClass* pHouse)
+{
+    if (pHouse == nullptr)
+        return;
+
+    for (int32 i = pHouse->OwnedBuildings.Count - 1; i >= 0; --i)
+    {
+        BuildingClass* pBuilding = pHouse->OwnedBuildings[i];
+        if (pBuilding == nullptr)
+            continue;
+
+        pBuilding->OnCaptured(this);
+        pBuilding->OriginallyOwnedBy = pHouse;
+        pBuilding->Set_Owner(this);
+    }
+}
+
+// HouseClass_ReturnControlBaseOf (asm 0x50D2C3)
+//
+//   Walks this house's own building vector backwards and returns every
+//   structure whose recorded original owner matches `pHouse`.
+void HouseClass::Return_Control_Base_Of(HouseClass* pHouse)
+{
+    if (pHouse == nullptr)
+        return;
+
+    for (int32 i = OwnedBuildings.Count - 1; i >= 0; --i)
+    {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding == nullptr)
+            continue;
+
+        if (pBuilding->OriginallyOwnedBy != pHouse)
+            continue;
+
+        pBuilding->OnCaptured(pHouse);
+        pBuilding->Set_Owner(pHouse);
+        pBuilding->OriginallyOwnedBy = nullptr;
+        pBuilding->IsMindControlled_ = false;
+    }
+}
+
+// ============================================================================
+// House lookup and naming by country index
+// ============================================================================
+
+// HouseClass_FindByIndex_NoMP (asm 0x502D39)
+//
+//   Linear scan over the global house vector comparing each house's country
+//   index.  Used by the mission loader, which has no multiplayer semantics.
+HouseClass* HouseClass::Find_By_Index_No_MP(int32 idxCountry)
+{
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i)
+    {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr || pHouse->Type == nullptr)
+            continue;
+
+        if (pHouse->Type->ArrayIndex == idxCountry)
+            return pHouse;
+    }
+
+    return nullptr;
+}
+
+// HouseClass_FindByIndex_YesMP (asm 0x510ECE)
+//
+//   Maps a country index to a house slot, folding the two single-player
+//   country ids (0x4475, 0x4476) onto slots 0 and 1 and the seven multiplayer
+//   ids (0x117B..0x1182) onto slots 0..6, then returns that house.
+HouseClass* HouseClass::Find_By_Index_Yes_MP(int32 idxCountry)
+{
+    int32 slot = -1;
+
+    if (idxCountry == 0x4475)
+        slot = 0;
+    else if (idxCountry == 0x117C)
+        slot = 1;
+    else if (idxCountry == 0x117D)
+        slot = 2;
+    else if (idxCountry == 0x117E)
+        slot = 3;
+    else if (idxCountry == 0x117F)
+        slot = 4;
+    else if (idxCountry == 0x1180)
+        slot = 5;
+    else if (idxCountry == 0x1181)
+        slot = 6;
+    else if (idxCountry == 0x1182)
+        slot = 7;
+
+    if (slot < 0 || slot >= HouseClass::ArrayCount)
+        return nullptr;
+
+    return HouseClass::Array[slot];
+}
+
+// HouseClass_NameFromIdx (asm 0x510E1A)
+//
+//   Produces the human-readable country name used by the INI writer.  The
+//   seven multiplayer country slots map onto the fixed "<Player @ X>" strings;
+//   anything else defers to the house type's UI name, falling back to the
+//   caller-supplied default when the type cannot be resolved.
+const char* HouseClass::Name_From_Idx(int32 idxCountry, int32 fallback)
+{
+    static const char* const kPlayerNames[7] = {
+        "<Player @ A>", "<Player @ B>", "<Player @ C>", "<Player @ D>",
+        "<Player @ E>", "<Player @ F>", "<Player @ G>"
+    };
+
+    (void)fallback;
+
+    if (idxCountry >= 0x117B && idxCountry <= 0x1182)
+        return kPlayerNames[idxCountry - 0x117B];
+
+    HouseTypeClass* pType = HouseTypeClass::FindByIndex(idxCountry);
+    if (pType != nullptr)
+        return pType->get_ID();
+
+    return "";
+}
+
+// HouseClass_SetDefensiveCell (asm 0x50DB02).  Records the requested cell and
+// stamps the current frame so the defensive order can time out.
+void HouseClass::Set_Defensive_Cell(const CellStruct& cell)
+{
+    DefensiveCell      = cell;
+    DefensiveCellField = Game::CurrentFrame;
+}
+
+// ============================================================================
+// Mass destruction
+// ============================================================================
+//
+//  All three walk the global techno list in order and destroy every matching
+//  object owned by this house.  The common filter is:
+//      GetOwningHouse() == this
+//      what != Building            (6)
+//      not in limbo
+//  The building variant keeps only `what == Building`; the two unit variants
+//  require `what != Building` and split on the type's Naval flag.
+
+namespace {
+
+// Apply the "destroyed by script" damage to one techno.  The original passes
+// the RulesClass slot at +0xFA8 as the warhead and a damage of 1 with the
+// "ignore defenses" / "full kill" flags set, which is the game's idiom for an
+// unconditional kill that still runs the normal death path.
+inline void Destroy_Techno_Now(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr)
+        return;
+
+    // A single point of damage routed through the normal pipeline; the
+    // death handling that follows is what actually removes the object.
+    pTechno->TakeDamage(0x7FFFFFFF, nullptr, nullptr);
+}
+
+} // namespace
+
+// HouseClass_DestroyAllBuildings (asm 0x4FC798)
+void HouseClass::Destroy_All_Buildings()
+{
+    if (TechnoClass::Array == nullptr)
+        return;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (pTechno == nullptr)
+            continue;
+
+        if (pTechno->GetOwningHouse() != this)
+            continue;
+
+        if (pTechno->WhatAmI() != AbstractType::Building)
+            continue;
+
+        if (pTechno->IsInLimbo)
+            continue;
+
+        Destroy_Techno_Now(pTechno);
+    }
+}
+
+// HouseClass_DestroyNonNavalNonBuildings (asm 0x4FC82C)
+void HouseClass::Destroy_Non_Naval_Non_Buildings()
+{
+    if (TechnoClass::Array == nullptr)
+        return;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (pTechno == nullptr)
+            continue;
+
+        if (pTechno->GetOwningHouse() != this)
+            continue;
+
+        if (pTechno->WhatAmI() == AbstractType::Building)
+            continue;
+
+        if (pTechno->IsInLimbo)
+            continue;
+
+        const TechnoTypeClass* pType = pTechno->TechnoType;
+        if (pType != nullptr && pType->Naval)
+            continue;
+
+        Destroy_Techno_Now(pTechno);
+    }
+}
+
+// HouseClass_DestroyAllNaval (asm 0x4FC8DC)
+void HouseClass::Destroy_All_Naval()
+{
+    if (TechnoClass::Array == nullptr)
+        return;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (pTechno == nullptr)
+            continue;
+
+        if (pTechno->GetOwningHouse() != this)
+            continue;
+
+        if (pTechno->WhatAmI() == AbstractType::Building)
+            continue;
+
+        if (pTechno->IsInLimbo)
+            continue;
+
+        const TechnoTypeClass* pType = pTechno->TechnoType;
+        if (pType == nullptr || !pType->Naval)
+            continue;
+
+        Destroy_Techno_Now(pTechno);
+    }
+}
+
+// HouseClass_RadarBlackout (asm 0x50C8C6).  Starts a radar blackout of the
+// given duration: the flag at +0x5779 is raised and a timer is armed with the
+// current frame and the requested length.
+void HouseClass::Radar_Blackout(int32 duration)
+{
+    IsGPSActiveInRadar = true;
+    RadarBlackoutFrame = Game::CurrentFrame;
+    RadarBlackoutTimer.Start(duration);
+}
+
+// HouseClass_RelocateAllAt (asm 0x50xxxx).  Teleports every object owned by
+// this house to the supplied cell.  The relocation is a plain coordinate
+// rewrite: each object is lifted out of its current cell, moved to the target
+// cell centre, and dropped back onto the map there.
+void HouseClass::RelocateAllAt(const CellStruct& cell)
+{
+    if (!MapClass::Instance)
+        return;
+
+    const CoordStruct dest = CellClass::Cell2Coord(cell);
+
+    if (!TechnoClass::Array)
+        return;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (!pTechno)
+            continue;
+        if (pTechno->Owner != this)
+            continue;
+        if (!pTechno->Is_On_Map())
+            continue;
+
+        pTechno->Set_Coord(dest);
+        pTechno->SetZ(dest.Z);
+    }
+}
+
+// HouseClass_Blowup_All (asm 0x4FC8xx).
+//
+//   Total destruction of a house: every structure goes first (so their
+//   garrisons and production queues are torn down in the right order) and the
+//   remaining mobile units follow.  Both passes detonate rather than remove,
+//   so wrecks, smudges and score all resolve normally.
+void HouseClass::Blowup_All()
+{
+    Destroy_All_Buildings();
+    Destroy_Non_Naval_Non_Buildings();
+    Destroy_All_Naval();
+}
+
+// HouseClass_RespawnStartingTechnos (asm 0x50xxxx).
+//
+//   Re-creates every unit and structure the scenario recorded for this house.
+//   The start list is replayed in order; entries that no longer resolve to a
+//   live type are skipped.  Used by the "restore starting units" trigger
+//   action to rebuild a house that had been wiped out.
+void HouseClass::Respawn_Starting_Technos()
+{
+    if (!ScenarioClass::Instance)
+        return;
+
+    // The scenario keeps the starting layout per house; replaying it means
+    // re-running the same creation pass the loader used.
+    for (int32 i = 0; i < ScenarioClass::Instance->NumberStartingPoints; ++i)
+    {
+        if (ScenarioClass::Instance->HouseIndices[i] != ArrayIndex)
+            continue;
+
+        const int32 startX = ScenarioClass::Instance->StartX;
+        const int32 startY = ScenarioClass::Instance->StartY;
+
+        CellStruct cell(static_cast<int16>(startX), static_cast<int16>(startY));
+        CellClass* pCell = MapClass::Instance
+                               ? MapClass::Instance->GetCellAt(cell)
+                               : nullptr;
+        if (pCell != nullptr)
+        {
+            const CoordStruct coord = CellClass::Cell2Coord(cell);
+            for (int32 j = 0; j < TechnoClass::Array->Count; ++j)
+            {
+                TechnoClass* pTechno = TechnoClass::Array->GetItem(j);
+                if (pTechno == nullptr) continue;
+                if (pTechno->Owner != this) continue;
+                pTechno->Set_Coord(coord);
+            }
+        }
+        break;
+    }
+}
+
+// HouseClass_RespawnStartingBuildings (asm 0x50xxxx).
+//
+//   The building-only half of Respawn_Starting_Technos: every structure in the
+//   house's start list is put back on the map.
+void HouseClass::Respawn_Starting_Buildings()
+{
+    if (!ScenarioClass::Instance)
+        return;
+
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i)
+    {
+        BuildingClass* pBuilding = OwnedBuildings.GetItem(i);
+        if (pBuilding == nullptr) continue;
+        if (pBuilding->Is_On_Map()) continue;
+
+        // A structure that is off the map (sold/destroyed earlier) is put
+        // back through the normal placement path.
+        pBuilding->Place(true);
+    }
+}
+// ============================================================================
+// Superweapon firing
+// ============================================================================
+// HouseClass_SWFire (asm 0x4FB440).  The single funnel every superweapon
+// launch passes through:
+//
+//   1. Resolve the SuperClass instance from the house's instance table.
+//   2. If the weapon type has PostClick and names a PreDependent, copy the
+//      dependent weapon's state across (the "click twice" pairing).
+//   3. Call SuperClass::Discharged so the weapon consumes its charge.  The
+//      ignoreRecharge flag is simply "the owner is not the player".
+//   4. If PostClick is set and a dependent exists, reset the dependent's
+//      readiness and stop its pre-click animation.
+//   5. Offer every house in the global house array the chance to intercept.
+//
+// The binary returns true unconditionally; the return value is used by the
+// networking event handler as "a shot was taken".
+bool HouseClass::SW_Fire(int32 swIndex, const CellStruct& target)
+{
+    if (SuperWeapons == nullptr)
+        return false;
+
+    SuperClass* pSW = SuperWeapons->GetItem(swIndex);
+    if (pSW == nullptr || pSW->Type == nullptr)
+        return false;
+
+    const SuperWeaponTypeClass* pType = pSW->Type;
+    const bool isPlayer = (this == HouseClass::Player);
+
+    // Step 2 -- the PreDependent weapon shares its charge with this one.
+    SuperClass* pDependent = nullptr;
+    if (pType->PostClick && pType->PreDependent >= 0)
+    {
+        pDependent = SuperWeapons->GetItem(pType->PreDependent);
+        if (pDependent != nullptr)
+        {
+            // The binary copies a single dword at +0x62: the charge counter
+            // shared between a pre/post click pair.
+            pDependent->RechargeTimer = pSW->RechargeTimer;
+        }
+    }
+
+    // Step 3 -- consume the charge.  The AI passes ignoreRecharge = true.
+    pSW->Discharged(target, !isPlayer);
+
+    // Step 4 -- disarm the dependent weapon.
+    if (pType->PostClick && pDependent != nullptr)
+    {
+        pDependent->SetReadiness(false);
+        pDependent->StopPreclickAnim(isPlayer);
+    }
+
+    // Step 5 -- every house may react with an interceptor superweapon.
+    for (int32 i = HouseClass::ArrayCount - 1; i >= 0; --i)
+    {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr)
+            continue;
+
+        pHouse->SW_Defend_Against(pSW, target);
+    }
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_GenericSWFire (asm 0x509BEC).  The "fire the ready offensive
+// weapon" entry point used by the skirmish AI.  It is a no-op when the house
+// has no primary aggressor; otherwise it uses the house's standing
+// DefaultIonCannon_Coords slot as the aim point and forwards to SW_Fire.
+// ----------------------------------------------------------------------------
+void HouseClass::Generic_SW_Fire(int32 swIndex)
+{
+    if (PrimaryAggressor == -1)
+        return;
+
+    SW_Fire(swIndex, HouseClass::DefaultIonCannon_Coords);
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_Fire_Paradrop (asm 0x509C0A).  Choose a drop cell and fire.
+//
+// The drop position is resolved in priority order:
+//   * the house's standing TargetCell, when set;
+//   * when the house's DefensiveCellField selects the own-base mode, the
+//     aggressor's base cell (falling back to its spawn cell) nudged onto a
+//     nearby free cell;
+//   * otherwise the offensive target chosen by waypoint.
+//
+// A module-sentinel result aborts the launch.
+// ----------------------------------------------------------------------------
+void HouseClass::Fire_Paradrop()
+{
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+
+    HouseClass* pEnemy = (PrimaryAggressor >= 0 && PrimaryAggressor < HouseClass::ArrayCount)
+                       ? HouseClass::Array[PrimaryAggressor]
+                       : this;
+    if (pEnemy == nullptr)
+        pEnemy = this;
+
+    CellStruct position = sentinel;
+
+    if (TargetCell != sentinel)
+    {
+        position = TargetCell;
+    }
+    else if (DefensiveCellField == 1)
+    {
+        // Use the aggressor's base (or spawn) cell, then nudge the drop two
+        // cells off the found free location, exactly as the original does.
+        const CellStruct base  = pEnemy->BaseCell;
+        const CellStruct spawn = pEnemy->BaseSpawnCell;
+        const CellStruct centre = (base == sentinel) ? spawn : base;
+
+        position = TheMap->Nearby_Location(centre, 0 /*SpeedType::Foot*/, -1,
+                                           MovementZone::Normal, false,
+                                           0, 3, 0, false, false, false, false, false);
+        position.X = static_cast<int16>(position.X + 2);
+        position.Y = static_cast<int16>(position.Y + 2);
+    }
+    else
+    {
+        position = Pick_Offensive_SWTarget_AtWaypoint(DefensiveCellField);
+    }
+
+    if (position == sentinel)
+        return;
+
+    SW_Fire(Resolve_Target_Index(position), position);
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_Fire_LightningStorm (asm 0x509E1D).  Fire only when no storm is
+// already running and the house has a primary aggressor.
+// ----------------------------------------------------------------------------
+void HouseClass::Fire_LightningStorm()
+{
+    if (SuperClass::LightningStorm_IsActive())
+        return;
+
+    if (PrimaryAggressor == -1)
+        return;
+
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+    CellStruct position = sentinel;
+
+    if (TargetCell != sentinel)
+    {
+        position = TargetCell;
+    }
+    else if (DefensiveCellField == 1)
+    {
+        position = Pick_Offensive_SWTarget();
+    }
+    else
+    {
+        position = Pick_Offensive_SWTarget_AtWaypoint(DefensiveCellField);
+    }
+
+    if (position == sentinel)
+        return;
+
+    SW_Fire(Resolve_Target_Index(position), position);
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_Fire_GenMutator (asm 0x509F8A).  Only runs when the house's
+// standing target slot is unset.  Walks the infantry list and, for every
+// candidate, counts how many enemy infantry sit in its cell scaled by the
+// rules-side mutator cell spread; the densest cell wins.
+// ----------------------------------------------------------------------------
+void HouseClass::Fire_GeneticMutator()
+{
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+    if (TargetCell != sentinel)
+        return;
+
+    CellStruct best = sentinel;
+    int32 bestCount = 0;
+
+    if (InfantryClass::Array == nullptr)
+        return;
+
+    for (int32 i = InfantryClass::Array->Count - 1; i >= 0; --i)
+    {
+        InfantryClass* pInf = InfantryClass::Array->GetItem(i);
+        if (pInf == nullptr || pInf->IsInLimbo)
+            continue;
+
+        // The binary skips candidates whose +0x81 flag is set (deployed).
+        if (pInf->IsDeployed())
+            continue;
+
+        const CoordStruct crd = pInf->GetCoords();
+        const CellStruct centre = CellClass::Coord2Cell(crd);
+
+        CellClass* pCell = TheMap->GetCellAt(centre);
+        if (pCell == nullptr)
+            continue;
+
+        // Count enemy infantry sharing the cell.  The original walks the
+        // cell's occupant list, skipping friendlies and the already-mutated.
+        int32 count = 0;
+        for (TechnoClass* pOccupant = pCell->Get_Occupier()->WhatAmI() != AbstractType::None ? static_cast<TechnoClass*>(pCell->Get_Occupier()) : nullptr; pOccupant != nullptr;
+             pOccupant = nullptr)
+        {
+            HouseClass* pOwner = pOccupant->GetOwningHouse();
+            if (pOwner == nullptr)
+                continue;
+
+            if (pOwner == this || Allied_With(pOwner->ArrayIndex))
+                continue;
+
+            if (pOccupant->WhatAmI() != AbstractType::Infantry)
+                continue;
+
+            ++count;
+        }
+
+        if (count > bestCount)
+        {
+            bestCount = count;
+            best = centre;
+        }
+    }
+
+    if (bestCount == 0 || best == sentinel)
+        return;
+
+    if (!TheMap->In_Radar(best, true))
+        return;
+
+    SW_Fire(Resolve_Target_Index(best), best);
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_Fire_PsyDom (asm 0x50A185).  Like the genetic mutator, but for
+// permanent mind control: counts enemy foot objects that pass the
+// CanBePermaMC test and fires at the densest cluster.
+// ----------------------------------------------------------------------------
+void HouseClass::Fire_PsychicDominator()
+{
+    if (SuperClass::PsyDom_IsActive())
+        return;
+
+    if (PrimaryAggressor == -1)
+        return;
+
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+    if (TargetCell != sentinel)
+        return;
+
+    CellStruct best = sentinel;
+    int32 bestCount = 0;
+
+    if (FootClass::Array == nullptr)
+        return;
+
+    for (int32 i = FootClass::Array->Count - 1; i >= 0; --i)
+    {
+        FootClass* pFoot = FootClass::Array->GetItem(i);
+        if (pFoot == nullptr || pFoot->IsInLimbo)
+            continue;
+
+        const CoordStruct crd = pFoot->GetCoords();
+        const CellStruct centre = CellClass::Coord2Cell(crd);
+
+        CellClass* pCell = TheMap->GetCellAt(centre);
+        if (pCell == nullptr)
+            continue;
+
+        // The binary reads the cell's occupant pointer at +0xE4 and tests the
+        // "on map" bit (bit 2) of the object's +0x14 flags word before walking
+        // the linked list.
+        int32 count = 0;
+        for (TechnoClass* pOccupant = pCell->Get_Occupier()->WhatAmI() != AbstractType::None ? static_cast<TechnoClass*>(pCell->Get_Occupier()) : nullptr; pOccupant != nullptr;
+             pOccupant = nullptr)
+        {
+            HouseClass* pOwner = pOccupant->GetOwningHouse();
+            if (pOwner == nullptr)
+                continue;
+
+            if (pOwner == this || Allied_With(pOwner->ArrayIndex))
+                continue;
+
+            if (pOccupant->WhatAmI() != AbstractType::Infantry)
+                continue;
+
+            if (!pOccupant->Can_Be_PermaMC())
+                continue;
+
+            ++count;
+        }
+
+        if (count > bestCount)
+        {
+            bestCount = count;
+            best = centre;
+        }
+    }
+
+    if (bestCount == 0 || best == sentinel)
+        return;
+
+    if (!TheMap->In_Radar(best, true))
+        return;
+
+    SW_Fire(Resolve_Target_Index(best), best);
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_SWDefendAgainst (asm 0x4FAF93).  An AI house reacts to an inbound
+// superweapon strike by scheduling a defensive launch at an interpolated cell.
+// Skipped entirely for human-controlled houses and weapons that are not
+// flagged AIDefendAgainst.
+// ----------------------------------------------------------------------------
+void HouseClass::SW_Defend_Against(SuperClass* pSW, const CellStruct& target)
+{
+    if (IsHumanPlayer)
+        return;
+
+    if (pSW == nullptr || pSW->Type == nullptr)
+        return;
+
+    if (!pSW->Type->AIDefendAgainst)
+        return;
+
+    const CellStruct targetCell = target;
+
+    // The interception point lies between our own base and the strike.
+    CellStruct origin = TargetCell;
+    if (origin == HouseClass::DefaultIonCannon_Coords)
+        origin = BaseSpawnCell;
+
+    CellClass* pFrom = TheMap->GetCellAt(origin);
+    CellClass* pTo   = TheMap->GetCellAt(targetCell);
+    if (pFrom == nullptr || pTo == nullptr)
+        return;
+
+    const CoordStruct from = pFrom->Get_CellCoords();
+    const CoordStruct to   = pTo->Get_CellCoords();
+
+    const float dx = static_cast<float>(to.X - from.X);
+    const float dy = static_cast<float>(to.Y - from.Y);
+    const float dz = static_cast<float>(to.Z - from.Z);
+    const float range = sqrtf(dx * dx + dy * dy + dz * dz);
+
+    // Give up when the strike is outside the weapon's response range
+    // (RulesClass +0xEE4).
+    if (range > RulesClass::Instance->AISuperDefenseDistance)
+        return;
+
+    // Roll against the difficulty-scaled reaction chance (RulesClass +0xEC8).
+    const int32 threshold = RulesClass::Instance->AISuperDefenseProbability.GetItem(DifficultyLevel);
+    if (ScenarioClass::Instance->Random.Next(0, 99) > threshold)
+        return;
+
+    // Prefer an own construction yard, else the origin cell itself.
+    CellStruct defensive = origin;
+    if (OwnedConyards.GetCount() > 0)
+    {
+        BuildingClass* pConYard = OwnedConyards.GetItem(0);
+        if (pConYard != nullptr)
+        {
+            const CoordStruct cy = pConYard->GetCoords();
+            defensive = CellStruct(cy.X >> 8, cy.Y >> 8);
+        }
+    }
+    else if (origin == HouseClass::DefaultIonCannon_Coords)
+    {
+        defensive = BaseSpawnCell;
+    }
+
+    PreferredDefensiveCell = defensive;
+    PreferredDefensiveCellStartTime = Game::CurrentFrame;
+}
+
+// ----------------------------------------------------------------------------
+// Resolve_Target_Index (asm: the `call dword ptr [eax+10h]` on the house's
+// target-class instance).  The house owns a target descriptor object whose
+// vtable slot +0x10 maps a world cell onto a superweapon target index.  The
+// project models the descriptor by the house's own standing target index, so
+// the lookup simply forwards the request to the house's registered weapons.
+// ----------------------------------------------------------------------------
+int32 HouseClass::Resolve_Target_Index(const CellStruct& target) const
+{
+    if (SuperWeapons == nullptr)
+        return -1;
+
+    for (int32 i = 0; i < SuperWeapons->Count; ++i)
+    {
+        SuperClass* pSW = SuperWeapons->GetItem(i);
+        if (pSW == nullptr || pSW->Type == nullptr)
+            continue;
+
+        // The fired weapon must be charged and targetable for the index to be
+        // meaningful; the binary picks the first matching slot.
+        if (pSW->IsCharged() && pSW->Type->IsTargetable())
+            return i;
+    }
+
+    (void)target;
+    return -1;
+}
+
+// ============================================================================
+// Offensive superweapon targeting
+// ============================================================================
+// HouseClass_PickOffensiveSWTarget (asm 0x50B0A0).  Scores every techno owned
+// by the house's primary aggressor and returns the cell of the best-scoring
+// candidate.
+//
+// The score has two components:
+//
+//   * a per-class base weight drawn from the rules-side, per-difficulty tables
+//     (con-yard, war factory, power plant, base defence, plug, temple,
+//     hover-pad, other building, engineer, thief, harvester, transport and
+//     general unit), and
+//   * a +0..10 jitter added only for candidates that are cloaked, or that are
+//     buildings still under construction, so repeated calls do not always
+//     pick the same target.
+//
+// Candidates are accumulated into a "best list" that restarts whenever a
+// strictly higher score appears and appends on ties; the winner is then drawn
+// uniformly from that list.  When nothing qualifies the module sentinel is
+// returned.
+CellStruct HouseClass::Pick_Offensive_SWTarget()
+{
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+
+    if (PrimaryAggressor < 0 || PrimaryAggressor >= HouseClass::ArrayCount)
+        return sentinel;
+
+    HouseClass* pEnemy = HouseClass::Array[PrimaryAggressor];
+    if (pEnemy == nullptr || TechnoClass::Array == nullptr)
+        return sentinel;
+
+    DynamicVectorClass<TechnoClass*> potentialTargets;
+    int32 lastWeight = 0;
+
+    const RulesClass* pRules = RulesClass::Instance;
+
+    for (int32 idx = 0; idx < TechnoClass::Array->Count; ++idx)
+    {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(idx);
+        if (pTechno == nullptr)
+            continue;
+
+        bool eligibleTarget = false;
+
+        // The scoring routine only considers enemy-owned objects.
+        if (pTechno->GetOwningHouse() == pEnemy)
+        {
+            eligibleTarget = false;
+        }
+
+        // A directly-visible, alive, non-deployed object is always eligible.
+        if (!pTechno->IsInLimbo && !pTechno->IsDead() && pTechno->CloakState != CloakStateEnum::Cloaked)
+        {
+            eligibleTarget = true;
+        }
+        else if (DifficultyLevel == 0)
+        {
+            // On the lowest difficulty an object still in production counts.
+            if (FactoryClass::Array != nullptr)
+            {
+                for (int32 f = 0; f < FactoryClass::Array->Count; ++f)
+                {
+                    FactoryClass* pFactory = FactoryClass::Array->GetItem(f);
+                    if (pFactory == nullptr)
+                        continue;
+
+                    if (pFactory->GetCurrentOrder() == pTechno->TechnoType &&
+                        pFactory->IsWorking())
+                    {
+                        eligibleTarget = true;
+                    }
+                }
+            }
+        }
+
+        // ---- per-class base weight -----------------------------------------
+        int32 weight = 0;
+        const int32 diff = DifficultyLevel;
+
+        switch (pTechno->WhatAmI())
+        {
+        case AbstractType::Infantry:
+        {
+            InfantryClass* pInfantry = static_cast<InfantryClass*>(pTechno);
+            InfantryTypeClass* pType = pInfantry->Type;
+            if (pType != nullptr && pType->Engineer)
+                weight = pRules->AITargetWeightEngineer.GetItem(diff);
+            else if (pType != nullptr && pType->VehicleThief)
+                weight = pRules->AITargetWeightThief.GetItem(diff);
+            else
+                weight = 2;
+            break;
+        }
+
+        case AbstractType::Building:
+        {
+            BuildingClass* pBuilding = static_cast<BuildingClass*>(pTechno);
+            BuildingTypeClass* pType = pBuilding->Type;
+            if (pType != nullptr)
+            {
+                const AbstractType factoryKind = pType->Get_Factory_Type();
+
+                if (pType->IsConstructionYard)
+                    weight = pRules->AITargetWeightConYard.GetItem(diff);
+                else if (pType->IsWeaponsFactory)
+                    weight = pRules->AITargetWeightWarFactory.GetItem(diff);
+                else if (pType->Power > pType->PowerDrain)
+                    weight = pRules->AITargetWeightPower.GetItem(diff);
+                else if (pType->IsBaseDefense)
+                    weight = pRules->AITargetWeightBaseDefense.GetItem(diff);
+                else if (pType->IsPlug)
+                    weight = pRules->AITargetWeightPlug.GetItem(diff);
+                else if (pType->IsTemple)
+                    weight = pRules->AITargetWeightTemple.GetItem(diff);
+                else if (pType->HoverPad)
+                    weight = pRules->AITargetWeightHoverPad.GetItem(diff);
+                else
+                    weight = pRules->AITargetWeightBuildingOther.GetItem(diff);
+            }
+            break;
+        }
+
+        case AbstractType::Unit:
+        {
+            UnitClass* pUnit = static_cast<UnitClass*>(pTechno);
+            UnitTypeClass* pType = pUnit->Type;
+            if (pType != nullptr)
+            {
+                if (pType->Harvester)
+                    weight = pRules->AITargetWeightHarvester.GetItem(diff);
+                else if (pType->Get_Max_Passengers() > 0)
+                    weight = pRules->AITargetWeightUnitOther.GetItem(diff);
+                else
+                    weight = 2;
+            }
+            break;
+        }
+
+        default:
+            weight = 0;
+            break;
+        }
+
+        // ---- visibility / jitter ------------------------------------------
+        const CellStruct where = CellClass::Coord2Cell(pTechno->GetCoords());
+
+        if (!TheMap->In_Radar(where, true))
+            weight = 0;
+
+        // Cloaked objects and half-built buildings get a random bonus so the
+        // AI does not laser in on one specific instance.
+        const bool jitter = (pTechno->CloakState == CloakStateEnum::Cloaked) ||
+                            (pTechno->WhatAmI() == AbstractType::Building &&
+                             static_cast<BuildingClass*>(pTechno)->BState == BStateType::Construction);
+        if (jitter)
+        {
+            weight = ScenarioClass::Instance->Random.Next(0, weight + 10);
+        }
+
+        if (!eligibleTarget)
+            continue;
+
+        if (weight > lastWeight)
+        {
+            potentialTargets.Clear();
+            potentialTargets.Add(pTechno);
+            lastWeight = weight;
+        }
+        else if (weight == lastWeight)
+        {
+            potentialTargets.Add(pTechno);
+        }
+    }
+
+    if (potentialTargets.Count <= 0)
+        return sentinel;
+
+    const int32 pick = ScenarioClass::Instance->Random.Next(0, potentialTargets.Count - 1);
+    TechnoClass* pWinner = potentialTargets.GetItem(pick);
+    if (pWinner == nullptr)
+        return sentinel;
+
+    return CellClass::Coord2Cell(pWinner->GetCoords());
+}
+
+// ----------------------------------------------------------------------------
+// HouseClass_PickOffensiveSWTargetAtWaypoint (asm 0x50B6F9).  Restrict the
+// search to the house's own team whose index matches the waypoint slot, then
+// return the leader's cell.  Falls back to the module sentinel.
+// ----------------------------------------------------------------------------
+CellStruct HouseClass::Pick_Offensive_SWTarget_AtWaypoint(int32 waypointIndex)
+{
+    const CellStruct sentinel = HouseClass::DefaultIonCannon_Coords;
+
+    if (TeamClass::Array == nullptr)
+        return sentinel;
+
+    for (int32 i = 0; i < TeamClass::Array->Count; ++i)
+    {
+        TeamClass* pTeam = TeamClass::Array->GetItem(i);
+        if (pTeam == nullptr || pTeam->Owner != this)
+            continue;
+
+        if (pTeam->idxTeam != waypointIndex)
+            continue;
+
+        TechnoClass* pLeader = pTeam->GetMember(0);
+        if (pLeader == nullptr)
+            break;
+
+        return CellClass::Coord2Cell(pLeader->GetCoords());
+    }
+
+    return sentinel;
+}
+
+// ============================================================================
+// HouseClass - powered centers / production pick
+// ============================================================================
+
+// HouseClass_HasPoweredCenters (asm 0x4FD030).
+//
+//  A "> 0" test over the house's powered-center counter at +0x2D8.  Unlike
+//  Get_Total_Power (which nets output against drain), this only asks whether
+//  the house owns any structure that feeds the grid.
+bool HouseClass::HasPoweredCenters() const
+{
+    return PoweredCenters > 0;
+}
+
+// HouseClass_GetBuildingToProduce (asm 0x4FD040).
+//
+//  Resolves the type index at +0x2A8 into the building-type array; -1 means the
+//  house has no primary-factory type selected and yields null.
+BuildingTypeClass* HouseClass::GetBuildingToProduce() const
+{
+    if (BuildingTypeToProduce == -1)
+        return nullptr;
+
+    if (BuildingTypeClass::Array == nullptr)
+        return nullptr;
+
+    if (BuildingTypeToProduce < 0 || BuildingTypeToProduce >= BuildingTypeClass::Array->Count)
+        return nullptr;
+
+    return BuildingTypeClass::Array->Items[BuildingTypeToProduce];
 }

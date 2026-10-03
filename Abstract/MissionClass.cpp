@@ -111,15 +111,22 @@ void MissionControlClass::LoadAllFromINI(CCINIClass* pINI)
 // MissionClass
 // ============================================================================
 
+// MissionClass_CTOR (asm 0x5B3680).
+//
+//  ObjectClass_CTOR, then every mission slot is set to -1 (no mission) and
+//  the two counters / the timer are zeroed; MissionTimer.TimeStart is left 0
+//  and its second word is stamped with the current frame.
 MissionClass::MissionClass() noexcept
     : ObjectClass()
-    , CurrentMission(Mission::Guard)
-    , SuspendedMission(Mission::Sleep)
-    , QueuedMission(Mission::Sleep)
-    , unknown_bool_B8(false)
+    , LineTrailer(nullptr)
+    , CurrentMission(Mission::None)
+    , PendingMission(Mission::None)
+    , QueuedMission(Mission::None)
+    , SuspendedMission(Mission::None)
+    , unknown_bool_B4(false)
     , MissionStatus(0)
     , CurrentMissionStartTime(0)
-    , unknown_C4(0)
+    , unknown_C0(0)
     , UpdateTimer()
 {
 }
@@ -222,176 +229,192 @@ bool MissionClass::ReadyToNextMission() const
 }
 
 // ============================================================================
-// Mission state handlers (31 missions)
-// Each returns a status code: 0 = running, >0 = complete, <0 = error
+// Mission state handlers (28 missions)
+//
+//  Every one of these is the *base* stub of a mission-step virtual.  The
+//  original compiles each of them down to a bare constant return:
+//      MissionClass_Mi_<Name>  ->  mov eax, <const> ; retn
+//  so the whole point of the base class is to give every mission a default
+//  "keep running" answer.  MissionClass_Mi_Return and MissionClass_Mi_Stop are
+//  the two exceptions, both returning 0x450 instead of 0x1C2.
+//
+//      const 0x1C2 (= 450)  - step not finished, stay on this mission
+//      const 0x450 (= 1104) - step finished, the mission chain may advance
+//
+//  FootClass / TechnoClass override the missions they actually implement.
 // ============================================================================
 
+// The default answer for every mission step (asm mov eax, 1C2h).
+static const int32 MISSION_NOT_DONE = 0x1C2;
+// The two missions that complete in their base form (asm mov eax, 450h).
+static const int32 MISSION_DONE     = 0x450;
+
+// MissionClass_Mi_Sleep (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Sleep()
 {
-    // Do nothing - unit is sleeping
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Harmless (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Harmless()
 {
-    // Do nothing - harmless mode
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Ambush (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Ambush()
 {
-    // Wait for enemy to come in range, then attack
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Attack (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Attack()
 {
-    // Move toward target and attack
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Capture (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Capture()
 {
-    // Move to target building and capture it
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Eaten (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Eaten()
 {
-    // Being eaten by something
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Guard (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Guard()
 {
-    // Guard current area - attack nearby enemies
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_AreaGuard (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_AreaGuard()
 {
-    // Guard a specific area
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Harvest (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Harvest()
 {
-    // Move to tiberium field, harvest, return to refinery
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Hunt (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Hunt()
 {
-    // Hunt for enemy units
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Move (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Move()
 {
-    // Move to destination
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Retreat (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Retreat()
 {
-    // Retreat from current position
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Return (asm: mov eax, 450h ; retn).
 int32 MissionClass::Mission_Return()
 {
-    // Return to base
-    return 1;
+    return MISSION_DONE;
 }
 
+// MissionClass_Mi_Stop (asm: mov eax, 450h ; retn).
 int32 MissionClass::Mission_Stop()
 {
-    // Stop all movement
-    return 1;
+    return MISSION_DONE;
 }
 
+// MissionClass_Mi_Unload (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Unload()
 {
-    // Unload passengers
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Enter (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Enter()
 {
-    // Enter a transport or building
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Construction (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Construction()
 {
-    // Building construction in progress
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Selling (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Selling()
 {
-    // Building being sold
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Repair (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Repair()
 {
-    // Repairing at a repair bay
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Missile (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Missile()
 {
-    // Missile tracking its target
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Open (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Open()
 {
-    // Gate opening
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Rescue (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Rescue()
 {
-    // Rescue mission
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Patrol (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Patrol()
 {
-    // Patrol between waypoints
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_ParaDropApproach (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_ParaDropApproach()
 {
-    // Paratrooper plane approaching drop zone
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_ParaDropOverfly (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_ParaDropOverfly()
 {
-    // Paratrooper plane flying over drop zone
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_Wait (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_Wait()
 {
-    // Wait for a specified duration
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_SpyPlaneApproach (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_SpyPlaneApproach()
 {
-    // Spy plane approaching target area
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
+// MissionClass_Mi_SpyPlaneOverfly (asm: mov eax, 1C2h ; retn).
 int32 MissionClass::Mission_SpyPlaneOverfly()
 {
-    // Spy plane flying over target area
-    return 1;
+    return MISSION_NOT_DONE;
 }
 
 // ============================================================================
@@ -440,4 +463,68 @@ void MissionClass::SuspendMission(Mission mission)
     SuspendedMission = CurrentMission;
     CurrentMission = mission;
     MissionStatus = 0;
+}
+// ============================================================================
+// Mission-layer queries
+// ============================================================================
+
+// MissionClass_FindNameByIdx (asm 0x5B3730).
+//
+//  Returns the INI section name of the *current* mission.  A mission of -1
+//  (no mission assigned) resolves to the literal "<none>" instead of a table
+//  entry, exactly as the original does before indexing the name table.
+const char* MissionClass::FindNameByIdx() const
+{
+    if (CurrentMission == Mission::None)
+        return "<none>";
+
+    return MissionControlClass::FindName(CurrentMission);
+}
+
+// MissionClass_IsRecruitable (asm 0x5B36D0).
+//
+//  The AI team recruiter asks the object whether its current mission permits
+//  being pulled into a team.  An unassigned mission (-1) always answers yes;
+//  otherwise the answer comes from the MissionControlClass table, which the
+//  rules INI fills in.  The original indexes by `mission << 5`, i.e. by the
+//  32-byte record stride.
+bool MissionClass::IsRecruitable() const
+{
+    if (CurrentMission == Mission::None)
+        return true;
+
+    const int32 idx = static_cast<int32>(CurrentMission);
+    if (idx < 0 || idx >= MissionControlClass::Array.Count)
+        return false;
+
+    return MissionControlClass::Array.Items[idx].Recruitable;
+}
+
+// MissionClass_ResetMission (asm 0x5B36C0).
+//
+//  Promotes a queued mission into the live slot.  With nothing queued (-1)
+//  the call is a no-op that reports failure; otherwise the queued value moves
+//  into `what`, the queue is cleared back to -1 and the step counter resets so
+//  the fresh mission starts at its first step.
+bool MissionClass::ResetMission()
+{
+    if (QueuedMission == Mission::None)
+        return false;
+
+    PendingMission = QueuedMission;
+    QueuedMission = Mission::None;
+    MissionStatus = 0;
+
+    return true;
+}
+
+// MissionClass_LoadMissionControlFromINI (asm 0x5B3760).
+//
+//  RulesData_LoadTypeData reaches this to fill the whole [MissionControl]
+//  block of the rules INI into the MissionControlClass table.  Each table
+//  entry reads its own section, and the section name comes from the same
+//  string table FindNameByIdx indexes.
+void MissionClass::LoadMissionControlFromINI(CCINIClass* pINI)
+{
+    MissionControlClass::LoadAllFromINI(pINI);
 }

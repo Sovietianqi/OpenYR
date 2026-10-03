@@ -485,12 +485,9 @@ void Update_SuperWeapons()
 
 void Update_SpecialEffects()
 {
-    // Grow / spread tiberium deposits every frame.
-    TiberiumManagerClass* pMgr = TiberiumManagerClass::GetInstance();
-    if (pMgr != nullptr)
-    {
-        pMgr->UpdateAllTiberium();
-    }
+    // Ore growth and spreading are driven per cell by the map's cell update
+    // pass; there is no separate manager object in the original, so nothing
+    // extra is done here.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -159,4 +159,15 @@ public:
     // UniqueID generator - monotonic counter for standalone builds.
     // ========================================================================
     void Create_ID_Internal();
+    // ========================================================================
+    // LoadTables (asm 0x410E30)
+    //
+    //  AbstractClass_LoadTables re-stamps the four abstract interface vtable
+    //  pointers that a deserialized image has lost: AbstractClass at +0,
+    //  IRTTITypeInfo at +4, INoticeSink at +8 and INoticeSource at +0xC.  The
+    //  stream argument is accepted for signature parity but unused - the
+    //  original discards it as well.
+    //  Derived layers chain this and then re-stamp their own identity on top.
+    // ========================================================================
+    virtual void LoadTables(IStream* pStm);
 };

@@ -59,6 +59,14 @@ public:
 
     int32 Get_Width() const;
     int32 Get_Height() const;
+
+    // Foundation span in cells along each axis (asm 0x45EC8F / 0x45ECAA).
+    // X_Foundation_Value indexes Foundation_CellsX with the Foundation enum;
+    // Y_Foundation_Value optionally adds the extra bib row when the building
+    // type carries a bib and the caller asks for it.
+    int32 X_Foundation_Value() const;
+    int32 Y_Foundation_Value(bool bib) const;
+
     RectangleStruct Get_Occupy_Rect() const;
     int32 Get_Power_Output() const;
     int32 Get_Power_Drain() const;

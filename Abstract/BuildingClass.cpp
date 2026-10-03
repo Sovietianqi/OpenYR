@@ -138,9 +138,11 @@ BuildingClass::BuildingClass(HouseClass* pOwner) noexcept
     , IsDisabled_(false)
     , IsDisguised_(false)
     , IsMindControlled_(false)
+    , OriginallyOwnedBy(nullptr)
     , IsPrimaryFactory(false)
     , BunkerState(0)
     , PrismStage(0)
+    , WeaponStage(0)
     , PrismTargetCoords{}
     , DelayBeforeFiring(0)
     , SecretProduction(nullptr)
@@ -2719,4 +2721,17 @@ void BuildingClass::Load(LoadGameClass& loader)
     loader.Read(flag); IsTentativelyOccupied = (flag != 0);
     loader.Read(flag); IsCurrentlyOccupied = (flag != 0);
     loader.Read(flag); IsStateChanging = (flag != 0);
+}
+
+// ============================================================================
+// BuildingClass - weapon stage
+// ============================================================================
+
+// BuildingClass_GetCurrentWeaponStage (asm 0x452290).
+//
+//  A bare load of the building's multi-stage firing counter at +0x140; the
+//  update loop advances it as a gattling/prism building cycles its stages.
+int32 BuildingClass::GetCurrentWeaponStage() const
+{
+    return WeaponStage;
 }

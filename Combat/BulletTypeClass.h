@@ -100,6 +100,10 @@ public:
     char        Image[0x20];
     AnimTypeClass* Trailer;
     int32        SpawnDelay;
+    // BulletTypeClass_SetSpawnDelay (asm 0x46Bxxx).
+    //   BulletClass_InitScalable re-stamps the delay for scalable projectiles
+    //   after scaling it by the firing object's range.
+    void SetSpawnDelay(int32 delay) { SpawnDelay = delay; }
     bool         Rotates;
     bool         Flat;
     WeaponTypeClass* AirburstWeapon;

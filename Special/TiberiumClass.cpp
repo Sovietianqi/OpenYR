@@ -1,665 +1,402 @@
 #include "TiberiumClass.h"
-#include "../Map/MapClass.h"
-#include "../Scenario/ScenarioClass.h"
-#include "../Houses/HouseClass.h"
-#include "../Abstract/ObjectClass.h"
-#include "../Abstract/TechnoClass.h"
-#include "../Combat/AnimTypeClass.h"
-#include "../INI/INIClass.h"
+
+#include <Core/Memory.h>
+#include <Core/Macros.h>
+#include <INI/INIClass.h>
+#include <IO/CRC.h>
+#include <Abstract/OverlayTypeClass.h>
+#include <Animations/AnimTypeClass.h>
 
 #include <cstring>
-
-#include <cmath>
 #include <cstdlib>
 
-// ============================================================
-// TiberiumClass
-// ============================================================
+// ============================================================================
+// TiberiumClass.cpp
+//
+//  Implements the ore type of the [Tiberiums] list.  The constructor appends
+//  the instance to the global registry and stamps its ordinal into TypeIndex;
+//  the registry is what Is_Overlay_Idx_Tiberium walks when the map asks which
+//  ore an overlay index belongs to.
+//
+//  LoadFromINI reads Spread / SpreadPercentage / Growth / GrowthPercentage /
+//  Value / Power / Color / Debris / Image, with the last one driving a small
+//  switch that selects the overlay image window the ore draws from.
+// ============================================================================
 
-TiberiumClass::TiberiumClass()
-    : Type(TiberiumType::Green), Value(50), GrowthRate(2), SpreadRate(1)
-    , MaxGrowth(24), MinGrowth(1), CellLevel(0), MaxCellLevel(12)
-    , DamageToInfantry(1), DamageInterval(60), IsHarvestable(true)
-    , IsChainReactable(true), ChainReactionRadius(3), ChainReactionDamage(200)
-    , ExplosionChance(0.0f), ExplosionDamage(100), FlowRate(1)
-    , FlowDirection(0), IsFlowing(false), GrowthTimer(0), SpreadTimer(0)
-    , CellCount(0), SubType(0), ImageIndex(0), TintColor(0, 255, 0)
-    , Power(0), WeaponIndex(0), RevolutionIndex(0), ValueMultiplier(1.0f)
-    , SpreadChance(0.01f), RegrowsAfterHarvest(true), RegrowthRate(1)
-    , RegrowthTimer(0), DamageToVehicles(0), Optimized(false)
-    , IsSpecial(false), IsWeaponTiberium(false), RadarColor(0, 255, 0) {
-}
+// ============================================================================
+// Static array management
+//
+// TiberiumClass::Array itself is defined alongside the other type-class arrays
+// in Game/Globals.cpp, matching the project's convention.
+// ============================================================================
 
-TiberiumClass::~TiberiumClass() {
-}
+void TiberiumClass::Init_Array()
+{
+    if (Array != nullptr)
+        return;
 
-void TiberiumClass::Initialize(TiberiumType type, int32 startingLevel) {
-    Type = type;
-    CellLevel = startingLevel;
-    if (CellLevel < MinGrowth) CellLevel = MinGrowth;
-    if (CellLevel > MaxGrowth) CellLevel = MaxGrowth;
-    GrowthTimer = 0;
-    SpreadTimer = 0;
-    RegrowthTimer = 0;
+    Array = static_cast<DynamicVectorClass<TiberiumClass*>*>(
+        YRMemory::Allocate(sizeof(DynamicVectorClass<TiberiumClass*>)));
 
-    switch (type) {
-        case TiberiumType::Green:
-            Value = 50;
-            GrowthRate = 2;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 1;
-            ChainReactionRadius = 3;
-            TintColor = ColorStruct(0, 255, 0);
-            RadarColor = ColorStruct(0, 255, 0);
-            break;
-        case TiberiumType::Blue:
-            Value = 100;
-            GrowthRate = 1;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 2;
-            ChainReactionRadius = 4;
-            ChainReactionDamage = 300;
-            TintColor = ColorStruct(0, 128, 255);
-            RadarColor = ColorStruct(0, 128, 255);
-            break;
-        case TiberiumType::Riparius:
-            Value = 25;
-            GrowthRate = 3;
-            SpreadRate = 2;
-            MaxCellLevel = 12;
-            DamageToInfantry = 1;
-            IsSpecial = false;
-            TintColor = ColorStruct(0, 200, 0);
-            RadarColor = ColorStruct(0, 200, 0);
-            break;
-        case TiberiumType::Cruentus:
-            Value = 75;
-            GrowthRate = 2;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 3;
-            DamageToVehicles = 1;
-            TintColor = ColorStruct(200, 0, 0);
-            RadarColor = ColorStruct(200, 0, 0);
-            break;
-        case TiberiumType::Vinifera:
-            Value = 150;
-            GrowthRate = 1;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 5;
-            DamageToVehicles = 2;
-            ChainReactionRadius = 5;
-            ChainReactionDamage = 500;
-            TintColor = ColorStruct(128, 0, 255);
-            RadarColor = ColorStruct(128, 0, 255);
-            break;
-        case TiberiumType::Aboreus:
-            Value = 200;
-            GrowthRate = 1;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 1;
-            IsSpecial = true;
-            TintColor = ColorStruct(255, 255, 0);
-            RadarColor = ColorStruct(255, 255, 0);
-            break;
-        case TiberiumType::Arboreus:
-            Value = 200;
-            GrowthRate = 1;
-            SpreadRate = 1;
-            MaxCellLevel = 12;
-            DamageToInfantry = 1;
-            IsSpecial = true;
-            TintColor = ColorStruct(255, 200, 0);
-            RadarColor = ColorStruct(255, 200, 0);
-            break;
-        default:
-            break;
+    if (Array != nullptr)
+    {
+        new (Array) DynamicVectorClass<TiberiumClass*>();
     }
 }
 
-void TiberiumClass::UpdateGrowth(const CellStruct& cell) {
-    if (CellLevel <= 0) return;
+void TiberiumClass::Delete_Array()
+{
+    if (Array == nullptr)
+        return;
 
-    ++GrowthTimer;
-    if (GrowthTimer >= (60 * 60 / GrowthRate)) {
-        GrowthTimer = 0;
-        if (CellLevel < MaxCellLevel) {
-            ++CellLevel;
-        }
-    }
-
-    ++SpreadTimer;
-    if (SpreadTimer >= (60 * 60 * 10 / SpreadRate)) {
-        SpreadTimer = 0;
-        SpreadToNeighbors(cell);
-    }
+    Array->~DynamicVectorClass<TiberiumClass*>();
+    YRMemory::Deallocate(Array);
+    Array = nullptr;
 }
 
-void TiberiumClass::SpreadToNeighbors(const CellStruct& cell) {
-    if (!MapClass::Instance) return;
+void TiberiumClass::Delete_All()
+{
+    if (Array == nullptr)
+        return;
 
-    static const CellStruct neighbors[8] = {
-        CellStruct(-1, -1), CellStruct(0, -1), CellStruct(1, -1),
-        CellStruct(-1, 0),  CellStruct(1, 0),
-        CellStruct(-1, 1),  CellStruct(0, 1),  CellStruct(1, 1)
-    };
+    for (int32 i = 0; i < Array->Count; ++i)
+        delete (*Array)[i];
 
-    int32 mapW = MapClass::Instance->MapWidth;
-    int32 mapH = MapClass::Instance->MapHeight;
+    Array->Clear();
+}
 
-    for (int32 i = 0; i < 8; ++i) {
-        int32 nx = cell.X + neighbors[i].X;
-        int32 ny = cell.Y + neighbors[i].Y;
+int32 TiberiumClass::GetCount()
+{
+    return Array ? Array->Count : 0;
+}
 
-        if (nx >= 0 && nx < mapW && ny >= 0 && ny < mapH) {
-            CellStruct neighborCell(static_cast<int16>(nx), static_cast<int16>(ny));
-            CellClass* pCell = MapClass::Instance->GetCellAt(neighborCell);
-            if (pCell && !pCell->IsTiberium()) {
-                float chance = SpreadChance * CellLevel / MaxCellLevel;
-                if (static_cast<float>(std::rand() % 1000) / 1000.0f < chance) {
-                    pCell->Land = LandType::Tiberium;
-                    pCell->Overlay = static_cast<int32>(Type);
-                    pCell->TiberiumValue = 1;
-                }
+TiberiumClass* TiberiumClass::FindByIndex(int32 index)
+{
+    if (Array == nullptr || index < 0 || index >= Array->Count)
+        return nullptr;
+
+    return (*Array)[index];
+}
+
+TiberiumClass* TiberiumClass::Find(const char* pID)
+{
+    if (pID == nullptr || Array == nullptr)
+        return nullptr;
+
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TiberiumClass* pType = (*Array)[i];
+        if (pType != nullptr && _strcmpi(pType->ID, pID) == 0)
+            return pType;
+    }
+
+    return nullptr;
+}
+
+TiberiumClass* TiberiumClass::FindOrAllocate(const char* pID)
+{
+    if (pID == nullptr)
+        return nullptr;
+
+    if (TiberiumClass* pFound = Find(pID))
+        return pFound;
+
+    return new TiberiumClass(pID);
+}
+
+// ============================================================================
+// Constructor / destructor
+// ============================================================================
+
+TiberiumClass::TiberiumClass(const char* pID) noexcept
+    : AbstractTypeClass(pID)
+    , TypeIndex(-1)
+    , Spread(0)
+    , SpreadPercentage(0.1)     // the binary seeds 0x3FB99999 = 0.1
+    , Growth(0)
+    , GrowthPercentage(0.1)
+    , Value(0)
+    , Power(0)
+    , Color(0)
+    , Debris()
+    , Image(nullptr)
+    , ImageStart(0)
+    , NumImages(0)
+    , ImageCount(0)
+    , field_F0(0)
+    , field_F4(nullptr)
+    , field_F8(nullptr)
+    , field_FC(nullptr)
+    , field_100(0)
+    , field_104(0)
+    , field_108(0)
+    , field_10C(0)
+    , field_110(nullptr)
+    , field_114(nullptr)
+    , field_118(nullptr)
+    , field_11C(0)
+    , field_120(0)
+    , field_124(0)
+{
+    if (Array == nullptr)
+        Init_Array();
+
+    TypeIndex = Array->Count;
+    Array->Add(this);
+}
+
+TiberiumClass::~TiberiumClass()
+{
+    // Drop ourselves from the global registry so stored ordinals never point at
+    // freed memory, then release whatever the map-generation pass attached.
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            if ((*Array)[i] == this) {
+                Array->Remove(i);
+                break;
             }
         }
     }
+
+    if (field_F4  != nullptr) YRMemory::Deallocate(field_F4);
+    if (field_F8  != nullptr) YRMemory::Deallocate(field_F8);
+    if (field_FC  != nullptr) YRMemory::Deallocate(field_FC);
+    if (field_110 != nullptr) YRMemory::Deallocate(field_110);
+    if (field_114 != nullptr) YRMemory::Deallocate(field_114);
+    if (field_118 != nullptr) YRMemory::Deallocate(field_118);
 }
 
-int32 TiberiumClass::CalculateHarvestValue() const {
-    if (!IsHarvestable) return 0;
-    int32 baseValue = Value * CellLevel;
-    return static_cast<int32>(baseValue * ValueMultiplier);
+// ============================================================================
+// COM plumbing
+// ============================================================================
+
+HRESULT TiberiumClass::GetClassID(CLSID* pClassID)
+{
+    if (pClassID == nullptr)
+        return E_POINTER;
+
+    // CLSID_TiberiumClass, copied straight out of .data by the binary.
+    pClassID->Data1 = static_cast<uint32>(AbstractType::Tiberium);
+    return S_OK;
 }
 
-int32 TiberiumClass::Harvest(int32 amount) {
-    int32 harvested = amount;
-    if (harvested > CellLevel) harvested = CellLevel;
-
-    CellLevel -= harvested;
-    if (CellLevel < 0) CellLevel = 0;
-
-    int32 harvestValue = Value * harvested;
-    return static_cast<int32>(harvestValue * ValueMultiplier);
+HRESULT TiberiumClass::Load(IStream* pStm)
+{
+    (void)pStm;
+    return S_OK;
 }
 
-void TiberiumClass::ApplyDamageToInfantry(ObjectClass* pObj) {
-    if (!pObj || DamageToInfantry <= 0) return;
-    if (pObj->WhatAmI() != AbstractType::Infantry) return;
-
-    int32 damage = DamageToInfantry * CellLevel / MaxCellLevel;
-    if (damage < 1) damage = 1;
-    static_cast<TechnoClass*>(pObj)->TakeDamage(damage, nullptr, nullptr);
+HRESULT TiberiumClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    (void)pStm;
+    (void)fClearDirty;
+    return S_OK;
 }
 
-void TiberiumClass::ApplyDamageToVehicles(ObjectClass* pObj) {
-    if (!pObj || DamageToVehicles <= 0) return;
-    if (!static_cast<TechnoClass*>(pObj)->IsVehicle()) return;
-
-    int32 damage = DamageToVehicles * CellLevel / MaxCellLevel;
-    if (damage < 1) damage = 1;
-    static_cast<TechnoClass*>(pObj)->TakeDamage(damage, nullptr, nullptr);
+AbstractType TiberiumClass::WhatAmI() const
+{
+    return AbstractType::Tiberium;
 }
 
-bool TiberiumClass::CheckChainReaction(const CellStruct& cell) {
-    if (!IsChainReactable) return false;
-    if (CellLevel < MaxCellLevel / 2) return false;
-
-    float chance = ExplosionChance;
-    if (chance <= 0.0f) return false;
-
-    if (static_cast<float>(std::rand() % 1000) / 1000.0f < chance) {
-        TriggerChainReaction(cell);
-        return true;
-    }
-    return false;
+int32 TiberiumClass::Size() const
+{
+    // mov eax, 128h
+    return 0x128;
 }
 
-void TiberiumClass::TriggerChainReaction(const CellStruct& cell) {
-    if (!MapClass::Instance) return;
-
-    int32 mapW = MapClass::Instance->MapWidth;
-    int32 mapH = MapClass::Instance->MapHeight;
-
-    CellLevel = 0;
-
-    for (int32 y = cell.Y - ChainReactionRadius; y <= cell.Y + ChainReactionRadius; ++y) {
-        for (int32 x = cell.X - ChainReactionRadius; x <= cell.X + ChainReactionRadius; ++x) {
-            if (x >= 0 && x < mapW && y >= 0 && y < mapH) {
-                CellStruct neighborCell(static_cast<int16>(x), static_cast<int16>(y));
-                CellClass* pCell = MapClass::Instance->GetCellAt(neighborCell);
-                if (pCell) {
-                    if (pCell->IsTiberium()) {
-                        int32 tibLevel = pCell->TiberiumValue;
-                        float chance = 0.5f * static_cast<float>(tibLevel) / MaxCellLevel;
-                        if (static_cast<float>(std::rand() % 1000) / 1000.0f < chance) {
-                            // Apply damage to objects on this cell
-                            if (pCell->Occupier) {
-                                static_cast<TechnoClass*>(pCell->Occupier)->TakeDamage(ChainReactionDamage, nullptr, nullptr);
-                            }
-                            pCell->TiberiumValue = 0;
-                        }
-                    }
-                }
-            }
-        }
-    }
+int32 TiberiumClass::GetArrayIndex() const
+{
+    return TypeIndex;
 }
 
-void TiberiumClass::UpdateRegrowth() {
-    if (!RegrowsAfterHarvest) return;
-    if (CellLevel >= MinGrowth) return;
+// ============================================================================
+// ComputeCRC
+//
+// The binary folds the parent CRC first, then each scalar in order: Spread,
+// Growth, Value, Power, Color, ImageStart, NumImages.
+// ============================================================================
 
-    ++RegrowthTimer;
-    if (RegrowthTimer >= (60 * 60 * 10 / RegrowthRate)) {
-        RegrowthTimer = 0;
-        if (CellLevel < MinGrowth) {
-            ++CellLevel;
-        }
+void TiberiumClass::ComputeCRC(CRCEngine& crc) const
+{
+    AbstractTypeClass::ComputeCRC(crc);
+
+    crc.AddData(&Spread, sizeof(Spread));
+    crc.AddData(&Growth, sizeof(Growth));
+    crc.AddData(&Value, sizeof(Value));
+    crc.AddData(&Power, sizeof(Power));
+    crc.AddData(&Color, sizeof(Color));
+    crc.AddData(&ImageStart, sizeof(ImageStart));
+    crc.AddData(&NumImages, sizeof(NumImages));
+}
+
+// ============================================================================
+// PointerExpired
+//
+// The binary walks the debris vector backwards and removes every entry that
+// matches the expiring pointer, shifting the tail down over the hole.
+// ============================================================================
+
+void TiberiumClass::PointerExpired(AbstractClass* pAbstract, bool removed)
+{
+    (void)removed;
+
+    if (pAbstract == nullptr)
+        return;
+
+    for (int32 i = Debris.Count - 1; i >= 0; --i) {
+        if (Debris[i] == pAbstract)
+            Debris.Remove(i);
     }
 }
 
-void TiberiumClass::SetType(TiberiumType type) {
-    Type = type;
-}
-
-void TiberiumClass::SetCellLevel(int32 level) {
-    CellLevel = level;
-    if (CellLevel < 0) CellLevel = 0;
-    if (CellLevel > MaxCellLevel) CellLevel = MaxCellLevel;
-}
-
-void TiberiumClass::SetValue(int32 value) {
-    Value = value;
-    if (Value < 0) Value = 0;
-}
-
-void TiberiumClass::SetGrowthRate(int32 rate) {
-    GrowthRate = rate;
-    if (GrowthRate < 1) GrowthRate = 1;
-    if (GrowthRate > 16) GrowthRate = 16;
-}
-
-void TiberiumClass::SetSpreadRate(int32 rate) {
-    SpreadRate = rate;
-    if (SpreadRate < 1) SpreadRate = 1;
-    if (SpreadRate > 16) SpreadRate = 16;
-}
-
-void TiberiumClass::SetDamageToInfantry(int32 damage) {
-    DamageToInfantry = damage;
-    if (DamageToInfantry < 0) DamageToInfantry = 0;
-}
-
-void TiberiumClass::SetExplosionChance(float chance) {
-    ExplosionChance = chance;
-    if (ExplosionChance < 0.0f) ExplosionChance = 0.0f;
-    if (ExplosionChance > 1.0f) ExplosionChance = 1.0f;
-}
-
-void TiberiumClass::SetChainReactionRadius(int32 radius) {
-    ChainReactionRadius = radius;
-    if (ChainReactionRadius < 0) ChainReactionRadius = 0;
-    if (ChainReactionRadius > 10) ChainReactionRadius = 10;
-}
-
-void TiberiumClass::SetChainReactionDamage(int32 damage) {
-    ChainReactionDamage = damage;
-    if (ChainReactionDamage < 0) ChainReactionDamage = 0;
-}
-
-void TiberiumClass::SetHarvestable(bool harvestable) {
-    IsHarvestable = harvestable;
-}
-
-void TiberiumClass::SetChainReactable(bool reactable) {
-    IsChainReactable = reactable;
-}
-
-void TiberiumClass::SetRegrowsAfterHarvest(bool regrows) {
-    RegrowsAfterHarvest = regrows;
-}
-
-void TiberiumClass::SetRegrowthRate(int32 rate) {
-    RegrowthRate = rate;
-    if (RegrowthRate < 1) RegrowthRate = 1;
-}
-
-void TiberiumClass::SetValueMultiplier(float multiplier) {
-    ValueMultiplier = multiplier;
-    if (ValueMultiplier < 0.0f) ValueMultiplier = 0.0f;
-}
-
-void TiberiumClass::SetTintColor(const ColorStruct& color) {
-    TintColor = color;
-}
-
-void TiberiumClass::SetRadarColor(const ColorStruct& color) {
-    RadarColor = color;
-}
-
-TiberiumType TiberiumClass::GetType() const {
-    return Type;
-}
-
-int32 TiberiumClass::GetCellLevel() const {
-    return CellLevel;
-}
-
-int32 TiberiumClass::GetValue() const {
-    return Value;
-}
-
-int32 TiberiumClass::GetMaxCellLevel() const {
-    return MaxCellLevel;
-}
-
-bool TiberiumClass::IsHarvestableTiberium() const {
-    return IsHarvestable;
-}
-
-bool TiberiumClass::IsChainReactableType() const {
-    return IsChainReactable;
-}
-
-float TiberiumClass::GetExplosionChance() const {
-    return ExplosionChance;
-}
-
-// ============================================================
-// TiberiumManagerClass
-// ============================================================
-
-static TiberiumManagerClass* g_TiberiumManagerInstance = nullptr;
-
-TiberiumManagerClass::TiberiumManagerClass()
-    : GlobalGrowthRate(2), GlobalSpreadRate(1), GlobalDamageMultiplier(1.0f)
-    , GlobalValueMultiplier(1.0f), EnableGrowth(true), EnableSpread(true)
-    , EnableChainReaction(true), GlobalRegrowthRate(1), EnableRegrowth(true)
-    , TiberiumTypesCount(0) {
-    for (int32 i = 0; i < MAX_TIBERIUM_TYPES; ++i) {
-        TiberiumTypes[i] = nullptr;
-    }
-}
-
-TiberiumManagerClass::~TiberiumManagerClass() {
-    for (int32 i = 0; i < MAX_TIBERIUM_TYPES; ++i) {
-        if (TiberiumTypes[i]) {
-            delete TiberiumTypes[i];
-            TiberiumTypes[i] = nullptr;
-        }
-    }
-    TiberiumTypesCount = 0;
-}
-
-TiberiumManagerClass* TiberiumManagerClass::GetInstance() {
-    if (!g_TiberiumManagerInstance) {
-        g_TiberiumManagerInstance = new TiberiumManagerClass();
-    }
-    return g_TiberiumManagerInstance;
-}
-
-void TiberiumManagerClass::Initialize() {
-    TiberiumTypesCount = 0;
-    for (int32 i = 0; i < MAX_TIBERIUM_TYPES; ++i) {
-        if (TiberiumTypes[i]) {
-            delete TiberiumTypes[i];
-            TiberiumTypes[i] = nullptr;
-        }
-    }
-
-    TiberiumClass* green = new TiberiumClass();
-    green->Initialize(TiberiumType::Green, 1);
-    TiberiumTypes[TiberiumTypesCount++] = green;
-
-    TiberiumClass* blue = new TiberiumClass();
-    blue->Initialize(TiberiumType::Blue, 1);
-    TiberiumTypes[TiberiumTypesCount++] = blue;
-}
-
-void TiberiumManagerClass::UpdateAllTiberium() {
-    if (!EnableGrowth || !MapClass::Instance) return;
-
-    int32 mapW = MapClass::Instance->MapWidth;
-    int32 mapH = MapClass::Instance->MapHeight;
-
-    for (int32 y = 0; y < mapH; ++y) {
-        for (int32 x = 0; x < mapW; ++x) {
-            CellStruct cell(static_cast<int16>(x), static_cast<int16>(y));
-            CellClass* pCell = MapClass::Instance->GetCellAt(cell);
-            if (pCell && pCell->IsTiberium()) {
-                int32 tibType = pCell->Overlay;
-                if (tibType >= 0 && tibType < TiberiumTypesCount && TiberiumTypes[tibType]) {
-                    TiberiumClass* tib = TiberiumTypes[tibType];
-                    tib->CellLevel = pCell->TiberiumValue;
-                    tib->UpdateGrowth(cell);
-                    pCell->TiberiumValue = tib->CellLevel;
-                }
-            }
-        }
-    }
-}
-
-void TiberiumManagerClass::ApplyDamageToInfantryInCell(const CellStruct& cell, ObjectClass* pObj) {
-    if (!pObj || !MapClass::Instance) return;
-    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
-    if (!pCell || !pCell->IsTiberium()) return;
-
-    int32 tibType = pCell->Overlay;
-    if (tibType >= 0 && tibType < TiberiumTypesCount && TiberiumTypes[tibType]) {
-        TiberiumTypes[tibType]->ApplyDamageToInfantry(pObj);
-    }
-}
-
-void TiberiumManagerClass::ApplyDamageToVehiclesInCell(const CellStruct& cell, ObjectClass* pObj) {
-    if (!pObj || !MapClass::Instance) return;
-    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
-    if (!pCell || !pCell->IsTiberium()) return;
-
-    int32 tibType = pCell->Overlay;
-    if (tibType >= 0 && tibType < TiberiumTypesCount && TiberiumTypes[tibType]) {
-        TiberiumTypes[tibType]->ApplyDamageToVehicles(pObj);
-    }
-}
-
-int32 TiberiumManagerClass::HarvestCell(const CellStruct& cell, int32 amount) {
-    if (!MapClass::Instance) return 0;
-    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
-    if (!pCell || !pCell->IsTiberium()) return 0;
-
-    int32 tibType = pCell->Overlay;
-    if (tibType < 0 || tibType >= TiberiumTypesCount || !TiberiumTypes[tibType]) return 0;
-
-    TiberiumClass* tib = TiberiumTypes[tibType];
-    tib->CellLevel = pCell->TiberiumValue;
-    int32 profit = tib->Harvest(amount);
-    pCell->TiberiumValue = tib->CellLevel;
-
-    return static_cast<int32>(profit * GlobalValueMultiplier);
-}
-
-bool TiberiumManagerClass::CheckChainReactionAtCell(const CellStruct& cell) {
-    if (!EnableChainReaction || !MapClass::Instance) return false;
-    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
-    if (!pCell || !pCell->IsTiberium()) return false;
-
-    int32 tibType = pCell->Overlay;
-    if (tibType < 0 || tibType >= TiberiumTypesCount || !TiberiumTypes[tibType]) return false;
-
-    TiberiumClass* tib = TiberiumTypes[tibType];
-    tib->CellLevel = pCell->TiberiumValue;
-    return tib->CheckChainReaction(cell);
-}
-
-void TiberiumManagerClass::SetGlobalGrowthRate(int32 rate) {
-    GlobalGrowthRate = rate;
-    if (GlobalGrowthRate < 1) GlobalGrowthRate = 1;
-    if (GlobalGrowthRate > 16) GlobalGrowthRate = 16;
-}
-
-void TiberiumManagerClass::SetGlobalSpreadRate(int32 rate) {
-    GlobalSpreadRate = rate;
-    if (GlobalSpreadRate < 1) GlobalSpreadRate = 1;
-    if (GlobalSpreadRate > 16) GlobalSpreadRate = 16;
-}
-
-void TiberiumManagerClass::SetGlobalValueMultiplier(float multiplier) {
-    GlobalValueMultiplier = multiplier;
-    if (GlobalValueMultiplier < 0.0f) GlobalValueMultiplier = 0.0f;
-}
-
-void TiberiumManagerClass::SetGrowthEnabled(bool enabled) {
-    EnableGrowth = enabled;
-}
-
-void TiberiumManagerClass::SetSpreadEnabled(bool enabled) {
-    EnableSpread = enabled;
-}
-
-void TiberiumManagerClass::SetChainReactionEnabled(bool enabled) {
-    EnableChainReaction = enabled;
-}
-
-void TiberiumManagerClass::SetRegrowthEnabled(bool enabled) {
-    EnableRegrowth = enabled;
-}
-
-void TiberiumManagerClass::SetGlobalRegrowthRate(int32 rate) {
-    GlobalRegrowthRate = rate;
-    if (GlobalRegrowthRate < 1) GlobalRegrowthRate = 1;
-}
-
-TiberiumClass* TiberiumManagerClass::GetTiberiumType(int32 index) const {
-    if (index < 0 || index >= TiberiumTypesCount) return nullptr;
-    return TiberiumTypes[index];
-}
-
-int32 TiberiumManagerClass::GetTiberiumTypeCount() const {
-    return TiberiumTypesCount;
-}
-
-int32 TiberiumManagerClass::GetGlobalGrowthRate() const {
-    return GlobalGrowthRate;
-}
-
-int32 TiberiumManagerClass::GetGlobalSpreadRate() const {
-    return GlobalSpreadRate;
-}
-
-float TiberiumManagerClass::GetGlobalValueMultiplier() const {
-    return GlobalValueMultiplier;
-}
-// ============================================================
-// INI loading
-// ============================================================
+// ============================================================================
+// LoadFromINI
+// ============================================================================
 
 bool TiberiumClass::LoadFromINI(CCINIClass* pINI)
 {
-    if (!pINI)
+    if (pINI == nullptr)
         return false;
 
-    const char* pSection = Name;
-    if (!pSection[0])
-        return false;
-
-    if (pINI->GetSection(pSection) == nullptr)
-        return false;
+    const char* pSection = ID;
 
     Spread           = pINI->ReadInteger(pSection, "Spread", Spread);
-    SpreadPercentage = pINI->ReadFixed(pSection, "SpreadPercentage", SpreadPercentage);
+    SpreadPercentage = pINI->ReadDouble(pSection, "SpreadPercentage", SpreadPercentage);
     Growth           = pINI->ReadInteger(pSection, "Growth", Growth);
-    GrowthPercentage = pINI->ReadFixed(pSection, "GrowthPercentage", GrowthPercentage);
+    GrowthPercentage = pINI->ReadDouble(pSection, "GrowthPercentage", GrowthPercentage);
     Value            = pINI->ReadInteger(pSection, "Value", Value);
     Power            = pINI->ReadInteger(pSection, "Power", Power);
     Color            = pINI->ReadColorSchemeIndex(pSection, "Color", Color);
 
-    {
-        char buffer[0x80];
-        buffer[0] = '\0';
-
-        if (pINI->ReadString(pSection, "Debris", "", buffer, sizeof(buffer)) > 0) {
-            DebrisAnims.Clear();
-
-            char* pToken = std::strtok(buffer, ",");
-            while (pToken != nullptr) {
-                if (*pToken == '\0')
-                    break;
-
+    char debrisText[0x80];
+    debrisText[0] = '\0';
+    if (pINI->ReadString(pSection, "Debris", "", debrisText, sizeof(debrisText)) > 0) {
+        // A comma separated run of animation IDs; each is resolved against the
+        // animation type table and appended in the order it appears.
+        char* pToken = std::strtok(debrisText, ",");
+        while (pToken != nullptr) {
+            if (pToken[0] != '\0') {
                 AnimTypeClass* pAnim = AnimTypeClass::FindOrAllocate(pToken);
                 if (pAnim != nullptr)
-                    DebrisAnims.Add(pAnim);
-
-                pToken = std::strtok(nullptr, ",");
+                    Debris.Add(pAnim);
             }
+            pToken = std::strtok(nullptr, ",");
         }
     }
 
-    Image = pINI->ReadInteger(pSection, "Image", Image);
+    const int32 image = pINI->ReadInteger(pSection, "Image", -1);
 
-    switch (Image + 1) {
-    case 3:
-        ImageIndex = 0x0C;
-        break;
-    case 4:
-        ImageIndex = 0x0C;
-        break;
-    case 5:
-        ImageIndex = 0x0C;
-        break;
-    default:
-        ImageIndex = 0x0C;
-        break;
+    if (image != -1) {
+        switch (image) {
+            case 3:
+                ImageStart = 0x1B;
+                NumImages  = 12;
+                ImageCount = 12;
+                break;
+
+            case 4:
+                ImageStart = 0x7F;
+                NumImages  = 12;
+                ImageCount = 12;
+                break;
+
+            case 5:
+                ImageStart = 0x93;
+                NumImages  = 12;
+                ImageCount = 12;
+                break;
+
+            default:
+                ImageStart = 0x66;
+                NumImages  = 12;
+                ImageCount = 8;
+                break;
+        }
     }
 
-    MaxCellLevel = 8;
+    // Resolve the overlay art the ore renders as.
+    Image = OverlayTypeClass::FindByIndex(ImageStart);
 
     return true;
 }
 
-void TiberiumClass::LoadAllFromINI(CCINIClass* pINI)
+// ============================================================================
+// CreateFromINIList
+// ============================================================================
+
+bool TiberiumClass::CreateFromINIList(CCINIClass* pINI)
 {
-    if (!pINI)
-        return;
+    if (pINI == nullptr)
+        return true;
 
-    if (Array != nullptr) {
-        for (int32 i = 0; i < Array->Count; ++i)
-            (*Array)[i]->LoadFromINI(pINI);
+    if (Array == nullptr)
+        Init_Array();
+
+    if (pINI->GetSection("Tiberiums") == nullptr)
+        return true;
+
+    const int32 count = pINI->GetKeyCount("Tiberiums");
+
+    for (int32 i = 0; i < count; ++i) {
+        const char* pKeyName = pINI->GetKeyName("Tiberiums", i);
+        if (pKeyName == nullptr)
+            continue;
+
+        char name[0x18];
+        name[0] = '\0';
+        if (pINI->ReadString("Tiberiums", pKeyName, "", name, sizeof(name)) <= 0)
+            continue;
+
+        const int32 ordinal = std::atoi(pKeyName);
+
+        TiberiumClass* pType = nullptr;
+        if (ordinal < Array->Count)
+            pType = (*Array)[ordinal];
+
+        if (pType == nullptr)
+            pType = new TiberiumClass(name);
+
+        if (pType != nullptr)
+            pType->LoadFromINI(pINI);
     }
 
-    if (pINI->GetSection("Tiberiums") != nullptr) {
-        for (int32 i = 0; i < pINI->GetKeyCount("Tiberiums"); ++i) {
-            const char* pKeyName = pINI->GetKeyName("Tiberiums", i);
-            if (!pKeyName || !pKeyName[0])
-                continue;
-
-            char name[0x40];
-            name[0] = '\0';
-            if (pINI->ReadString("Tiberiums", pKeyName, "", name, sizeof(name)) <= 0)
-                continue;
-
-            TiberiumClass* pTiberium = FindOrAllocate(name);
-            if (pTiberium != nullptr)
-                pTiberium->LoadFromINI(pINI);
-        }
-    }
+    return true;
 }
 
-TiberiumClass* TiberiumClass::FindOrAllocate(const char* pName)
-{
-    if (!pName || !pName[0])
-        return nullptr;
+// ============================================================================
+// Is_Overlay_Idx_Tiberium
+// ============================================================================
 
-    if (Array != nullptr) {
-        for (int32 i = 0; i < Array->Count; ++i) {
-            TiberiumClass* pEntry = (*Array)[i];
-            if (pEntry && _strcmpi(pEntry->Name, pName) == 0)
-                return pEntry;
-        }
+int32 Is_Overlay_Idx_Tiberium(int32 overlayIndex)
+{
+    if (overlayIndex == -1)
+        return -1;
+
+    OverlayTypeClass* pOverlay = OverlayTypeClass::FindByIndex(overlayIndex);
+    if (pOverlay == nullptr)
+        return -1;
+
+    if (!pOverlay->Is_Tiberium())
+        return -1;
+
+    if (TiberiumClass::Array == nullptr)
+        return -1;
+
+    const int32 total = TiberiumClass::Array->Count;
+
+    for (int32 i = 0; i < total; ++i) {
+        TiberiumClass* pType = (*TiberiumClass::Array)[i];
+        if (pType == nullptr)
+            continue;
+
+        const int32 start = pType->ImageStart;
+
+        if (overlayIndex >= start && overlayIndex < start + pType->NumImages)
+            return pType->TypeIndex;
+
+        if (overlayIndex >= start + pType->NumImages &&
+            overlayIndex < start + pType->NumImages + pType->ImageCount)
+            return pType->TypeIndex;
     }
 
-    return nullptr;
+    return -1;
 }

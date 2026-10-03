@@ -128,6 +128,19 @@ public:
     // section preserves the scenario's own settings.
     void GetGlobalFlags(CCINIClass* pINI);
 
+    // ========================================================================
+    // Global / local variable accessors
+    //
+    //  The script actions (TeamClass_SetGlobal and friends) and the trigger
+    //  conditions read and write the 50 global and 100 local variable slots by
+    //  index.  SetGlobalValue / SetLocalValue store 0 or 1 into the slot's
+    //  Value; an out-of-range index is ignored.
+    // ========================================================================
+    void SetGlobalValue(int32 index, bool value);
+    void SetLocalValue(int32 index, bool value);
+    bool GetGlobalValue(int32 index) const;
+    bool GetLocalValue(int32 index) const;
+
     // ScenarioClass_ReadLocalVariables - the [VariableNames] pass.  The
     // section is purely index-keyed: every key parses as an integer slot,
     // the value splits on ',' into "<name>,<initial value>" and the second
@@ -201,6 +214,18 @@ public:
     CDTimerClass        unknown_timer_123c;
     CDTimerClass        AmbientTimer;
     int32               TechLevel;
+
+    // ------------------------------------------------------------------
+    // Map tint (asm ScenarioClass+0x3534 / +0x3538 / +0x353C).
+    //
+    //  The action 'Retint Red/Green/Blue' overwrites one channel of the map
+    //  tint; the value stored here is the raw scenario field, whereas the
+    //  lighting routine consumes it pre-multiplied by 10 (the `lea eax,
+    //  [eax+eax*4] / shl eax, 1` sequence in the original).
+    // ------------------------------------------------------------------
+    int32               MapTintR;
+    int32               MapTintG;
+    int32               MapTintB;
     TheaterType         Theater;
     char                FileName[0x104];
     wchar_t             Name[0x2D];

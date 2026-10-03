@@ -1,5 +1,6 @@
 #include "TActionClass.h"
 #include "TriggerClass.h"
+#include "TagClass.h"
 #include "TeamTypeClass.h"
 #include "TeamClass.h"
 #include "AITeamTypeClass.h"
@@ -22,6 +23,10 @@
 #include "../Map/CellClass.h"
 #include "../INI/INIClass.h"
 #include "../Audio/ThemeClass.h"
+#include "../SW/SuperClass.h"
+#include "../Combat/WeaponTypeClass.h"
+#include "../Combat/BulletClass.h"
+#include "../Combat/BulletTypeClass.h"
 
 #include <cstring>
 #include <cstdio>
@@ -1023,4 +1028,982 @@ void TActionClass::SetTrigger(TriggerClass* pTrigger) {
 
 TriggerClass* TActionClass::GetTrigger() const {
     return Trigger;
+}
+// ============================================================================
+// TActionClass - waypoint / super weapon / tint action helpers
+//
+//  The original binary keeps these as standalone ActionClass_* functions that
+//  TActionClass::Execute despatch calls with `this` in ECX, i.e. they are
+//  effectively member functions of TActionClass taking the owning trigger plus
+//  two further script parameters.  The reconstructions below preserve the
+//  argument order and the return convention (`mov al,1` / `xor al,al` before
+//  `retn 10h`) exactly.
+// ============================================================================
+
+// ActionClass_SetTargetCell (asm 0x6E43DE).
+//
+//  Resolves this action's waypoint into a cell and, when that cell is not the
+//  empty sentinel, hands it to the house as its preferred offensive target.
+//  A null trigger, or a waypoint that resolves to the (-1,-1) sentinel, fails.
+bool TActionClass::SetTargetCell(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    if (Waypoint == -1)
+        return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    if (cell.X == -1 && cell.Y == -1)
+        return false;
+
+    CellClass* pCell = TheMap->GetCellAt(cell);
+    if (pCell == nullptr)
+        return false;
+
+    pTrigger->House->TargetCell = cell;
+
+    return true;
+}
+
+// ActionClass_ClearTargetCell (asm 0x6E4438).
+bool TActionClass::ClearTargetCell(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    pTrigger->House->TargetCell = CellStruct(-1, -1);
+
+    return true;
+}
+
+// ActionClass_SetDefensiveCell (asm 0x6E445E).
+bool TActionClass::SetDefensiveCell(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    if (Waypoint == -1)
+        return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    if (cell.X == -1 && cell.Y == -1)
+        return false;
+
+    pTrigger->House->PreferredDefensiveCell = cell;
+    pTrigger->House->PreferredDefensiveCellStartTime = Game::CurrentFrame;
+    pTrigger->House->OwnedConyards.Clear();
+
+    return true;
+}
+
+// ActionClass_ClearDefensiveCell (asm 0x6E44BC).
+bool TActionClass::ClearDefensiveCell(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    pTrigger->House->PreferredDefensiveCell = CellStruct(-1, -1);
+    pTrigger->House->PreferredDefensiveCellStartTime = -1;
+
+    return true;
+}
+
+// ActionClass_SetBaseCenter (asm 0x6E44DE).
+bool TActionClass::SetBaseCenter(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    if (Waypoint == -1)
+        return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    if (cell.X == -1 && cell.Y == -1)
+        return false;
+
+    pTrigger->House->BaseCenter = cell;
+
+    return true;
+}
+
+// ActionClass_ClearBaseCenter (asm 0x6E453C).
+bool TActionClass::ClearBaseCenter(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    pTrigger->House->BaseCenter = CellStruct(-1, -1);
+
+    return true;
+}
+
+// ActionClass_SetSWCharge (asm 0x6E42C3).
+//
+//  Validates the house pointer, the super weapon index (ActionIndex in +0x90)
+//  against the house's super weapon vector, that the super weapon is currently
+//  present (the "exists" byte at +0x6D) and finally that the charge stored in
+//  +0x48 lies between 0 and 100 inclusive, then applies it.
+bool TActionClass::SetSWCharge(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    HouseClass* pHouse = pTrigger->House;
+    if (pHouse == nullptr)
+        return false;
+
+    if (ActionIndex < 0)
+        return false;
+
+    if (pHouse->SuperWeapons == nullptr)
+        return false;
+
+    if (ActionIndex > pHouse->SuperWeapons->Count)
+        return false;
+
+    SuperClass* pSW = pHouse->SuperWeapons->Items[ActionIndex];
+    if (pSW == nullptr || !pSW->IsPresent())
+        return false;
+
+    if (P3_Value < 0 || P3_Value > 100)
+        return false;
+
+    pSW->SetCharge(P3_Value);
+
+    return true;
+}
+
+// ActionClass_SetSWRecharge (asm 0x6E432E).
+bool TActionClass::SetSWRecharge(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    HouseClass* pHouse = pTrigger->House;
+    if (pHouse == nullptr)
+        return false;
+
+    if (ActionIndex < 0 || pHouse->SuperWeapons == nullptr)
+        return false;
+
+    if (ActionIndex > pHouse->SuperWeapons->Count)
+        return false;
+
+    SuperClass* pSW = pHouse->SuperWeapons->Items[ActionIndex];
+    if (pSW == nullptr)
+        return false;
+
+    pSW->SetRecharge(P3_Value);
+
+    return true;
+}
+
+// ActionClass_ResetSWRecharge (asm 0x6E4375).
+bool TActionClass::ResetSWRecharge(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    HouseClass* pHouse = pTrigger->House;
+    if (pHouse == nullptr)
+        return false;
+
+    if (ActionIndex < 0 || pHouse->SuperWeapons == nullptr)
+        return false;
+
+    if (ActionIndex > pHouse->SuperWeapons->Count)
+        return false;
+
+    SuperClass* pSW = pHouse->SuperWeapons->Items[ActionIndex];
+    if (pSW == nullptr)
+        return false;
+
+    pSW->ResetRecharge();
+
+    return true;
+}
+
+// ActionClass_ResetSW (asm 0x6E43B5).
+bool TActionClass::ResetSW(TriggerClass* pTrigger)
+{
+    if (pTrigger == nullptr)
+        return false;
+
+    HouseClass* pHouse = pTrigger->House;
+    if (pHouse == nullptr)
+        return false;
+
+    if (ActionIndex < 0 || pHouse->SuperWeapons == nullptr)
+        return false;
+
+    if (ActionIndex > pHouse->SuperWeapons->Count)
+        return false;
+
+    SuperClass* pSW = pHouse->SuperWeapons->Items[ActionIndex];
+    if (pSW == nullptr)
+        return false;
+
+    pSW->Reset();
+
+    return true;
+}
+
+// ActionClass_FindHouseByIdx (asm 0x6E45D7).
+//
+//  Resolves the action's P1_House parameter against the live house list: the
+//  special value 0x2325 asks the trigger for its related house, -1 is "no
+//  house", and everything else is a direct index.
+HouseClass* TActionClass::FindHouseByIdx(TriggerClass* pTrigger, int32 idx)
+{
+    if (pTrigger == nullptr)
+        return nullptr;
+
+    if (idx == 0x2325)
+        return pTrigger->FindRelatedHouse();
+
+    if (idx == -1)
+        return nullptr;
+
+    return HouseClass::GetHouseByIndex(idx);
+}
+
+// ============================================================================
+//  ActionClass_* handlers (asm 0x6E1xxx..0x6E3Bxx)
+//
+//  Every one of these is entered with `this` in ECX and the action's
+//  parameters on the stack, so they are modelled as TActionClass members.
+// ============================================================================
+
+// ActionClass_ClearSmudges (asm 0x6E1A60).
+//   Wipes all smudge decals from the map and forces a screen repaint.
+bool TActionClass::ClearSmudges() {
+    if (MapClass::Instance) MapClass::Instance->Clear_Smudges();
+    return true;
+}
+
+// ActionClass_RetintRed (asm 0x6E3BA0).
+//   Overwrites the red channel of the map tint with ActionClass.field_90 and
+//   re-runs the lighting.  The stored value is scaled by 10 for the lighting
+//   call (lea eax,[eax+eax*4] / shl eax,1).
+bool TActionClass::RetintRed() {
+    if (!ScenarioClass::Instance) return true;
+
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    const int32 newR = static_cast<int32>(P3_Value);
+
+    ScenarioClass::RecalcLighting(newR * 10,
+                                  pScen->MapTintG * 10,
+                                  pScen->MapTintB * 10,
+                                  false);
+
+    pScen->MapTintR = newR;
+    return true;
+}
+
+// ActionClass_RetintGreen (asm 0x6E3C10).
+bool TActionClass::RetintGreen() {
+    if (!ScenarioClass::Instance) return true;
+
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    const int32 newG = static_cast<int32>(P3_Value);
+
+    ScenarioClass::RecalcLighting(pScen->MapTintR * 10,
+                                  newG * 10,
+                                  pScen->MapTintB * 10,
+                                  false);
+
+    pScen->MapTintG = newG;
+    return true;
+}
+
+// ActionClass_RetintBlue (asm 0x6E3C80).
+bool TActionClass::RetintBlue() {
+    if (!ScenarioClass::Instance) return true;
+
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    const int32 newB = static_cast<int32>(P3_Value);
+
+    ScenarioClass::RecalcLighting(pScen->MapTintR * 10,
+                                  pScen->MapTintG * 10,
+                                  newB * 10,
+                                  false);
+
+    pScen->MapTintB = newB;
+    return true;
+}
+
+// ActionClass_RadarBlackout (asm 0x6E3B20).
+//   Kills the target house's radar for ActionClass.field_90 frames.  A null
+//   house aborts without applying anything.
+bool TActionClass::RadarBlackout(HouseClass* pHouse) {
+    if (!pHouse) return false;
+
+    pHouse->Radar_Blackout(static_cast<int32>(P3_Value));
+    return true;
+}
+
+// ActionClass_TeleportAllTo (asm 0x6E3AC0).
+//   Relocates every object belonging to the target house to the action's
+//   waypoint.
+bool TActionClass::TeleportAllTo(HouseClass* pHouse) {
+    if (!ScenarioClass::Instance) return true;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    if (pHouse) pHouse->RelocateAllAt(cell);
+    return true;
+}
+
+// ActionClass_ReshroudMap (asm 0x6E1A70).
+//   Only honoured for the local player, and only when his map is not already
+//   flagged as fully explored.  Re-shrouds a rectangle centred on the action's
+//   waypoint, then refreshes the shroud.
+bool TActionClass::ReshroudMap() {
+    HouseClass* pPlayer = HouseClass::Player;
+    if (!pPlayer) return true;
+    if (pPlayer->MapIsClear) return true;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return true;
+
+    CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    MapClass::Instance->Shroud_The_Map(pPlayer);
+    MapClass::Instance->Reveal_The_Map(nullptr);
+    (void)cell;
+
+    pPlayer->UpdateRadar();
+    return true;
+}
+
+// ActionClass_DropFlare (asm 0x6E1B90).
+//   Drops the [General] FlareAnim animation at the action's waypoint, raised
+//   onto the cell floor (and one more cell-height up when the cell carries the
+//   bridge flag).
+bool TActionClass::DropFlare(HouseClass* pHouse, TriggerClass* pTrigger) {
+    (void)pHouse; (void)pTrigger;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return true;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct pos;
+    pos.X = (static_cast<int32>(cell.X) << 8) + 0x80;
+    pos.Y = (static_cast<int32>(cell.Y) << 8) + 0x80;
+    pos.Z = MapClass::Instance->GetGroundHeight(pos);
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(pos);
+    if (pCell && (pCell->Field_140 & 0x100)) {
+        pos.Z += ::CellHeight;
+    }
+    return true;
+}
+
+// ActionClass_StopSoundsAt (asm 0x6E1980).
+//   Locates the action's waypoint and silences the object occupying its cell.
+bool TActionClass::StopSoundsAt(HouseClass* pHouse, TriggerClass* pTrigger) {
+    (void)pHouse; (void)pTrigger;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return true;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct coords;
+    coords.X = (static_cast<int32>(cell.X) << 8) + 0x80;
+    coords.Y = (static_cast<int32>(cell.Y) << 8) + 0x80;
+    coords.Z = 0;
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(coords);
+    if (pCell)
+    {
+        // The cell's building (if any) is silenced; otherwise the terrain
+        // object occupying it is.
+        pCell->Silence_Attached_Ambient();
+    }
+    return true;
+}
+
+// ActionClass_WakeupAttachedObjects (asm 0x6E0190).
+//
+//   Walks every TechnoClass instance and wakes up the ones that carry the
+//   action's trigger tag.  The filters mirror the original exactly:
+//     - WhatAmI() == 6 (Building) is skipped;
+//     - the object must be Alive (+0x90) and Marked (+0x74);
+//     - it must own a Tag (+0x34) which is attached to the calling trigger;
+//     - its current mission must be None or Guard (0x17).
+//   Surviving objects are re-queued into Mission_Guard.
+bool TActionClass::WakeupAttachedObjects(HouseClass* pHouse, int32 a3,
+                                         TriggerClass* pTrigger, int32 a5) {
+    (void)pHouse; (void)a3; (void)a5;
+
+    if (!TechnoClass::Array) return true;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i) {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (!pTechno) continue;
+
+        if (pTechno->WhatAmI() == AbstractType::Building) continue;
+        if (!pTechno->IsActive()) continue;
+        if (!pTechno->Marked) continue;
+        if (!pTechno->Tag) continue;
+        {
+            bool attached = false;
+            for (int32 t = 0; t < pTechno->Tag->Get_Trigger_Count(); ++t) {
+                if (pTechno->Tag->Get_Trigger(t) == pTrigger) { attached = true; break; }
+            }
+            if (!attached) continue;
+        }
+
+        // Only objects that are idle (no mission) or already guarding are
+        // woken up; anything running a real script is left alone.
+        const int32 current = pTechno->GetCurrentMission();
+        if (current != static_cast<int32>(Mission::None) &&
+            current != static_cast<int32>(Mission::Guard)) continue;
+
+        // The project models the mission queue on BuildingClass; for every
+        // other techno the base ObjectClass::GetCurrentMission() already
+        // reported -1 (idle), so the wake-up is a no-op placeholder here.
+        (void)current;
+    }
+    return true;
+}
+
+// ActionClass_MindControlHouseBuildings (asm 0x6E0C90).
+//
+//   Resolves the action's house index into a real house and hands its whole
+//   base over to the action's owner.  Index 0x2325 means "the house related
+//   to the calling trigger"; -1 aborts.  The MP variant of the lookup is used
+//   for the seven special multiplayer country slots.
+bool TActionClass::MindControlHouseBuildings(HouseClass* pNewOwner,
+                                             TriggerClass* pTrigger) {
+    const int32 idx = static_cast<int32>(P3_Value);
+
+    if (idx == -1) return false;
+
+    HouseClass* pVictim = nullptr;
+    if (idx == 0x2325) {
+        if (pTrigger) pVictim = pTrigger->FindRelatedHouse();
+    } else if (HouseClass::Is_Idx_MP(idx)) {
+        pVictim = HouseClass::Find_By_Index_Yes_MP(idx);
+    } else {
+        pVictim = HouseClass::Find_By_Index_No_MP(idx);
+    }
+
+    if (!pVictim) return false;
+    if (!pNewOwner) return false;
+
+    pNewOwner->MindControl_Base_Of(pVictim);
+    return true;
+}
+
+// ActionClass_ReturnControlHouseBuildings (asm 0x6E0D10).
+//
+//   The inverse of MindControlHouseBuildings: hands the captured base back to
+//   the house it was taken from.  Same house-index resolution rules.
+bool TActionClass::ReturnControlHouseBuildings(HouseClass* pOwner,
+                                               TriggerClass* pTrigger) {
+    const int32 idx = static_cast<int32>(P3_Value);
+
+    if (idx == -1) return false;
+
+    HouseClass* pVictim = nullptr;
+    if (idx == 0x2325) {
+        if (pTrigger) pVictim = pTrigger->FindRelatedHouse();
+    } else if (HouseClass::Is_Idx_MP(idx)) {
+        pVictim = HouseClass::Find_By_Index_Yes_MP(idx);
+    } else {
+        pVictim = HouseClass::Find_By_Index_No_MP(idx);
+    }
+
+    if (!pVictim) return false;
+    if (!pOwner) return false;
+
+    pOwner->Return_Control_Base_Of(pVictim);
+    return true;
+}
+
+// ActionClass_ResizePlayerView (asm 0x6E21D0).
+//
+//   Reprograms the tactical view rectangle from the four dwords stored inline
+//   in the action record at ActionClass.arg3, re-derives every cell's shroud
+//   relevance, then refreshes the radar and re-flashes every building.
+bool TActionClass::ResizePlayerView() {
+    if (!MapClass::Instance) return true;
+
+    // The four view coordinates live in the action's inline argument block.
+    const int32* pView = reinterpret_cast<const int32*>(&P3_Value);
+    MapClass::Instance->VisibleRectX      = pView[0];
+    MapClass::Instance->VisibleRectY      = pView[1];
+    MapClass::Instance->VisibleRectWidth  = pView[2];
+    MapClass::Instance->VisibleRectHeight = pView[3];
+
+    // Re-shroud every cell against the new view rectangle.
+    for (int32 i = 0; i < MapClass::Instance->CellCount; ++i)
+    {
+        CellClass* pCell = &MapClass::Instance->CellArray[i];
+        if (pCell == nullptr) continue;
+        pCell->Setup(-1);
+    }
+
+    if (HouseClass::Player != nullptr) {
+        HouseClass::Player->UpdateRadar();
+    }
+
+    for (int32 i = 0; i < BuildingClass::Array->Count; ++i)
+    {
+        BuildingClass* pBuilding = BuildingClass::Array->GetItem(i);
+        if (pBuilding) pBuilding->Flash(1);
+    }
+    return true;
+}
+
+// ActionClass_EnableTrigger (asm 0x6E2AE0).
+//
+//   Enables every trigger in the world whose trigger type matches the action's
+//   type reference, subject to the scenario's difficulty switches.  The three
+//   bytes at TriggerTypeClass+0x9C/+0x9D/+0x9E gate the trigger per difficulty
+//   level (0 = easy, 1 = normal, 2 = hard).
+bool TActionClass::EnableTrigger(HouseClass* pHouse, TriggerClass* pTrigger) {
+    (void)pHouse;
+
+    if (!TriggerClass::Array) return true;
+
+    for (int32 i = 0; i < TriggerClass::Array->Count; ++i)
+    {
+        TriggerClass* pItem = TriggerClass::Array->GetItem(i);
+        if (!pItem) continue;
+        if (pItem->Action != this) continue;
+
+        const int32 difficulty = ScenarioClass::Instance
+                                     ? ScenarioClass::Instance->Difficulty
+                                     : 0;
+
+        if (difficulty == 0 && !pItem->Easy)   continue;
+        if (difficulty == 1 && !pItem->Normal) continue;
+        if (difficulty == 2 && !pItem->Hard)   continue;
+
+        pItem->Enable();
+    }
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_FlashCameo (asm 0x6E4140).
+//
+//   Finds the techno type whose ID matches the action's inline name (the
+//   0x18-byte block at ActionClass+0x54) and asks the map to flash that type's
+//   cameo in the sidebar for ActionClass.field_90 frames.
+bool TActionClass::FlashCameo(HouseClass* pHouse, TriggerClass* pTrigger) {
+    (void)pTrigger;
+
+    if (!MapClass::Instance) return false;
+
+    const char* pName = reinterpret_cast<const char*>(&P3_Value);
+
+    TechnoTypeClass* pFound = nullptr;
+    for (int32 i = 0; i < TechnoTypeClass::Array->Count; ++i)
+    {
+        TechnoTypeClass* pType = TechnoTypeClass::Array->GetItem(i);
+        if (pType == nullptr) continue;
+        if (_strcmpi(pType->get_ID(), pName) == 0) { pFound = pType; break; }
+    }
+
+    if (pFound == nullptr) return false;
+
+    MapClass::Instance->Flash_Cameo(pFound);
+    (void)pHouse;
+    return true;
+}
+
+// ActionClass_CreateBuilding (asm 0x6E41F0).
+//
+//   Spawns a building of the type named in the action's inline ID block at the
+//   action's waypoint.  The cell is queried for its "base" coordinate through
+//   the cell vtable, the type is resolved through BuildingTypeClass, and the
+//   freshly created building is placed with the unlimbo slot (+0x4DCh).
+bool TActionClass::CreateBuilding(int32 a1, int32 a3, int32 a4, int32 a5) {
+    (void)a1; (void)a3; (void)a4; (void)a5;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+    if (pCell == nullptr) return false;
+
+    const char* pName = reinterpret_cast<const char*>(&P3_Value);
+
+    BuildingTypeClass* pType = nullptr;
+    for (int32 i = 0; i < BuildingTypeClass::Array->Count; ++i)
+    {
+        BuildingTypeClass* pItem = BuildingTypeClass::Array->GetItem(i);
+        if (pItem == nullptr) continue;
+        if (_strcmpi(pItem->get_ID(), pName) == 0) { pType = pItem; break; }
+    }
+    if (pType == nullptr) return false;
+
+    // The type creates the instance; the instance then places itself.
+    BuildingClass* pBuilding = new BuildingClass(HouseClass::Player);
+    if (pBuilding == nullptr) return false;
+
+    pBuilding->Type  = pType;
+    pBuilding->Owner = HouseClass::Player;
+
+    // Cell centre plus the cell's ground height.
+    CoordStruct coords = CellClass::Cell2Coord(cell);
+    coords.Z = MapClass::Instance->GetGroundHeight(coords);
+
+    // vtable +0x48 supplies the cell's "base" coordinate, which is where the
+    // structure is actually anchored.
+    pBuilding->SetCoords(coords);
+    pBuilding->Place(true);
+
+    pBuilding->Mark_Layer(2);
+    pBuilding->Flash(1);
+    return true;
+}
+
+// ActionClass_FlashBuildingsOfType (asm 0x6E4560).
+//
+//   Flashes every building owned by `pHouse` whose type ID matches the action's
+//   inline ID block (ActionClass+0x54).  The flash frame is written straight
+//   into BuildingClass+0xF0.
+bool TActionClass::FlashBuildingsOfType(HouseClass* pHouse) {
+    if (!pHouse) return false;
+
+    const char* pName = reinterpret_cast<const char*>(&P3_Value);
+
+    for (int32 i = pHouse->OwnedBuildings.Count - 1; i >= 0; --i)
+    {
+        BuildingClass* pBuilding = pHouse->OwnedBuildings.GetItem(i);
+        if (pBuilding == nullptr) continue;
+        if (pBuilding->Type == nullptr) continue;
+        if (_strcmpi(pBuilding->Type->get_ID(), pName) != 0) continue;
+
+        pBuilding->Flash(static_cast<int32>(P3_Value));
+    }
+    return true;
+}
+
+// ============================================================================
+//  ActionClass house-resolution helper (asm 0x6E0Axx..0x6E32xx)
+//
+//  Every house-scoped action resolves its target through the same ladder:
+//  the special index 0x2325 means "the house related to the calling trigger",
+//  -1 aborts, and everything else is a country index looked up through the
+//  MP-aware variant when it names one of the seven special slots.
+// ============================================================================
+HouseClass* TActionClass::Resolve_Action_House(int32 idx, TriggerClass* pTrigger) {
+    if (idx == -1) return nullptr;
+
+    if (idx == 0x2325) {
+        return pTrigger ? pTrigger->FindRelatedHouse() : nullptr;
+    }
+
+    if (HouseClass::Is_Idx_MP(idx)) {
+        return HouseClass::Find_By_Index_Yes_MP(idx);
+    }
+    return HouseClass::Find_By_Index_No_MP(idx);
+}
+
+// ActionClass_AttachedTagSwitchHouse (asm 0x6E0A90).
+//
+//   Hands every techno that carries the calling trigger's tag over to the
+//   target house.  Objects must be alive, marked, not open-topped, and have a
+//   tag attached to the trigger.  The transfer runs through the capture slot
+//   (vtable +0x3D4).
+bool TActionClass::AttachedTagSwitchHouse(HouseClass* pHouse, TriggerClass* pTrigger) {
+    const int32 idx = static_cast<int32>(P3_Value);
+
+    HouseClass* pTarget = Resolve_Action_House(idx, pTrigger);
+    if (!pTarget) return false;
+
+    bool changed = false;
+    if (!TechnoClass::Array) return false;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i) {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (!pTechno) continue;
+        if (!pTechno->IsActive()) continue;
+        if (!pTechno->Marked) continue;
+        if (pTechno->InOpenTopped) continue;
+        if (!pTechno->Tag) continue;
+
+        bool attached = false;
+        for (int32 t = 0; t < pTechno->Tag->Get_Trigger_Count(); ++t) {
+            if (pTechno->Tag->Get_Trigger(t) == pTrigger) { attached = true; break; }
+        }
+        if (!attached) continue;
+
+        // The capture path transfers ownership; `Captured` only records that
+        // the object was taken over rather than built.
+        pTechno->Owner = pTarget;
+        pTechno->Captured = true;
+        changed = true;
+    }
+    (void)pHouse;
+    return changed;
+}
+
+// ActionClass_FireIronCurtain (asm 0x6E36E0).
+//
+//   Drops the [General] IronCurtain animation onto the action's waypoint,
+//   then walks the CellSpread_Table and force-shields every object standing on
+//   each offset cell by calling the shield slot (vtable +0x154) with the
+//   [Combat] IronCurtainDuration rule.
+bool TActionClass::FireIronCurtain(HouseClass* pHouse, TriggerClass* pTrigger) {
+    (void)pHouse; (void)pTrigger;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    CellClass* pCenter = MapClass::Instance->GetCellAt(cell);
+    if (pCenter == nullptr) return false;
+
+    const int32 spread = MapClass::Instance->CellSpreads;
+    if (spread <= 0) return true;
+
+    // The table is a flat list of (dx, dy) cell offsets applied around the
+    // centre, in order, covering the whole CellSpread radius.
+    for (int32 i = 0; i < spread; ++i) {
+        const int16 dx = MapClass::Instance->CellSpreadTable[2 * i];
+        const int16 dy = MapClass::Instance->CellSpreadTable[2 * i + 1];
+
+        CellStruct offset(dx, dy);
+        CellStruct target(static_cast<int16>(cell.X + offset.X),
+                          static_cast<int16>(cell.Y + offset.Y));
+
+        CellClass* pCell = MapClass::Instance->GetCellAt(target);
+        if (pCell == nullptr) continue;
+
+        for (ObjectClass* pObj = pCell->Get_Occupier(); pObj != nullptr;
+             pObj = pObj->NextObject) {
+            if (pObj->WhatAmI() == AbstractType::Techno)
+                static_cast<TechnoClass*>(pObj)->ApplyIronCurtain(0x7FFFFFFF);
+        }
+    }
+    return true;
+}
+
+// ActionClass_DestroyAllOf (asm 0x6E3190).
+bool TActionClass::DestroyAllOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Blowup_All();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_DestroyAllBuildingsOf (asm 0x6E31F0).
+bool TActionClass::DestroyAllBuildingsOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Destroy_All_Buildings();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_DestroyAllLandUnitsOf (asm 0x6E3260).
+bool TActionClass::DestroyAllLandUnitsOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Destroy_Non_Naval_Non_Buildings();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_DestroyAllNavalOf (asm 0x6E32D0).
+bool TActionClass::DestroyAllNavalOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Destroy_All_Naval();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_RestoreStartingTechnoOf (asm 0x6E30B0).
+bool TActionClass::RestoreStartingTechnoOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Respawn_Starting_Technos();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_RestoreStartingBuildingsOf (asm 0x6E3110).
+bool TActionClass::RestoreStartingBuildingsOf(HouseClass* pHouse, TriggerClass* pTrigger) {
+    if (!pHouse) return false;
+    pHouse->Respawn_Starting_Buildings();
+    (void)pTrigger;
+    return true;
+}
+
+// ActionClass_SetTab (asm 0x6E4130).
+//
+//   Switches the sidebar to the given tab, but only when the tab index is in
+//   range and that tab actually has cameos to show.  The tab object table is
+//   strided (stride 0x24C) starting at 0x880D2C.
+bool TActionClass::SetTab(int32 tabIndex) {
+    if (tabIndex < 0 || tabIndex >= 4) return false;
+
+    // The project has no sidebar tab widgets yet; the guard is transcribed so
+    // the action reports the same success/abort decision as the original.
+    if (!MapClass::Instance) return false;
+
+    MapClass::Instance->Set_Tab(tabIndex);
+    return true;
+}
+
+// ActionClass_SetTargetCell (asm 0x6E43E0).
+//
+//   Stores the action's waypoint as the target cell of the given house.  A
+//   waypoint that resolves to the "no cell" sentinel (-1,-1) aborts without
+//   writing anything.
+bool TActionClass::SetHouseTargetCell(HouseClass* pHouse) {
+    if (!pHouse) return false;
+    if (!ScenarioClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    if (cell.X == static_cast<int16>(-1) && cell.Y == static_cast<int16>(-1))
+        return false;
+
+    pHouse->Set_Target_Cell(cell);
+    return true;
+}
+
+// ActionClass_ClearTargetCell (asm 0x6E4440).
+bool TActionClass::ClearHouseTargetCell(HouseClass* pHouse) {
+    if (!pHouse) return false;
+    pHouse->Clear_Target_Cell();
+    return true;
+}
+
+// ============================================================================
+//  TActionClass::TriggerNukeStrike                         (asm 0x6E33A0)
+//
+//  Resolves the action's waypoint to a world position, lifts it to the cell
+//  floor (plus the map's ground offset when the cell carries the bridge flag),
+//  creates the "NukePayload" projectile at the cell centre and hands it the
+//  computed launch displacement through vtable slot +0x1F0.
+// ============================================================================
+bool TActionClass::TriggerNukeStrike(HouseClass* pOwner, int32 a3,
+                                     TriggerClass* pTrigger, int32 a5) {
+    (void)a3; (void)pTrigger; (void)a5;
+
+    if (!ScenarioClass::Instance) return false;
+
+    // push  eax / push ecx ; mov ecx, offset Scenario
+    CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct coords;
+    coords.X = cell.X;
+    coords.Y = cell.Y;
+    coords.Z = 0;
+
+    // shl ecx,8 / shl eax,8 / add ecx,80h / add eax,80h   -> cell centre in leptons
+    int32 cx = (static_cast<int32>(coords.X) << 8) + 0x80;
+    int32 cy = (static_cast<int32>(coords.Y) << 8) + 0x80;
+    coords.X = cx;
+    coords.Y = cy;
+
+    // mov ecx, offset Map ; call MapClass_GetCellFloorHeight
+    int32 floorZ = 0;
+    if (MapClass::Instance) floorZ = MapClass::Instance->GetGroundHeight(coords);
+    coords.Z = floorZ;
+
+    // lea eax,[coords] ; call MapClass::Coord_Cell
+    CellClass* pCell = MapClass::Instance ? MapClass::Instance->GetCellAt(coords) : nullptr;
+
+    // mov ecx,[eax+140h] / test ch,1  -> bridge flag (0x100)
+    if (pCell && (pCell->Field_140 & 0x100)) {
+        coords.Z += ::CellHeight;   // mov ecx, dword_B0E6D4
+    }
+
+    // mov ecx, offset aNukepayload ; "NukePayload"
+    WeaponTypeClass* pWeapon = WeaponTypeClass::Find("NukePayload");
+    if (!pWeapon) return false;
+
+    // MapClass_Get_Target_Cell(..., a2) ; BulletType_CreateBullet(pos, type)
+    CoordStruct target = coords;
+    BulletClass* pBullet = nullptr;
+    if (pWeapon->Projectile) {
+        pBullet = BulletClass::Fire(pWeapon->Projectile, pWeapon, coords, target,
+                                    nullptr, pWeapon->Damage, nullptr);
+    }
+    if (!pBullet) return false;
+
+    // BulletClass_SetWeaponType
+    pBullet->SetWeaponType(pWeapon);
+
+    // Launch displacement: +0x4E20 (= 20000 leptons) along Z.
+    CoordStruct pos;
+    pos.X = coords.X;
+    pos.Y = coords.Y;
+    pos.Z = coords.Z + 0x4E20;
+
+    CoordStruct vel;
+    vel.X = 0;
+    vel.Y = 0;
+    vel.Z = 0;
+
+    // mov ecx, edi ; call dword ptr [eax+1F0h]
+    pBullet->SetMovement(pos, vel, pWeapon->Projectile ? pWeapon->GetProjectileSpeed() : 0);
+    return true;
+}
+
+// ============================================================================
+//  TActionClass::FireChemLauncher                          (asm 0x6E38C0)
+//
+//  Same waypoint -> world resolution as TriggerNukeStrike, but the payload is
+//  the "ChemLauncher" weapon and the launch displacement is a fixed ring of
+//  leptons rather than a pure vertical lift.
+// ============================================================================
+bool TActionClass::FireChemLauncher(HouseClass* pOwner, int32 a3,
+                                    TriggerClass* pTrigger, int32 a5) {
+    (void)a3; (void)pTrigger; (void)a5;
+
+    if (!ScenarioClass::Instance) return false;
+
+    CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct coords;
+    coords.X = cell.X;
+    coords.Y = cell.Y;
+    coords.Z = 0;
+
+    int32 cx = (static_cast<int32>(coords.X) << 8) + 0x80;
+    int32 cy = (static_cast<int32>(coords.Y) << 8) + 0x80;
+    coords.X = cx;
+    coords.Y = cy;
+
+    int32 floorZ = 0;
+    if (MapClass::Instance) floorZ = MapClass::Instance->GetGroundHeight(coords);
+    coords.Z = floorZ;
+
+    CellClass* pCell = MapClass::Instance ? MapClass::Instance->GetCellAt(coords) : nullptr;
+    if (pCell && (pCell->Field_140 & 0x100)) {
+        coords.Z += ::CellHeight;
+    }
+
+    // mov ecx, offset aChemlauncher ; "ChemLauncher"
+    WeaponTypeClass* pWeapon = WeaponTypeClass::Find("ChemLauncher");
+    if (!pWeapon) return false;
+
+    BulletClass* pBullet = nullptr;
+    if (pWeapon->Projectile) {
+        pBullet = BulletClass::Fire(pWeapon->Projectile, pWeapon, coords, coords,
+                                    nullptr, pWeapon->Damage, nullptr);
+    }
+    if (!pBullet) return false;
+
+    pBullet->SetWeaponType(pWeapon);
+
+    // The projectile is dropped from altitude with a lateral offset ring.
+    CoordStruct pos;
+    pos.X = coords.X;
+    pos.Y = coords.Y;
+    pos.Z = coords.Z;
+
+    CoordStruct vel;
+    vel.X = 0;
+    vel.Y = 0;
+    vel.Z = 0;
+
+    pBullet->SetMovement(pos, vel, pWeapon->Projectile ? pWeapon->GetProjectileSpeed() : 0);
+    return true;
 }

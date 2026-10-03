@@ -108,6 +108,38 @@ public:
     static RulesClass* Instance;
 
     // ========================================================================
+    // LandTypeCharacteristics - one row of the [LandCharacteristics] table
+    //
+    //   The binary keeps twelve of these (one per LandType, stride 0x24) in a
+    //   single contiguous block, reading each row from the identically named
+    //   INI section.  The seven floats are movement multipliers and the flag
+    //   says whether the terrain may carry a structure.
+    // ========================================================================
+    struct LandTypeCharacteristics {
+        float Hover;        // +0x00
+        float Foot;         // +0x04
+        float Track;        // +0x08
+        float Wheel;        // +0x0C
+        float Float;        // +0x10
+        float Amphibious;   // +0x14
+        float FloatBeach;   // +0x18
+        bool  Buildable;    // +0x1C
+        uint8 _pad[3];
+    };
+    static_assert(sizeof(LandTypeCharacteristics) == 0x20,
+                  "LandTypeCharacteristics must match the binary's 0x20 stride");
+
+    // Number of rows, one per LandType.
+    static constexpr int32 LAND_TYPE_COUNT = 12;
+
+    // The whole [LandCharacteristics] table, indexed by LandType.
+    LandTypeCharacteristics LandCharacteristics[LAND_TYPE_COUNT];
+
+    // Movement multiplier for a cell, selected by land type and speed class.
+    // Returns 0.0 when either index is out of range.
+    double Get_Movement_Multiplier(int32 landType, int32 speedType) const;
+
+    // ========================================================================
     // Constructor / Destructor
     // ========================================================================
     RulesClass();
@@ -163,6 +195,55 @@ public:
     void Read_Difficulties(CCINIClass* pINI);
 
     void PointerGotInvalid(AbstractClass* pInvalid, bool removed);
+
+    // ========================================================================
+    // RulesClass_Addition_* - the original binary's rules-loading entry points
+    //
+    //  The engine assembles the whole RulesClass by invoking one Addition_*
+    //  routine per INI section, in a fixed order, from RulesClass::Addition.
+    //  The reconstruction's earlier Read_* helpers implement the same work;
+    //  these members carry the original names so the dispatch table and the
+    //  call order match the binary exactly, and Read_* forwards to them.
+    // ========================================================================
+    void Addition(CCINIClass* pINI);
+    void CreateVectors();
+
+    void Addition_SpecialWeapons(CCINIClass* pINI);
+    void Addition_AudioVisual(CCINIClass* pINI);
+    void Addition_CrateRules(CCINIClass* pINI);
+    void Addition_CombatDamage(CCINIClass* pINI);
+    void Addition_Radiation(CCINIClass* pINI);
+    void Addition_ElevationModel(CCINIClass* pINI);
+    void Addition_WallModel(CCINIClass* pINI);
+    void Addition_Difficulty(CCINIClass* pINI);
+    void Addition_Colors(CCINIClass* pINI);
+    void Addition_ColorAdd(CCINIClass* pINI);
+    void Addition_General(CCINIClass* pINI);
+    void Addition_MultiplayerDialogSettings(CCINIClass* pINI);
+    void Addition_Maximums(CCINIClass* pINI);
+    void Addition_InfantryTypes(CCINIClass* pINI);
+    void Addition_Countries(CCINIClass* pINI);
+    void Addition_VehicleTypes(CCINIClass* pINI);
+    void Addition_AircraftTypes(CCINIClass* pINI);
+    void Addition_Sides(CCINIClass* pINI);
+    void Addition_SuperWeaponTypes(CCINIClass* pINI);
+    void Addition_BuildingTypes(CCINIClass* pINI);
+    void Addition_TerrainTypes(CCINIClass* pINI);
+    void Addition_Teams_obsolete(CCINIClass* pINI);
+    void Addition_SmudgeTypes(CCINIClass* pINI);
+    void Addition_OverlayTypes_obsolete(CCINIClass* pINI);
+    void Addition_Animations(CCINIClass* pINI);
+    void Addition_VoxelAnims(CCINIClass* pINI);
+    void Addition_Warheads(CCINIClass* pINI);
+    void Addition_Particles(CCINIClass* pINI);
+    void Addition_ParticleSystems(CCINIClass* pINI);
+    void Addition_AI(CCINIClass* pINI);
+    void Addition_Powerups(CCINIClass* pINI);
+    void Addition_LandCharacteristics(CCINIClass* pINI);
+    void Addition_IQ(CCINIClass* pINI);
+    void Addition_Movies(CCINIClass* pINI);
+    void Addition_AdvancedCommandBar(CCINIClass* pINI);
+    void LoadDifficulties_unused(CCINIClass* pINI);
 
     // ========================================================================
     // Helper: get difficulty struct for current difficulty
@@ -696,6 +777,25 @@ public:
     DynamicVectorClass<int32> AISuperDefenseProbability;
     int32       AISuperDefenseFrames;
     float       AISuperDefenseDistance;
+
+    // ── AI offensive-superweapon target weights ───────────────────────────
+    // Per-difficulty priority tables consulted by
+    // HouseClass_PickOffensiveSWTarget (asm 0x50B0A0) when deciding which
+    // enemy object to aim an offensive superweapon at.  Each entry is indexed
+    // by the attacker's AIDifficulty.  The offsets are the binary's own.
+    DynamicVectorClass<int32> AITargetWeightConYard;        // +0x1198
+    DynamicVectorClass<int32> AITargetWeightWarFactory;     // +0x11B4
+    DynamicVectorClass<int32> AITargetWeightPower;          // +0x11D0
+    DynamicVectorClass<int32> AITargetWeightBaseDefense;    // +0x1294
+    DynamicVectorClass<int32> AITargetWeightPlug;           // +0x12B0
+    DynamicVectorClass<int32> AITargetWeightTemple;         // +0x12E8
+    DynamicVectorClass<int32> AITargetWeightHoverPad;       // +0x12CC
+    DynamicVectorClass<int32> AITargetWeightBuildingOther;  // +0x11EC
+    DynamicVectorClass<int32> AITargetWeightEngineer;       // +0x1208
+    DynamicVectorClass<int32> AITargetWeightThief;          // +0x1224
+    DynamicVectorClass<int32> AITargetWeightHarvester;      // +0x1240
+    DynamicVectorClass<int32> AITargetWeightTransport;      // +0x125C
+    DynamicVectorClass<int32> AITargetWeightUnitOther;      // +0x1278
     DynamicVectorClass<int32> OverloadCount;
     DynamicVectorClass<int32> OverloadDamage;
     DynamicVectorClass<int32> OverloadFrames;
@@ -1187,14 +1287,7 @@ public:
     ColorStruct              NoneValue;
 
     // --- Read_LandCharacteristics ---
-    double                   Hover;
-    double                   Foot;
-    double                   Track;
-    double                   Wheel;
-    double                   Float;
-    double                   Amphibious;
-    double                   FloatBeach;
-    bool                     Buildable;
+    // (the table itself is declared at the top of the class)
 
     // --- Read_AdvancedCommandBar ---
     char                     NoneValue2[0x20];

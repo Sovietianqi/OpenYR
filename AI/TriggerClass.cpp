@@ -89,7 +89,7 @@ namespace {
 // =============================================================================
 TriggerClass::TriggerClass(const char* pID) noexcept
     : ID(nullptr), IsEnabled(true), TriggerAction(nullptr), Event(nullptr),
-      CurrentAction(nullptr), House(nullptr), Name(nullptr),
+      CurrentAction(nullptr), House(nullptr), RelatedHouse(nullptr), Name(nullptr),
       Data(-1), HasBeenFired(false), JustFired(false),
       IsDisabled(false), IsBeingFired(false), IsLinked(false),
       Repeatable(false), Easy(false), Normal(false), Medium(false),
@@ -593,4 +593,17 @@ void TriggerClass::FireAllTriggersForEvent(TriggerEventType eventType,
         TriggerClass* trigger = Array->GetItem(i);
         if (trigger) trigger->Spring(eventType, pObject, cell);
     }
+}
+
+// ============================================================================
+// TriggerClass - related-house accessors (asm 0x726910 / 0x726920)
+// ============================================================================
+HouseClass* TriggerClass::FindRelatedHouse() const
+{
+    return RelatedHouse;
+}
+
+void TriggerClass::SetRelatedHouse(HouseClass* pHouse)
+{
+    RelatedHouse = pHouse;
 }

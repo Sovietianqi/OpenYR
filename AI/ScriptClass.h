@@ -26,6 +26,10 @@ public:
     int32 GetAction() const;
     int32 GetLine() const;
 
+    // AIScriptClass::SetCurrentLine (asm 0x754E5D): stores idx into the
+    // current-line slot (+0x2C) and always reports success.
+    bool SetCurrentLine(int32 idx);
+
 private:
     void DispatchAction(int32 action, int32 argument);
     void AdvanceLine();

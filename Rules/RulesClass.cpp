@@ -349,6 +349,21 @@ RulesClass::RulesClass()
     , LaserTargetColor(0), IronCurtainColor(0), BerserkColor(0), ForceShieldColor(0)
     , DirectRockingCoefficient(0.0f), FallBackCoefficient(0.0f)
 {
+    // Initialize the [LandCharacteristics] table.  Every movement multiplier
+    // defaults to 1.0 (fully passable) and every terrain is buildable until a
+    // rules file says otherwise - that mirrors the binary, where a missing
+    // section leaves the previous value untouched.
+    for (int32 i = 0; i < LAND_TYPE_COUNT; ++i) {
+        LandCharacteristics[i].Hover      = 1.0f;
+        LandCharacteristics[i].Foot       = 1.0f;
+        LandCharacteristics[i].Track      = 1.0f;
+        LandCharacteristics[i].Wheel      = 1.0f;
+        LandCharacteristics[i].Float      = 1.0f;
+        LandCharacteristics[i].Amphibious = 1.0f;
+        LandCharacteristics[i].FloatBeach = 1.0f;
+        LandCharacteristics[i].Buildable  = true;
+    }
+
     // Initialize ColorAdd
     for (int32 i = 0; i < 0x10; ++i) {
         ColorAdd[i] = ColorStruct();
@@ -869,7 +884,7 @@ void RulesClass::Read_Tiberiums(CCINIClass* pINI)
 {
     if (!pINI) return;
 
-    TiberiumClass::LoadAllFromINI(pINI);
+    TiberiumClass::CreateFromINIList(pINI);
 }
 
 // ============================================================================
@@ -2102,26 +2117,59 @@ void RulesClass::Read_Powerups(CCINIClass* pINI)
 
 // ----------------------------------------------------------------------------
 // Read_LandCharacteristics - [LandCharacteristics] section
+//
+//   Twelve sections - Clear, Road, Water, Rock, Wall, Tiberium, Beach, Rough,
+//   Ice, Railroad, Tunnel, Weeds - are read in LandType order into a flat
+//   table.  Each section supplies seven movement multipliers and one build
+//   flag; every key falls back to its current value, so a partially specified
+//   rules file keeps the previous (or default) settings.
 // ----------------------------------------------------------------------------
+
+namespace {
+
+// The sections are read in this exact order; index N fills row N.
+const char* const LandCharacteristicsSections[RulesClass::LAND_TYPE_COUNT] = {
+    "Clear", "Road", "Water", "Rock", "Wall", "Tiberium",
+    "Beach", "Rough", "Ice", "Railroad", "Tunnel", "Weeds"
+};
+
+} // namespace
 
 void RulesClass::Read_LandCharacteristics(CCINIClass* pINI)
 {
-    const char* section = "LandCharacteristics";
     if (!pINI) return;
-    // [LandCharacteristics] section: per-LandType Speed, Buildable, Passable
-    // values.  Land movement characteristics are handled by the SpeedType /
-    // MovementZone systems in TechnoTypeClass and do not require RulesClass
-    // members.
 
-    // ---- rules keys ----
-    Hover                            = pINI->ReadDouble(section, "Hover", Hover);
-    Foot                             = pINI->ReadDouble(section, "Foot", Foot);
-    Track                            = pINI->ReadDouble(section, "Track", Track);
-    Wheel                            = pINI->ReadDouble(section, "Wheel", Wheel);
-    Float                            = pINI->ReadDouble(section, "Float", Float);
-    Amphibious                       = pINI->ReadDouble(section, "Amphibious", Amphibious);
-    FloatBeach                       = pINI->ReadDouble(section, "FloatBeach", FloatBeach);
-    Buildable                        = pINI->ReadBool(section, "Buildable", Buildable);
+    for (int32 i = 0; i < LAND_TYPE_COUNT; ++i) {
+        const char* section = LandCharacteristicsSections[i];
+        LandTypeCharacteristics& row = LandCharacteristics[i];
+
+        row.Hover       = static_cast<float>(pINI->ReadDouble(section, "Hover", row.Hover));
+        row.Foot        = static_cast<float>(pINI->ReadDouble(section, "Foot", row.Foot));
+        row.Track       = static_cast<float>(pINI->ReadDouble(section, "Track", row.Track));
+        row.Wheel       = static_cast<float>(pINI->ReadDouble(section, "Wheel", row.Wheel));
+        row.Float       = static_cast<float>(pINI->ReadDouble(section, "Float", row.Float));
+        row.Amphibious  = static_cast<float>(pINI->ReadDouble(section, "Amphibious", row.Amphibious));
+        row.FloatBeach  = static_cast<float>(pINI->ReadDouble(section, "FloatBeach", row.FloatBeach));
+        row.Buildable   = pINI->ReadBool(section, "Buildable", row.Buildable);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Get_Movement_Multiplier - movement cost table lookup
+//
+//   Mirrors the binary's `LandCharacteristics.Foot[land*9 + speed]` indexing:
+//   the speed classes are laid out in SpeedType order immediately after the
+//   seven named members, so the row is effectively a 9-entry array.
+// ----------------------------------------------------------------------------
+double RulesClass::Get_Movement_Multiplier(int32 landType, int32 speedType) const
+{
+    if (landType < 0 || landType >= LAND_TYPE_COUNT) return 0.0;
+    if (speedType < 0 || speedType >= 9) return 0.0;
+
+    const LandTypeCharacteristics& row = LandCharacteristics[landType];
+    const float* values = &row.Hover;   // Hover, Foot, Track, Wheel, Float,
+                                        // Amphibious, FloatBeach, then Buildable
+    return static_cast<double>(values[speedType]);
 }
 
 // ----------------------------------------------------------------------------
@@ -2317,3 +2365,110 @@ void RulesClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
         VeinholeTypeClass = nullptr;
 }
 
+
+// ============================================================================
+// RulesClass - Addition_* dispatch family
+//
+//  RulesClass_Addition (asm 0x6AF6B0) builds the entire rules set by invoking
+//  one Addition_* routine per INI section in a fixed order.  The routines
+//  themselves are the ones the reconstruction already provides under the
+//  Read_* names; the members below carry the original binary's names and the
+//  original invocation order so that the load sequence matches the assembly
+//  exactly, while Read_* keeps working as the implementation body.
+// ============================================================================
+
+// RulesClass_Addition (asm 0x6AF6B0).
+//
+//  The order below mirrors the sequence of `call RulesClass_Addition_*` sites
+//  in the original: the fundamental tables first, then the object type lists,
+//  then the tuning sections and finally the command-bar/UI data.
+void RulesClass::Addition(CCINIClass* pINI)
+{
+    if (pINI == nullptr)
+        return;
+
+    CreateVectors();
+
+    Addition_SpecialWeapons(pINI);
+    Addition_AudioVisual(pINI);
+    Addition_CrateRules(pINI);
+    Addition_CombatDamage(pINI);
+    Addition_Radiation(pINI);
+    Addition_ElevationModel(pINI);
+    Addition_WallModel(pINI);
+    Addition_Difficulty(pINI);
+    Addition_Colors(pINI);
+    Addition_ColorAdd(pINI);
+    Addition_General(pINI);
+    Addition_MultiplayerDialogSettings(pINI);
+    Addition_Maximums(pINI);
+    Addition_InfantryTypes(pINI);
+    Addition_Countries(pINI);
+    Addition_VehicleTypes(pINI);
+    Addition_AircraftTypes(pINI);
+    Addition_Sides(pINI);
+    Addition_SuperWeaponTypes(pINI);
+    Addition_BuildingTypes(pINI);
+    Addition_TerrainTypes(pINI);
+    Addition_Teams_obsolete(pINI);
+    Addition_SmudgeTypes(pINI);
+    Addition_OverlayTypes_obsolete(pINI);
+    Addition_Animations(pINI);
+    Addition_VoxelAnims(pINI);
+    Addition_Warheads(pINI);
+    Addition_Particles(pINI);
+    Addition_ParticleSystems(pINI);
+    Addition_AI(pINI);
+    Addition_Powerups(pINI);
+    Addition_LandCharacteristics(pINI);
+    Addition_IQ(pINI);
+    Addition_Movies(pINI);
+    Addition_AdvancedCommandBar(pINI);
+}
+
+// RulesClass_CreateVectors (asm 0x6B1BC0).
+//
+//  Allocates every per-object vector the rules own.  The reconstruction keeps
+//  its arrays as members that are constructed with the instance, so nothing
+//  needs allocating here; the entry point exists so the load sequence is
+//  identical.
+void RulesClass::CreateVectors()
+{
+}
+
+void RulesClass::Addition_InfantryTypes(CCINIClass* pINI)   { Read_InfantryTypes(pINI); }
+void RulesClass::Addition_Countries(CCINIClass* pINI)       { Read_Countries(pINI); }
+void RulesClass::Addition_VehicleTypes(CCINIClass* pINI)    { Read_VehicleTypes(pINI); }
+void RulesClass::Addition_AircraftTypes(CCINIClass* pINI)   { Read_AircraftTypes(pINI); }
+void RulesClass::Addition_Sides(CCINIClass* pINI)           { Read_Sides(pINI); }
+void RulesClass::Addition_SuperWeaponTypes(CCINIClass* pINI){ Read_SuperWeaponTypes(pINI); }
+void RulesClass::Addition_BuildingTypes(CCINIClass* pINI)   { Read_BuildingTypes(pINI); }
+void RulesClass::Addition_TerrainTypes(CCINIClass* pINI)    { Read_TerrainTypes(pINI); }
+void RulesClass::Addition_SmudgeTypes(CCINIClass* pINI)     { Read_SmudgeTypes(pINI); }
+void RulesClass::Addition_Animations(CCINIClass* pINI)      { Read_Animations(pINI); }
+void RulesClass::Addition_VoxelAnims(CCINIClass* pINI)      { Read_VoxelAnims(pINI); }
+void RulesClass::Addition_Warheads(CCINIClass* pINI)        { Read_Warheads(pINI); }
+void RulesClass::Addition_Particles(CCINIClass* pINI)       { Read_Particles(pINI); }
+void RulesClass::Addition_ParticleSystems(CCINIClass* pINI) { Read_ParticleSystems(pINI); }
+void RulesClass::Addition_AI(CCINIClass* pINI)              { Read_AI(pINI); }
+void RulesClass::Addition_Powerups(CCINIClass* pINI)        { Read_Powerups(pINI); }
+void RulesClass::Addition_LandCharacteristics(CCINIClass* pINI) { Read_LandCharacteristics(pINI); }
+void RulesClass::Addition_IQ(CCINIClass* pINI)              { Read_IQ(pINI); }
+void RulesClass::Addition_Movies(CCINIClass* pINI)          { Read_Movies(pINI); }
+void RulesClass::Addition_AdvancedCommandBar(CCINIClass* pINI) { Read_AdvancedCommandBar(pINI); }
+void RulesClass::Addition_General(CCINIClass* pINI)         { Read_General(pINI); }
+void RulesClass::Addition_CombatDamage(CCINIClass* pINI)    { Read_CombatDamage(pINI); }
+void RulesClass::Addition_Radiation(CCINIClass* pINI)       { Read_Radiation(pINI); }
+void RulesClass::Addition_ElevationModel(CCINIClass* pINI)  { Read_ElevationModel(pINI); }
+void RulesClass::Addition_WallModel(CCINIClass* pINI)       { Read_WallModel(pINI); }
+void RulesClass::Addition_Colors(CCINIClass* pINI)          { Read_Colors(pINI); }
+void RulesClass::Addition_ColorAdd(CCINIClass* pINI)        { Read_ColorAdd(pINI); }
+void RulesClass::Addition_Difficulty(CCINIClass* pINI)      { Read_Difficulties(pINI); }
+void RulesClass::Addition_MultiplayerDialogSettings(CCINIClass* pINI) { Read_MultiplayerDialogSettings(pINI); }
+void RulesClass::Addition_Maximums(CCINIClass* pINI)        { Read_Maximums(pINI); }
+void RulesClass::Addition_SpecialWeapons(CCINIClass* pINI)  { Read_SuperWeaponTypes(pINI); }
+void RulesClass::Addition_CrateRules(CCINIClass* pINI)      { Read_CrateRules(pINI); }
+void RulesClass::Addition_AudioVisual(CCINIClass* pINI)     { Read_AudioVisual(pINI); }
+void RulesClass::Addition_Teams_obsolete(CCINIClass* pINI)  { (void)pINI; }
+void RulesClass::Addition_OverlayTypes_obsolete(CCINIClass* pINI) { Read_OverlayTypes(pINI); }
+void RulesClass::LoadDifficulties_unused(CCINIClass* pINI)  { Read_Difficulties(pINI); }

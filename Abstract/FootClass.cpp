@@ -1299,3 +1299,59 @@ void FootClass::Scatter(const CoordStruct& from, bool ignoreMission)
         Set_Destination(dest);
     }
 }
+
+// ============================================================================
+// FootClass - mission-controller neutral overrides
+//
+//  These slots exist so that a derived type which does not implement the
+//  behaviour still occupies the correct vtable entry.  The bodies are literal
+//  transcriptions of the assembly stubs (bare `retn` and `retn 4` / `retn 8`).
+// ============================================================================
+
+void FootClass::Panic()
+{
+}
+
+void FootClass::Unpanic()
+{
+}
+
+void FootClass::PlayIdleAnim(int32 a2)
+{
+    (void)a2;
+}
+
+void FootClass::Draw(int32 a2, int32 a3, int32 a4)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+}
+
+// ============================================================================
+// FootClass - team / layer probes
+// ============================================================================
+
+// FootClass_PartOfTeam (asm 0x4D4A30).
+//
+//  True when the unit is currently attached to a team (the +0x5D0 team
+//  pointer is non-null).
+bool FootClass::PartOfTeam() const
+{
+    return Team != nullptr;
+}
+
+// FootClass_InAir (asm 0x4D4A40): thunk to the TechnoClass air-layer test.
+bool FootClass::InAirLayer() const
+{
+    return IsInAir();
+}
+
+// FootClass_CanAttack (asm 0x4D4A48).
+//
+//  Thunk through TechnoClass_4C0 into the type's CanMobileAttack slot: a foot
+//  class may only attack on the move when its type permits it.
+bool FootClass::CanAttack() const
+{
+    return (TechnoType != nullptr) && TechnoType->CanMobileAttack();
+}

@@ -90,6 +90,25 @@ public:
     void SuspendMission(Mission mission);
 
     // ========================================================================
+    // Mission-layer queries (asm: all read the fields below)
+    // ========================================================================
+    // MissionClass_FindNameByIdx (asm 0x5B3730): the INI section name of the
+    //   *current* mission, or "<none>" when none is set (-1).
+    const char* FindNameByIdx() const;
+    // MissionClass_IsRecruitable (asm 0x5B36D0): whether the current mission
+    //   lets the owner recruit this object into an AI team.  An unset mission
+    //   (-1) is recruitable by default; otherwise the MissionControlClass
+    //   table supplies the answer.
+    bool IsRecruitable() const;
+    // MissionClass_ResetMission (asm 0x5B36C0): promotes a queued mission into
+    //   the current slot, clearing the queue and the step counter.  Returns
+    //   false when nothing was queued.
+    bool ResetMission();
+    // MissionClass_LoadMissionControlFromINI (asm 0x5B3760): loads the whole
+    //   MissionControlClass table out of the [MissionControl] sections.
+    static void LoadMissionControlFromINI(CCINIClass* pINI);
+
+    // ========================================================================
     // Constructor
     // ========================================================================
     MissionClass() noexcept;
@@ -98,15 +117,37 @@ protected:
     explicit __forceinline MissionClass(noinit_t) noexcept : ObjectClass(noinit) {}
 
     // ========================================================================
-    // Properties (offset 0xB8 from MissionClass start)
+    // Properties
+    //
+    //  MissionClass struc (asm sizeof = 0xD0, ObjectClass = 0xA4):
+    //      +0xA4 LineTrailer
+    //      +0xA8 currentMission        (enum eMission)
+    //      +0xAC what                  (pending mission promoted by ResetMission)
+    //      +0xB0 QueuedMission         (enum eMission)
+    //      +0xB4 field_B4              (byte)
+    //      +0xB8 MissionStatus         (int32)
+    //      +0xBC CurrentMissionStartTime
+    //      +0xC0 field_C0
+    //      +0xC4 MissionTimer          (TimerStruct)
     // ========================================================================
 public:
+    // LineTrailer (+0xA4): scratch pointer the mission line parser uses while
+    // stepping through a mission script; null between scripts.
+    void*         LineTrailer;
+    // currentMission (+0xA8): the mission being executed right now.
     Mission       CurrentMission;
-    Mission       SuspendedMission;
+    // what (+0xAC): the mission promoted from the queue by ResetMission.
+    Mission       PendingMission;
+    // QueuedMission (+0xB0): the mission QueueMission stored, awaiting
+    // promotion by ResetMission.
     Mission       QueuedMission;
-    bool          unknown_bool_B8;
+    // SuspendedMission: the mission saved by Mission_Revert / Override_Mission
+    // so it can be restored later (reconstruction-only; the original keeps the
+    // previous mission in the object's own mission field).
+    Mission       SuspendedMission;
+    bool          unknown_bool_B4;
     int32         MissionStatus;
     int32         CurrentMissionStartTime;
-    DWORD         unknown_C4;
+    DWORD         unknown_C0;
     CDTimerClass  UpdateTimer;
 };

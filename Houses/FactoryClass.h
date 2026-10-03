@@ -49,6 +49,19 @@ public:
     HouseClass*      GetOwner() const { return Owner; }
     TechnoTypeClass* GetCurrentOrder() const { return CurrentType; }
 
+    // FactoryClass_IsOnHold (asm 0x4C9xxx): `mov al, [ecx+OnHold]`.
+    //   True while the factory's owner has put the queue on hold.
+    bool IsOnHold() const { return OnHold; }
+    // FactoryClass::Has_Changed (asm 0x4C9xxx).
+    //   Reads the "the queue changed since the sidebar last looked" byte and
+    //   clears it, so the caller learns about an update exactly once.
+    bool Has_Changed() { const bool c = IsDifferent; IsDifferent = false; return c; }
+    // FactoryClass::Get_Product (asm 0x4C9xxx): the type currently on the line.
+    TechnoTypeClass* Get_Product() const { return CurrentProduction; }
+    // FactoryClass_GetSpecialItem (asm 0x4C9xxx): the side-specific "special"
+    //   item (a free bonus unit the house can build), cached at +0x68.
+    TechnoTypeClass* GetSpecialItem() const { return SpecialItem; }
+
     // Serialization / CRC
     bool Save(IStream* pStm) const;
     bool Load(IStream* pStm);
@@ -70,4 +83,10 @@ private:
     int32            ProductionType;    // 0 = unit, 1 = building (ABuildingType)
     bool             Suspended;
     bool             HasCompleted;
+
+    // ── Fields the vtable probes read directly ──────────────────────────
+    bool             OnHold;             // factory queue suspended by the owner
+    bool             IsDifferent;        // "queue changed" flag, cleared on read
+    TechnoTypeClass* CurrentProduction;  // the type on the line right now
+    TechnoTypeClass* SpecialItem;        // side-specific bonus buildable
 };

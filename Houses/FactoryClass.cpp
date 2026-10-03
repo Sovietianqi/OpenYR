@@ -56,6 +56,10 @@ FactoryClass::FactoryClass(BuildingClass* pFactory, HouseClass* pOwner)
     , ProductionType(0)
     , Suspended(false)
     , HasCompleted(false)
+    , OnHold(false)
+    , IsDifferent(false)
+    , CurrentProduction(nullptr)
+    , SpecialItem(nullptr)
 {
     if (Array == nullptr)
         Init_Array();

@@ -569,6 +569,11 @@ int32 ScriptClass::GetLine() const {
     return CurrentLine;
 }
 
+bool ScriptClass::SetCurrentLine(int32 idx) {
+    CurrentLine = idx;
+    return true;
+}
+
 bool ScriptClass::IsActive() const {
     return IsScriptActive;
 }

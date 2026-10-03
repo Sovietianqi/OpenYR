@@ -50,6 +50,9 @@ public:
     virtual bool HasDeployer() const;
     virtual bool HasUndeployer() const;
     virtual bool HasFirewall() const;
+    // TechnoTypeClass vtable slot "CanMobileAttack": whether the type is
+    // allowed to fire while on the move.  FootClass::CanAttack forwards here.
+    virtual bool CanMobileAttack() const;
     virtual int32 GetWeaponCount() const;
     virtual WeaponStruct* GetWeapon(int32 index) const;
 

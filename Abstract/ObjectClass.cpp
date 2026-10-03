@@ -1,8 +1,12 @@
 #include <Abstract/ObjectClass.h>
 
+#include <Abstract/BuildingClass.h>
+#include <Abstract/BuildingTypeClass.h>
 #include <Houses/HouseClass.h>
 #include <Core/Memory.h>
 #include <Core/Macros.h>
+
+#include <cmath>
 
 // ============================================================================
 // ObjectClass.cpp
@@ -15,6 +19,28 @@
 //  plumbing and the limbo / unlimbo / select / deselect helpers that the
 //  original binary provides at this layer.
 // ============================================================================
+
+// ============================================================================
+// File-local helpers
+// ============================================================================
+
+namespace
+{
+    // Floor of an integer square root - used by the distance helpers so that
+    // they agree with the original's float_sqrt / Float_To_Int_Floor pair
+    // (asm 0x5F6452 and 0x5F62FB).
+    int32 FloorSqrt(int32 value) noexcept
+    {
+        if (value <= 0)
+            return 0;
+        int32 r = static_cast<int32>(std::sqrt(static_cast<double>(value)));
+        while (r > 0 && r * r > value)
+            --r;
+        while ((r + 1) * (r + 1) <= value)
+            ++r;
+        return r;
+    }
+}
 
 // ============================================================================
 // Static member definitions
@@ -334,6 +360,156 @@ void ObjectClass::ComputeCRC(CRCEngine& crc) const
     // Owner is a pointer; hash the raw bits so save/multiplayer checksums
     // still catch the "same object, different owner" case.
     crc.AddData(&Owner, sizeof(Owner));
+}
+
+// ============================================================================
+// SetZ
+//
+//  asm 0x5F5F4F
+//
+//  Writes the new height into Location.Z.  The original brackets the store
+//  with a RemoveFromLayer(0) / AddToLayer(1) pair when the "on map" byte at
+//  +0x74 is set, which forces the isometric render order to be rebuilt with
+//  the new Z.  That layer plumbing has no counterpart in the reconstruction
+//  yet, so the height is written directly; callers that must re-sort should
+//  rebuild the layer through MapClass.
+// ============================================================================
+void ObjectClass::SetZ(int32 z)
+{
+    Location.Z = z;
+}
+
+// ============================================================================
+// RealYSort
+//
+//  asm 0x5F6AC8
+//
+//  The default sort key is Y + Z.  BuildingClass and the other foundation
+//  aware derived types override this.
+// ============================================================================
+int32 ObjectClass::RealYSort() const
+{
+    return Location.Y + Location.Z;
+}
+
+// ============================================================================
+// CompareYSort
+//
+//  asm 0x5F6A39
+//
+//  `setnle` on (this->RealYSort() - other->RealYSort()) means the predicate
+//  is "greater than", computed as signed 32-bit and evaluated as
+//  !(this <= other), i.e. true exactly when this is strictly greater.
+// ============================================================================
+bool ObjectClass::CompareYSort(ObjectClass* pOther) const
+{
+    if (pOther == nullptr)
+        return true;
+
+    return RealYSort() > pOther->RealYSort();
+}
+
+// ============================================================================
+// DistanceFrom
+//
+//  asm 0x5F6452
+//
+//  Reads both coordinate blocks through the virtual GetCoords slot, forms the
+//  integer deltas in X and Y, sums the squares in double precision, takes the
+//  floored square root, and then - when the target is a building - adds the
+//  target's foundation width and height (each scaled by 0x40, i.e. one cell)
+//  to account for the fact that a building's origin is only one corner of its
+//  footprint.  A negative result from that adjustment is clamped to zero.
+// ============================================================================
+int32 ObjectClass::DistanceFrom(ObjectClass* pTarget) const
+{
+    if (pTarget == nullptr)
+        return 0;
+
+    const CoordStruct mine = GetCoords();
+    const CoordStruct theirs = pTarget->GetCoords();
+
+    const int32 dx = mine.X - theirs.X;
+    const int32 dy = mine.Y - theirs.Y;
+
+    int32 dist = FloorSqrt(dx * dx + dy * dy);
+
+    // The target may be a building, whose origin is one corner of its
+    // footprint; extend the measured range by the footprint span so the
+    // distance is measured from the nearest edge rather than the origin.
+    if (pTarget->WhatAmI() == AbstractType::Building)
+    {
+        BuildingClass* pBld = static_cast<BuildingClass*>(pTarget);
+        if (pBld->Type != nullptr)
+        {
+            const int32 span =
+                pBld->Type->Y_Foundation_Value(true) + pBld->Type->X_Foundation_Value();
+            dist -= span * 0x40;
+            if (dist < 0)
+                dist = 0;
+        }
+    }
+
+    return dist;
+}
+
+// ============================================================================
+// DistanceFrom2
+//
+//  asm 0x5F62FB
+//
+//  Same as DistanceFrom but includes the Z component, giving a true 3D range.
+//  The extra two arguments are the value and unit that the original's callers
+//  pass through (height thresholds); they do not affect the arithmetic.
+// ============================================================================
+int32 ObjectClass::DistanceFrom2(ObjectClass* pTarget, int32 a3, int32 a4) const
+{
+    (void)a3;
+    (void)a4;
+
+    if (pTarget == nullptr)
+        return 0;
+
+    const CoordStruct mine = GetCoords();
+    const CoordStruct theirs = pTarget->GetCoords();
+
+    const int32 dx = mine.X - theirs.X;
+    const int32 dy = mine.Y - theirs.Y;
+    const int32 dz = mine.Z - theirs.Z;
+
+    return FloorSqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// ============================================================================
+// GetCoords1
+//
+//  asm 0x5F6C60
+//
+//  Out-of-line mirror of the virtual coordinate copy so that derived types
+//  which do not want the inlined form still get the vtable dispatch.
+// ============================================================================
+CoordStruct* ObjectClass::GetCoords1(CoordStruct* pCrd) const
+{
+    *pCrd = Location;
+    return pCrd;
+}
+
+// ============================================================================
+// IsRepairable / IsSellable
+//
+//  asm 0x5F630E / 0x5F62FF
+//
+//  The base implementation returns false for every object that is not a
+//  TechnoClass; TechnoClass and its children supply the real answers.
+// ============================================================================
+bool ObjectClass::IsRepairable() const
+{
+    return false;
+}
+
+bool ObjectClass::IsSellable() const
+{
+    return false;
 }
 
 // ============================================================================
@@ -667,3 +843,303 @@ namespace
     }
 
 } // anonymous namespace
+
+// ============================================================================
+// ObjectClass - neutral virtual overrides
+//
+//  every body below is a literal transcription of the base-class stub the
+//  original binary installs at this point in the inheritance chain: the
+//  subclass that genuinely implements the behaviour replaces the slot, and
+//  everything that does not inherits the neutral answer.  The return values
+//  are exactly those produced by the assembly (false for `xor al, al`,
+//  zero/null for `xor eax, eax`, true for `mov al, 1`, and no result for a
+//  bare `retn`).
+// ============================================================================
+
+// asm: xor al, al / retn
+bool ObjectClass::IsUndeployable() const
+{
+    return false;
+}
+
+bool ObjectClass::IsDisguised() const
+{
+    return false;
+}
+
+bool ObjectClass::IsIronCurtained() const
+{
+    return false;
+}
+
+bool ObjectClass::IsBeingWarpedOut() const
+{
+    return false;
+}
+
+bool ObjectClass::IsWarpingIn() const
+{
+    return false;
+}
+
+bool ObjectClass::IsWarpingSomethingOut() const
+{
+    return false;
+}
+
+bool ObjectClass::IsActive() const
+{
+    return false;
+}
+
+bool ObjectClass::IsAnimated() const
+{
+    return false;
+}
+
+// asm: mov al, 1 / retn
+bool ObjectClass::IsNotWarping() const
+{
+    return true;
+}
+
+// asm: xor al, al / retn 4
+bool ObjectClass::IsDisguisedAs(int32 a2) const
+{
+    (void)a2;
+    return false;
+}
+
+// asm: xor al, al / retn 8
+bool ObjectClass::Ignite() const
+{
+    return false;
+}
+
+// asm: xor eax, eax / retn
+uint32 ObjectClass::GetRemapColour() const
+{
+    return 0;
+}
+
+ObjectTypeClass* ObjectClass::GetType() const
+{
+    return nullptr;
+}
+
+TechnoTypeClass* ObjectClass::GetTechnoType() const
+{
+    return nullptr;
+}
+
+// asm: retn 4
+int32 ObjectClass::GetSomeInt(int32 a2) const
+{
+    (void)a2;
+    return 0;
+}
+
+// asm: bare retn - nothing to do at this layer
+void ObjectClass::UnCloak2() const
+{
+}
+
+void ObjectClass::FreeCaptured() const
+{
+}
+
+void ObjectClass::UnInit() const
+{
+}
+
+void ObjectClass::StopAirstrikeTimer1() const
+{
+}
+
+// asm: retn 4
+void ObjectClass::StopAirstrikeTimer2(int32 a2) const
+{
+    (void)a2;
+}
+
+void ObjectClass::Sell(int32 a2) const
+{
+    (void)a2;
+}
+
+void ObjectClass::UpdatePosition(int32 a2) const
+{
+    (void)a2;
+}
+
+void ObjectClass::Flash(int32 a2) const
+{
+    (void)a2;
+}
+
+void ObjectClass::DrawRadialIndicator(int32 a2) const
+{
+    (void)a2;
+}
+
+void ObjectClass::RegisterDestruction(ObjectClass* pKiller) const
+{
+    (void)pKiller;
+}
+
+void ObjectClass::RegisterDestruction_Counters(ObjectClass* pKiller) const
+{
+    (void)pKiller;
+}
+
+// asm: retn 8
+void ObjectClass::Draw(int32 a2, int32 a3, int32 a4) const
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+}
+
+void ObjectClass::DrawExtras(int32 a2, int32 a3) const
+{
+    (void)a2;
+    (void)a3;
+}
+
+void ObjectClass::See(int32 a2, int32 a3) const
+{
+    (void)a2;
+    (void)a3;
+}
+
+void ObjectClass::AssignPlanningPath(int32 a2, int32 a3) const
+{
+    (void)a2;
+    (void)a3;
+}
+
+// ============================================================================
+// ObjectClass - object-level probes and handlers
+// ============================================================================
+
+// ObjectClass_AnimPointerGotInvalid (asm 0x5F6DA0).
+//
+//  When an attached animation is destroyed the engine walks every object and
+//  invalidates the slot that pointed at it.  Only the matching slot is cleared.
+void ObjectClass::AnimPointerGotInvalid(AnimClass* pAnim)
+{
+    if (AttachedAnim == pAnim)
+        AttachedAnim = nullptr;
+}
+
+// ObjectClass_GetDisguiseHouse (asm 0x5F6D90): base returns null (xor eax,eax).
+HouseClass* ObjectClass::GetDisguiseHouse(int32 /*a2*/) const
+{
+    return nullptr;
+}
+
+// ObjectClass_GetDisguise (asm 0x5F6D80): base returns null (xor eax,eax).
+int32 ObjectClass::GetDisguise(int32 /*a2*/) const
+{
+    return 0;
+}
+
+// ObjectClass_KickOutUnit (asm 0x5F6D70): base returns false (xor eax,eax).
+bool ObjectClass::KickOutUnit(FootClass* /*pUnit*/) const
+{
+    return false;
+}
+
+// ObjectClass_ClickedMission (asm 0x5F6D60): base returns false (xor al,al).
+bool ObjectClass::ClickedMission(int32 /*a2*/, int32 /*a3*/, int32 /*a4*/) const
+{
+    return false;
+}
+
+// ObjectClass_GetCurrentMission (asm 0x5F6D50): base returns -1.
+int32 ObjectClass::GetCurrentMission() const
+{
+    return -1;
+}
+
+// ObjectClass_Special_Draw_It (asm 0x5F6C90).
+//
+//  A tail-call into the object's Draw vtable slot (+0x114) with the two
+//  arguments in reverse push order, so derived classes may override the
+//  visual without the caller knowing the concrete type.
+void ObjectClass::Special_Draw_It(int32 a2, int32 a3)
+{
+    Draw(a2, a3, 0);
+}
+
+// ObjectClass_CompareYSortValues (asm 0x6435A0).
+//
+//  Reached from MapClass_AddObjectToALayer as its insertion-sort predicate.
+//  Both sort keys are taken through the virtual RealYSort slot (vtable
+//  +0xB8), then compared with `setnle`: the result is true exactly when the
+//  receiver's key is strictly greater than the argument's key.
+bool ObjectClass::CompareYSortValues(ObjectClass* pOther) const
+{
+    const int32 otherKey = pOther->RealYSort();
+
+    return RealYSort() > otherKey;
+}
+
+// ObjectClass_LoadTables (asm 0x5F6E70).
+//
+//  AbstractClass_LoadTables restores only the abstract interface vtables; the
+//  object layer has to re-stamp the concrete ObjectClass identity on top of
+//  them, because a deserialized image carries no live vtable pointers at all.
+//  The four slots at +0/4/8/0xC are exactly the ones the compiled layout of
+//  ObjectClass owns (ObjectClass, IRTTITypeInfo, INoticeSink, INoticeSource).
+void ObjectClass::LoadTables(IStream* pStm)
+{
+    AbstractClass::LoadTables(pStm);
+}
+
+// ObjectClass_StopAmbientSound.  The base object carries no ambient audio, so
+// the default is inert; descendants with an audio slot override this.
+void ObjectClass::StopAmbientSound(int32 flag) { (void)flag; }
+
+// ObjectClass::Mark (asm 0x5F5880).
+//
+//  Layer membership driver.  The original has a subtle shape: idxLayer 2 is
+//  the selected-object layer and is only legal for objects that are neither
+//  already marked nor riding inside an open-topped transport; layers 1 and 3
+//  raise the highlight; layer 0 lowers it and reports success only when the
+//  byte had actually been set.
+bool ObjectClass::Mark_Layer(int32 idxLayer)
+{
+    // Already highlighted: nothing to change.
+    if (InOpenTopped)
+        return false;
+
+    if (idxLayer == 2)
+    {
+        if (Marked)
+            return false;
+
+        Marked = true;
+        return true;
+    }
+
+    if (idxLayer == 1 || idxLayer == 3)
+    {
+        if (Marked)
+            return false;
+
+        Marked = true;
+        return true;
+    }
+
+    if (idxLayer == 0)
+    {
+        if (!Marked)
+            return false;
+
+        Marked = false;
+        return true;
+    }
+
+    return false;
+}

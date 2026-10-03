@@ -233,6 +233,13 @@ CellStruct        g_Waypoints[256]     = { CellStruct(0, 0) };
 int               g_WaypointCount      = 0;
 char              g_WaypointNames[256][32] = { {0} };
 
+// ── Map local rect ────────────────────────────────────────────────────────
+
+int32             MapLocalRect_X       = 0;
+int32             MapLocalRect_Y       = 0;
+int32             MapLocalRect_Width   = 0;
+int32             MapLocalRect_Height  = 0;
+
 // ── Minimap / Radar globals ───────────────────────────────────────────────
 
 bool              g_bRadarEnabled      = true;
@@ -403,6 +410,12 @@ void InitGlobals()
     ResetGameCounters();
     ResetScoreStats();
     ClearWaypoints();
+
+    // Map local rect starts empty; Set_Map_Dimensions publishes it later.
+    MapLocalRect_X      = 0;
+    MapLocalRect_Y      = 0;
+    MapLocalRect_Width  = 0;
+    MapLocalRect_Height = 0;
 
     // Clear scenario strings.
     std::memset(g_ScenarioName, 0, sizeof(g_ScenarioName));

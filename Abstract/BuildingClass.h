@@ -151,6 +151,10 @@ public:
     virtual void DisguiseDetectorActivate(CellStruct cell);
     virtual void DisguiseDetectorDeactivate(CellStruct cell);
     virtual int32 AlwaysZero();
+    // BuildingClass_GetCurrentWeaponStage (asm 0x452290): the building's
+    // current firing stage (+0x140), advanced for multi-stage weapons
+    // (gattling / prism towers).
+    int32 GetCurrentWeaponStage() const;
     virtual bool ForceCreate(CoordStruct& coord, DWORD dwUnk);
     virtual CellStruct FindExitCell(DWORD dwUnk, DWORD dwUnk2) const;
     virtual int32 DistanceToDockingCoord(ObjectClass* pObj) const;
@@ -359,9 +363,15 @@ public:
     bool                IsDisabled_;                   // explicitly disabled
     bool                IsDisguised_;                  // disguised (spy)
     bool                IsMindControlled_;             // under mind control
+
+    // House that owned this structure before it was mind-controlled away.
+    // Set by HouseClass::MindControl_Base_Of and cleared by
+    // HouseClass::Return_Control_Base_Of.
+    HouseClass*         OriginallyOwnedBy;             // +0x2E0
     bool                IsPrimaryFactory;              // primary factory for its type
     int32               BunkerState;                   // garrison state machine value
     int32               PrismStage;                    // prism charge state
+    int32               WeaponStage;                   // +0x140 multi-stage firing counter
     CoordStruct         PrismTargetCoords;             // prism fire destination
     int32               DelayBeforeFiring;            // frames before next shot
     TechnoTypeClass*    SecretProduction;              // secret lab bonus type

@@ -43,6 +43,11 @@ public:
     void SetData(int32 data);
     void SetTimer(int32 frames);
 
+    // TriggerClass_FindRelatedHouse (asm 0x726910): returns the house stored
+    // at +0x2C, which is the "related house" the trigger was bound to.
+    HouseClass* FindRelatedHouse() const;
+    void SetRelatedHouse(HouseClass* pHouse);
+
     static void ProcessTriggerEvents();
     static void ResetAllTriggers();
     static void FireAllTriggersForEvent(TriggerEventType eventType, AbstractClass* pObject, CellStruct cell);
@@ -54,6 +59,8 @@ public:
     TEventClass* Event;
     TActionClass* CurrentAction;
     HouseClass* House;
+    // The "related house" slot at +0x2C that FindRelatedHouse hands back.
+    HouseClass* RelatedHouse;
     char* Name;
     int32 Data;
     bool HasBeenFired;

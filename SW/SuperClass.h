@@ -44,6 +44,21 @@ public:
     static SuperClass* FindByIndex(int32 index);
     static int32 GetCount();
 
+    // ── Global weather / global-effect state ──────────────────────────────
+    // LightningStorm_Active (asm 0x...): set while a lightning storm is
+    // running anywhere on the map.  LightningStorm_IsActive simply reads it.
+    static bool LightningStorm_Active;
+
+    // PsyDom_Status (asm 0x...): non-zero while a psychic dominator is
+    // active.  PsyDom_IsActive returns `Status != 0`.
+    static int32 PsyDom_Status;
+
+    // byte __cdecl LightningStorm_IsActive()  (asm 0x68F0C0)
+    static bool LightningStorm_IsActive() { return LightningStorm_Active; }
+
+    // byte __cdecl PsyDom_IsActive()          (asm 0x68EFD0)
+    static bool PsyDom_IsActive() { return PsyDom_Status != 0; }
+
     SuperClass(SuperWeaponTypeClass* pType, HouseClass* pOwner) noexcept;
     virtual ~SuperClass();
 
@@ -132,6 +147,39 @@ public:
     void Grant();
     void Revoke();
 
+    // ── Click-through pairing ─────────────────────────────────────────────
+    // SuperClass_SetReadiness (asm 0x6CB893): store the arming flag at +0x6F.
+    void SetReadiness(bool ready) { IsReady_ = ready; }
+
+    // SuperClass_StopPreclickAnim (asm 0x6CB8A5): tear down the pre-click
+    // animation that is playing for this weapon, if any.  `isPlayer` is
+    // forwarded to the animation registry so a player-owned weapon also
+    // clears its pending click.
+    void StopPreclickAnim(bool isPlayer);
+
+    // SuperClass::Discharged (asm 0x6CB920): consume the weapon's charge when
+    // it is fired.  `ignoreRecharge` short-circuits the recharge bookkeeping
+    // (used by the AI), `coords` is the cell the weapon was fired at.  The
+    // launch itself is dispatched by Launch().
+    void Discharged(const CellStruct& coords, bool ignoreRecharge);
+
+    // ── Scripted charge manipulation ──────────────────────────────────────
+    //  The trigger-action family (ActionClass_SetSWCharge / SetSWRecharge /
+    //  ResetSWRecharge / ResetSW) drives these.  They are the scripted
+    //  counterparts of the automatic recharge bookkeeping performed by
+    //  UpdateRecharge.
+
+    // SuperClass_SetSWCharge (asm 0x6CBE50): force the weapon's charge
+    // percentage (0..100), re-deriving the recharge timer from the type's
+    // RechargeTime and the rules-side ChargeToDrainRatio.
+    void SetCharge(int32 percent);
+    // SuperClass_SetSWRecharge (asm 0x6CBF10): overwrite the remaining
+    // recharge frames and re-arm the timer.
+    void SetRecharge(int32 frames);
+    // SuperClass_ResetSWRecharge (asm 0x6CBF50): restore the recharge timer to
+    // the type's nominal RechargeTime without changing the charge state.
+    void ResetRecharge();
+
     // Static utility methods
     static void UpdateAll();
     static void RemoveAll();
@@ -148,6 +196,11 @@ public:
     SWState State;
     int32 ChargeDrain;
     SuperClass* next;
+
+    // Scriptable recharge override (asm +0x24).  -1 means "use the type's own
+    // RechargeTime"; SetSWRecharge stores an explicit frame count here and
+    // ResetSWRecharge restores the -1 sentinel.
+    int32 CustomChargeTime;
     bool IsGranted;
     bool IsAnimationPlaying;
     bool IsAlreadyActivated;

@@ -3,6 +3,8 @@
 #include "ObjectClass.h"
 #include "TechnoTypeClass.h"
 
+class BuildingClass;
+
 // ============================================================================
 // CloakStateEnum - tracks the cloak fade animation
 // ============================================================================
@@ -41,6 +43,21 @@ public:
         , TemporalTimer(0)
         , GasTimer(0)
         , RadiationTimer(0)
+        , Tunnel(false)
+        , ActiveTurretIndex(0)
+        , CurrentWeaponNumber(-1)
+        , OrigOwner(nullptr)
+        , Captured(false)
+        , IsDisguisedFlag(false)
+        , WarpInTimer(0)
+        , WarpOutTimer(0)
+        , IsWarpingOutFlag(false)
+        , DrainTimer(0)
+        , PlanningToken(-1)
+        , WeaponStage(0)
+        , FocusOnUnit(nullptr)
+        , TemporalImUsing(nullptr)
+        , QueuedVoiceIndex(-1)
     {}
     virtual ~TechnoClass() {}
 
@@ -53,6 +70,18 @@ public:
 
     HouseClass* GetOwningHouse() const { return Owner; }
     int32 GetOwningHouseIndex() const { return 0; }
+
+    // TechnoClass_GetThreatPosed (asm 0x708B50).  The threat this object
+    // presents to the enemy, counted into the owning house's threat grid.
+    //
+    //   * Without a type the answer is zero.
+    //   * A building carrying occupants (WhatAmI == 6) multiplies the occupant
+    //     count by RulesClass::ThreatPerOccupant.
+    //   * Otherwise the type's ThreatPosed value is returned.
+    virtual int32 GetThreatValue() const;
+
+    // The cell the object currently stands in.
+    CellStruct Get_Cell_Ptr_Coord() const;
 
     // ========================================================================
     // Static Array management
@@ -161,19 +190,103 @@ public:
     virtual void Destroyed(ObjectClass* Killer) {}
     virtual bool CanScatter() const { return false; }
     virtual int32 GetDefaultSpeed() const { return 0; }
-    virtual bool HasTurret() const { return false; }
+    virtual bool HasTurret() const;
     virtual bool CanDeploySlashUnload() const { return false; }
     virtual bool IsUnitFactory() const { return false; }
     virtual void TakeDamage(int32 damage, ObjectClass* source, WarheadTypeClass* warhead) {}
     virtual bool IsEngineer() const { return false; }
     virtual bool IsCloseEnough(AbstractClass* pTarget, int32 idxWeapon) const { return false; }
     virtual bool IsCloseEnoughToAttack(AbstractClass* pTarget) const { return false; }
-    virtual bool IsInAir() const { return false; }
-    virtual bool IsOnFloor() const { return false; }
-    virtual void Panic() {}
+    virtual bool IsInAir() const;
+    virtual bool IsOnFloor() const;
+    virtual bool OnBridge() const;
+
+    // ── TechnoClass state probes / accessors ──────────────────────────────
+    // TechnoClass_IsCrewed (asm 0x6F3B30): mirrors the type's Crewed flag.
+    virtual bool IsCrewed() const;
+    // TechnoClass_IsFactory (asm 0x102414): base-class answer is false.
+    virtual bool IsFactory() const;
+    // TechnoClass_HasMultipleTurrets (asm 0x70DC90).
+    virtual bool HasMultipleTurrets() const;
+    // TechnoClass_GetZ (asm 0x5F3C70).
+    virtual int32 GetZ() const;
+    // TechnoClass_GetActiveTurretIndex (asm 0x70DCB0).
+    virtual int32 GetActiveTurretIndex() const;
+    // TechnoClass_GetTurretIndex (asm 0x70DD30).
+    virtual int32 GetTurretIndex() const;
+    // TechnoClass_CurrentWeaponSelected (asm 0x70DCA0).
+    virtual bool CurrentWeaponSelected() const;
+    // TechnoClass_GetOwner (asm 0x70F810).
+    HouseClass* Get_Owner() const;
+    // ── Disguise ──────────────────────────────────────────────────────────
+    // TechnoClass_IsDisguised (asm 0x1905A8): reads the type/instance disguise
+    // flag.  The two-argument form adds a range parameter the original accepts
+    // and ignores.
+    virtual bool IsDisguised() const;
+    virtual bool IsDisguised2(int32 a2) const;
+    // TechnoClass_ClearDisguise (asm 0x1905C0): drops the disguise.
+    virtual void ClearDisguise();
+
+    // ── Cloak / warp / temporal state ─────────────────────────────────────
+    // TechnoClass_IsCloakable (asm 0x708C40).
+    virtual bool IsCloakable() const;
+    // TechnoClass_IsBeingWarpedOut (asm 0x708C50).
+    virtual bool IsBeingWarpedOut() const;
+    // TechnoClass_IsWarpingOut (asm 0x708C5E).
+    virtual bool IsWarpingOut() const;
+    // TechnoClass_IsNotTemporalLocked (asm 0x708C8E).
+    virtual bool IsNotTemporalLocked() const;
+    // TechnoClass_IsNotWarpingIn (asm 0x5F3E31).
+    virtual bool IsNotWarpingIn() const;
+    // TechnoClass_IsDraining (asm 0x70F5B5).
+    virtual bool IsDraining() const;
+
+    // ── Temporal / weapon-legal probes ────────────────────────────────────
+    // TechnoClass_IsTemporalSource (asm 0x70C5D0): true when this techno is
+    // currently the source of a temporal weapon that has a victim.
+    bool IsTemporalSource() const;
+    // TechnoClass_IsLegalWeapon (asm 0x70E245): true when the weapon container
+    // is non-null and holds a weapon id.
+    bool IsLegalWeapon(const void* pWeapon) const;
+    // TechnoClass_GetNonSprayWeapon (asm 0x70DDC8-adjacent): returns the weapon
+    // in the slot that IsNoSprayAttack selects.
+    void* GetNonSprayWeapon() const;
+    // TechnoClass_CanAreaFire (asm 0x70DD40): true when the current weapon is
+    // flagged as an area-effect weapon.
+    bool CanAreaFire() const;
+
+    // ── Weapon selection helpers ──────────────────────────────────────────
+    // TechnoClass_CanPassiveAquire (asm 0x70917A).
+    virtual bool CanPassiveAquire() const;
+    // TechnoClass_CanTraverse (asm 0x802612).
+    virtual bool CanTraverse() const;
+    // TechnoClass_CanSetWaypoint (asm 0x700C40).
+    virtual bool CanSetWaypoint() const;
+
+    // ── Miscellaneous probes ──────────────────────────────────────────────
+    // TechnoClass_NeedsToSelfHeal (asm 0x70BE80).
+    virtual bool NeedsToSelfHeal() const;
+    // TechnoClass_GetHealthState (asm 0x5F5DF0): 0 = healthy, 1 = damaged,
+    // 2 = critical, matching the rules-side health thresholds.
+    virtual int32 GetHealthState() const;
+    // TechnoClass_GetXYDistanceFrom (asm 0x5F6500): planar distance to another
+    // object, in leptons.
+    virtual double GetXYDistanceFrom(const AbstractClass* pOther) const;
+    // ── Panic / idle / power probes ───────────────────────────────────────
+    // TechnoClass_Panic (asm 0x41B3xx): the zero-argument form does nothing at
+    // this layer; the mission-controller entry point is FootClass::Panic.
+    virtual void Panic();
+    // TechnoClass_Unpanic: the counterpart that returns the object to normal
+    // morale; the base class does nothing.
+    virtual void Unpanic();
     virtual void Scatter(const CoordStruct& crd, bool ignoreMission, bool ignoreDestination) {}
+    // TechnoClass_IdleAction (asm 0x41B5A4): returns false - derived missions
+    // override it to report that they have finished idling.
+    virtual bool IdleAction();
     virtual void UpdateIdleAction() {}
-    virtual bool IsPowerOnline() const { return false; }
+    // TechnoClass_IsPowerOnline (asm 0x41B57x): true only for powered
+    // structures; the base class answers false.
+    virtual bool IsPowerOnline() const;
     virtual bool IsArmed() const { return false; }
     virtual bool IsBeingRepaired() const { return false; }
     virtual bool IsCurrentlyBeingSold() const { return false; }
@@ -197,8 +310,88 @@ public:
     virtual bool IsLight() const { return false; }
     virtual bool IsVehicle() const { return false; }
     virtual bool IsTiberium() const { return false; }
-    virtual bool CanOccupyFire() const { return false; }
-    virtual int32 GetOccupantCount() const { return 0; }
+    // TechnoClass_GetTiberium (asm 0x6C9640).  Sums the four tiberium storage
+    // floats carried by a harvesting techno and floors the running total.  The
+    // base implementation carries no storage and therefore reports zero.
+    virtual double Get_Tiberium() const { return 0.0; }
+
+    // IsBeingMindControlled - the vtable slot the original queries at +0x160.
+    // True while this object is already under an external mind controller.
+    virtual bool IsBeingMindControlled() const { return false; }
+
+    // TechnoClass_CanBePermaMC (asm 0x53C445).  Whether this object may be
+    // permanently mind controlled by a psychic dominator:
+    //
+    //   * buildings never qualify (WhatAmI() == Building);
+    //   * the techno type must not be ImmuneToPsionics;
+    //   * the object must not already be mind controlled;
+    //   * the techno type must not be a balloon-hover type;
+    //   * the object must still be alive.
+    virtual bool Can_Be_PermaMC() const
+    {
+        if (WhatAmI() == AbstractType::Building)
+            return false;
+
+        const TechnoTypeClass* pType = TechnoType;
+        if (pType != nullptr && pType->IsImmuneToPsionics)
+            return false;
+
+        if (IsBeingMindControlled())
+            return false;
+
+        if (pType != nullptr && pType->IsBalloonHover)
+            return false;
+
+        return !IsDead();
+    }
+    // TechnoClass_CanOccupyFire (asm 0x41B534): only buildings and the infantry
+    // that garrison them answer true; the base class returns false.
+    virtual bool CanOccupyFire() const;
+    // TechnoClass_GetOccupantCount (asm 0x41B53C): number of occupants garrisoned.
+    virtual int32 GetOccupantCount() const;
+
+    // ── Layer / cell helpers ──────────────────────────────────────────────
+    // TechnoClass_InWhichLayer (asm 0x41ADCB): asks the locomotor which draw
+    // layer this techno currently occupies.
+    virtual int32 InWhichLayer() const;
+    // TechnoClass_GetCellCoords (asm 0x41BEBE): converts the world coordinates
+    // into the owning cell's X/Y, dividing by 0x100 (one leptons-per-cell unit).
+    virtual CellStruct GetCellCoords() const;
+
+    // ── Threat / value ratings (asm 0x41B547 / 0x41B54F / 0x41B557) ──────
+    virtual int32 GetAntiAirValue() const;
+    virtual int32 GetAntiArmorValue() const;
+    virtual int32 GetAntiInfantryValue() const;
+
+    // TechnoClass_UpdateRefinerySmokeSystems (asm 0x41B5C0): no-op at this layer.
+    virtual void UpdateRefinerySmokeSystems() {}
+
+    // ========================================================================
+    // Planning-token and type-flag probes
+    // ========================================================================
+    // TechnoClass_GetPlanningToken (asm 0x70DDC0): the waypoint token slot
+    // (+0x514).
+    int32 GetPlanningToken() const;
+    // TechnoClass_AttachPlanningToken (asm 0x70DDC8): stores token into the
+    // waypoint token slot (+0x514).
+    void AttachPlanningToken(int32 token);
+    // TechnoClass_Assign_Destination_Cell (asm 0x70DDD5): stores the target
+    // building into the "focus on unit" slot.
+    void Assign_Destination_Cell(BuildingClass* pTarget);
+    // TechnoClass_NotSubmerged (asm 0x70DDE0): true when the object's height is
+    // above the submarine threshold (-20).
+    bool NotSubmerged() const;
+    // TechnoClass_IsNotSprayAttack (asm 0x70DD00).
+    bool IsNotSprayAttack() const;
+    // TechnoClass_IsNotSprayAttack2 (asm 0x70DD20).
+    bool IsNotSprayAttack2() const;
+    // TechnoClass_SetCurrentWeaponStage (asm 0x70DDD4): stores idx into the
+    // multi-stage weapon counter (+0x140) when it is non-negative.
+    void SetCurrentWeaponStage(int32 idx);
+    // TechnoClass_HasTurretTooltips (asm 0x70DDA6): the type's turret-tooltip
+    // flag.
+    bool HasTurretTooltips() const;
+
     virtual double GetStoragePercentage() const { return 0.0; }
     virtual int32 GetRefund() const { return 0; }
     virtual BulletClass* Fire(AbstractClass* pTarget, int32 nWeaponIndex) { return nullptr; }
@@ -269,12 +462,56 @@ public:
     // Used by Fire_Impl to gate firing on the weapon's rate of fire.
     int32         LastFireFrame;
 
+    // Layer flag at +0x74: true while this object occupies a tunnel, bridge or
+    // similar non-ground layer.  Consulted by IsOnFloor / IsInAir.
+    bool          Tunnel;
+    uint8         pad_Tunnel[3];
+
+    // Turret-slot bookkeeping.  ActiveTurretIndex addresses +0x124 (the slot
+    // the unit is currently drawn with) and CurrentWeaponNumber addresses
+    // +0x134; -1 means "no weapon selected".
+    int32         ActiveTurretIndex;
+    int32         CurrentWeaponNumber;
+
+    // House that owned this object before it was captured.  Only meaningful
+    // while Captured is set.  (asm +0x2E0)
+    HouseClass*   OrigOwner;
+    bool          Captured;
+
+    // ── Disguise / warp / drain state ─────────────────────────────────────
+    bool          IsDisguisedFlag;    // +0x81 style disguise flag
+    int32         WarpInTimer;        // remaining frames of a chrono-warp-in
+    int32         WarpOutTimer;       // remaining frames of a chrono-warp-out
+    bool          IsWarpingOutFlag;   // warp-out has completed
+    int32         DrainTimer;         // remaining frames of a drain effect
+
+    // Planning-token slot: -1 when the object has no waypoint assigned.
+    int32         PlanningToken;
+
+    // Multi-stage weapon counter at +0x140 (gattling / prism style weapons).
+    int32         WeaponStage;
+
+    // The building this techno is currently focused on (asm FocusOnUnit).
+    BuildingClass* FocusOnUnit;
+
+    // Index of a voice line queued for playback, or -1.
+    int32         QueuedVoiceIndex;
+
+    // The locomotor COM object driving this techno's every-frame movement
+    // (asm +0x674).  May be null for statics such as buildings.
+    ILocomotion*  Locomotor;
+
     // Secondary warhead-effect state. These timers/counters are decremented
     // by Update_AI each frame and consulted by the damage / rendering code.
     int32         FireDamageTimer;    // frames remaining while burning
     int32         SparkyCounter;      // pending spark particle spawns
     bool          IsParasited;        // a parasite is attached to this techno
     int32         TemporalTimer;      // frames frozen by the chronosphere weapon
+
+    // The temporal weapon object this techno is currently applying (asm
+    // TemporalImUsing), or null.  IsTemporalSource tests both this and its
+    // victim slot.
+    void*         TemporalImUsing;
     int32         GasTimer;           // frames affected by gas
     int32         RadiationTimer;     // frames irradiated by a rad warhead
 

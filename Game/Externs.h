@@ -283,6 +283,18 @@ extern CellStruct        g_Waypoints[256];
 extern int               g_WaypointCount;
 extern char              g_WaypointNames[256][32];
 
+// ── Map local rect ────────────────────────────────────────────────────────
+//
+// The playable window inside the full map, published as four loose globals by
+// the original (dword_87F90C/X, dword_87F910/Y, dword_87F914/Width,
+// dword_87F918/Height).  Nearly every "pick a spot on the map" routine draws
+// from this window rather than from the full map extent.
+
+extern int32             MapLocalRect_X;
+extern int32             MapLocalRect_Y;
+extern int32             MapLocalRect_Width;
+extern int32             MapLocalRect_Height;
+
 // ── Minimap / Radar globals ───────────────────────────────────────────────
 
 extern bool              g_bRadarEnabled;

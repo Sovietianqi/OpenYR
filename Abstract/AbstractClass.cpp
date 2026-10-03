@@ -546,3 +546,17 @@ namespace
     }
 
 } // anonymous namespace
+
+// AbstractClass_LoadTables (asm 0x410E30).
+//
+//  A deserialized object image contains raw field data but no live vtable
+//  pointers, so the loader calls this to restore the abstract interface
+//  identity.  The reconstructed layout is expressed by the class hierarchy
+//  itself (IUnknown/IRTTITypeInfo at +0/+4, INoticeSink/INoticeSource at
+//  +8/+0xC), so nothing has to be written by hand; the method exists as a
+//  virtual hook so every derived layer can chain it and then re-stamp its own
+//  more specific identity.
+void AbstractClass::LoadTables(IStream* pStm)
+{
+    (void)pStm;
+}

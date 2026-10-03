@@ -1,4 +1,5 @@
 #include <Abstract/AircraftClass.h>
+#include <Game/Externs.h>
 #include <Game/SaveGameClass.h>
 #include <Abstract/AircraftTypeClass.h>
 #include <Abstract/BuildingClass.h>
@@ -6,6 +7,7 @@
 #include <Combat/WeaponTypeClass.h>
 #include <Map/MapClass.h>
 #include <Map/CellClass.h>
+#include <Rules/RulesClass.h>
 #include <Game/Game.h>
 #include <Math/CoordStruct.h>
 #include <Math/Facing.h>
@@ -2843,4 +2845,26 @@ void AircraftClass::Load(LoadGameClass& loader)
     loader.Read(mission);
     CurrentMission = static_cast<Mission>(mission);
     loader.Read(MissionStatus);
+}
+
+// ============================================================================
+// AircraftClass - pose / ground-state probes
+// ============================================================================
+
+// AircraftClass_GetPoseDir (asm 0x4163C8).
+//
+//  The global RulesData pose direction, consulted when a parked aircraft is
+//  oriented to the map.  A bare load-and-return in the original.
+int32 AircraftClass::GetPoseDir() const
+{
+    return (TheRules != nullptr) ? TheRules->PoseDir : 0;
+}
+
+// AircraftClass_IsGroundUnit (asm 0x4163D0).
+//
+//  Tail-call into the OnFloor vtable slot: an aircraft counts as a ground
+//  unit exactly when its locomotion layer reports it on the floor.
+bool AircraftClass::IsGroundUnit() const
+{
+    return IsOnFloor();
 }

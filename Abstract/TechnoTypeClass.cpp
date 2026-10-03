@@ -351,6 +351,12 @@ bool TechnoTypeClass::HasDeployer() const      { return HasDeployer_ || Deployer
 bool TechnoTypeClass::HasUndeployer() const    { return HasUndeployer_ || Undeployer; }
 bool TechnoTypeClass::HasFirewall() const      { return HasFirewall_ || Firewall; }
 
+// TechnoTypeClass vtable slot "CanMobileAttack".
+//
+//  Base types may fire on the move; the mobile-warhead types (infantry that
+//  must stop, deployable vehicles) override this to false.
+bool TechnoTypeClass::CanMobileAttack() const  { return true; }
+
 int32 TechnoTypeClass::GetWeaponCount() const
 {
     return WeaponCount;

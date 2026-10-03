@@ -177,3 +177,31 @@ namespace CD {
 // CD vtable at construction time.  Returns whether the requested drive is
 // usable; on this platform the working directory always is.
 bool CD_ForceAvailable(int32 nIndex);
+
+// ============================================================================
+// CD volume scanning (asm Get_CD_Index 0x4A80D0, CD_GetCDIndex 0x4A8xxx)
+//
+//  The retail binary locates the game discs by their volume label rather than
+//  by drive letter, so a user whose CD-ROM landed on E: still works.  It walks
+//  the drive letters and asks the OS for each volume's label, looking for the
+//  string "YR1" (Yuri's Revenge disc 1).
+//
+//  Two globals drive the caching:
+//      RequiredCDNumber    - the drive index the game last resolved (or
+//                            0xFFFFFFFE for "current drive")
+//      OldRequiredCDNumber - the previous value, restored by
+//                            CD_SetRequiredCDIndex when a scan is reverted
+// ============================================================================
+// CD_GetCDIndex (asm): returns the cached RequiredCDNumber, scanning the
+//   volume labels first when nothing has been resolved yet.
+int32 CD_GetCDIndex();
+
+// CD_SetRequiredCDIndex (asm): swaps in a new drive index, keeping the old one
+//   in OldRequiredCDNumber so the previous selection can be restored.
+void CD_SetRequiredCDIndex(int32 nVolume);
+
+// Get_CD_Index (asm 0x4A80D0): probes drive letters for the "YR1" volume
+//   label.  `startLetter` is the ASCII drive letter to begin at ('A'), and
+//   `timeout` bounds how long the scan keeps retrying a busy drive (in
+//   GetTickCount units).  Returns the zero-based drive index, or -1.
+int32 Get_CD_Index(char startLetter, int32 timeout);

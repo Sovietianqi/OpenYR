@@ -51,6 +51,9 @@ ScenarioClass::ScenarioClass()
     , NumCoopHumanStartSpots(0)
     , MissionTimerTextCSF(nullptr)
     , TechLevel(-1)
+    , MapTintR(0)
+    , MapTintG(0)
+    , MapTintB(0)
     , Theater(TheaterType::Temperate)
     , Intro(nullptr)
     , Brief(nullptr)
@@ -968,4 +971,44 @@ void ScenarioClass::ReadRanking(CCINIClass* pINI)
     pINI->ReadString(SECTION, "UnderParMessage", "", UnderParMessage, 0x1F);
     pINI->ReadString(SECTION, "OverParTitle", "", OverParTitle, 0x1F);
     pINI->ReadString(SECTION, "OverParMessage", "", OverParMessage, 0x1F);
+}
+
+// ============================================================================
+// ScenarioClass - global / local variable accessors (asm 0x6AE1xx)
+//
+//  The script VM's Set/Clear Global and Set/Clear Local actions store a
+//  boolean into the indexed variable slot; the trigger conditions read it
+//  back.  Out-of-range indices are silently ignored, matching the original's
+//  range checks.
+// ============================================================================
+void ScenarioClass::SetGlobalValue(int32 index, bool value)
+{
+    if (index < 0 || index >= MaxGlobalVariables)
+        return;
+
+    GlobalVariables[index].Value = value ? 1 : 0;
+}
+
+void ScenarioClass::SetLocalValue(int32 index, bool value)
+{
+    if (index < 0 || index >= MaxLocalVariables)
+        return;
+
+    LocalVariables[index].Value = value ? 1 : 0;
+}
+
+bool ScenarioClass::GetGlobalValue(int32 index) const
+{
+    if (index < 0 || index >= MaxGlobalVariables)
+        return false;
+
+    return GlobalVariables[index].Value != 0;
+}
+
+bool ScenarioClass::GetLocalValue(int32 index) const
+{
+    if (index < 0 || index >= MaxLocalVariables)
+        return false;
+
+    return LocalVariables[index].Value != 0;
 }

@@ -2966,3 +2966,25 @@ void InfantryClass::Load(LoadGameClass& loader)
     loader.Read(flag); IsC4Now = (flag != 0);
     loader.Read(flag); IsUsingDeployFireWeapon = (flag != 0);
 }
+
+// ============================================================================
+// InfantryClass - berzerk / deployer probes
+// ============================================================================
+
+// InfantryClass_GoBerzerk (asm 0x5226E8).
+//
+//  A one-store setter: stamps the berzerk flag in place, without the
+//  side-effects (fear reset, bomb flag) the virtual Berzerk() performs.
+void InfantryClass::GoBerzerk()
+{
+    IsABombNow = true;
+}
+
+// InfantryClass_IsDeployer (asm 0x5226F0).
+//
+//  Reads the infantry type's Deployer byte - an infantry that can turn into a
+//  structure or emplacement (GI, ...).
+bool InfantryClass::IsDeployer() const
+{
+    return (Type != nullptr) && Type->Deployer;
+}

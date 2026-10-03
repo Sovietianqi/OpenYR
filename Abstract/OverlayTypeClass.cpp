@@ -143,6 +143,7 @@ OverlayTypeClass::OverlayTypeClass(const char* pID) noexcept
     DeathAnim              = -1;
     ShapeCount             = 0;
 
+
     std::memset(ArtName, 0, sizeof(ArtName));
 }
 

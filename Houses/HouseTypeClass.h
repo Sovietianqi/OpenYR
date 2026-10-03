@@ -46,6 +46,9 @@ public:
     virtual bool SaveToINI(CCINIClass* pINI) override;
     virtual int32 Size() const override;
     virtual HRESULT __stdcall GetClassID(CLSID* pClassID) override;
+    // HouseTypeClass_IsDirty (asm 0x4E9xxx): the stream is never dirty - a type
+    //   record is rebuilt from the INI rather than round-tripped through a save.
+    virtual HRESULT __stdcall IsDirty() override { return 0; }
     virtual AbstractType WhatAmI() const override;
     virtual void ComputeCRC(CRCEngine& crc) const override;
 

@@ -8,6 +8,8 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <cerrno>
+#include <ctime>
+#include <cstdint>
 
 // ============================================================================
 // RawFileClass implementation
@@ -898,4 +900,96 @@ bool CD_ForceAvailable(int32 nIndex)
     }
 
     return nIndex == g_ForcedCDNumber || nIndex == 0;
+}
+
+// ============================================================================
+// CD volume scanning
+// ============================================================================
+
+// RequiredCDNumber / OldRequiredCDNumber - the resolved-drive globals.
+int32 g_RequiredCDNumber    = static_cast<int32>(0xFFFFFFFE);
+int32 g_OldRequiredCDNumber = static_cast<int32>(0xFFFFFFFE);
+
+namespace {
+
+// Platform_GetTickCount - the host's millisecond counter.  The original calls
+// the Win32 GetTickCount; the standalone build reads the POSIX monotonic clock
+// so the CD-scan timeout logic stays faithful.
+uint32 Platform_GetTickCount()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint32>(ts.tv_sec) * 1000u
+         + static_cast<uint32>(ts.tv_nsec / 1000000);
+}
+
+// TryGetVolumeLabel - the host's GetVolumeInformationA.
+//
+//  The original asks Win32 for the volume label of "<letter>:\\" and inspects
+//  GetLastError on failure.  There is no portable equivalent, so the standalone
+//  build reports "not ready" for every letter; that makes Get_CD_Index walk the
+//  whole alphabet and answer -1, which is exactly what the game does on a
+//  machine with no disc inserted.
+bool TryGetVolumeLabel(char /*letter*/, char* pBuffer, size_t /*cbBuffer*/, int32& errOut)
+{
+    if (pBuffer != nullptr && pBuffer[0] != '\0')
+        pBuffer[0] = '\0';
+
+    errOut = 0x15; // ERROR_NOT_READY
+    return false;
+}
+
+} // namespace
+
+// Get_CD_Index (asm 0x4A80D0).
+//
+//  Formats "<letter>:\" for each candidate drive and asks the OS for the
+//  volume label, then compares it - case-insensitively - against the game's
+//  disc label "YR1".  A drive that reports ERROR_NOT_READY (0x15) is retried
+//  until `timeout` ticks have elapsed, so a spindle that has not spun up yet
+//  is not mistaken for an empty drive.  The first match wins and its drive
+//  index (letter - 'A') is returned; -1 means no disc was found.
+//
+//  The standalone build reaches the volume label through the platform layer
+//  (see TryGetVolumeLabel); on a host without optical drives no letter ever
+//  matches and the sentinel "current drive" answer stands.
+int32 Get_CD_Index(char startLetter, int32 timeout)
+{
+    const uint32 begin = Platform_GetTickCount();
+
+    for (char letter = startLetter; letter <= 'Z'; ++letter)
+    {
+        uint32 remaining = static_cast<uint32>(timeout);
+        char volumeName[MAX_PATH_LEN] = {};
+        bool ready = false;
+
+        for (;;)
+        {
+            int32 err = 0;
+            if (TryGetVolumeLabel(letter, volumeName, sizeof(volumeName), err))
+            {
+                ready = true;
+                break;
+            }
+
+            // Only "device not ready" is worth waiting on; anything else means
+            // there is nothing here.
+            if (err != 0x15 /* ERROR_NOT_READY */)
+                break;
+
+            if (remaining == 0)
+                break;
+
+            const uint32 elapsed = Platform_GetTickCount() - begin;
+            if (elapsed < remaining)
+                continue;
+
+            remaining = 0;
+        }
+
+        if (ready && _strcmpi(volumeName, "YR1") == 0)
+            return letter - 'A';
+    }
+
+    return -1;
 }

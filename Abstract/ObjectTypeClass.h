@@ -87,6 +87,27 @@ public:
     virtual int32 Get_Max_Pips() const;
 
     // ------------------------------------------------------------------
+    // ObjectTypeClass vtable probes (asm one-liners)
+    // ------------------------------------------------------------------
+    // ObjectTypeClass_GetImage (asm 0x718xxx): the loaded SHP the type draws
+    //   itself with, cached at +0x10 by Resolve_SHP_References.
+    virtual SHPStruct* GetImage() const;
+    // ObjectTypeClass_GetPipMax (asm 0x716xxx): base answers 0 - only the
+    //   types that actually render pips (buildings, harvesters) override it.
+    virtual int32 GetPipMax() const;
+    // ObjectTypeClass_GetActualCost (asm 0x716xxx): the cost after the
+    //   owner's modifiers; at type level nothing is applied, so 0.
+    virtual int32 GetActualCost(HouseClass* pOwner) const;
+    // ObjectTypeClass_GetBuildSpeed (asm 0x716xxx): base build-speed factor.
+    int32 GetBuildSpeed() const;
+    // ObjectTypeClass_GetCameo (asm 0x716xxx): the sidebar cameo index; base
+    //   has no cameo of its own.
+    virtual int32 GetCameo() const;
+    // ObjectTypeClass_Generic (asm 0x716xxx): stamps the 'G' marker byte that
+    //   the sidebar uses to flag a generic (non-faction) cameo.
+    void Generic();
+
+    // ------------------------------------------------------------------
     // Factory helpers
     // ------------------------------------------------------------------
     virtual ObjectClass* Create_One_Of(HouseClass* pOwner);
@@ -129,6 +150,9 @@ public:
     // ------------------------------------------------------------------
     // Rules / Art INI fields
     // ------------------------------------------------------------------
+    // ImageSHP (+0x10): the loaded SHP handle for Image, resolved after the
+    // art INI has been read.  Null until Resolve_SHP_References runs.
+    SHPStruct*  ImageSHP;
     char        Image[0x20];
     char        AlphaImage[0x20];
     int32 CrushSound;
