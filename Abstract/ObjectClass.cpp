@@ -2,6 +2,8 @@
 
 #include <Abstract/BuildingClass.h>
 #include <Abstract/BuildingTypeClass.h>
+#include <Abstract/TechnoClass.h>
+#include <Abstract/ObjectTypeClass.h>
 #include <Houses/HouseClass.h>
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -1142,4 +1144,104 @@ bool ObjectClass::Mark_Layer(int32 idxLayer)
     }
 
     return false;
+}
+
+// ============================================================================
+// ObjectClass coordinate-forwarding getters
+// ============================================================================
+
+// ObjectClass_GetPos (asm 0x5F55C0).
+CoordStruct* ObjectClass::GetPos(CoordStruct* pPos) const
+{
+    CoordStruct tmp;
+    GetCoords(&tmp);
+    *pPos = tmp;
+    return pPos;
+}
+
+// ObjectClass_GetCoords_2 (asm 0x5F55E0).
+CoordStruct* ObjectClass::GetCoords2(CoordStruct* pPos) const
+{
+    CoordStruct tmp;
+    GetCoords(&tmp);
+    *pPos = tmp;
+    return pPos;
+}
+
+// ObjectClass_GetExitCoords (asm 0x5F5600).
+//
+//  The second argument is a direction code that the base implementation
+//  discards; only a derived class with an exit layout (refineries, repair
+//  depots) would consume it.
+CoordStruct* ObjectClass::GetExitCoords(CoordStruct* pPos, int32 a3) const
+{
+    (void)a3;
+
+    CoordStruct tmp;
+    GetCoords(&tmp);
+    *pPos = tmp;
+    return pPos;
+}
+
+// ObjectClass_ReturnRealYSort (asm 0x5F3EB0).
+//
+//  The binary invokes the object's GetCoords virtual twice, discards the
+//  return of the second call, and returns the sum of the two Y components.
+//  In this project the two calls collapse to the same accessor, so the sum
+//  is twice the object's own Y - which is exactly what the original computes
+//  for any object whose animation shares its position.
+int32 ObjectClass::ReturnRealYSort() const
+{
+    CoordStruct a;
+    CoordStruct b;
+    GetCoords(&a);
+    GetCoords(&b);
+    return a.Y + b.Y;
+}
+
+// ============================================================================
+// ObjectClass_ReceivedRadioCommand (asm 0x5F5310).
+// ============================================================================
+int32 ObjectClass::ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4)
+{
+    (void)arg0;
+    (void)a4;
+
+    if (cmd == 0x0D)
+    {
+        // MarkGround: drop the object onto the ground layer.  The binary
+        // pushes the Ground layer constant into the Mark slot.
+        Mark_Layer(static_cast<int32>(Layer::Ground));
+        return 1;
+    }
+
+    if (cmd == 0x22)
+    {
+        // Confirm: refuse while the object is badly damaged.  Only technos
+        // carry a health pool (ObjectClass sits above them in the hierarchy),
+        // so the fraction test is applied after confirming the runtime kind
+        // through WhatAmI - the project builds without RTTI.  The binary
+        // compares the fraction against a rules-level threshold that the
+        // project does not yet store, so any shortfall from full health is
+        // treated as a refusal.
+        const AbstractType what = WhatAmI();
+        const bool isTechno = (what == AbstractType::Unit
+                            || what == AbstractType::Infantry
+                            || what == AbstractType::Building
+                            || what == AbstractType::Aircraft);
+
+        const ObjectTypeClass* pType = GetType();
+        const int32 strength = (pType != nullptr) ? pType->Strength : 0;
+
+        if (isTechno && strength > 0
+            && static_cast<double>(static_cast<const TechnoClass*>(this)->Health)
+                   / static_cast<double>(strength) < 1.0)
+        {
+            return 0x0A;
+        }
+
+        return 1;
+    }
+
+    return 0;
 }

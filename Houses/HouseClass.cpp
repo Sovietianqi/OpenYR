@@ -159,6 +159,10 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , RevealedByHeight(false)
     , BaseCenter(CellStruct(0, 0))
     , BaseNodesCount(0)
+    , BaseOutlineLeft(0)
+    , BaseOutlineTop(0)
+    , BaseOutlineWidth(0)
+    , BaseOutlineHeight(0)
     , BestTargetCell(CellStruct(-1, -1))
     , BaseCell(CellStruct(-1, -1))
     , BaseSpawnCell(CellStruct(-1, -1))
@@ -4036,4 +4040,20 @@ BuildingTypeClass* HouseClass::GetBuildingToProduce() const
         return nullptr;
 
     return BuildingTypeClass::Array->Items[BuildingTypeToProduce];
+}
+
+// ============================================================================
+// HouseClass_GetHomeCell (asm 0x50DF00).
+//
+//  The binary compares the house's base cell against the module sentinel
+//  (DefaultIonCannon_Coords) and, when they match, substitutes the ion-cannon
+//  aim point.  Either way a packed wXY is copied out - modelled here as a
+//  reference to whichever cell wins.
+// ============================================================================
+const CellStruct& HouseClass::GetHomeCell() const
+{
+    if (BaseCell == DefaultIonCannon_Coords)
+        return DefaultIonCannon_Coords;
+
+    return BaseCell;
 }

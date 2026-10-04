@@ -475,6 +475,34 @@ enum class MovementZone : int32 {
     Count = 13
 };
 
+// Number of external units a single structure may power (asm BuildingTypeClass
+// slots at +0xF8C, each 0x44 bytes wide).
+static constexpr int32 BUILDING_POWERED_UNIT_COUNT = 3;
+
+// ============================================================================
+// ProjectileTypeFlags - the projectile capability / target-class bitmask used// by TechnoClass::Greatest_Threat and every SelectAutoTarget override.
+// Values match the original binary's equates exactly.
+// ============================================================================
+enum ProjectileTypeFlags : int32 {
+    ttNone         = 0x0000,
+    e01            = 0x0001,   // ground target: general military sweep
+    e02            = 0x0002,   // ground target: secondary sweep
+    ttAircraft     = 0x0004,   // can engage aircraft
+    ttInf          = 0x0008,   // can engage infantry
+    ttVeh          = 0x0010,   // can engage vehicles
+    ttBuild        = 0x0020,   // can engage buildings
+    ttHarvest      = 0x0040,   // can engage harvesters
+    eCapture       = 0x0200,   // can capture (enemy priority)
+    ttPower        = 0x0800,   // can engage power plants
+    ttFactories    = 0x1000,   // can engage factories
+    ttBaseDefense  = 0x2000,   // can engage base defences
+    ttFriendlies   = 0x4000,   // include friendly units in the sweep
+    ttOccupiable   = 0x8000,   // can engage occupiable structures
+    ttTechCapture  = 0x10000,  // can capture tech structures
+    ttAllGround    = 0x0801,   // general sweep mask tested by Greatest_Threat
+    ttSweepMask    = 0x0E01    // the "caller asked for a full sweep" mask
+};
+
 // Land types
 enum class LandType : int32 {
     Clear = 0, Road = 1, Water = 2, Rock = 3, Wall = 4,

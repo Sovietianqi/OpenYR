@@ -434,6 +434,9 @@ public:
     bool         Crusher;
     bool         OmniCrusher;
     bool         OmniCrushResistant;
+    // TechnoTypeClass+0x[Uncrushable]: the art declares the unit can never be
+    // crushed even by an omni-crusher.
+    bool         Uncrushable;
     bool         AutoCrush;
     bool         ImmuneToRadiation;
     bool         Underwater;

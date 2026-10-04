@@ -2,6 +2,7 @@
 
 #include "ObjectClass.h"
 #include "TechnoTypeClass.h"
+#include <Math/Timer.h>
 
 class BuildingClass;
 
@@ -52,12 +53,21 @@ public:
         , WarpInTimer(0)
         , WarpOutTimer(0)
         , IsWarpingOutFlag(false)
+        , DisguiseCreationFrame(-1)
+        , DisguiseBlinkTimer()
+        , PrimaryFacing()
+        , GroundHeight(0)
         , DrainTimer(0)
         , PlanningToken(-1)
         , WeaponStage(0)
         , FocusOnUnit(nullptr)
         , TemporalImUsing(nullptr)
         , QueuedVoiceIndex(-1)
+        , CurrentAmmo(0)
+        , ReloadTimer()
+        , AirstrikeTimeStart(0)
+        , AirstrikeTimeLeft(0)
+        , AirstrikeTimeGen(0)
     {}
     virtual ~TechnoClass() {}
 
@@ -174,6 +184,10 @@ public:
     VisualType VisualCharacter(bool raw);
     void   CreateGap();
     void   DeleteGap();
+    // TechnoClass_UpdatePowered (asm 0x70ED20): re-evaluates whether this
+    // techno still receives the power feed it depends on.  Called by an
+    // owning structure's BuildingClass_InitMore for each powered unit slot.
+    void   UpdatePowered();
     void   UpdateSight();
     void   DrawExtras(Point2D* pCoord, RectangleStruct* pRect);
     void   DrawHidden(Point2D* pCoord, RectangleStruct* pRect);
@@ -392,6 +406,108 @@ public:
     // flag.
     bool HasTurretTooltips() const;
 
+    // TechnoClass::Greatest_Threat (asm 0x6F8DA0).  The engine's universal
+    // target-acquisition entry point.  `projFlags` is the projectile-
+    // capability bitmask (ProjectileTypeFlags); `curThreat` seeds the best
+    // threat so a caller can require a strictly better candidate; `a4`
+    // enumerates the caller class (0 = building, 1 = vehicle, 2 = infantry).
+    // Returns the best target found, or null.
+    virtual ObjectClass* Greatest_Threat(int32 projFlags, int32 curThreat, int32 a4);
+
+    // TechnoClass_Combat_Damage (asm 0x6F8CB0).  Weapon-slot damage query used
+    // by Greatest_Threat to decide whether a special movement class (engineer
+    // / terrorist) should ignore military targets.
+    int32 Combat_Damage(int32 idxWeapon) const;
+
+    // TechnoClass_Techno_31C (asm 0x7087D0).  Vtable +0x31C - resolves the
+    // techno's current target object honouring the requested slot.
+    ObjectClass* Techno_31C(int32 which) const;
+
+    // ========================================================================
+    // Position / altitude probes
+    // ========================================================================
+
+    // TechnoClass_GetCellCoords1 (asm 0x5F6A50).  Writes the techno's owning
+    // map cell (floored to the cell grid) into `pOut` and returns it.
+    CellStruct* GetCellCoords1(CellStruct* pOut) const;
+
+    // TechnoClass_GetCell1 (asm 0x5F6A90).  The CellClass the techno is
+    // standing on, or null off-map.
+    CellClass* GetCell1() const;
+
+    // TechnoClass_OnFloor (asm 0x5F6B60) / _InAir (asm 0x5F6B90).  True when
+    // the techno's Z puts it on the ground / in the air.  Both test the
+    // "has height" flag at +0x74 first, then compare the current Z against
+    // twice the ObjectClass::HeightAtSpawn offset (the parked-on-ground
+    // threshold).
+    bool OnFloor() const;
+    bool InAir() const;
+
+    // TechnoClass_GetZFudgeCliff (asm 0x704270) / _Column (asm 0x703E60) /
+    // _Tunnel (asm 0x703F00).  FootClass::Get_ZAdjustment consults these to
+    // snap a unit's draw height to the terrain in front of it.  Each returns
+    // a fudge value in pixels.
+    int32 GetZFudgeCliff() const;
+    int32 GetZFudgeColumn() const;
+    int32 GetZFudgeTunnel() const;
+
+    // TechnoClass_GetElevationRangeBonus (asm 0x6F6FA0) /
+    // _GetElevationBonusNoSqrt (asm 0x6F7090).  The extra weapon range a
+    // height advantage confers.  The NoSqrt variant skips the square root and
+    // is used by the cheaper proximity test.
+    double GetElevationRangeBonus(ObjectClass* pTarget) const;
+    double GetElevationBonusNoSqrt(ObjectClass* pTarget) const;
+
+    // TechnoClass_TimeForCellInset (asm 0x6F7690).  True when the distance to
+    // the target exceeds (warhead CellSpread - CellInset), i.e. the shot has
+    // already cleared the minimum arming distance.
+    bool TimeForCellInset(TechnoClass* pTarget) const;
+
+    // ========================================================================
+    // Combat / role classifiers
+    // ========================================================================
+
+    // TechnoClass_CanLobber (asm 0x6F9CB0).  True when the techno's current
+    // weapon is flagged as a lobber (arcing artillery).
+    bool CanLobber() const;
+
+    // TechnoClass_HasAbility (asm 0x6F9BE0).  True when the type carries the
+    // requested special ability flag.
+    bool HasAbility(int32 ability) const;
+
+    // TechnoClass_CanBeBunkered (asm 0x6FB5E0).  True when this techno may be
+    // loaded into a battle bunker / tank bunker.
+    bool CanBeBunkered() const;
+
+    // TechnoClass_CanBePermaMC (asm 0x5B1080).  True when this techno may be
+    // permanently mind-controlled (Yuri Prime's capture).
+    bool CanBePermaMC() const;
+
+    // TechnoClass_BelongsToPlayer (asm 0x6FBF40) /
+    // _PlayerOwnedAliveAndNamed (asm 0x6FBFF0).  Ownership probes used by the
+    // damage text / EVA paths.
+    bool BelongsToPlayer() const;
+    bool PlayerOwnedAliveAndNamed() const;
+
+    // TechnoClass_GetPointsValue (asm 0x707DC0).  The score value this techno
+    // contributes when destroyed: the type's PointValue, plus the value of
+    // everything it carries, plus the locomotor's contributed value.
+    int32 GetPointsValue() const;
+
+    // TechnoClass_GetTiberiumPercentage (asm 0x708B90).  Ore storage fill
+    // fraction (0.0..1.0).  Zero when the type has no storage.
+    double GetTiberiumPercentage() const;
+
+    // TechnoClass_GetFacingAgain (asm 0x70ED90).  Writes the current facing
+    // through the out-pointer and returns it.
+    DirStruct* GetFacingAgain(DirStruct* pOut) const;
+
+    // TechnoClass_GetDisguiseFlags (asm 0x70ED60) /
+    // _IsDisguisedAgainst (asm 0x70EE40).  Disguise-blinking state helpers.
+    int32 GetDisguiseFlags(int32 flags) const;
+    bool IsDisguisedAgainst(HouseClass* pHouse) const;
+
+
     virtual double GetStoragePercentage() const { return 0.0; }
     virtual int32 GetRefund() const { return 0; }
     virtual BulletClass* Fire(AbstractClass* pTarget, int32 nWeaponIndex) { return nullptr; }
@@ -429,6 +545,26 @@ public:
 
     bool IsTemporalized() const { return TemporalTimer > 0; }
     void SetTemporal(int32 frames) { if (frames > TemporalTimer) TemporalTimer = frames; }
+
+    // TechnoClass_Reload (asm 0x6FB000).
+    //
+    //  Ticks the ammo counter up by one once the reload timer has run out and
+    //  the magazine is not yet full.  A type with Ammo == -1 never reloads
+    //  (infinite magazine); a type with a finite magazine whose timer is
+    //  still running is left alone.  On a successful reload the techno is
+    //  Mark()ed (ground layer) and Techno_Update_Reloading restarts the timer
+    //  for the next round.
+    void Reload();
+
+    // Techno_Update_Reloading (asm 0x6FB0D0): recomputes and restarts the
+    //  reload delay after a round has been loaded.
+    void Update_Reloading();
+
+    // TechnoClass_StartAirstrikeTimer (asm 0x6FC930) / _StopAirstrikeTimer
+    //  (asm 0x6FC950): arm / disarm the frame window during which a follow-up
+    //  airstrike may be requested.  Start also zeroes the generation counter.
+    void StartAirstrikeTimer(int32 duration);
+    void StopAirstrikeTimer();
 
     bool IsGassed() const { return GasTimer > 0; }
     void SetGas(int32 frames) { if (frames > GasTimer) GasTimer = frames; }
@@ -485,6 +621,13 @@ public:
     bool          IsWarpingOutFlag;   // warp-out has completed
     int32         DrainTimer;         // remaining frames of a drain effect
 
+    // Disguise blinking.  `DisguiseCreationFrame` (+0x1DC) remembers when the
+    // disguise was taken; `DisguiseBlinkTimer` (+0x1EC / +0x1F4) drives the
+    // periodic flicker that tips the player off.  GetDisguiseFlags and
+    // IsDisguisedAgainst read both.
+    int32         DisguiseCreationFrame;
+    CDTimerClass  DisguiseBlinkTimer;
+
     // Planning-token slot: -1 when the object has no waypoint assigned.
     int32         PlanningToken;
 
@@ -493,6 +636,15 @@ public:
 
     // The building this techno is currently focused on (asm FocusOnUnit).
     BuildingClass* FocusOnUnit;
+
+    // Primary facing (+0x388).  Where the object points.  FootClass keeps its
+    // own copy for the locomotor; this is the location the binary's
+    // Desired_Facing256 reads for structures and turreted units.
+    DirStruct     PrimaryFacing;
+
+    // Height used by the on-floor / in-air tests (+0x68 in the original's
+    // type block, mirrored here).  Zero for ground vehicles and structures.
+    int32         GroundHeight;
 
     // Index of a voice line queued for playback, or -1.
     int32         QueuedVoiceIndex;
@@ -514,6 +666,24 @@ public:
     void*         TemporalImUsing;
     int32         GasTimer;           // frames affected by gas
     int32         RadiationTimer;     // frames irradiated by a rad warhead
+
+    // ========================================================================
+    // Ammunition & reloading (asm currentAmmo / ReloadTimer)
+    // ========================================================================
+    // CurrentAmmo (+0x[+], asm TechnoClass.currentAmmo): rounds remaining.
+    //   Reload adds one round once ReloadTimer has elapsed, up to the type's
+    //   Ammo ceiling (-1 = infinite, in which case Reload does nothing).
+    int32         CurrentAmmo;
+    CDTimerClass  ReloadTimer;
+
+    // ========================================================================
+    // Airstrike timer (asm TechnoClass.StartAirstrikeTimer / StopAirstrikeTimer)
+    // ========================================================================
+    // The airstrike window is a plain frame stamp plus a generation counter,
+    // touched by the two helpers below rather than by a real countdown.
+    int32         AirstrikeTimeStart;
+    int32         AirstrikeTimeLeft;
+    int32         AirstrikeTimeGen;
 
 protected:
     explicit TechnoClass(noinit_t) noexcept : ObjectClass(noinit) {}

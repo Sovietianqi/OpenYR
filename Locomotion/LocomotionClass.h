@@ -34,7 +34,17 @@ public:
     virtual HRESULT IsDirty() override { return 0; }
     virtual HRESULT Load(IStream* pStm) override { return S_OK; }
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override { return S_OK; }
-    virtual HRESULT GetSizeMax(uint64* pcbSize) override { return 0; }
+    // LocomotionClass_GetMaxSize (asm 0x55AB40).
+    //
+    //  Serialised size of a locomotion object: the instance's own Size() plus
+    //  the four-byte class tag.  A null output pointer yields E_POINTER.
+    virtual HRESULT GetSizeMax(uint64* pcbSize) override {
+        if (pcbSize == nullptr)
+            return E_POINTER;
+
+        *pcbSize = static_cast<uint64>(Size()) + 4u;
+        return S_OK;
+    }
 
     virtual ~LocomotionClass() = default;
     virtual int32 Size() = 0;
@@ -120,6 +130,16 @@ public:
     bool Is_To_Have_Moving_Anim() const;
 
     LocomotionClass();
+
+    // LocomotionClass_HandItOver (asm 0x5233C0).
+    //
+    //  COM-style ownership handover: when the caller already holds a
+    //  locomotion pointer and is about to overwrite the slot with
+    //  `pNew`, the incumbent's reference is released and the incoming
+    //  pointer is AddRef'd.  A null incoming pointer simply releases the old
+    //  one and clears the slot.  `pSlot` is the holder's locomotion slot;
+    //  the function returns it for chaining.
+    static ILocomotion** HandItOver(ILocomotion** pSlot, ILocomotion* pNew);
 
 protected:
     explicit LocomotionClass(noinit_t) noexcept {}

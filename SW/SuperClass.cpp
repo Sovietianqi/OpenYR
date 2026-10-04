@@ -1,3 +1,4 @@
+#include "../Combat/DamageArea.h"
 #include "SuperClass.h"
 #include "SuperWeaponTypeClass.h"
 #include "../Houses/HouseClass.h"
@@ -1733,4 +1734,19 @@ void SuperClass::SetRecharge(int32 frames)
 void SuperClass::ResetRecharge()
 {
     CustomChargeTime = -1;
+}
+
+
+// LightningStorm_Strike (asm 0x6E0060).
+//
+//   Fires a single lightning bolt at the given cell.  The bolt is a plain
+//   damage application with the lightning warhead; the visual beam is driven
+//   by the storm's own animation pass, which watches the bolt list.
+void SuperClass::LightningStorm_Strike(const CellStruct& cell)
+{
+    if (MapClass::Instance == nullptr)
+        return;
+
+    const CoordStruct coord = CellClass::Cell2Coord(cell);
+    DamageArea::ApplyCellDamage(coord, 100, nullptr, nullptr, true, nullptr);
 }

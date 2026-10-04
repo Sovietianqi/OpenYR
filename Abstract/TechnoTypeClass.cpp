@@ -272,6 +272,11 @@ TechnoTypeClass::TechnoTypeClass() noexcept
     IdleTimer             = 0;
     IsCrewed_             = false;
 
+    Crusher               = false;
+    OmniCrusher           = false;
+    OmniCrushResistant    = false;
+    Uncrushable           = false;
+
     Cameo[0]              = '\0';
     ImageFile[0]          = '\0';
     CameoShape            = nullptr;
@@ -955,6 +960,7 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     HunterSeeker = pINI->ReadBool(section, "HunterSeeker", HunterSeeker);
     Crusher = pINI->ReadBool(section, "Crusher", Crusher);
     OmniCrusher = pINI->ReadBool(section, "OmniCrusher", OmniCrusher);
+    Uncrushable = pINI->ReadBool(section, "Uncrushable", Uncrushable);
     OmniCrushResistant = pINI->ReadBool(section, "OmniCrushResistant", OmniCrushResistant);
     AutoCrush = pINI->ReadBool(section, "AutoCrush", AutoCrush);
     ImmuneToRadiation = pINI->ReadBool(section, "ImmuneToRadiation", ImmuneToRadiation);

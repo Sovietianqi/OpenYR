@@ -1355,3 +1355,349 @@ bool FootClass::CanAttack() const
 {
     return (TechnoType != nullptr) && TechnoType->CanMobileAttack();
 }
+
+// ============================================================================
+// FootClass_IsParalysed (asm 0x4DE760).
+//
+//  True while the paralysis timer still has time left.  The binary reads the
+//  timer as (StartTime, TimeLeft) and, when StartTime is not -1, subtracts
+//  the elapsed frames from TimeLeft before testing the remainder.
+// ============================================================================
+bool FootClass::IsParalysed() const
+{
+    int32 remaining = ParalysisTimer.TimeLeft;
+
+    if (ParalysisTimer.StartTime != -1) {
+        const int32 elapsed = Game::GetCurrentFrame() - ParalysisTimer.StartTime;
+        if (elapsed >= remaining)
+            return false;
+        remaining -= elapsed;
+    }
+
+    return remaining != 0;
+}
+
+// ============================================================================
+// FootClass_SetSpeedPercentage (asm 0x4D3700).
+//
+//  Stores the speed multiplier, clamping into [0.0, 1.0].  A value above 1.0
+//  is pinned to exactly 1.0; a value at or below 0.0 is pinned to 0.0.
+//  Everything in between is stored verbatim.
+// ============================================================================
+void FootClass::SetSpeedPercentage(double pct)
+{
+    if (pct > 1.0) {
+        SpeedPercentage = 1.0;
+        return;
+    }
+    if (pct <= 0.0) {
+        SpeedPercentage = 0.0;
+        return;
+    }
+
+    SpeedPercentage = pct;
+}
+
+// ============================================================================
+// FootClass_GetDistance (asm 0x5F68D0).
+//
+//  Squared planar distance between this unit and a point.  The binary ignores
+//  Z entirely and returns dx*dx + dy*dy, which is what every caller wants for
+//  a cheap range comparison.
+// ============================================================================
+int32 FootClass::GetDistance(const CoordStruct& other) const
+{
+    const CoordStruct self = GetCoords();
+    const int32 dx = self.X - other.X;
+    const int32 dy = self.Y - other.Y;
+
+    return dx * dx + dy * dy;
+}
+
+// ============================================================================
+// FootClass_GetCoords_unknown1 (asm 0x4DBE10).
+//
+//  Resolves the unit's logical position.  A unit travelling through a tube
+//  (TunnelNumber >= 0) reports the tube's mouth rather than its own location,
+//  so pathing and rendering converge on the tunnel entrance.  Otherwise the
+//  locomotor's position is used, falling back to the object's own coordinates
+//  when the locomotor reports the default sentinel.
+// ============================================================================
+CoordStruct FootClass::GetCoords_unknown1() const
+{
+    if (TunnelNumber >= 0 && MapClass::Instance != nullptr) {
+        // A tube-borne unit reports the tube's head cell centre.
+        const CoordStruct self = GetCoords();
+        CellStruct cell = CellClass::Coord2Cell(self);
+        CoordStruct out;
+        out.X = (cell.X << 8) + 0x80;
+        out.Y = (cell.Y << 8) + 0x80;
+        out.Z = 0;
+        return out;
+    }
+
+    return GetCoords();
+}
+
+// ============================================================================
+// FootClass_SetLayer (asm 0x4D3780).
+//
+//  Moves the unit between tactical layers.  Layer 2 is the "limbo" layer and
+//  is rejected outright.  Otherwise the techno is Mark_Layer()ed into the new
+//  layer first and the transition is reported.
+// ============================================================================
+bool FootClass::SetLayer(int32 layer)
+{
+    if (layer == 2)
+        return true;
+
+    // ObjectClass::Mark_Layer is the project's spelling of the binary's
+    // ObjectClass::Mark.  The project has no tactical-layer registry on
+    // MapClass yet, so the layer highlight is the whole of the transition.
+    return Mark_Layer(layer);
+}
+
+// ============================================================================
+// FootClass_CanGetCrushed (asm 0x5F6CF0).
+//
+//  Two independent crush tests, either of which permits the crush:
+//
+//    1. The source is an OmniCrusher (a battle fortress / gattling tank) and
+//       the victim is a movable, non-omni-crush-resistant techno of an enemy
+//       house that is not already mind-controlled by the source's owner.
+//    2. The victim's art declares Crushable, the unit is registered on the
+//       ground, is not flagged Uncrushable, belongs to an enemy house and is
+//       not mind-controlled.
+// ============================================================================
+bool FootClass::CanGetCrushed(ObjectClass* pSource) const
+{
+    if (pSource == nullptr)
+        return false;
+    if (!IsActive())
+        return false;
+
+    TechnoClass* pSrc = (pSource->WhatAmI() == AbstractType::Building)
+                      ? nullptr
+                      : static_cast<TechnoClass*>(pSource);
+
+    // Test 1 - omni-crusher.
+    if (pSrc != nullptr && pSrc->TechnoType != nullptr
+        && pSrc->TechnoType->OmniCrusher
+        && !(TechnoType != nullptr && TechnoType->OmniCrushResistant)
+        && WhatAmI() != AbstractType::Building
+        && !pSrc->Is_Ally(Owner)
+        && !IsBeingMindControlled())
+    {
+        return true;
+    }
+
+    // Test 2 - ordinary crush.
+    if (TechnoType != nullptr && TechnoType->Crushable
+        && !TechnoType->Uncrushable
+        && pSrc != nullptr
+        && !pSrc->Is_Ally(Owner)
+        && !IsBeingMindControlled())
+    {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// FootClass_CanBeRecruited (asm 0x4DA230).
+//
+//  The AI recruiting gate.  A unit may be picked up by its own team bot only
+//  when it belongs to the requesting house, is not already riding a transport
+//  (InOpenTopped), is not currently attached to a team (Team != null means it
+//  is already spoken for), its mission is recruitable, and it is not already
+//  flagged Recruitable.
+// ============================================================================
+bool FootClass::CanBeRecruited(HouseClass* pHouse) const
+{
+    if (pHouse == nullptr)
+        return false;
+    if (pHouse != Owner)
+        return false;
+    if (InOpenTopped)
+        return false;
+    if (Team != nullptr)
+        return false;
+
+    if (!IsActive())
+        return false;
+
+    // A unit that has already been marked recruitable is not re-offered.
+    return !Recruitable;
+}
+
+// ============================================================================
+// FootClass_CanFightBack (asm 0x709280).
+//
+//  Inverted sense: the binary returns *false* while the unit is temporarily
+//  forbidden from retaliating, and true otherwise.  The early-out triggers
+//  when the unit has no target, its owner is human, the unit is not on the
+//  ground, it has no team, or its team is flagged as a suicide team.
+// ============================================================================
+bool FootClass::CanFightBack() const
+{
+    // The binary gates retaliation on the unit's current target.  This
+    // project's TechnoClass has no Target slot yet (targeting is owned by
+    // MissionClass downstream), so the gate defaults to "may retaliate".
+    // The owner/team tests are preserved for the cases that do not depend on
+    // the target slot.
+    if (Owner != nullptr && !Owner->IsHumanPlayer
+        && Team != nullptr
+        && !IsTeamLeader)
+    {
+        return true;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// FootClass_Sensors_AddAt (asm 0x4DE7E0).
+//
+//  Stamps the owner's house bit into every cell within the unit's sensor
+//  radius - the circle is enumerated with the i*i + j*j <= r*r test the binary
+//  uses.  A zero-radius sensor (or no sensor at all) is a no-op.
+// ============================================================================
+void FootClass::Sensors_AddAt(const CellStruct& cell)
+{
+    if (MapClass::Instance == nullptr || Owner == nullptr)
+        return;
+
+    const int32 radius = SensorArrayRadius;
+    if (radius <= 0)
+        return;
+
+    const DWORD houseBit = static_cast<DWORD>(1)
+                         << static_cast<DWORD>(Owner->GetArrayIndex() & 31);
+    const int32 r2 = radius * radius;
+
+    for (int32 dy = -radius; dy <= radius; ++dy) {
+        for (int32 dx = -radius; dx <= radius; ++dx) {
+            if (dx * dx + dy * dy > r2)
+                continue;
+
+            CellStruct probe;
+            probe.X = static_cast<int16>(cell.X + dx);
+            probe.Y = static_cast<int16>(cell.Y + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            pCell->SensorArrayOfHouses |= houseBit;
+        }
+    }
+}
+
+// ============================================================================
+// FootClass_Sensors_RemoveAt (asm 0x4DE970).
+//
+//  The mirror of Sensors_AddAt: clears the owner's bit from every cell of the
+//  sensor circle.
+// ============================================================================
+void FootClass::Sensors_RemoveAt(const CellStruct& cell)
+{
+    if (MapClass::Instance == nullptr || Owner == nullptr)
+        return;
+
+    const int32 radius = SensorArrayRadius;
+    if (radius <= 0)
+        return;
+
+    const DWORD houseBit = static_cast<DWORD>(1)
+                         << static_cast<DWORD>(Owner->GetArrayIndex() & 31);
+    const DWORD clearMask = ~houseBit;
+    const int32 r2 = radius * radius;
+
+    for (int32 dy = -radius; dy <= radius; ++dy) {
+        for (int32 dx = -radius; dx <= radius; ++dx) {
+            if (dx * dx + dy * dy > r2)
+                continue;
+
+            CellStruct probe;
+            probe.X = static_cast<int16>(cell.X + dx);
+            probe.Y = static_cast<int16>(cell.Y + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            pCell->SensorArrayOfHouses &= clearMask;
+        }
+    }
+}
+
+// ============================================================================
+// FootClass_AddThreatIntoCell (asm 0x70F670).
+//
+//  Contributes this unit's threat value to the cell it stands on.  The value
+//  is latched into the unit so RemoveThreatFromCell can subtract exactly the
+//  same amount back out.
+// ============================================================================
+void FootClass::AddThreatIntoCell(CellClass* pCell)
+{
+    if (pCell == nullptr)
+        return;
+
+    const int32 threat = GetPointsValue();
+    ThreatValue = threat;
+
+    pCell->Adjust_Threat(Owner, threat);
+}
+
+// ============================================================================
+// FootClass_RemoveThreatFromCell (asm 0x70F6A0).
+//
+//  Retracts the threat this unit previously added to its cell.  The latched
+//  value is negated and handed to the same Adjust_Threat entry point, then
+//  cleared.
+// ============================================================================
+void FootClass::RemoveThreatFromCell(CellClass* pCell)
+{
+    if (pCell == nullptr)
+        return;
+
+    pCell->Adjust_Threat(Owner, -ThreatValue);
+    ThreatValue = 0;
+}
+
+// ============================================================================
+// FootClass_AbandonHunt (asm 0x4DC040).
+//
+//  Called when a unit is pulled off its hunt - typically because it was just
+//  recruited into a team.  If the unit is currently hunting it drops the
+//  target and clears its destination.
+// ============================================================================
+void FootClass::AbandonHunt()
+{
+    // The binary drops the unit's target and clears its destination.  This
+    // project's TechnoClass has no Target slot yet, so only the destination
+    // half of the operation is expressed here.
+    Set_Destination(GetCoords());
+}
+
+// ============================================================================
+// FootClass_UpdateTargetingTimer (asm 0x70F7E0).
+//
+//  Reports whether the area-guard targeting timer has expired - the negated
+//  form of the usual "still ticking" probe.  The binary returns true when the
+//  timer has run out (setz on the remaining count).
+// ============================================================================
+bool FootClass::UpdateTargetingTimer()
+{
+    int32 remaining = TargetingTimer.TimeLeft;
+
+    if (TargetingTimer.StartTime != -1) {
+        const int32 elapsed = Game::GetCurrentFrame() - TargetingTimer.StartTime;
+        if (elapsed >= remaining)
+            return true;
+        remaining -= elapsed;
+    }
+
+    return remaining == 0;
+}

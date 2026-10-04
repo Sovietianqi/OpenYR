@@ -156,6 +156,55 @@ public:
     bool       Recruitable;
     int32      Group;
 
+    // ========================================================================
+    // Motion / status state
+    // ========================================================================
+
+    // ParalysisTimer (+0x528/+0x530): disabled by a warhead such as the
+    // EMPulse or a temporal weapon.  IsParalysed reports whether it is still
+    // ticking.
+    CDTimerClass ParalysisTimer;
+
+    // SpeedPercentage (+0x578): a double multiplier applied to the
+    // locomotor's speed.  1.0 is normal.
+    double      SpeedPercentage;
+
+    // SensorArrayRadius (+0x5F0 in the type): the radius in cells this unit's
+    // sensors sweep.  Sensors_AddAt / Sensors_RemoveAt stamp the owner's bit
+    // into every cell of the circle.
+    int32       SensorArrayRadius;
+
+    // ThreatValue (+0x508): the last threat this unit contributed to the
+    // cell it occupies.  RemoveThreatFromCell subtracts exactly this back out.
+    int32       ThreatValue;
+
+    // TunnelNumber (+0x8C): the tube this unit is travelling through, or a
+    // negative value when it is not in a tunnel.
+    int8        TunnelNumber;
+
+    // TargetingTimer (+0x180/+0x188): paces how often a unit re-evaluates
+    // its target while on area guard.
+    CDTimerClass TargetingTimer;
+
+    // ========================================================================
+    // Motion / status probes
+    // ========================================================================
+    bool  IsParalysed() const;
+    void  SetSpeedPercentage(double pct);
+    int32 GetDistance(const CoordStruct& other) const;
+    CoordStruct GetCoords_unknown1() const;
+    bool  SetLayer(int32 layer);
+    bool  CanGetCrushed(ObjectClass* pSource) const;
+    bool  CanBeRecruited(HouseClass* pHouse) const;
+    bool  CanFightBack() const;
+    void  Sensors_AddAt(const CellStruct& cell);
+    void  Sensors_RemoveAt(const CellStruct& cell);
+    void  AddThreatIntoCell(class CellClass* pCell);
+    void  RemoveThreatFromCell(class CellClass* pCell);
+    void  AbandonHunt();
+    bool  UpdateTargetingTimer();
+
+
 protected:
     explicit __forceinline FootClass(noinit_t) noexcept : TechnoClass(noinit), Pitch(0), CurrentSequence(Sequence::Ready), Locomotion(nullptr),
         Team(nullptr), NextTeamMember(nullptr), IsTeamLeader(false), Recruitable(false), Group(-1) {}

@@ -353,6 +353,27 @@ public:
     bool         InvisibleInGame;
     char        PowersUpBuilding[0x20];
     int32        PowersUpToLevel;
+    // BuildingTypeClass_PoweredUnit (asm +0xF8C, three 0x44-byte slots).  A
+    // structure may power up to three external units; each entry names the
+    // unit id that receives a continuous power feed.
+    bool         PoweredUnit[BUILDING_POWERED_UNIT_COUNT];
+    // BuildingTypeClass_DontSaveToMap (asm +0x16BF).  Set on decoration types
+    // (walls, fence posts, bridge repair huts) that must not be written into
+    // the map INI's [Structures] list.
+    bool         DontSaveToMap;
+    // BuildingTypeClass_GapGenerator-driven "super charged" variant source:
+    // whether the structure is currently feeding a super-charged gap.
+    bool         GapSuperCharged;
+    // BuildingTypeClass reference at +0x16C7: cloak generator enabled.
+    bool         IsCloakGenerator;
+    // BuildingTypeClass reference at +0x16C8: private/sensor cloak; the
+    // structure reveals its own radius without a public gap.
+    bool         PrivateCloak;
+    // BuildingTypeClass +0x16B7: the type can be driven over when its door is
+    // open (gates, walls-with-door).
+    bool         IsTraversableType;
+    // BuildingTypeClass +0x1707: the radius shown for sensor/detector types.
+    int32        SensorRadiusInCells;
     bool         BridgeRepairHut;
     bool         HasStupidGuardMode;
     bool         CrateBeneath;

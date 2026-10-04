@@ -221,6 +221,25 @@ public:
     virtual void Detach_Target();
     virtual void Attach_Target(AbstractClass* pTarget);
     virtual void PlayAnim(Sequence index, bool force, bool randomStartFrame);
+
+    // ── Sequence classification (asm InfantryClass_Is* family) ────────────
+    // The three predicates below classify the current sequence index.  They
+    // are expressed numerically because the binary's ordinal layout is the
+    // authoritative source and the project's Sequence enum orders the tail
+    // entries differently.
+
+    // InfantryClass_IsAutoUndeployer (asm 0x5224B0): true while a follow-up
+    //  sequence is queued (index != -1).
+    bool IsAutoUndeployer() const;
+
+    // InfantryClass_IsDeployed_Anim (asm 0x5224XX): the deployed set - indices
+    //  0x1B..0x1E (DeployedFire, DeployedIdle, Undeploy, Paradrop).
+    bool IsDeployed_Anim() const;
+
+    // InfantryClass_IsSpecialSequence (asm 0x522CC0): sequences that suspend
+    //  normal activity - the die/swim/flight and the harvest/count set:
+    //  0x0B..0x0F, 0x14, 0x15 and 0x22..0x24.
+    bool IsSpecialSequence() const;
     virtual bool IsTechno() const;
     virtual bool IsInfantry() const;
     virtual bool IsUnit() const;

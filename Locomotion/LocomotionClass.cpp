@@ -1127,3 +1127,31 @@ int32 LocomotionClass::Get_Speed_Accum()
 {
     return static_cast<const LocomotionClass*>(this)->Get_Speed_Accum();
 }
+
+// ============================================================================
+// LocomotionClass_HandItOver (asm 0x5233C0).
+//
+//  Swaps the locomotion COM pointer held at `*pSlot` for `pNew`.  The binary
+//  compares the two, releases the incumbent through its Release slot
+//  (vtable +8) and, when the incoming pointer is non-null, AddRef's it
+//  (vtable +4).  The slot is returned unchanged so callers can chain.
+// ============================================================================
+ILocomotion** LocomotionClass::HandItOver(ILocomotion** pSlot, ILocomotion* pNew)
+{
+    if (pSlot == nullptr)
+        return pSlot;
+
+    ILocomotion* pOld = *pSlot;
+    if (pOld == pNew)
+        return pSlot;
+
+    *pSlot = pNew;
+
+    if (pNew != nullptr)
+        pNew->AddRef();
+
+    if (pOld != nullptr)
+        pOld->Release();
+
+    return pSlot;
+}

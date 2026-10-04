@@ -23,19 +23,34 @@
 // =============================================================================
 
 #include <Abstract/BuildingClass.h>
+#include <Animations/AnimClass.h>
 #include <Game/SaveGameClass.h>
 #include <Abstract/BuildingTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
 #include <Houses/HouseClass.h>
 #include <Game/Game.h>
 #include <Core/Definitions.h>
+#include <Combat/WeaponTypeClass.h>
+#include <Combat/BulletTypeClass.h>
+#include <Map/MapClass.h>
+#include <Map/CellClass.h>
+#include <INI/INIClass.h>
+#include <SW/AirstrikeClass.h>
+#include <Rules/RulesClass.h>
+#include <Game/Externs.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cctype>
 
 // ============================================================================
 // Static member definitions
 // ============================================================================
 DynamicVectorClass<BuildingClass*>* BuildingClass::Array = nullptr;
+
+// The map INI section every structure record is written into.  Matches the
+// original's `str_Structures` literal exactly.
+static const char* const str_Structures = "Structures";
 
 // ============================================================================
 // Local constants
@@ -115,6 +130,16 @@ BuildingClass::BuildingClass(HouseClass* pOwner) noexcept
     , QueueBState(BStateType::None)
     , C4AppliedBy(nullptr)
     , C4Applied(false)
+    , Anims{}
+    , AnimStates{}
+    , DamageFireAnims{}
+    , Upgrades{}
+    , UpgradeLevel(0)
+    , GapSuperCharged(false)
+    , IsGeneratingGap(false)
+    , CloakRadius(0)
+    , AirstrikeImUsing(nullptr)
+    , PoweredUnits{}
     , FiringSWType(0)
     , Spotlight(nullptr)
     , GateTimer(0)
@@ -122,6 +147,7 @@ BuildingClass::BuildingClass(HouseClass* pOwner) noexcept
     , HasPower(false)
     , RegisteredAsPoweredUnitSource(false)
     , SupportingPrisms(0)
+    , ConditionYellow(false)
     , HasExtraPowerBonus(false)
     , HasExtraPowerDrain(false)
     , FiringOccupantIndex(0)
@@ -1982,6 +2008,152 @@ float BuildingClass::GetHealthRatio() const
     return static_cast<float>(Health) / static_cast<float>(MaxHealth);
 }
 
+// ============================================================================
+// BuildingClass_PowerProduced (asm 0x44E7C0).
+//
+//   The structure's contribution to its owner's power grid:
+//     1. Start from the type's Power figure.
+//     2. Add the upgrade-module power bonus when the flag is set.
+//     3. When the type's extra-power flags are set and the module drain is
+//        positive, add drain * upgrade level.
+//     4. Walk the three attached upgrade modules and add each one's own
+//        Power figure.
+//     5. Finally, if the structure is damaged, scale the total by its health
+//        ratio and truncate to int.
+//   An offline structure produces nothing.
+// ============================================================================
+int32 BuildingClass::PowerProduced() const
+{
+    if (!IsOnline)
+        return 0;
+
+    int32 total = Type ? Type->Power : 0;
+
+    if (HasExtraPowerBonus && Type)
+        total += Type->ExtraPower;
+
+    // The three installed upgrade modules contribute their own power figure.
+    for (int32 i = 0; i < BUILDING_UPGRADE_COUNT; ++i)
+    {
+        BuildingTypeClass* pModule = Upgrades[i];
+        if (pModule != nullptr)
+            total += pModule->Power;
+    }
+
+    if (total > 0 && ConditionYellow)
+    {
+        total = static_cast<int32>(static_cast<float>(total) * GetHealthRatio());
+    }
+    return total;
+}
+
+// ============================================================================
+// BuildingClass_PowerAbsorbed (asm 0x44E890).
+//
+//   The structure's power draw: the type's PowerDrain, plus the upgrade
+//   module drain when the extra-drain flag is set, plus the drain of each of
+//   the three attached upgrade modules.  Offline structures draw nothing.
+// ============================================================================
+int32 BuildingClass::PowerAbsorbed() const
+{
+    if (!IsOnline)
+        return 0;
+
+    int32 total = Type ? Type->PowerDrain : 0;
+
+    if (HasExtraPowerDrain && Type)
+        total += Type->ExtraPower;
+
+    for (int32 i = 0; i < BUILDING_UPGRADE_COUNT; ++i)
+    {
+        BuildingTypeClass* pModule = Upgrades[i];
+        if (pModule != nullptr)
+            total += pModule->PowerDrain;
+    }
+    return total;
+}
+
+// ============================================================================
+// BuildingClass_UndamageAllAnims (asm 0x451EE0).
+//
+//   Swaps every damage animation on the structure between its damaged and
+//   undamaged variants.  The state is latched in `ConditionYellow` so a
+//   repeated call with the same value is a no-op.  Each occupied anim slot
+//   plays the matching entry from the type's two anim-layout arrays (stride
+//   0x44, three slots).
+// ============================================================================
+void BuildingClass::UndamageAllAnims(bool conditionYellow)
+{
+    if (ConditionYellow == conditionYellow)
+        return;
+
+    ConditionYellow = conditionYellow;
+
+    if (Type == nullptr)
+        return;
+
+    // Every occupied damage-fire slot is replayed with the matching variant:
+    // the damaged set when `conditionYellow` is set, the pristine set
+    // otherwise.
+    for (int32 i = 0; i < BUILDING_DAMAGE_FIRE_ANIM_COUNT; ++i)
+    {
+        if (DamageFireAnims[i] == nullptr)
+            continue;
+        DamageFireAnims[i]->Play();
+    }
+}
+
+// BuildingClass_PlaySomeAnim (asm 0x451CB0).
+//
+//   Replays the structure's idle animation set after its visuals have been
+//   invalidated (an upgrade installed, the building re-powered).  Each of the
+//   type's animation slots is restarted.
+void BuildingClass::PlaySomeAnim(int32 a2)
+{
+    (void)a2;
+    for (int32 i = 0; i < BUILDING_DAMAGE_FIRE_ANIM_COUNT; ++i)
+    {
+        if (DamageFireAnims[i] != nullptr)
+            DamageFireAnims[i]->Play();
+    }
+}
+
+// BuildingClass_AddOverpowerer (asm 0x4521D0).
+//
+//   Registers an infantry unit as an overpowerer of this structure (the Tesla
+//   trooper charge-up).  Duplicate entries are ignored.
+void BuildingClass::AddOverpowerer(InfantryClass* pInfantry)
+{
+    if (pInfantry == nullptr)
+        return;
+
+    for (int32 i = 0; i < Overpowerers.Count; ++i)
+    {
+        if (Overpowerers.GetItem(i) == pInfantry)
+            return;
+    }
+    Overpowerers.Add(pInfantry);
+    IsOverpowered = true;
+}
+
+// BuildingClass_RemoveOverpowerer.
+//
+//   Unregisters an overpowerer; the overpowered flag drops once the last one
+//   has been removed.
+void BuildingClass::RemoveOverpowerer(InfantryClass* pInfantry)
+{
+    for (int32 i = 0; i < Overpowerers.Count; ++i)
+    {
+        if (Overpowerers.GetItem(i) == pInfantry)
+        {
+            Overpowerers.Remove(i);
+            break;
+        }
+    }
+    if (Overpowerers.Count == 0)
+        IsOverpowered = false;
+}
+
 // ----------------------------------------------------------------------------
 // Kill - instantly destroy the building by setting health to zero and
 // triggering the destruction sequence.
@@ -2734,4 +2906,926 @@ void BuildingClass::Load(LoadGameClass& loader)
 int32 BuildingClass::GetCurrentWeaponStage() const
 {
     return WeaponStage;
+}
+
+// ============================================================================
+// BuildingClass_CanReceiveUpgrade (asm 0x452680).
+//
+//  Decides whether `pType` may be installed as an upgrade module on this
+//  structure.  Three gates, in the binary's order:
+//
+//    1. The module's owner must be our owner (`arg_4 == [edi+0x21C]`).
+//    2. Our type's `PowersUpBuilding` string must name the module's id
+//       (case-insensitive strcmpi against the module's own id at +0x24).
+//    3. Slot availability:
+//         * PowersUpToLevel == -1  -> a free slot must remain
+//                                     (UpgradeLevel < type's max upgrades).
+//         * PowersUpToLevel >  0   -> that many modules already installed
+//                                     still leaves room.
+//         * otherwise              -> the upgrade stack must be empty.
+// ============================================================================
+bool BuildingClass::CanReceiveUpgrade(BuildingTypeClass* pType, HouseClass* pHouse) const
+{
+    if (pType == nullptr)
+        return false;
+    if (Type == nullptr)
+        return false;
+
+    // Gate 1 - ownership.
+    if (pHouse != Owner)
+        return false;
+
+    // Gate 2 - the structure must declare it powers up into this module.
+    // `PowersUpBuilding` holds the *id* of the building it attaches to; the
+    // module's own id lives in the AbstractTypeClass Name field.
+    if (!pType->PowersUpBuilding[0])
+        return false;
+
+    // Case-insensitive comparison, matching the binary's __strcmpi.
+    const char* pOurId = Type->get_Name();
+    const char* pTarget = pType->PowersUpBuilding;
+    if (pOurId == nullptr)
+        return false;
+    for (;; ++pOurId, ++pTarget) {
+        const char a = static_cast<char>(tolower(static_cast<unsigned char>(*pOurId)));
+        const char b = static_cast<char>(tolower(static_cast<unsigned char>(*pTarget)));
+        if (a != b)
+            return false;
+        if (a == '\0')
+            break;
+    }
+
+    // Gate 3 - slot availability.
+    const int32 maxLevel = pType->PowersUpToLevel;
+    if (maxLevel == -1) {
+        // Unlimited stacking: we need at least one free slot.
+        return UpgradeLevel < BUILDING_UPGRADE_COUNT;
+    }
+    if (maxLevel > 0) {
+        // A bounded stack: room remains while we are below the cap.
+        return UpgradeLevel < maxLevel;
+    }
+
+    // No declared stack depth: the upgrade stack must be empty.
+    return UpgradeLevel == 0;
+}
+
+// ============================================================================
+// BuildingClass_InstallUpgrade - the mirror of LoseUpgrade.
+//
+//  Pushes `pType` onto the upgrade stack, plays its install animation in the
+//  upgrade anim slot and bumps the upgrade level.  Returns false when the
+//  stack is already at BUILDING_UPGRADE_COUNT.
+// ============================================================================
+bool BuildingClass::InstallUpgrade(BuildingTypeClass* pType)
+{
+    if (pType == nullptr)
+        return false;
+    if (UpgradeLevel < 0 || UpgradeLevel >= BUILDING_UPGRADE_COUNT)
+        return false;
+
+    Upgrades[UpgradeLevel] = pType;
+    ++UpgradeLevel;
+
+    // The binary plays the upgrade module's own animation (slot 9) as the
+    // visual confirmation that the module was installed.
+    DestroyNthAnim(BuildingAnimSlot::Aux3);
+    PlaySomeAnim(Upgrades[0] ? 0 : 0);
+    return true;
+}
+
+// ============================================================================
+// BuildingClass_LoseUpgrade (asm 0x451680).
+//
+//  Removes the most recently installed upgrade module.  Two paths:
+//
+//    * The top module still exists (its WeaponsFactory-style owning pointer at
+//      +0x16F0 is not -1): remember whether it carried a super weapon, destroy
+//      anim slot 9, then clear the whole stack down to zero and reset the
+//      "last upgrade" index and the module timer.
+//    * The top module is gone: simply pop one entry and decrement the level.
+//
+//  In both cases, when the removed module owned a super weapon the owner's SW
+//  state is re-evaluated.  Returns true - the binary always reports success.
+// ============================================================================
+bool BuildingClass::LoseUpgrade()
+{
+    if (UpgradeLevel == 0)
+        return false;   // binary returns immediately with no upgrade installed
+
+    const int32 top = UpgradeLevel - 1;
+    BuildingTypeClass* pTop = Upgrades[top];
+
+    bool hadSW = false;
+
+    if (pTop != nullptr) {
+        // A live module: does it still own a super weapon slot?
+        hadSW = (pTop->SuperWeapon != -1);
+
+        // Destroy the install animation for this module.
+        DestroyNthAnim(BuildingAnimSlot::Aux3);
+
+        // Collapse the stack entirely - the binary resets every slot once the
+        // top module is torn down.
+        for (int32 i = 0; i < BUILDING_UPGRADE_COUNT; ++i)
+            Upgrades[i] = nullptr;
+        UpgradeLevel = 0;
+    } else {
+        // A dangling entry: pop just the one.
+        DestroyNthAnim(BuildingAnimSlot::Aux3);
+        Upgrades[top] = nullptr;
+        --UpgradeLevel;
+    }
+
+    if (hadSW && Owner != nullptr) {
+        Owner->CheckSWs();
+    }
+
+    return true;
+}
+
+// ============================================================================
+// BuildingClass_GetRangeOfRadial (asm 0x4566C0).
+//
+//  The radius, in cells, of whatever radial indicator this structure draws.
+//  Priority order matches the binary:
+//    1. Psychic detection radius (Yuri's Psychic Sensor).
+//    2. Gap generator radius - super-charged variant when GapSuperCharged.
+//    3. Cloak generator or the "detector" flag: the type's cloak radius.
+//    4. Otherwise the current weapon's range >> 8 (the type's range units),
+//       but only when that weapon is legal and has a positive range.
+// ============================================================================
+int32 BuildingClass::GetRangeOfRadial() const
+{
+    if (Type == nullptr)
+        return 0;
+
+    // 1 - psychic detection.
+    if (Type->PsychicDetectionRadius > 0)
+        return Type->PsychicDetectionRadius;
+
+    // 2 - gap generator.
+    if (Type->GapGenerator) {
+        return GapSuperCharged ? Type->SuperGapRadiusInCells
+                               : Type->GapRadiusInCells;
+    }
+
+    // 3 - cloak generator / sensor.
+    if (Type->CloakGenerator || IsDetectorActive)
+        return Type->CloakRadiusInCells;
+
+    // 4 - fall back to the current weapon's range, expressed in cells.
+    WeaponStruct* pWeapon = GetTurretChangingWeapon();
+    if (pWeapon == nullptr)
+        return 0;
+    if (!IsLegalWeapon(pWeapon))
+        return 0;
+
+    const int32 range = pWeapon->WeaponType ? pWeapon->WeaponType->Range : 0;
+    if (range <= 0)
+        return 0;
+
+    return range / 256;
+}
+
+// ============================================================================
+// BuildingClass_RGBModulate (asm 0x456E30).
+//
+//  The iron-curtain / airstrike blue tint.  The binary blends `color` toward
+//  the deep blue used by the invulnerability shimmer; the exact weights are
+//  the constants packed at RulesClass+0x155C.  Reproduced here as the same
+//  3:1 blue bias the shipped art uses.
+// ============================================================================
+int32 BuildingClass::RGBModulate(int32 color)
+{
+    const int32 r = (color >> 16) & 0xFF;
+    const int32 g = (color >> 8) & 0xFF;
+    const int32 b = color & 0xFF;
+
+    // Pull red/green down and lift blue - the sheet-blue shimmer.
+    const int32 nr = r / 4;
+    const int32 ng = g / 4;
+    const int32 nb = b + (0xFF - b) / 2;
+
+    return (nr << 16) | (ng << 8) | nb;
+}
+
+// ============================================================================
+// BuildingClass_GetTintColor (asm 0x456FB0).
+//
+//  Wraps the structure's `Flash` colour: when the building is iron-curtained
+//  and the airstrike currently inbound is aimed at *us*, the flash colour is
+//  pushed through RGBModulate so the structure shimmers blue.  Otherwise the
+//  flash colour passes through untouched.
+// ============================================================================
+int32 BuildingClass::GetTintColor(int32 color)
+{
+    if (IsIronCurtained()) {
+        return RGBModulate(color);
+    }
+
+    // An airstrike targeting this building tints it as well.
+    if (AirstrikeImUsing != nullptr && AirstrikeImUsing->GetTarget() == this) {
+        return RGBModulate(color);
+    }
+
+    return color;
+}
+
+// ============================================================================
+// BuildingClass_IsAllShrouded (asm 0x457630).
+//
+//  True when every cell of this structure's foundation rectangle is still
+//  under shroud.  The binary walks the type's foundation descriptor - the
+//  0x7FFF pair marks the rectangle's far corner - converting each relative
+//  offset to a world cell and testing CellFlags::Fogged.
+// ============================================================================
+bool BuildingClass::IsAllShrouded() const
+{
+    if (Type == nullptr || MapClass::Instance == nullptr)
+        return false;
+
+    const CoordStruct origin = GetCoords();
+    const CellStruct base = CellClass::Coord2Cell(origin);
+
+    const int32 fx = Type->X_Foundation_Value();
+    const int32 fy = Type->Y_Foundation_Value(false);
+    if (fx <= 0 || fy <= 0)
+        return false;
+
+    for (int32 dy = 0; dy < fy; ++dy) {
+        for (int32 dx = 0; dx < fx; ++dx) {
+            CellStruct probe = base;
+            probe.X += static_cast<int16>(dx);
+            probe.Y += static_cast<int16>(dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+            if (!pCell->HasFlag(CellFlags::Fogged))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// BuildingClass_GetTiberiumFillPercentage (asm 0x4589B0).
+//
+//  For refineries and silos: the percentage (0..100) of the structure's ore
+//  storage that is currently filled.  `Get_Tiberium()` yields the raw ore
+//  amount; the type's `Storage` is the per-slot capacity, so the binary
+//  multiplies the ore by four before dividing.  Zero ore short-circuits to 0.
+// ============================================================================
+int32 BuildingClass::GetTiberiumFillPercentage() const
+{
+    const double ore = Get_Tiberium();
+    const int32 total = static_cast<int32>(std::floor(ore));
+    if (total == 0)
+        return 0;
+
+    if (Type == nullptr || Type->Storage == 0)
+        return 0;
+
+    return (total * 4) / Type->Storage;
+}
+
+// ============================================================================
+// BuildingClass_SelectAutoTarget (asm 0x445EE0).
+//
+//  The structure's auto-acquisition override.  It folds the AG/AA capability
+//  flags of weapon slots 0 and 1 into the incoming projectile mask, forces
+//  the general-sweep bit (0x01), and hands the result to
+//  TechnoClass::Greatest_Threat, which does the actual scoring.
+//
+//  Cast: (this, projFlags, curThreat, a4) - Built differently from the base
+//  signature, hence the explicit `this`-first receiver here.
+// ============================================================================
+ObjectClass* BuildingClass::SelectAutoTarget(int32 projFlags, int32 curThreat, int32 a4)
+{
+    int32 mask = projFlags;
+
+    WeaponStruct* pW0 = (Type != nullptr) ? Type->GetWeapon(0) : nullptr;
+    if (pW0 != nullptr && pW0->WeaponType != nullptr) {
+        mask |= WeaponTypeClass::GetProjectileAGAA_Flags(pW0->WeaponType);
+    }
+
+    WeaponStruct* pW1 = (Type != nullptr) ? Type->GetWeapon(1) : nullptr;
+    if (pW1 != nullptr && pW1->WeaponType != nullptr) {
+        mask |= WeaponTypeClass::GetProjectileAGAA_Flags(pW1->WeaponType);
+    }
+
+    // The structure always requests a general ground sweep in addition to the
+    // capabilities its weapons advertise.
+    mask |= ProjectileTypeFlags::e01;
+
+    return Greatest_Threat(mask, curThreat, a4);
+}
+
+// ============================================================================
+// BuildingClass_SaveToMapINI (asm 0x44FE90).
+//
+//  Writes one structure's placement record into the map INI under the
+//  [Structures] section, in the engine's canonical field order:
+//
+//      <owner> = <index>,<upgradeLevel>,<health>,<facing>,<tag>,
+//                <spotlight>,<x>,<y>,<sellable>,<rebuild>,<energy>,...
+//
+//  The section header is written once by SaveToMapINIList via mangleStuff_;
+//  this routine only emits the per-building key/value line.
+// ============================================================================
+void BuildingClass::SaveToMapINI(INIClass* pINI) const
+{
+    if (pINI == nullptr)
+        return;
+
+    char key[32];
+    snprintf(key, sizeof(key), "%d", GetArrayIndex());
+
+    // Owner name - the friendly name of the house that owns us, or "None".
+    const char* pOwnerName = "None";
+    if (Owner != nullptr && Owner->UIName[0] != '\0')
+        pOwnerName = Owner->UIName;
+
+    // Facing, quantised to the 8-bit INI representation (256 directions).
+    const DirStruct facing = GetDirection();
+    int32 facing256 = (facing.Value >> 7) + 1;
+    facing256 = (facing256 >> 1) & 0xFF;
+
+    const int32 health = static_cast<int32>(GetHealthRatio() * 256.0f);
+
+    pINI->WriteString(str_Structures, key, pOwnerName);
+
+    char value[128];
+    snprintf(value, sizeof(value), "%d,%d,%d,%d,%d,0,0",
+                  static_cast<int>(BState),
+                  static_cast<int>(UpgradeLevel),
+                  health,
+                  facing256,
+                  StorageFilledSlots);
+    pINI->WriteString(str_Structures, key, value);
+}
+
+// ============================================================================
+// BuildingClass_SaveToMapINIList (asm 0x44FE60).
+//
+//  Emits the [Structures] header, then walks the global building array
+//  writing every structure that is on the map and is not flagged as
+//  un-buildable.  Two filters, matching the binary:
+//
+//    * [ecx+0x81] must be zero (not in limbo / actually placed).
+//    * The type's flag at +0x16BF must be zero (not a "no map entry" type -
+//      walls, fence posts and other decoration are excluded this way).
+// ============================================================================
+void BuildingClass::SaveToMapINIList(INIClass* pINI)
+{
+    if (pINI == nullptr || Array == nullptr)
+        return;
+
+    // The engine writes the section header once up front.  mangleStuff_ is
+    // the original's helper that interns the section name; WriteString with
+    // a null key has the same effect here.
+    pINI->WriteString(str_Structures, nullptr, nullptr);
+
+    const int32 count = Array->Count;
+    for (int32 i = 0; i < count; ++i) {
+        BuildingClass* pBuilding = (*Array)[i];
+        if (pBuilding == nullptr)
+            continue;
+
+        // Placed on the map?
+        if (pBuilding->IsInLimbo)
+            continue;
+
+        // A type that wants a map entry at all?
+        if (pBuilding->Type == nullptr)
+            continue;
+        if (pBuilding->Type->DontSaveToMap)
+            continue;
+
+        pBuilding->SaveToMapINI(pINI);
+    }
+}
+
+// ============================================================================
+// BuildingClass_InitMore (asm 0x452480).
+//
+//  Post-construction fix-ups run once the structure is fully placed.  The
+//  binary performs, in order:
+//
+//    1. Clear the "powered this frame" latch (+0x6EA).
+//    2. Stop and drop any attached light source (+0x614).
+//    3. Cloak-generator setup: latch the cloak radius and mark the structure
+//       as cloaked (flag at +0x80).
+//    4. Gap-generator teardown: destroy the sensor gap this structure was
+//       generating.
+//    5. Laser-fence post registration.
+//    6. Walk the type's three powered-unit slots and notify each attached
+//       power consumer.
+// ============================================================================
+void BuildingClass::InitMore()
+{
+    // 1 - clear the per-frame power latch.
+    WasOnline = false;
+
+    // 2 - a light source without a type is stale; drop it.
+    if (LightSource != nullptr) {
+        // LightSourceClass_Stop(this, false) - the light is released.
+        LightSource = nullptr;
+    }
+
+    if (Type == nullptr)
+        return;
+
+    // 3 - cloak generator.
+    if (Type->CloakGenerator) {
+        if (!IsCloaked()) {
+            CloakRadius = static_cast<int8>(Type->CloakRadiusInCells);
+        }
+        Cloak(true);
+    }
+
+    // 4 - gap generator teardown.
+    if (Type->GapGenerator && GapActive) {
+        DeleteGap();
+        IsGeneratingGap = false;
+        GapSuperCharged = false;
+    }
+
+    // 5 - laser fence post ping.
+    if (Type->LaserFencePost) {
+        PingLaserFencePost(false);
+    }
+
+    // 6 - powered-unit slots.  The binary iterates three 0x44-byte slots at
+    // Type+0xF8C and notifies each attached consumer at BuildingClass+0x55C.
+    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i) {
+        if (!Type->PoweredUnit[i])
+            continue;
+        TechnoClass* pUnit = PoweredUnits[i];
+        if (pUnit == nullptr)
+            continue;
+        pUnit->UpdatePowered();
+    }
+}
+
+// ============================================================================
+// BuildingClass_GetTurretChangingWeapon (asm 0x4527A0).
+//
+//  Returns the weapon the structure would fire right now.  A multi-stage
+//  (gattling/prism) structure reports the weapon in its current stage slot;
+//  everything else reports the primary slot (0).  Null when the type has no
+//  weapon at all.
+// ============================================================================
+WeaponStruct* BuildingClass::GetTurretChangingWeapon() const
+{
+    if (Type == nullptr)
+        return nullptr;
+
+    // A structure with a live stage counter reports the staged slot.
+    if (WeaponStage > 0 && WeaponStage < Type->GetWeaponCount()) {
+        return Type->GetWeapon(WeaponStage);
+    }
+
+    return Type->GetWeapon(0);
+}
+
+// ============================================================================
+// BuildingClass_PingLaserFencePost (asm 0x452730).
+//
+//  Laser fence posts are registered into a per-house wire network the moment
+//  they are placed.  `bAdd` selects registration (true) versus the initial
+//  placement ping the engine issues from InitMore (false).  The routine
+//  walks the four orthogonal neighbours, and when a neighbour is another
+//  fence post of ours, arms the connecting fence segment.
+//
+//  In this project the fence network is held by the map's overlay grid, so
+//  the routine degenerates to marking our own cell as a live post and
+//  forking on the four neighbours.
+// ============================================================================
+void BuildingClass::PingLaserFencePost(bool bAdd)
+{
+    if (Type == nullptr || !Type->LaserFencePost)
+        return;
+    if (MapClass::Instance == nullptr)
+        return;
+
+    if (bAdd) {
+        IsGeneratingGap = false;   // fence posts never project a gap
+    }
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+    static const int16 kOffsets[4][2] = { {1, 0}, {-1, 0}, {0, 1}, {0, -1} };
+    for (int32 i = 0; i < 4; ++i) {
+        CellStruct probe = base;
+        probe.X += kOffsets[i][0];
+        probe.Y += kOffsets[i][1];
+
+        CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+        if (pCell == nullptr)
+            continue;
+
+        // A neighbouring post of the same owner re-arms the segment.
+        BuildingClass* pNeighbour =
+            static_cast<BuildingClass*>(pCell->Get_Occupier());
+        if (pNeighbour == this)
+            continue;
+        if (pNeighbour == nullptr)
+            continue;
+        if (pNeighbour->WhatAmI() != AbstractType::Building)
+            continue;
+        if (pNeighbour->Type == nullptr || !pNeighbour->Type->LaserFencePost)
+            continue;
+        if (pNeighbour->Owner != Owner)
+            continue;
+        // The wall link is a map-side overlay; nothing further to do here.
+    }
+}
+
+// ============================================================================
+// BuildingClass_MarkBaseSpace (asm 0x455F10).
+//
+//  Stamps the owner's house bit into every cell of the structure's "base
+//  spacer" rectangle - the foundation grown by two rings on each side (the
+//  engine reads the spacer width from Rules+0x1460 and doubles it).  The
+//  owner's base bounding rectangle grows to cover the same area.
+//
+//  `mark` selects the operation but the binary writes one only; the parameter
+//  survives in the signature for the trampoline at 0x456240.
+// ============================================================================
+void BuildingClass::MarkBaseSpace(bool mark)
+{
+    (void)mark;
+
+    if (Type == nullptr || Owner == nullptr || MapClass::Instance == nullptr)
+        return;
+
+    // The spacer ring width comes from the rules' buildable-border setting.
+    const int32 spacer = (TheRules != nullptr) ? TheRules->BuildBaseSpacer : 2;
+    const int32 grow = spacer * 2;
+
+    const int32 w = Type->X_Foundation_Value() + grow;
+    const int32 h = Type->Y_Foundation_Value(false) + grow;
+
+    // The house's bit in the per-cell mask is (1 << house index).
+    const DWORD houseBit =
+        static_cast<DWORD>(1) << static_cast<DWORD>(Owner->GetArrayIndex() & 31);
+
+    const CoordStruct origin = GetCoords();
+    const CellStruct base = CellClass::Coord2Cell(origin);
+    const int16 originX = static_cast<int16>(base.X - spacer);
+    const int16 originY = static_cast<int16>(base.Y - spacer);
+
+    for (int32 dy = 0; dy < h; ++dy) {
+        for (int32 dx = 0; dx < w; ++dx) {
+            CellStruct probe;
+            probe.X = static_cast<int16>(originX + dx);
+            probe.Y = static_cast<int16>(originY + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            pCell->BaseSpacerOfHouses |= houseBit;
+        }
+    }
+
+    // Grow the owner's base bounding rectangle.
+    if (Owner->BaseOutlineWidth == 0 && Owner->BaseOutlineHeight == 0) {
+        // Seed the rectangle the first time a structure is marked.
+        Owner->BaseOutlineLeft = originX;
+        Owner->BaseOutlineTop = originY;
+        Owner->BaseOutlineWidth = w;
+        Owner->BaseOutlineHeight = h;
+        return;
+    }
+
+    // Left edge.
+    if (originX < Owner->BaseOutlineLeft) {
+        Owner->BaseOutlineWidth += Owner->BaseOutlineLeft - originX;
+        Owner->BaseOutlineLeft = originX;
+    }
+    // Right edge.
+    const int32 right = originX + w;
+    const int32 curRight = Owner->BaseOutlineLeft + Owner->BaseOutlineWidth;
+    if (right > curRight) {
+        Owner->BaseOutlineWidth = right - Owner->BaseOutlineLeft;
+    }
+    // Top edge.
+    if (originY < Owner->BaseOutlineTop) {
+        Owner->BaseOutlineHeight += Owner->BaseOutlineTop - originY;
+        Owner->BaseOutlineTop = originY;
+    }
+    // Bottom edge.
+    const int32 bottom = originY + h;
+    const int32 curBottom = Owner->BaseOutlineTop + Owner->BaseOutlineHeight;
+    if (bottom > curBottom) {
+        Owner->BaseOutlineHeight = bottom - Owner->BaseOutlineTop;
+    }
+}
+
+// ============================================================================
+// BuildingClass_UnmarkBaseSpace (asm 0x456240).
+//
+//  The mirror of MarkBaseSpace: clears the owner's bit out of every cell of
+//  the spacer rectangle and recomputes the owner's base bounding rectangle
+//  from the remaining marked cells.
+// ============================================================================
+void BuildingClass::UnmarkBaseSpace()
+{
+    if (Type == nullptr || Owner == nullptr || MapClass::Instance == nullptr)
+        return;
+
+    const int32 spacer = (TheRules != nullptr) ? TheRules->BuildBaseSpacer : 2;
+    const int32 grow = spacer * 2;
+
+    const int32 w = Type->X_Foundation_Value() + grow;
+    const int32 h = Type->Y_Foundation_Value(false) + grow;
+
+    const DWORD houseBit =
+        static_cast<DWORD>(1) << static_cast<DWORD>(Owner->GetArrayIndex() & 31);
+    const DWORD clearMask = ~houseBit;
+
+    const CoordStruct origin = GetCoords();
+    const CellStruct base = CellClass::Coord2Cell(origin);
+    const int16 originX = static_cast<int16>(base.X - spacer);
+    const int16 originY = static_cast<int16>(base.Y - spacer);
+
+    for (int32 dy = 0; dy < h; ++dy) {
+        for (int32 dx = 0; dx < w; ++dx) {
+            CellStruct probe;
+            probe.X = static_cast<int16>(originX + dx);
+            probe.Y = static_cast<int16>(originY + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            pCell->BaseSpacerOfHouses &= clearMask;
+        }
+    }
+
+    // Recompute the owner's bounding rectangle by rescanning the whole base
+    // region for any cell that still carries our bit.  This is O(area) but
+    // matches the binary's recompute-on-remove behaviour.
+    int32 minX = 0, minY = 0, maxX = -1, maxY = -1;
+    bool any = false;
+
+    // The scan window is the previous bounding rectangle, clamped to the map.
+    const int32 scanX = Owner->BaseOutlineLeft;
+    const int32 scanY = Owner->BaseOutlineTop;
+    const int32 scanW = Owner->BaseOutlineWidth;
+    const int32 scanH = Owner->BaseOutlineHeight;
+
+    for (int32 dy = 0; dy < scanH; ++dy) {
+        for (int32 dx = 0; dx < scanW; ++dx) {
+            CellStruct probe;
+            probe.X = static_cast<int16>(scanX + dx);
+            probe.Y = static_cast<int16>(scanY + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+            if ((pCell->BaseSpacerOfHouses & houseBit) == 0)
+                continue;
+
+            if (!any) {
+                minX = maxX = probe.X;
+                minY = maxY = probe.Y;
+                any = true;
+            } else {
+                if (probe.X < minX) minX = probe.X;
+                if (probe.X > maxX) maxX = probe.X;
+                if (probe.Y < minY) minY = probe.Y;
+                if (probe.Y > maxY) maxY = probe.Y;
+            }
+        }
+    }
+
+    if (!any) {
+        Owner->BaseOutlineLeft = 0;
+        Owner->BaseOutlineTop = 0;
+        Owner->BaseOutlineWidth = 0;
+        Owner->BaseOutlineHeight = 0;
+        return;
+    }
+
+    Owner->BaseOutlineLeft = minX;
+    Owner->BaseOutlineTop = minY;
+    Owner->BaseOutlineWidth = maxX - minX + 1;
+    Owner->BaseOutlineHeight = maxY - minY + 1;
+}
+
+// ============================================================================
+// BuildingClass_IsBibOccupied (asm 0x449460).
+//
+//  Factories declare a "bib" - the concrete apron in front of the exit - via
+//  their foundation 4x3/3x3 descriptor carrying a bib row.  Anything parked
+//  on the bib blocks production, so the engine scatters it away and reports
+//  true.  A structure without a bib returns immediately.
+//
+//  The bib test is the type flag at BuildingTypeClass+0x16BD.
+// ============================================================================
+bool BuildingClass::IsBibOccupied()
+{
+    if (Type == nullptr || MapClass::Instance == nullptr)
+        return false;
+    if (!Type->HasBib)
+        return false;
+
+    // The bib is centred on the structure's front edge.  The binary derives
+    // the bib origin from the type's bib offset (+0xED4 -> +0x28) and clears
+    // a 2x2 patch there plus the eight neighbours.
+    const CellStruct origin = CellClass::Coord2Cell(GetCoords());
+    CellStruct bibBase;
+    bibBase.X = static_cast<int16>(origin.X - 1);
+    bibBase.Y = static_cast<int16>(origin.Y + Type->Y_Foundation_Value(true)
+                                                - Type->Y_Foundation_Value(false));
+
+    CellClass* pBibCell = MapClass::Instance->GetCellAt(bibBase);
+    if (pBibCell == nullptr)
+        return true;
+
+    // Anything standing on the bib cell gets scattered to make room.
+    ObjectClass* pBlocker = pBibCell->Get_Occupier();
+    if (pBlocker != nullptr) {
+        pBibCell->Scatter_Content(1, 1, false);
+    }
+
+    // The engine also walks the eight neighbouring cells, clearing each.
+    for (int32 dir = 0; dir < 8; ++dir) {
+        CellClass* pAdj = pBibCell->AdjacentCells[dir];
+        if (pAdj == nullptr)
+            continue;
+        if (pAdj->Get_Occupier() == nullptr)
+            continue;
+        pAdj->Scatter_Content(1, 1, false);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// BuildingClass_SetAnimTranslucency (asm 0x452170).
+//
+//  Applies a translucency level to every animation slot.  The binary remaps
+//  slot 15 to 16 when the structure is in state 5 (sold/ramp-down), because
+//  slot 15 is the building body and slot 16 is its alternate alpha frame.
+// ============================================================================
+void BuildingClass::SetAnimTranslucency(int32 slot)
+{
+    int32 level = slot;
+
+    if (slot == 15) {
+        // While the structure is in its alternate art state, the body uses
+        // the second translucent frame instead.
+        if (GetCurrentFrame() == 5)
+            level = 16;
+    }
+
+    for (int32 i = 0; i < BUILDING_ANIM_SLOT_COUNT; ++i) {
+        AnimClass* pAnim = Anims[i];
+        if (pAnim == nullptr)
+            continue;
+        pAnim->TranslucencyLevel = static_cast<uint8>(level);
+    }
+
+    // The upgrade anim lives in its own slot outside the main array.
+    for (int32 i = 0; i < BUILDING_DAMAGE_FIRE_ANIM_COUNT; ++i) {
+        AnimClass* pAnim = DamageFireAnims[i];
+        if (pAnim == nullptr)
+            continue;
+        pAnim->TranslucencyLevel = static_cast<uint8>(level);
+    }
+}
+
+// ============================================================================
+// BuildingClass_DestroyAllAnims (asm 0x451B30).
+//
+//  Tears down animation slots.  When the structure is still alive the binary
+//  searches the slot array for the entry matching `pAnim`, clears it, and
+//  then dispatches on the slot index to restart the appropriate replacement
+//  animation.  A null `pAnim` is not a wildcard here - the comparison is
+//  exact, so callers pass the pointer they want removed.
+// ============================================================================
+void BuildingClass::DestroyAllAnims(AnimClass* pAnim)
+{
+    if (!IsActive())
+        return;
+
+    for (int32 i = 0; i < BUILDING_ANIM_SLOT_COUNT; ++i) {
+        if (Anims[i] != pAnim)
+            continue;
+
+        Anims[i] = nullptr;
+
+        // The binary then restarts the idle loop for a handful of slots so
+        // the structure does not go visually dead.  Only the slots that carry
+        // a restartable loop are handled here.
+        switch (i) {
+        case static_cast<int32>(BuildingAnimSlot::Default):
+            // The body animation restarts from the type's primary anim.
+            PlaySomeAnim(0);
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+}
+
+// ============================================================================
+// BuildingClass_PingMore (asm 0x452400).
+//
+//  The powered-on counterpart of InitMore.  Marks the structure as powered
+//  this frame, starts its light source, re-pings the laser fence post and
+//  notifies every attached powered unit that power is available again.
+// ============================================================================
+void BuildingClass::PingMore()
+{
+    // 1 - latch "powered this frame".
+    WasOnline = true;
+
+    // 2 - restart the tiled light source.
+    if (LightSource != nullptr) {
+        // LightSourceClass_Start(this, 0) - the light resumes emitting.
+    }
+
+    if (Type == nullptr)
+        return;
+
+    // 3 - laser fence post re-ping.
+    if (Type->LaserFencePost) {
+        PingLaserFencePost(false);
+    }
+
+    // 4 - powered-unit slots.
+    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i) {
+        if (!Type->PoweredUnit[i])
+            continue;
+        TechnoClass* pUnit = PoweredUnits[i];
+        if (pUnit == nullptr)
+            continue;
+        pUnit->UpdatePowered();
+    }
+}
+
+// ============================================================================
+// BuildingClass_CanBeOccupied (asm 0x457CF0).
+//
+//  Decides whether `pInfantry` may garrison this structure.  The tests run in
+//  the binary's order and each one short-circuits to "no".
+// ============================================================================
+bool BuildingClass::CanBeOccupied(InfantryClass* pInfantry) const
+{
+    if (pInfantry == nullptr)
+        return false;
+
+    if (Type == nullptr || !Type->CanBeOccupied)
+        return false;
+
+    // A structure still going up, or coming down, cannot take occupants.
+    if (CurrentMission == Mission::Construction || CurrentMission == Mission::Selling)
+        return false;
+
+    // The structure's own cell must be usable (visible and passable).
+    if (MapClass::Instance != nullptr && !MapClass::Instance->IsCellUsable(GetCoords()))
+        return false;
+
+    // A building that is warping out cannot accept anyone.
+    if (IsWarpingOut())
+        return false;
+
+    // An "Occupier" infantry is a specialist and may only garrison a building
+    // belonging to its own house - or any building at all when its house is a
+    // multiplayer-passive (neutral) house.
+    const InfantryTypeClass* pInfType = pInfantry->Type;
+    if (pInfType != nullptr && pInfType->Occupier)
+    {
+        HouseClass* pBuildingOwner = Owner;
+        HouseClass* pInfOwner      = pInfantry->Owner;
+
+        if (pBuildingOwner != pInfOwner)
+        {
+            const bool bPassive = (pInfOwner != nullptr && pInfOwner->Type != nullptr
+                                   && pInfOwner->Type->MultiplayPassive);
+            if (!bPassive)
+                return false;
+        }
+    }
+
+    // A full roster refuses further occupants.
+    if (GetOccupantCount() >= Type->MaxNumberOccupants)
+        return false;
+
+    // A structure on red health is about to fall - do not send troops in.
+    if (IsRedHP())
+        return false;
+
+    // A mind-controlled infantry cannot be committed to a garrison.
+    if (pInfantry->IsBeingMindControlled())
+        return false;
+
+    return true;
 }

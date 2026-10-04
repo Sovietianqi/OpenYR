@@ -51,6 +51,14 @@ public:
     // decal placed on the map and asks the display to repaint.
     void Clear_Smudges();
 
+    // MapClass_Sight_From (asm 0x587180).  Reveals a square of `radius` cells
+    // around `coords` for `pHouse`.
+    void Sight_From(const CoordStruct& coords, int32 radius, HouseClass* pHouse);
+
+    // MapClass_CanLocationBeReached (asm 0x578850).  True when the given world
+    // position can be reached with the supplied movement zone.
+    bool Can_Location_Be_Reached(const CoordStruct& coords, bool a3, int32 zone);
+
     // MapClass_FlashCameo (asm 0x4E3xx0).  Lights up the sidebar cameo for
     // `pType` so the player notices a newly available build option.
     void Flash_Cameo(TechnoTypeClass* pType);
@@ -78,6 +86,12 @@ public:
     CellClass* TryGetCellAt(int32 x, int32 y);
     bool IsValidCell(int32 x, int32 y) const;
     bool IsValidCell(int32 cellIndex) const;
+
+    // MapClass_Get_Target_Cell (asm 0x565750).
+    //
+    //  Maps a world coordinate to its cell, returning the scratch fallback
+    //  cell when the coordinate lies outside the flat cell table.
+    CellClass* GetTargetCell(const CoordStruct& coord);
 
     // Coordinate conversion
     int32 CoordToCell(const CoordStruct& coord) const;

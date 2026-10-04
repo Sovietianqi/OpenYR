@@ -56,6 +56,11 @@ public:
     // byte __cdecl LightningStorm_IsActive()  (asm 0x68F0C0)
     static bool LightningStorm_IsActive() { return LightningStorm_Active; }
 
+    // void __cdecl LightningStorm_Strike(CellStruct cell)  (asm 0x6E0060).
+    // Fires a single lightning bolt at the given cell; used by the
+    // 'Lightning strike at waypoint' trigger action.
+    static void LightningStorm_Strike(const CellStruct& cell);
+
     // byte __cdecl PsyDom_IsActive()          (asm 0x68EFD0)
     static bool PsyDom_IsActive() { return PsyDom_Status != 0; }
 

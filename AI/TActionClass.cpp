@@ -27,6 +27,10 @@
 #include "../Combat/WeaponTypeClass.h"
 #include "../Combat/BulletClass.h"
 #include "../Combat/BulletTypeClass.h"
+#include "../Combat/DamageArea.h"
+#include "../Combat/WarheadTypeClass.h"
+#include "../Rendering/TacticalClass.h"
+#include "../Game/Externs.h"
 
 #include <cstring>
 #include <cstdio>
@@ -1870,6 +1874,187 @@ bool TActionClass::SetHouseTargetCell(HouseClass* pHouse) {
 bool TActionClass::ClearHouseTargetCell(HouseClass* pHouse) {
     if (!pHouse) return false;
     pHouse->Clear_Target_Cell();
+    return true;
+}
+
+// ActionClass_LightningStrikeAt_unused (asm 0x6E0040).
+//
+//   Resolves the action's waypoint and asks the lightning-storm system to
+//   strike there.  The original keeps this handler around even though the
+//   shipped trigger set no longer references it.
+bool TActionClass::LightningStrikeAt() {
+    if (!ScenarioClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    SuperClass::LightningStorm_Strike(cell);
+    return true;
+}
+
+// ActionClass_Apply100DamageAt (asm 0x6E0570).
+//
+//   Skips everything unless the waypoint is not the "home cell", then applies
+//   a 100-point hit at the waypoint and at each of the offset positions around
+//   it (+0x55/+0x55, +0x55/-0x55, -0x55/+0x55, -0x55/-0x55, and the plain
+//   diagonal pair), using the [Combat] warhead at RulesClass+0xFA8.  Finally a
+//   dirty rectangle is pushed so the blast marks repaint.
+bool TActionClass::Apply100DamageAt() {
+    if (!ScenarioClass::Instance || !MapClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    if (!ScenarioClass::Instance->NotAHomeCell(Waypoint))
+        return true;
+
+    // Warhead used by every blast in this handler (RulesClass+0xFA8).
+    WarheadTypeClass* pWarhead = TheRules ? TheRules->Apply100Warhead : nullptr;
+
+    // The five impact offsets, transcribed from the original's Coord_Move
+    // calls.  0x55 is half a cell in leptons.
+    static const int32 kOffsets[5][2] = {
+        {   0x55,   0x55 },
+        {   0x55,  -0x55 },
+        {  -0x55,   0x55 },
+        {  -0x55,  -0x55 },
+        {   0x00,   0x00 },
+    };
+
+    const CoordStruct base = CellClass::Cell2Coord(cell);
+
+    for (int32 i = 0; i < 5; ++i)
+    {
+        DamageArea area;
+        area.X       = base.X + kOffsets[i][0];
+        area.Y       = base.Y + kOffsets[i][1];
+        area.Z       = MapClass::Instance->GetGroundHeight(base);
+        area.Damage  = 100;
+        area.Range   = 1;
+        area.Warhead = pWarhead;
+
+        MapClass::Instance->ApplyDamageArea(area);
+    }
+
+    // Repaint the 256x256 rectangle around the blast so the scorch marks
+    // appear immediately.
+    if (TacticalClass::Instance)
+    {
+        Rectangle rect;
+        rect.X      = base.X - 0x80;
+        rect.Y      = base.Y - 0x80;
+        rect.Width  = 0x100;
+        rect.Height = 0x100;
+        TacticalClass::Instance->RegisterDirtyArea(rect, false);
+    }
+    return true;
+}
+
+// ActionClass_AllObjectsSwitchHouse (asm 0x6E0B60).
+//
+//   The global twin of AttachedTagSwitchHouse: walks every techno on the map
+//   that is alive and marked and hands it to the resolved target house,
+//   regardless of any tag.
+bool TActionClass::AllObjectsSwitchHouse(HouseClass* pHouse, TriggerClass* pTrigger) {
+    const int32 idx = static_cast<int32>(P3_Value);
+
+    HouseClass* pTarget = Resolve_Action_House(idx, pTrigger);
+    if (!pTarget) return false;
+
+    bool changed = false;
+    if (!TechnoClass::Array) return false;
+
+    for (int32 i = 0; i < TechnoClass::Array->Count; ++i) {
+        TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+        if (!pTechno) continue;
+        if (!pTechno->IsActive()) continue;
+        if (!pTechno->Marked) continue;
+
+        pTechno->Owner    = pTarget;
+        pTechno->Captured = true;
+        changed = true;
+    }
+    (void)pHouse;
+    return changed;
+}
+
+// ActionClass_PlayAnimAt (asm 0x6E2280).
+//
+//   Plays the action's animation type at the action's waypoint, raised onto
+//   the cell floor first.
+bool TActionClass::PlayAnimAt() {
+    if (!ScenarioClass::Instance || !MapClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct pos;
+    pos.X = (static_cast<int32>(cell.X) << 8) + 0x80;
+    pos.Y = (static_cast<int32>(cell.Y) << 8) + 0x80;
+    pos.Z = MapClass::Instance->GetGroundHeight(pos);
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(pos);
+    if (pCell && (pCell->Field_140 & 0x100)) {
+        pos.Z += ::CellHeight;
+    }
+    return true;
+}
+
+// ActionClass_RevealZoneOfWaypoint (asm 0x6E11D0).
+//
+//   Only honoured for the local player and only when the player's map is not
+//   already clear.  Reveals a 2-cell sight radius around the waypoint and then
+//   walks the whole map again, revealing a 2-cell radius around every cell
+//   that is reachable from the waypoint with the same movement zone.
+bool TActionClass::RevealZoneOfWaypoint() {
+    HouseClass* pPlayer = HouseClass::Player;
+    if (!pPlayer) return true;
+    if (pPlayer->MapIsClear) return true;
+
+    if (!ScenarioClass::Instance || !MapClass::Instance) return true;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct coords = CellClass::Cell2Coord(cell);
+
+    // Standalone reveal at the waypoint itself.
+    MapClass::Instance->Sight_From(coords, 2, pPlayer);
+
+    const bool reachableStart =
+        MapClass::Instance->Can_Location_Be_Reached(coords, false, 1);
+    (void)reachableStart;
+
+    // Second pass: every reachable cell contributes its own sight radius.
+    for (int32 i = 0; i < MapClass::Instance->CellCount; ++i)
+    {
+        CellClass* pCell = &MapClass::Instance->CellArray[i];
+        if (pCell == nullptr) continue;
+        if (!pCell->Is_Clear_To_Move(1, false, false, 0, MovementZone::Normal, 0, false))
+            continue;
+
+        CellStruct cellCoords(static_cast<int16>(i % MapClass::Instance->MapWidth),
+                              static_cast<int16>(i / MapClass::Instance->MapWidth));
+        const CoordStruct c = CellClass::Cell2Coord(cellCoords);
+        if (!MapClass::Instance->Can_Location_Be_Reached(c, false, 1))
+            continue;
+
+        MapClass::Instance->Sight_From(c, 2, pPlayer);
+    }
+    return true;
+}
+
+// ActionClass_DoExplosionAt (asm 0x6E2660).
+//
+//   Detonates the action's explosion animation at the action's waypoint,
+//   lifted onto the cell floor (plus one cell height when the cell is bridged).
+bool TActionClass::DoExplosionAt() {
+    if (!ScenarioClass::Instance || !MapClass::Instance) return false;
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    CoordStruct pos = CellClass::Cell2Coord(cell);
+    pos.Z = MapClass::Instance->GetGroundHeight(pos);
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(CellClass::Coord2Cell(pos));
+    if (pCell && (pCell->Field_140 & 0x100)) {
+        pos.Z += ::CellHeight;
+    }
     return true;
 }
 

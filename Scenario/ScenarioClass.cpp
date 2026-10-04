@@ -1012,3 +1012,25 @@ bool ScenarioClass::GetLocalValue(int32 index) const
 
     return LocalVariables[index].Value != 0;
 }
+
+
+// ScenarioClass_NotAHomeCell (asm 0x6E0700 caller).
+//
+//   True when the waypoint does not resolve to this scenario's home cell.  The
+//   "apply 100 damage" action uses this to avoid nuking the player's own base
+//   start position.
+bool ScenarioClass::NotAHomeCell(int32 idx) const
+{
+    if (idx < 0 || idx >= MaxWaypoints)
+        return false;
+
+    const CellStruct cell = GetWaypointCoords(idx);
+    const int32 packed = (static_cast<int32>(cell.Y) << 16) |
+                         static_cast<uint16>(cell.X);
+
+    if (packed == HomeCell)
+        return false;
+    if (packed == AltHomeCell)
+        return false;
+    return true;
+}

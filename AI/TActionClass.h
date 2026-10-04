@@ -142,6 +142,12 @@ public:
     bool SetTab(int32 tabIndex);
     bool SetHouseTargetCell(HouseClass* pHouse);
     bool ClearHouseTargetCell(HouseClass* pHouse);
+    bool LightningStrikeAt();
+    bool Apply100DamageAt();
+    bool AllObjectsSwitchHouse(HouseClass* pHouse, TriggerClass* pTrigger);
+    bool PlayAnimAt();
+    bool RevealZoneOfWaypoint();
+    bool DoExplosionAt();
 
 private:
     void Action_WinGame();    void Action_LoseGame();

@@ -271,6 +271,13 @@ public:
     void Recalc_Threats();
     void CheerAllUnits();
     void SetPrimaryFactory(int32 factoryID);
+
+    // HouseClass_GetHomeCell (asm 0x50DF00).
+    //
+    //  Returns the house's home (base) cell, falling back to the default
+    //  ion-cannon aim point when no base cell has been recorded yet.  The
+    //  binary writes a packed wXY, so the project returns it by reference.
+    const CellStruct& GetHomeCell() const;
     void SellCell(const CellStruct& cell);
 
     // ── Base mind-control (asm HouseClass_MindControlBaseOf 0x50D28F /
@@ -542,6 +549,17 @@ public:
     bool                RevealedByHeight;
     CellStruct          BaseCenter;
     int32               BaseNodesCount;
+
+    // ── Base outline bookkeeping (asm HouseClass+0x1460+0x5728 block) ──────
+    // The four values below track the bounding rectangle of everything the
+    // player has marked as "base".  BuildingClass_MarkBaseSpace grows the
+    // rectangle as structures are placed; UnmarkBaseSpace shrinks it as they
+    // are removed.  `BaseOutlineInitialised` records whether the rectangle
+    // has ever been seeded (the binary tests the first field for zero).
+    int32               BaseOutlineLeft;
+    int32               BaseOutlineTop;
+    int32               BaseOutlineWidth;
+    int32               BaseOutlineHeight;
 
     // ── Target / base cell bookkeeping ────────────────────────────────────
     // Each is a wXY (two int16s).  A "cleared" slot holds the module sentinel

@@ -2988,3 +2988,49 @@ bool InfantryClass::IsDeployer() const
 {
     return (Type != nullptr) && Type->Deployer;
 }
+
+// ============================================================================
+// InfantryClass_IsAutoUndeployer (asm 0x5224B0).
+//
+//  A queued follow-up sequence (any index other than -1) means the deploy
+//  state machine still has work to do; the binary reports that as "auto
+//  undeployer" and the update path uses it to keep ticking.
+// ============================================================================
+bool InfantryClass::IsAutoUndeployer() const
+{
+    return static_cast<int32>(UnkSequence) != -1;
+}
+
+// ============================================================================
+// InfantryClass_IsDeployed_Anim (asm 0x522520).
+//
+//  True while the infantry is in one of the four deployed sequences: indices
+//  0x1B (27) through 0x1E (30) - deployed fire, deployed idle, undeploy and
+//  paradrop.
+// ============================================================================
+bool InfantryClass::IsDeployed_Anim() const
+{
+    const int32 seq = static_cast<int32>(CurrentSequence);
+    return seq >= 0x1B && seq <= 0x1E;
+}
+
+// ============================================================================
+// InfantryClass_IsSpecialSequence (asm 0x522CC0).
+//
+//  Sequences during which the infantry must not be treated as idle: the death
+//  and swim/flight rows (0x0B..0x0F), the flying idle rows (0x14, 0x15) and
+//  the harvest/count rows (0x22..0x24).
+// ============================================================================
+bool InfantryClass::IsSpecialSequence() const
+{
+    const int32 seq = static_cast<int32>(CurrentSequence);
+
+    if (seq >= 0x0B && seq <= 0x0F)
+        return true;
+    if (seq == 0x14 || seq == 0x15)
+        return true;
+    if (seq >= 0x22 && seq <= 0x24)
+        return true;
+
+    return false;
+}

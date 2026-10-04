@@ -2330,3 +2330,65 @@ bool UnitClass::PickUpFlag(int32 houseIndex)
 
     return true;
 }
+
+// ============================================================================
+// UnitClass_GetTiberiumPipFullness (asm 0x7414A0).
+//
+//  Fraction of the ore bay that is filled, used to size the harvest pip.  A
+//  unit whose type is neither a Harvester nor a Weeder has no bay to speak
+//  of and reports 0.0; a harvester divides its accumulated ore by the type's
+//  Storage capacity.
+// ============================================================================
+double UnitClass::GetTiberiumPipFullness() const
+{
+    if (Type == nullptr)
+        return 0.0;
+
+    if (!Type->Harvester && !Type->Weeder)
+        return 0.0;
+
+    const int32 storage = Type->Storage;
+    if (storage <= 0)
+        return 0.0;
+
+    return Get_Tiberium() / static_cast<double>(storage);
+}
+
+// ============================================================================
+// UnitClass_CanCrush (asm 0x7438F0).
+//
+//  True when this unit may roll over `pTarget`.  Authority to crush comes
+//  either from the type's Crusher flag or from the veteran/elite CRUSHER
+//  ability; the target must exist and be crushable, and the two must be
+//  within the crushing distance (the binary squares the coordinate delta and
+//  compares against the square of the crush reach).
+// ============================================================================
+bool UnitClass::CanCrush(FootClass* pTarget) const
+{
+    if (Type == nullptr || pTarget == nullptr)
+        return false;
+
+    // Crusher authority: the type flag, or the CRUSHER veteran/elite ability.
+    // The project's HasAbility indexes the four-slot ability arrays; CRUSHER
+    // is the third slot in the retail ability order.
+    const bool bAuthorised = Type->Crusher || HasAbility(2);
+
+    if (!bAuthorised)
+        return false;
+
+    if (!pTarget->CanGetCrushed(const_cast<UnitClass*>(this)))
+        return false;
+
+    const CoordStruct mine   = GetCoords();
+    const CoordStruct theirs = pTarget->GetCoords();
+
+    const double dx = static_cast<double>(mine.X - theirs.X);
+    const double dy = static_cast<double>(mine.Y - theirs.Y);
+    const double dz = static_cast<double>(mine.Z - theirs.Z);
+    const double distSq = dx * dx + dy * dy + dz * dz;
+
+    // The crush reach is one cell; the binary compares against the square of
+    // that distance.
+    const double reach = 256.0;
+    return distSq <= reach * reach;
+}

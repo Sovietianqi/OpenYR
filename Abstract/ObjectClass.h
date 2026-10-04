@@ -75,6 +75,33 @@ public:
     //   forwarded by the vtable slot at +0x50 / +0xA4.
     CoordStruct* GetCoords1(CoordStruct* pCrd) const;
 
+    // ObjectClass_GetPos (asm 0x5F55C0) / ObjectClass_GetCoords_2 (asm
+    //   0x5F55E0) / ObjectClass_GetExitCoords (asm 0x5F5600): thin
+    //   vtable-forwarding coordinate getters.  All three marshal a temporary
+    //   CoordStruct, invoke the object's own GetCoords slot (+0x48) and copy
+    //   the result into the caller's buffer.  GetExitCoords additionally
+    //   ignores its second argument (the binary's callers pass a direction
+    //   code that the base class does not use).
+    CoordStruct* GetPos(CoordStruct* pPos) const;
+    CoordStruct* GetCoords2(CoordStruct* pPos) const;
+    CoordStruct* GetExitCoords(CoordStruct* pPos, int32 a3) const;
+
+    // ObjectClass_ReturnRealYSort (asm 0x5F3EB0): returns the object's Y
+    //   coordinate offset for depth sorting by summing the Y components of
+    //   two successive GetCoords calls (the object's own and its animation's).
+    int32 ReturnRealYSort() const;
+
+    // ObjectClass_ReceivedRadioCommand (asm 0x5F5310).
+    //
+    //  Handles two radio commands at the ObjectClass level:
+    //    * cmd 0x0D (MarkGround): forwards a Mark() with Ground to the object,
+    //      then reports success (1).
+    //    * cmd 0x22 (0x22 = 'confirm'): returns 0x0A ("cannot comply") while
+    //      the object's health fraction is below the rules-level threshold
+    //      held just past GUIMoveOutSound; otherwise 1.
+    //  Every other command is unhandled and returns 0.
+    int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4);
+
     // ========================================================================
     // Map presence / validity
     // ========================================================================

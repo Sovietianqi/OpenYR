@@ -218,6 +218,16 @@ public:
     // ========================================================================
     CellClass* AdjacentCell(DirType dir) const;
 
+    // CellClass_ScatterContent (asm 0x4866A0).  Moves whatever object is
+    // sitting on this cell and its immediate neighbours out of the way, the
+    // way a freshly placed structure shoves parked units off its bib.
+    void Scatter_Content(int32 a2, int32 a3, bool bIgnoreInfantry);
+
+    // CellClass_AdjustThreat (asm 0x485220).  Adds `threat` to the cell's
+    // accumulated threat for `pFromHouse` (null means "the neutral bucket").
+    // FootClass_AddThreatIntoCell / _RemoveThreatFromCell drive it.
+    void Adjust_Threat(HouseClass* pFromHouse, int32 threat);
+
     // ========================================================================
     // Misc checks
     // ========================================================================
@@ -319,6 +329,25 @@ public:
     // Height accessors
     int32 Get_Ground_Height() const;
     int32 Get_Z_Height() const;
+
+    // CellClass_GetCoords_unknown2 (asm 0x486890).
+    //
+    //  Coordinate getter used by the vtable slot at +0xA4.  It forwards the
+    //  cell's own GetCoords and, when the cell flag word (+0x140) has bit
+    //  0x100 set, raises the returned Z by the global cell-height bias
+    //  (dword_89E7B4).  The bias is a runtime-tuned constant published when
+    //  the isometric tables are built; the project stores it as the nominal
+    //  level height.
+    CoordStruct* GetCoordsUnknown2(CoordStruct* pCoords) const;
+
+    // CellClass_IsVeins (asm 0x485450).
+    //
+    //  True while the cell can grow vein overlay: the overlay frame byte
+    //  (+0x11C) must be at most 4, the land byte (+0x117) must not be one of
+    //  the four vein-hostile land types (2, 3, 6, 8), and the overlay at
+    //  +0x44 must either be absent (-1) or a vein-type overlay.  The binary
+    //  reads the "is vein" byte out of the OverlayTypeClass record at +0x2AE.
+    bool IsVeins() const;
 
     // Occupier management
     int32 Get_Occupier_Count() const;
@@ -437,6 +466,17 @@ public:
     int32           CellIndex;
     CellFlags       Flags;
     AltCellFlags    AltFlags;
+    // BaseSpacerOfHouses (asm CellClass.BaseSpacerOfHouses): a per-house
+    // bitmask recording which houses have marked this cell as part of their
+    // base's "spacer" ring (the buildable perimeter a base is allowed to
+    // expand into).  BuildingClass_MarkBaseSpace sets the bit for its owner;
+    // BuildingClass_UnmarkBaseSpace clears it.
+    DWORD           BaseSpacerOfHouses;
+    // SensorArrayOfHouses (asm CellClass.SensorArrayOfHouses): the same
+    // per-house bitmask scheme, but for sensor coverage.  FootClass's
+    // Sensors_AddAt / Sensors_RemoveAt stamp and clear the owner's bit over
+    // the unit's sensor circle.
+    DWORD           SensorArrayOfHouses;
     ::LandType      Land;
     int32           TileType;
     int32           TileSubIndex;
@@ -563,6 +603,8 @@ inline CellClass::CellClass()
     , CellIndex(-1)
     , Flags(CellFlags::Empty)
     , AltFlags(AltCellFlags::Clear)
+    , BaseSpacerOfHouses(0)
+    , SensorArrayOfHouses(0)
     , Land(::LandType::Clear)
     , TileType(0)
     , TileSubIndex(0)

@@ -45,6 +45,14 @@ public:
     int32 GetProjectileSpeed() const;
     DamageType GetDamageType() const;
 
+    // WeaponTypeClass__GetProjectileAGAA_Flags (asm 0x771A40).
+    //
+    //  Translates a weapon's projectile capability flags into the
+    //  ProjectileTypeFlags bitmask consumed by TechnoClass::Greatest_Threat
+    //  and every SelectAutoTarget override.  Returns 0 when the weapon has no
+    //  projectile (instant-hit ray weapons are treated as "all targets").
+    static int32 GetProjectileAGAA_Flags(const WeaponTypeClass* pWeapon);
+
     WeaponTypeClass(const char* pID) noexcept;
 
 protected:

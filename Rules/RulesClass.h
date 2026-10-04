@@ -600,6 +600,10 @@ public:
     // ========================================================================
     double      WallBuildSpeedCoefficient;
     double      ChargeToDrainRatio;
+    // RulesClass+0x1460: the width of the buildable "spacer" ring the engine
+    // stamps around every placed structure.  BuildingClass_MarkBaseSpace
+    // doubles it on each axis to obtain the total growth.
+    int32       BuildBaseSpacer;
     double      TrackedUphill;
     double      TrackedDownhill;
     double      WheeledUphill;
@@ -828,6 +832,10 @@ public:
     WarheadTypeClass* FlameDamage;
     WarheadTypeClass* FlameDamage2;
     WarheadTypeClass* NukeWarhead;
+
+    // [Combat] warhead at RulesClass+0xFA8, used by the "apply 100 damage at
+    // waypoint" trigger action.
+    WarheadTypeClass* Apply100Warhead;
     BulletTypeClass* NukeProjectile;
     BulletTypeClass* NukeDown;
     WarheadTypeClass* MutateWarhead;

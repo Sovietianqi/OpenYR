@@ -45,6 +45,22 @@ public:
     virtual float GetTiberiumValue() const;
     virtual double Get_Tiberium() const override;
     virtual bool IsHarvestingTooMuch() const;
+
+    // UnitClass_GetTiberiumPipFullness (asm 0x7414A0).
+    //
+    //  Fraction of the harvester's ore bay that is full, used to size the
+    //  collection pip.  Non-harvesters (neither Harvester nor Weeder on the
+    //  type) report 0.0; harvesters divide their accumulated ore by the
+    //  type's Storage capacity.
+    double GetTiberiumPipFullness() const;
+
+    // UnitClass_CanCrush (asm 0x7438F0).
+    //
+    //  True when this unit may roll over `pTarget`.  The unit must be able to
+    //  crush (the type's Crusher flag, or the CRUSHER veteran/elite ability),
+    //  the target must exist and be crushable, and the two must be within
+    //  crushing distance.
+    bool CanCrush(FootClass* pTarget) const;
     virtual void StartHarvesting();
     virtual void StopHarvesting();
     virtual void HarvestTiberium();

@@ -1660,3 +1660,122 @@ bool CellClass::CanAddTiberium() const {
 
     return true;
 }
+
+// ============================================================================
+// CellClass_ScatterContent (asm 0x4866A0).
+//
+//  Shoves any object parked on this cell (and, for the ground layer, its
+//  immediate neighbourhood) toward an adjacent free cell.  Used when a
+//  structure is placed over ground a unit is sitting on, and when a factory's
+//  bib must be cleared before production can resume.
+//
+//  `bIgnoreInfantry` lets the caller leave infantry where they are - the
+//  original skips infantry when this is set so that guard-position troops are
+//  not displaced by a structure being built around them.
+// ============================================================================
+void CellClass::Scatter_Content(int32 a2, int32 a3, bool bIgnoreInfantry)
+{
+    (void)a2;
+    (void)a3;
+
+    ObjectClass* pObj = Get_Occupier();
+    if (pObj == nullptr)
+        return;
+    if (bIgnoreInfantry && pObj->WhatAmI() == AbstractType::Infantry)
+        return;
+
+    // Find a neighbouring cell without an occupant and hand the object off.
+    for (int32 i = 0; i < 8; ++i) {
+        CellClass* pAdj = AdjacentCells[i];
+        if (pAdj == nullptr)
+            continue;
+        if (pAdj->Get_Occupier() != nullptr)
+            continue;
+
+        // The unit's locomotor is responsible for walking over; the cell
+        // bookkeeping is all this routine owns.
+        pAdj->Add_Occupier(pObj);
+        Remove_Occupier(pObj);
+        return;
+    }
+}
+
+// ============================================================================
+// CellClass::Adjust_Threat - asm 0x481830
+//
+// Propagates a threat impulse into every house's threat grid at this cell's
+// region.  The original walks `vec_Houses`, skipping the source house itself
+// and any house it is allied with, and forwards the (coordHash, threat) pair
+// to HouseClass_SetThreat.  The coordHash is MapClass::Cell_Region of the
+// cell's own coordinates, so all cells of a region share one threat slot.
+// ============================================================================
+void CellClass::Adjust_Threat(HouseClass* pFromHouse, int32 threat)
+{
+    const int32 coordHash = MapClass::Cell_Region(MapCoords);
+    const int32 fromIndex = (pFromHouse != nullptr) ? pFromHouse->GetArrayIndex() : -1;
+
+    for (int32 i = 0; i < TheHouseCount; ++i)
+    {
+        HouseClass* pHouse = Houses[i];
+        if (pHouse == nullptr)
+            continue;
+
+        // The source house never penalises itself.
+        if (pHouse->GetArrayIndex() == fromIndex)
+            continue;
+
+        // Allied houses share the threat picture, so they are left alone -
+        // the loop only pushes the impulse to hostiles and neutrals.
+        if (pFromHouse != nullptr && pHouse->Allied_With(fromIndex))
+            continue;
+
+        pHouse->Set_Threat(coordHash, threat);
+    }
+}
+
+// ============================================================================
+// CellClass_GetCoords_unknown2 (asm 0x486890).
+//
+//  Forwards the cell's own coordinates and, when the flag word at +0x140 has
+//  bit 0x100 set, raises Z by the global bias dword_89E7B4 - the height of
+//  one isometric level, published when the tile tables are built.  The
+//  project maps that bias to LevelHeight.
+// ============================================================================
+CoordStruct* CellClass::GetCoordsUnknown2(CoordStruct* pCoords) const
+{
+    // CellClass is not an ObjectClass in this project, so the "vtable +0x48
+    // GetCoords" slot maps to the cell's own coordinate builder.
+    *pCoords = Get_CellCoords();
+
+    if ((Field_140 & 0x0100u) != 0)
+        pCoords->Z += LevelHeight;
+
+    return pCoords;
+}
+
+// ============================================================================
+// CellClass_IsVeins (asm 0x485450).
+//
+//  A cell accepts vein growth only when its overlay frame byte (+0x11C) is at
+//  most 4, its land byte is not one of the four vein-hostile types (2, 3, 6
+//  and 8), and the current overlay is either absent (-1) or flagged as a vein
+//  overlay.  The binary tests the vein flag directly on the OverlayTypeClass
+//  record at +0x2AE.
+// ============================================================================
+bool CellClass::IsVeins() const
+{
+    if (OverlayFrame > 4)
+        return false;
+
+    const int32 land = static_cast<int32>(Land);
+    if (land == 2 || land == 3 || land == 6 || land == 8)
+        return false;
+
+    if (Overlay == -1)
+        return true;
+
+    const OverlayTypeClass* pType = OverlayTypeClass::Array != nullptr
+                                  ? (*OverlayTypeClass::Array)[Overlay]
+                                  : nullptr;
+    return (pType != nullptr) && pType->IsVeinholeMonster;
+}

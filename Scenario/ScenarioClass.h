@@ -173,6 +173,9 @@ public:
     // Waypoints
     // ========================================================================
     bool IsDefinedWaypoint(int32 idx) const;
+    // ScenarioClass_NotAHomeCell (asm 0x6E0700 caller): true when the given
+    // waypoint does not resolve to this scenario's home cell.
+    bool NotAHomeCell(int32 idx) const;
     CellStruct GetWaypointCoords(int32 idx) const;
     void SetWaypointCoords(int32 idx, const CellStruct& cell);
 

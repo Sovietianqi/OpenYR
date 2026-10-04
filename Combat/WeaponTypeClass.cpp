@@ -848,3 +848,52 @@ int32 WeaponTypeClass::GetProjectileSpeed() const {
 DamageType WeaponTypeClass::GetDamageType() const {
     return DamageTypeValue;
 }
+
+// ============================================================================
+// WeaponTypeClass__GetProjectileAGAA_Flags (asm 0x771A40).
+//
+//  Folds a projectile's target-class flags into the ProjectileTypeFlags
+//  bitmask the acquisition code understands.  The mapping is the binary's:
+//
+//      AG  -> ttInf | ttVeh | ttBuild | ttHarvest   (ground targets)
+//      AA  -> ttAircraft                            (air targets)
+//      ASW -> ttVeh                                 (submerged vehicles)
+//      AN  -> ttAircraft                            (naval air)
+//
+//  A weapon without a projectile still reports the general ground sweep so
+//  that instant-hit (laser/prism) weapons keep acquiring targets.
+// ============================================================================
+int32 WeaponTypeClass::GetProjectileAGAA_Flags(const WeaponTypeClass* pWeapon)
+{
+    if (pWeapon == nullptr)
+        return 0;
+
+    if (pWeapon->Projectile == nullptr) {
+        // No projectile: instant-hit weapon, engages everything on the ground.
+        return ProjectileTypeFlags::e01
+             | ProjectileTypeFlags::ttInf
+             | ProjectileTypeFlags::ttVeh
+             | ProjectileTypeFlags::ttBuild;
+    }
+
+    int32 flags = 0;
+    const BulletTypeClass* pBullet = pWeapon->Projectile;
+
+    if (pBullet->AG) {
+        flags |= ProjectileTypeFlags::ttInf
+               | ProjectileTypeFlags::ttVeh
+               | ProjectileTypeFlags::ttBuild
+               | ProjectileTypeFlags::ttHarvest;
+    }
+    if (pBullet->AA) {
+        flags |= ProjectileTypeFlags::ttAircraft;
+    }
+    if (pBullet->ASW) {
+        flags |= ProjectileTypeFlags::ttVeh;
+    }
+    if (pBullet->AN) {
+        flags |= ProjectileTypeFlags::ttAircraft;
+    }
+
+    return flags;
+}

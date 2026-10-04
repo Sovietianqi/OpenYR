@@ -13,6 +13,8 @@ class CellClass;
 class AnimClass;
 class BuildingLightClass;
 class WarheadTypeClass;
+class INIClass;
+class AirstrikeClass;
 
 // ============================================================================
 // BStateType - the high-level state a building's art/logic is in. Mirrors the
@@ -191,6 +193,17 @@ public:
     virtual void CreateEndPost(bool arg);
     virtual DWORD GetFWFlags() const;
     virtual int32 GetOccupantCount() const;
+
+    // BuildingClass_CanBeOccupied (asm 0x457CF0).
+    //
+    //  Gate for garrisoning a civilian structure with `pInfantry`.  Grounds
+    //  for refusal, in the binary's order: a null occupant; a type that is not
+    //  occupiable; a building mid-construction or mid-sale; a building whose
+    //  cell is not usable; a warping-out building; an Occupier infantry whose
+    //  house neither matches the building's owner nor is a multiplayer-passive
+    //  (neutral) house; a full occupant roster; a building on red health; and
+    //  a mind-controlled infantry.
+    bool CanBeOccupied(InfantryClass* pInfantry) const;
     virtual bool AddOccupant(InfantryClass* pInfantry);
     virtual bool RemoveOccupant(InfantryClass* pInfantry);
     virtual InfantryClass* GetOccupant(int32 index) const;
@@ -243,6 +256,137 @@ public:
     virtual bool IsYellowHP() const;
     virtual bool IsRedHP() const;
     virtual float GetHealthRatio() const;
+
+    // ========================================================================
+    // Power accounting (asm BuildingClass_PowerProduced 0x44E7C0 /
+    // BuildingClass_PowerAbsorbed 0x44E890)
+    //
+    //  PowerProduced sums the type's [General] power contribution, the
+    //  upgrade bonus, the extra-power flags and the output of the three
+    //  attached upgrade modules, then scales the whole figure by the
+    //  structure's health when it is damaged (`conditionYellow`).
+    //  PowerAbsorbed adds up the type's drain plus its upgrade drain.
+    //  Both return 0 for an offline structure.
+    // ========================================================================
+    int32 PowerProduced() const;
+    int32 PowerAbsorbed() const;
+
+    // BuildingClass_UndamageAllAnims (asm 0x451EE0).  Switches every damage
+    // animation on the structure between the "damaged" and "undamaged"
+    // variants; `conditionYellow` selects the damaged set.
+    void UndamageAllAnims(bool conditionYellow);
+
+    // BuildingClass_PlaySomeAnim (asm 0x451CB0).  Replays the structure's
+    // idle animation set - used after an upgrade installs new anims.
+    void PlaySomeAnim(int32 a2);
+
+    // BuildingClass_AddOverpowerer (asm 0x4521D0) / _RemoveOverpowerer:
+    // register / unregister a Tesla trooper boosting this structure.
+    void AddOverpowerer(InfantryClass* pInfantry);
+    void RemoveOverpowerer(InfantryClass* pInfantry);
+
+    // ========================================================================
+    // Upgrade slots.  `UpgradeLevel` (asm +0x702) counts the installed upgrade
+    // modules held in `Upgrades[]`; the engine stacks at most
+    // BUILDING_UPGRADE_COUNT of them.
+    // ========================================================================
+
+    // BuildingClass_CanReceiveUpgrade (asm 0x452680).  True when `pType` is a
+    // legal upgrade module for this structure owned by `pHouse`: the module's
+    // `PowersUpBuilding` must name our type, the house must match, and we must
+    // still have a free slot (or the module carries no PowersUpToLevel gate).
+    bool CanReceiveUpgrade(BuildingTypeClass* pType, HouseClass* pHouse) const;
+
+    // BuildingClass_LoseUpgrade (asm 0x451680).  Removes the most recently
+    // installed upgrade module, destroys its slot anim, and (when the module
+    // had a super weapon) re-evaluates the owner's SWs.  Returns true when an
+    // upgrade was actually removed.
+    bool LoseUpgrade();
+
+    // BuildingClass_InstallUpgrade - the mirror of LoseUpgrade.  Pushes a
+    // module onto the upgrade stack, plays its install anim and bumps the
+    // upgrade level.  Returns false when the stack is already full.
+    bool InstallUpgrade(BuildingTypeClass* pType);
+
+    // BuildingClass_GetRangeOfRadial (asm 0x4566C0).  The radius in cells of
+    // the structure's radial indicator (psychic detection / gap generator /
+    // cloak generator / weapon range).
+    int32 GetRangeOfRadial() const;
+
+    // BuildingClass_GetTintColor (asm 0x456FB0).  Applies the red/blue/green
+    // modulation the structure owes to iron-curtain / airstrike states.
+    int32 GetTintColor(int32 color);
+
+    // BuildingClass_RGBModulate (asm 0x456E30).  Iron-curtain blue tint.
+    int32 RGBModulate(int32 color);
+
+    // BuildingClass_IsAllShrouded (asm 0x457630).  True when every cell of the
+    // structure's foundation is still under shroud.
+    bool IsAllShrouded() const;
+
+    // BuildingClass_GetTiberiumFillPercentage (asm 0x4589B0).  Ore storage
+    // occupancy in percent (0..100) for refineries and silos.
+    int32 GetTiberiumFillPercentage() const;
+
+    // BuildingClass_SelectAutoTarget (asm 0x445EE0).  Folds the AG/AA flags of
+    // weapon slots 0 and 1 into the incoming projectile mask and delegates the
+    // actual acquisition to TechnoClass::Greatest_Threat.
+    ObjectClass* SelectAutoTarget(int32 projFlags, int32 curThreat, int32 a4);
+
+    // BuildingClass_SaveToMapINIList (asm 0x44FE60).  Walks the global building
+    // array writing every placed, non-limbo structure into the map INI.
+    static void SaveToMapINIList(INIClass* pINI);
+
+    // BuildingClass_SaveToMapINI (asm 0x44FE90).  Serializes one structure's
+    // placement record into the map INI under [Structures].
+    void SaveToMapINI(INIClass* pINI) const;
+
+    // BuildingClass_InitMore (asm 0x452480).  Post-construction fix-ups: light
+    // source reset, cloak/gap registration, laser-fence post ping and the
+    // powered-unit anim sweep.
+    void InitMore();
+
+    // BuildingClass_GetTurretChangingWeapon (asm 0x4527A0).  The weapon the
+    // structure would fire right now, honouring its current turret stage.
+    WeaponStruct* GetTurretChangingWeapon() const;
+
+    // BuildingClass_PingLaserFencePost (asm 0x452730).  Registers this
+    // structure as a laser-fence post in the wall network and (when `bAdd`)
+    // also re-pings the neighbouring posts so the fence rebuilds its links.
+    void PingLaserFencePost(bool bAdd);
+
+    // ========================================================================
+    // Base-space marking.  When a structure is placed, the engine stamps its
+    // owner's bit into CellClass::BaseSpacerOfHouses over a rectangle grown
+    // by two rings (the buildable "spacer" area around the foundation).  The
+    // owner's base bounding rectangle is grown to cover the same region.
+    // ========================================================================
+
+    // BuildingClass_MarkBaseSpace (asm 0x455F10).
+    void MarkBaseSpace(bool mark);
+
+    // BuildingClass_UnmarkBaseSpace (asm 0x456240).
+    void UnmarkBaseSpace();
+
+    // BuildingClass_IsBibOccupied (asm 0x449460).  When the type declares a
+    // bib (the concrete apron in front of a factory), any unit sitting on the
+    // bib is shooed away.  Returns true when the structure has a bib.
+    bool IsBibOccupied();
+
+    // BuildingClass_SetAnimTranslucency (asm 0x452170).  Applies a
+    // translucency level to all of the structure's animation slots.  Slot 15
+    // (the upgrade anim) is remapped to 16 so it does not share the building
+    // body's fade.
+    void SetAnimTranslucency(int32 slot);
+
+    // BuildingClass_DestroyAllAnims (asm 0x451B30).  Tears down every active
+    // animation slot, optionally matching a specific anim pointer.
+    void DestroyAllAnims(AnimClass* pAnim);
+
+    // BuildingClass_PingMore (asm 0x452400).  The powered-on counterpart of
+    // InitMore: starts the light source, re-pings the laser fence post and
+    // notifies every attached powered unit.
+    void PingMore();
     virtual void Repair(int32 amount);
     virtual void Kill();
     virtual int32 GetValue() const;
@@ -338,6 +482,24 @@ public:
     bool                AnimStates[BUILDING_ANIM_SLOT_COUNT];// whether each anim was enabled
     AnimClass*          DamageFireAnims[BUILDING_DAMAGE_FIRE_ANIM_COUNT];
     BuildingTypeClass*  Upgrades[BUILDING_UPGRADE_COUNT];    // installed upgrade types
+    // UpgradeLevel (+0x702): number of live entries in Upgrades[].  Read as a
+    // signed byte by the binary (BuildingClass_LoseUpgrade, GetWeapon, ...).
+    int8                UpgradeLevel;
+    // GapSuperCharged: this structure's gap generator is being overcharged by
+    // a nearby Psychic Beacon, switching it to SuperGapRadiusInCells.
+    // (asm BuildingClass offset used by GetRangeOfRadial.)
+    bool                GapSuperCharged;
+    // IsGeneratingGap (+[edi+6EB]): a gap field is currently being projected.
+    bool                IsGeneratingGap;
+    // CloakRadius (+CloakRadius, byte): the radius latched by InitMore for a
+    // cloak generator / sensor structure.
+    int8                CloakRadius;
+    // AirstrikeImUsing (+AirstrikeImUsing): the airstrike super-weapon that
+    // is currently inbound to this structure, or null.
+    AirstrikeClass*     AirstrikeImUsing;
+    // PoweredUnits (+0x55C, three slots): the external units this structure is
+    // feeding power to, parallel to BuildingTypeClass::PoweredUnit[].
+    TechnoClass*        PoweredUnits[BUILDING_POWERED_UNIT_COUNT];
     int32               FiringSWType;                  // super-weapon currently launching
     BuildingLightClass* Spotlight;                     // attached building light
     int32               GateTimer;                     // frames remaining for gate anim
@@ -345,6 +507,9 @@ public:
     bool                HasPower;                      // power is currently available
     bool                RegisteredAsPoweredUnitSource;  // registered w/ powered-unit system
     DWORD               SupportingPrisms;              // prism chain contribution count
+    // ConditionYellow (+0x6E6): latched "structure is showing its damaged
+    // variant" state; BuildingClass_UndamageAllAnims owns it.
+    bool                ConditionYellow;
     bool                HasExtraPowerBonus;
     bool                HasExtraPowerDrain;
     DynamicVectorClass<InfantryClass*> Overpowerers;   // tesla troopers boosting us

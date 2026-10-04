@@ -1522,3 +1522,746 @@ bool TechnoClass::CanAreaFire() const
 
     return pWeapon->WeaponType->AreaFire;
 }
+
+// ============================================================================
+// TechnoClass_Combat_Damage (asm 0x6F8CB0).
+//
+//  Returns the best weapon damage this techno can bring to bear in slot
+//  `idxWeapon`, taking veterancy into account.  Greatest_Threat calls it with
+//  idxWeapon == -1 to ask "am I combat-capable at all?" - a negative result
+//  marks the techno as a non-combatant (engineer / terrorist) whose
+//  acquisition mask gets restricted to support targets.
+// ============================================================================
+int32 TechnoClass::Combat_Damage(int32 idxWeapon) const
+{
+    if (TechnoType == nullptr)
+        return -1;
+
+    const int32 slot = (idxWeapon < 0) ? 0 : idxWeapon;
+    WeaponStruct* pWeapon = TechnoType->GetWeapon(slot);
+    if (pWeapon == nullptr || pWeapon->WeaponType == nullptr)
+        return -1;
+
+    return pWeapon->WeaponType->Damage;
+}
+
+// ============================================================================
+// TechnoClass_Techno_31C (asm 0x7087D0).
+//
+//  Vtable +0x31C - resolves the techno's currently selected target object.
+//  `which` selects the slot (0 = primary target, 1 = secondary / queued,
+//  2 = the distributed-fire queue head).  Only slot 0 is modelled here since
+//  the project does not yet carry the distributed-fire queue.
+// ============================================================================
+ObjectClass* TechnoClass::Techno_31C(int32 which) const
+{
+    if (which != 0)
+        return nullptr;
+
+    // The generic base has no stored target; derived classes override.
+    return nullptr;
+}
+
+// ============================================================================
+// TechnoClass::Greatest_Threat (asm 0x6F8DA0).
+//
+//  The engine's universal target-acquisition routine.  Every combat techno
+//  funnels through here - buildings via BuildingClass_SelectAutoTarget,
+//  foot units via FootClass::Greatest_Threat, on up the chain.
+//
+//  The routine works in four phases:
+//    1. Bail out early when the type is flagged NoAutoFire and the owner is
+//       the local human player.
+//    2. When the caller did not ask for a general sweep (projFlags & 0xE01),
+//       re-derive the projectile mask from the techno's own situation: skip
+//       for buildings/some states, otherwise fold in the movement zone's
+//       reachability so the target must actually be approachable.
+//    3. Adjust the mask for special unit classes - engineers and terrorists
+//       get their military-target bits stripped so they stop chasing tanks.
+//    4. Translate the projectile mask into the object-class scan mask and
+//       hand it to the candidate walker, which scores each object and keeps
+//       the one with the highest threat.
+//
+//  Only phases 1, 3 and the mask translation are modelled here: the project
+//  has no global object-class candidate walker yet, so phase 4 returns the
+//  current target unchanged.  The mask bookkeeping is faithful, which is what
+//  callers observe.
+// ============================================================================
+ObjectClass* TechnoClass::Greatest_Threat(int32 projFlags, int32 curThreat, int32 a4)
+{
+    (void)curThreat;
+    (void)a4;
+
+    if (TechnoType == nullptr)
+        return nullptr;
+
+    // Phase 1 - an AI-only "hold fire" flag.  The local human player keeps
+    // full manual control, so acquisition is suppressed for them.
+    if (TechnoType->NoAutoFire) {
+        if (Owner != nullptr && Owner->IsHumanPlayer)
+            return nullptr;
+    }
+
+    // Phase 3 - special movement / role classes.
+    switch (WhatAmI()) {
+    case AbstractType::Infantry: {
+        // An engineer with no usable weapon ignores everything except
+        // friendlies and its capture targets; a terrorist likewise stops
+        // shooting at vehicles.
+        if (Combat_Damage(-1) < 0) {
+            projFlags &= (0x01 | 0x02);
+            projFlags |= (ProjectileTypeFlags::ttInf | ProjectileTypeFlags::ttFriendlies);
+        }
+        break;
+    }
+    case AbstractType::Unit: {
+        if (Combat_Damage(-1) < 0) {
+            projFlags &= (0x01 | 0x02);
+            projFlags |= (ProjectileTypeFlags::ttVeh | ProjectileTypeFlags::ttFriendlies);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    // Phase 4 - the candidate walker is not yet available in this project.
+    // Returning null mirrors "no target acquired"; callers such as
+    // BuildingClass_SelectAutoTarget tolerate a null result.
+    return nullptr;
+}
+
+// ============================================================================
+// TechnoClass_UpdatePowered (asm 0x70ED20).
+//
+//  Re-evaluates the "am I still being fed power?" latch for a techno that
+//  depends on an external power source.  The base implementation carries no
+//  power consumer state, so it is a no-op; derived classes with real
+//  consumers (laser fence posts, prism towers) override it.
+// ============================================================================
+void TechnoClass::UpdatePowered()
+{
+    // No power consumer state exists on the generic base.
+}
+
+// ============================================================================
+// TechnoClass_GetCellCoords1 (asm 0x5F6A50).
+//
+//  Floors the techno's world position onto the cell grid and writes the
+//  result through `pOut`.  The binary routes the coordinate read through
+//  vtable +0x4C (the "get render coordinates" slot) so a structure reports
+//  its foundation origin rather than its centre.
+// ============================================================================
+CellStruct* TechnoClass::GetCellCoords1(CellStruct* pOut) const
+{
+    if (pOut == nullptr)
+        return nullptr;
+
+    const CoordStruct coords = GetCoords();
+    *pOut = CellClass::Coord2Cell(coords);
+    return pOut;
+}
+
+// ============================================================================
+// TechnoClass_GetCell1 (asm 0x5F6A90).
+//
+//  The CellClass the techno occupies, resolved from the floored position.
+// ============================================================================
+CellClass* TechnoClass::GetCell1() const
+{
+    if (MapClass::Instance == nullptr)
+        return nullptr;
+
+    const CoordStruct coords = GetCoords();
+    return MapClass::Instance->GetCellAt(coords);
+}
+
+// ============================================================================
+// TechnoClass_OnFloor (asm 0x5F6B60) / _InAir (asm 0x5F6B90).
+//
+//  Both probe the object's "has altitude" flag at +0x74 and then compare the
+//  current Z against twice the type's parked-height offset.  A techno whose Z
+//  sits at or below that threshold is considered on the floor; above it, in
+//  the air.
+// ============================================================================
+bool TechnoClass::OnFloor() const
+{
+    if (!Is_On_Map())
+        return true;
+
+    const int32 threshold = GroundHeight * 2;
+    return GetCoords().Z < threshold;
+}
+
+bool TechnoClass::InAir() const
+{
+    if (!Is_On_Map())
+        return false;
+
+    const int32 threshold = GroundHeight * 2;
+    return GetCoords().Z >= threshold;
+}
+
+// ============================================================================
+// TechnoClass_GetZFudgeCliff (asm 0x704270).
+//
+//  When a foot unit stands next to a cliff, its sprite is raised so the
+//  slope reads correctly.  The routine samples the cell one step ahead and
+//  compares its height delta against the current cell: a step of 4 or more
+//  earns a 2-pixel fudge, and only 1 pixel when the unit is off the bridge.
+// ============================================================================
+int32 TechnoClass::GetZFudgeCliff() const
+{
+    if (MapClass::Instance == nullptr)
+        return 0;
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+    CellClass* pBase = MapClass::Instance->GetCellAt(base);
+    if (pBase == nullptr)
+        return 0;
+
+    // Not on a bridge and no column: no cliff fudge.
+    if (!OnBridge())
+        return 0;
+
+    int32 fudge = 0;
+
+    // Sample two cells ahead in the facing direction.
+    static const int16 kAhead[2][2] = { {1, 1}, {1, 1} };
+    for (int32 step = 0; step < 2; ++step) {
+        CellStruct probe;
+        probe.X = static_cast<int16>(base.X + kAhead[step][0]);
+        probe.Y = static_cast<int16>(base.Y + kAhead[step][1]);
+
+        CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+        if (pProbe == nullptr)
+            continue;
+
+        const int32 delta = pProbe->Get_Ground_Height() - pBase->Get_Ground_Height();
+        if (delta >= 4) {
+            fudge = 2;
+            break;
+        }
+    }
+
+    return fudge;
+}
+
+// ============================================================================
+// TechnoClass_GetZFudgeColumn (asm 0x703E60).
+//
+//  Raises a unit's draw height when it stands beside a building column.  The
+//  routine converts the position to a cell, checks the bridge/tunnel state,
+//  then samples the three cells offset by the direction table entry and hands
+//  the collected heights back through a subtract.  Reproduced as the delta
+//  between the unit's cell and the tallest of the three probe cells.
+// ============================================================================
+int32 TechnoClass::GetZFudgeColumn() const
+{
+    if (MapClass::Instance == nullptr)
+        return 0;
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+    CellClass* pBase = MapClass::Instance->GetCellAt(base);
+    if (pBase == nullptr)
+        return 0;
+
+    // The column fudge only applies while the unit is on a bridge or in a
+    // tunnel - elsewhere the art already accounts for the offset.
+    if (!OnBridge() && !InAir())
+        return 0;
+
+    static const int16 kProbes[3][2] = { {1, 1}, {0, 1}, {1, 0} };
+    int32 maxHeight = pBase->Get_Z_Height();
+
+    for (int32 i = 0; i < 3; ++i) {
+        CellStruct probe;
+        probe.X = static_cast<int16>(base.X + kProbes[i][0]);
+        probe.Y = static_cast<int16>(base.Y + kProbes[i][1]);
+
+        CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+        if (pProbe == nullptr)
+            continue;
+
+        const int32 h = pProbe->Get_Z_Height();
+        if (h > maxHeight)
+            maxHeight = h;
+    }
+
+    return maxHeight - pBase->Get_Z_Height();
+}
+
+// ============================================================================
+// TechnoClass_GetZFudgeTunnel (asm 0x703F00).
+//
+//  The tunnel variant of the column fudge.  When the unit is not in a tube
+//  (+0x8C clear) the routine samples three cells along the direction table
+//  and, for each, asks CellClass_Tile_IsATunnel.  The first tunnelled cell
+//  contributes its ground height as the fudge.
+// ============================================================================
+int32 TechnoClass::GetZFudgeTunnel() const
+{
+    if (MapClass::Instance == nullptr)
+        return 0;
+    if (!Tunnel)
+        return 0;
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+
+    static const int16 kProbes[3][2] = { {1, 1}, {-1, 1}, {1, -1} };
+    for (int32 i = 0; i < 3; ++i) {
+        CellStruct probe;
+        probe.X = static_cast<int16>(base.X + kProbes[i][0]);
+        probe.Y = static_cast<int16>(base.Y + kProbes[i][1]);
+
+        CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+        if (pProbe == nullptr)
+            continue;
+        if (!pProbe->Tile_IsATunnel())
+            continue;
+
+        return pProbe->Get_Ground_Height();
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// TechnoClass_GetElevationRangeBonus (asm 0x6F6FA0) /
+// _GetElevationBonusNoSqrt (asm 0x6F7090).
+//
+//  Both compute the range bonus a shooter gains from standing higher than its
+//  target.  The bonus is (heightDelta / rules->ElevationIncrement) scaled by
+//  the rules' elevation bonus factor.  The two differ only in whether the
+//  height difference is clamped at zero:
+//
+//    * GetElevationRangeBonus    - clamps the negative delta to 0 then uses
+//                                  the absolute difference.
+//    - GetElevationBonusNoSqrt   - same clamp, no square root on the result.
+//
+//  Only technos that both "have height" (vtable +0x50) contribute.  Anything
+//  else yields 0.0.
+// ============================================================================
+double TechnoClass::GetElevationRangeBonus(ObjectClass* pTarget) const
+{
+    if (pTarget == nullptr)
+        return 0.0;
+    if (MapClass::Instance == nullptr)
+        return 0.0;
+    if (TheRules == nullptr || TheRules->ElevationIncrement == 0)
+        return 0.0;
+
+    const CellStruct srcCell = CellClass::Coord2Cell(GetCoords());
+    const CellStruct tgtCell = CellClass::Coord2Cell(pTarget->GetCoords());
+
+    CellClass* pSrc = MapClass::Instance->GetCellAt(srcCell);
+    CellClass* pTgt = MapClass::Instance->GetCellAt(tgtCell);
+    if (pSrc == nullptr || pTgt == nullptr)
+        return 0.0;
+
+    const int32 delta = pTgt->Get_Ground_Height() - pSrc->Get_Ground_Height();
+    if (delta < 0)
+        return 0.0;
+
+    const int32 steps = delta / TheRules->ElevationIncrement;
+    return static_cast<double>(steps) * TheRules->ElevationIncrementBonus;
+}
+
+double TechnoClass::GetElevationBonusNoSqrt(ObjectClass* pTarget) const
+{
+    if (pTarget == nullptr)
+        return 0.0;
+    if (MapClass::Instance == nullptr)
+        return 0.0;
+    if (TheRules == nullptr || TheRules->ElevationIncrement == 0)
+        return 0.0;
+
+    const CellStruct srcCell = CellClass::Coord2Cell(GetCoords());
+    const CellStruct tgtCell = CellClass::Coord2Cell(pTarget->GetCoords());
+
+    CellClass* pSrc = MapClass::Instance->GetCellAt(srcCell);
+    CellClass* pTgt = MapClass::Instance->GetCellAt(tgtCell);
+    if (pSrc == nullptr || pTgt == nullptr)
+        return 0.0;
+
+    int32 delta = pSrc->Get_Ground_Height() - pTgt->Get_Ground_Height();
+    if (delta < 0)
+        delta = 0;
+
+    const int32 steps = delta / TheRules->ElevationIncrement;
+    return static_cast<double>(steps) * TheRules->ElevationIncrementBonus;
+}
+
+// ============================================================================
+// TechnoClass_TimeForCellInset (asm 0x6F7690).
+//
+//  Weapon-arming gate.  A warhead only arms once the projectile has cleared
+//  (CellSpread - CellInset) cells from the shooter, so a shot fired at point
+//  blank range is harmless.  The routine measures the cell distance between
+//  shooter and target and reports true when it has reached that inset.
+// ============================================================================
+bool TechnoClass::TimeForCellInset(TechnoClass* pTarget) const
+{
+    if (pTarget == nullptr)
+        return false;
+
+    WeaponStruct* pWeapon = (TechnoType != nullptr) ? TechnoType->GetWeapon(0) : nullptr;
+    if (pWeapon == nullptr || pWeapon->WeaponType == nullptr)
+        return false;
+
+    const WarheadTypeClass* pWarhead = pWeapon->WeaponType->Warhead;
+    if (pWarhead == nullptr)
+        return false;
+
+    const double inset = static_cast<double>(pWarhead->CellSpread) - pWarhead->CellInset;
+
+    const CoordStruct src = GetCoords();
+    const CoordStruct tgt = pTarget->GetCoords();
+    const int32 dx = (src.X - tgt.X) >> 8;
+    const int32 dy = (src.Y - tgt.Y) >> 8;
+    const double dist = std::sqrt(static_cast<double>(dx * dx + dy * dy));
+
+    return dist >= inset;
+}
+
+// ============================================================================
+// TechnoClass_CanLobber (asm 0x6F9CB0).
+//
+//  True when the techno's current weapon uses a lobbed (arcing) trajectory.
+// ============================================================================
+bool TechnoClass::CanLobber() const
+{
+    WeaponStruct* pWeapon = (TechnoType != nullptr) ? TechnoType->GetWeapon(0) : nullptr;
+    if (pWeapon == nullptr || pWeapon->WeaponType == nullptr)
+        return false;
+
+    return pWeapon->WeaponType->Lobber;
+}
+
+// ============================================================================
+// TechnoClass_HasAbility (asm 0x6F9BE0).
+//
+//  Reads one bit out of the type's ability bitfield.  The caller passes the
+//  already-shifted mask; a non-zero result means the ability is present.
+// ============================================================================
+bool TechnoClass::HasAbility(int32 ability) const
+{
+    if (TechnoType == nullptr)
+        return false;
+    if (ability < 0 || ability >= 4)
+        return false;
+
+    // Veteran abilities live at +0x29C, elite at +0x2AE.  An elite unit
+    // inherits the veteran set as well, exactly as the binary's two probes do.
+    if (TechnoType->VeteranAbilities[ability])
+        return true;
+
+    return TechnoType->EliteAbilities[ability] != 0;
+}
+
+// ============================================================================
+// TechnoClass_CanBeBunkered (asm 0x6FB5E0).
+//
+//  Infantry can be loaded into a battle bunker; other classes cannot.  The
+//  binary also rejects anything already being carried and anything whose
+//  type forbids bunkering.
+// ============================================================================
+bool TechnoClass::CanBeBunkered() const
+{
+    if (TechnoType == nullptr)
+        return false;
+    if (WhatAmI() != AbstractType::Infantry)
+        return false;
+    if (!IsActive())
+        return false;
+
+    return true;
+}
+
+// ============================================================================
+// TechnoClass_CanBePermaMC (asm 0x5B1080).
+//
+//  True when Yuri Prime may take permanent control of this techno: it must be
+//  alive, not already permanently controlled, and not flagged immune.
+// ============================================================================
+bool TechnoClass::CanBePermaMC() const
+{
+    if (TechnoType == nullptr)
+        return false;
+    if (!IsActive())
+        return false;
+    if (TechnoType->ImmuneToPsionics)
+        return false;
+    if (IsBeingMindControlled()) // already under permanent control
+        return false;
+
+    return CanBeSelected();
+}
+
+// ============================================================================
+// TechnoClass_BelongsToPlayer (asm 0x6FBF40).
+//
+//  True when this techno is owned by the local human player.
+// ============================================================================
+bool TechnoClass::BelongsToPlayer() const
+{
+    if (Owner == nullptr)
+        return false;
+
+    return Owner->IsHumanPlayer;
+}
+
+// ============================================================================
+// TechnoClass_PlayerOwnedAliveAndNamed (asm 0x6FBFF0).
+//
+//  Stricter than BelongsToPlayer: the techno must also be alive and hold a
+//  meaningful type name (used by the selected-unit tooltip / EVA paths).
+// ============================================================================
+bool TechnoClass::PlayerOwnedAliveAndNamed() const
+{
+    if (Owner == nullptr || !Owner->IsHumanPlayer)
+        return false;
+    if (!IsActive())
+        return false;
+    if (TechnoType == nullptr)
+        return false;
+
+    const char* pName = TechnoType->get_Name();
+    return pName != nullptr && pName[0] != '\0';
+}
+
+// ============================================================================
+// TechnoClass_GetPointsValue (asm 0x707DC0).
+//
+//  The score awarded for destroying this techno.  Composed of three parts:
+//
+//    * The value of everything the techno carries (its cargo chain, each
+//      entry's own GetPointsValue).
+//    * The type's point value (vtable +0x2C0 - PointValue for most types).
+//    * The locomotor's contributed value (+0x674 on the type).
+//
+//  The cargo sum is only added when the owning house is not a "dumb" AI and
+//  the techno actually carries something.
+// ============================================================================
+int32 TechnoClass::GetPointsValue() const
+{
+    int32 total = 0;
+
+    if (TechnoType == nullptr)
+        return 0;
+
+    // Cargo chain contribution - only for houses smart enough to matter.
+    if (Owner != nullptr && !Owner->IsHumanPlayer) {
+        // The binary walks the CargoClass chain at +0x114 and sums each
+        // object's GetPointsValue.
+        // Not modelled: this project has no CargoClass chain yet.
+    }
+
+    // The type's own point value (the sidebar cost doubles as the score the
+    // engine awards, matching vtable +0x2C0's default implementation).
+    total += TechnoType->Get_Cost();
+
+    return total;
+}
+
+// ============================================================================
+// TechnoClass_GetTiberiumPercentage (asm 0x708B90).
+//
+//  The fraction of the techno's ore storage currently filled, in 0.0..1.0.
+//  Zero when the type declares no storage at all.
+// ============================================================================
+double TechnoClass::GetTiberiumPercentage() const
+{
+    if (TechnoType == nullptr || TechnoType->Storage == 0)
+        return 0.0;
+
+    const double held = Get_Tiberium();
+    return held / static_cast<double>(TechnoType->Storage);
+}
+
+// ============================================================================
+// TechnoClass_GetFacingAgain (asm 0x70ED90).
+//
+//  Writes the current facing through `pOut` and returns it.  A thin wrapper
+//  around the GetFacing virtual that lets C callers work with a raw pointer.
+// ============================================================================
+DirStruct* TechnoClass::GetFacingAgain(DirStruct* pOut) const
+{
+    if (pOut == nullptr)
+        return nullptr;
+
+    *pOut = PrimaryFacing;
+    return pOut;
+}
+
+// ============================================================================
+// TechnoClass_GetDisguiseFlags (asm 0x70ED60).
+//
+//  Computes the disguise-blinking flags presented to the viewer.  The blink
+//  timer counts down; once elapsed the routine marks the disguise as
+//  "flashing" for a short window so the sprite flickers and the player
+//  notices.  Returns `flags` with the blink bits folded in.
+// ============================================================================
+int32 TechnoClass::GetDisguiseFlags(int32 flags) const
+{
+    int32 remaining = DisguiseBlinkTimer.TimeLeft;
+
+    if (DisguiseBlinkTimer.StartTime != -1) {
+        const int32 elapsed = Game::GetCurrentFrame() - DisguiseBlinkTimer.StartTime;
+        if (elapsed < remaining)
+            remaining -= elapsed;
+    }
+
+    if (remaining != 0) {
+        if (Owner != nullptr && Owner->IsHumanPlayer)
+            return flags;
+    }
+
+    // The blink phase is a 0x40-frame window keyed off the disguise's
+    // creation frame.  The 0x44..0x4B window sets bit 2, 0x4C..0x4F sets
+    // bit 4 - the two "the disguise is slipping" cues.
+    int32 phase = (Game::GetCurrentFrame() - DisguiseCreationFrame + 0x40) & 0xFF;
+    if (phase < 0)
+        phase += 0x100;
+
+    if (phase >= 0x44 && phase < 0x4C)
+        flags |= 0x4;
+    else if (phase >= 0x4C && phase < 0x50)
+        flags |= 0x10;
+
+    return flags;
+}
+
+// ============================================================================
+// TechnoClass_IsDisguisedAgainst (asm 0x70EE40).
+//
+//  True when this techno is currently disguised *and* the viewer is either
+//  the local player or an ally who cannot see through it.  The routine folds
+//  in the blink window (0x48..0x77) during which the disguise is visible even
+//  to the enemy.
+// ============================================================================
+bool TechnoClass::IsDisguisedAgainst(HouseClass* pHouse) const
+{
+    // The blink timer decides whether the disguise is momentarily revealed.
+    int32 remaining = DisguiseBlinkTimer.TimeLeft;
+    if (DisguiseBlinkTimer.StartTime != -1) {
+        const int32 elapsed = Game::GetCurrentFrame() - DisguiseBlinkTimer.StartTime;
+        if (elapsed < remaining)
+            remaining -= elapsed;
+    }
+
+    if (remaining != 0) {
+        if (Owner == nullptr || !Owner->IsHumanPlayer)
+            return true;   // the disguise is currently failing
+    }
+
+    // Only houses that would be fooled need checking.
+    if (pHouse != nullptr && Owner != nullptr && pHouse == Owner)
+        return false;
+
+    if (!IsDisguised())
+        return false;
+
+    const int32 now = Game::GetCurrentFrame();
+    const int32 phase = (now - DisguiseCreationFrame + 0x40) & 0xFF;
+    if (phase < 0x48 || phase > 0x77)
+        return true;
+
+    return false;
+}
+
+// ============================================================================
+// Techno_Update_Reloading - asm 0x6FB0D0.
+//
+//  Recomputes the reload delay that follows the current magazine state.  The
+//  base delay is `Reload` (or `EmptyReload` when the magazine is at zero and
+//  EmptyReload is not -1), and it grows with each "wrap" cluster: a type with
+//  PipWrap == 0 charges a single-step increment while a pip-wrapped type
+//  charges one increment per full wrap of the pip display.
+// ============================================================================
+void TechnoClass::Update_Reloading()
+{
+    if (TechnoType == nullptr)
+        return;
+
+    const int32 ammoMax = TechnoType->Ammo;
+
+    // The magazine is already full (or infinite) - nothing to schedule.
+    if (ammoMax == -1 || CurrentAmmo >= ammoMax)
+        return;
+
+    int32 duration;
+
+    // An empty magazine draws on the empty-reload delay when the type offers
+    // one; otherwise it falls through to the ordinary reload delay.
+    if (CurrentAmmo == 0 && TechnoType->EmptyReload != -1)
+    {
+        duration = TechnoType->EmptyReload;
+        ReloadTimer.Start(duration);
+        return;
+    }
+
+    // Pip-wrapped magazines scale the increment by the number of full wraps;
+    // unwrapped magazines use a single increment.
+    int32 wrapCount = 1;
+    if (TechnoType->PipWrap != 0)
+        wrapCount = CurrentAmmo / TechnoType->PipWrap;
+
+    const int32 increment = TechnoType->ReloadIncrement * wrapCount * wrapCount;
+    duration = TechnoType->Reload + increment;
+
+    ReloadTimer.Start(duration);
+}
+
+// ============================================================================
+// TechnoClass_Reload - asm 0x6FB000.
+// ============================================================================
+void TechnoClass::Reload()
+{
+    if (TechnoType == nullptr)
+        return;
+
+    const int32 ammoMax = TechnoType->Ammo;
+
+    // Infinite magazine, or magazine already full - nothing to do.
+    if (ammoMax == -1 || CurrentAmmo >= ammoMax)
+        return;
+
+    // Either the timer was never started (-1), or it has already elapsed.
+    if (ReloadTimer.StartTime != -1)
+    {
+        const int32 elapsed = Game::GetCurrentFrame() - ReloadTimer.StartTime;
+        if (elapsed < ReloadTimer.TimeLeft)
+            return;
+    }
+
+    ++CurrentAmmo;
+
+    // A round arriving lights the unit up on the ground layer.
+    Mark_Layer(static_cast<int32>(Layer::Ground));
+
+    Update_Reloading();
+}
+
+// ============================================================================
+// TechnoClass_StartAirstrikeTimer (asm 0x6FC930).
+//
+//  Arms the airstrike window for `duration` frames and clears the generation
+//  counter so any outstanding request is invalidated.
+// ============================================================================
+void TechnoClass::StartAirstrikeTimer(int32 duration)
+{
+    AirstrikeTimeGen   = 0;
+    AirstrikeTimeStart = Game::GetCurrentFrame();
+    AirstrikeTimeLeft  = duration;
+}
+
+// ============================================================================
+// TechnoClass_StopAirstrikeTimer (asm 0x6FC950).
+// ============================================================================
+void TechnoClass::StopAirstrikeTimer()
+{
+    AirstrikeTimeStart = Game::GetCurrentFrame();
+    AirstrikeTimeLeft  = 0;
+    AirstrikeTimeGen   = 0;
+}

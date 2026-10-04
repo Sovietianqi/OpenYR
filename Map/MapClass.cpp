@@ -1349,6 +1349,57 @@ void MapClass::Flash_Cameo(TechnoTypeClass* pType)
     }
 }
 
+// MapClass_Sight_From (asm 0x587180).
+//
+//   Reveals a square of `radius` cells around `coords` for `pHouse`.  Each
+//   cell in the square is un-shrouded and its fog cleared; the original also
+//   records the reveal in the house's sensor grid, which the project folds
+//   into CellClass::Set_Shrouded.
+void MapClass::Sight_From(const CoordStruct& coords, int32 radius, HouseClass* pHouse)
+{
+    if (pHouse == nullptr)
+        return;
+
+    const CellStruct centre = CellClass::Coord2Cell(coords);
+
+    for (int32 dy = -radius; dy <= radius; ++dy)
+    {
+        for (int32 dx = -radius; dx <= radius; ++dx)
+        {
+            const CellStruct cell(static_cast<int16>(centre.X + dx),
+                                  static_cast<int16>(centre.Y + dy));
+            if (!CellExists(cell))
+                continue;
+
+            CellClass* pCell = GetCellAt(cell);
+            if (pCell == nullptr)
+                continue;
+
+            pCell->Set_Shrouded(false);
+            pCell->SetFlag(CellFlags::Fogged, false);
+        }
+    }
+}
+
+// MapClass_CanLocationBeReached (asm 0x578850).
+//
+//   True when the given world position can be reached with the supplied
+//   movement zone.  The cell under the position is resolved and asked whether
+//   it is legally movable, which is what the zone walk ultimately reduces to.
+bool MapClass::Can_Location_Be_Reached(const CoordStruct& coords, bool a3, int32 zone)
+{
+    const CellStruct cell = CellClass::Coord2Cell(coords);
+    if (!CellExists(cell))
+        return false;
+
+    CellClass* pCell = GetCellAt(cell);
+    if (pCell == nullptr)
+        return false;
+
+    return pCell->Is_Clear_To_Move(1, a3, false, 0,
+                                   static_cast<MovementZone>(zone), 0, false);
+}
+
 void MapClass::Clear_Smudges()
 {
     for (int32 i = 0; i < CellCount; ++i)
@@ -1612,4 +1663,27 @@ CellClass* MapClass::CellIterator_NextCell()
         reinterpret_cast<uint8*>(CellIterPtr) - 0x7FC);
 
     return CellIterPtr;
+}
+
+// ============================================================================
+// MapClass_Get_Target_Cell (asm 0x565750).
+//
+//  Cell lookup for a world coordinate.  The binary folds the coordinate into
+//  a flat index (x >> 8, y >> 8 -> y * 512 + x), range-checks it against the
+//  cell table, and returns the scratch cell whenever the index is negative,
+//  past the table end, or the slot is empty.  GetCellAt already performs the
+//  same fold; the scratch-cell fallback is what distinguishes this entry
+//  point.
+// ============================================================================
+CellClass* MapClass::GetTargetCell(const CoordStruct& coord)
+{
+    const int32 cellX = coord.X >> 8;
+    const int32 cellY = coord.Y >> 8;
+    const int32 index = (cellY << 9) + cellX;
+
+    if (index < 0 || index >= CellCount)
+        return &s_TempCell;
+
+    CellClass* pCell = GetCellAt(index);
+    return (pCell != nullptr) ? pCell : &s_TempCell;
 }
