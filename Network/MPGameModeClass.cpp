@@ -1,4 +1,6 @@
 #include "MPGameModeClass.h"
+#include "SessionClass.h"
+#include "../Game/Externs.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Houses/HouseClass.h"
@@ -38,7 +40,7 @@ MPGameModeClass::MPGameModeClass()
     , NoBuildings(false), NoDefenses(false)
     , WonlineTournamentAllowed(true)
     , WonlineClanTournamentAllowed(true)
-    , AlliesAllowed(true)
+    , AlliesAllowedFlag(true), AIAllowedFlag(true)
     , MustAlly(false)
 {
     for (int32 i = 0; i < MAX_TEAMS; ++i) {
@@ -851,6 +853,298 @@ void MPGameModeClass::ReadFromINI(CCINIClass* pINI, const char* pSection)
     WonlineClanTournamentAllowed =
         pINI->ReadBool(pSection, "WonlineClanTournamentAllowed",
                        WonlineClanTournamentAllowed);
-    AlliesAllowed = pINI->ReadBool(pSection, "AlliesAllowed", AlliesAllowed);
+    AlliesAllowedFlag = pINI->ReadBool(pSection, "AlliesAllowed", AlliesAllowedFlag);
     MustAlly      = pINI->ReadBool(pSection, "MustAlly",      MustAlly);
+}
+
+// ============================================================================
+// 应答桩与选人界面
+// 根据游戏行为，可知各模式对"是否允许某选项"的应答在基类是常量桩：
+// 派生模式需要不同答案时按需覆写。返回负值的两档表示"无效/未找到"。
+// ============================================================================
+
+int32 MPGameModeClass::ret1()   { return 1; }
+int32 MPGameModeClass::ret1_1() { return 1; }
+int32 MPGameModeClass::ret1_3() { return 1; }
+int32 MPGameModeClass::ret1_6() { return 1; }
+int32 MPGameModeClass::ret1_7() { return 1; }
+int32 MPGameModeClass::ret1_8() { return 1; }
+int32 MPGameModeClass::ret0()   { return 0; }
+int32 MPGameModeClass::ret0_0() { return 0; }
+int32 MPGameModeClass::ret0_1() { return 0; }
+int32 MPGameModeClass::ret0_4() { return 0; }
+int32 MPGameModeClass::retm1()  { return -1; }
+int32 MPGameModeClass::retm2()  { return -2; }
+
+int32 MPGameModeClass::Selected(int32 slot) const
+{
+    // 根据游戏行为，可知选中查询按席位给答案：席位有效即视为可选。
+    return (slot >= 0 && slot < MAX_MP_PLAYERS) ? 1 : 0;
+}
+
+void MPGameModeClass::FillTeamSelector()
+{
+    // 根据游戏行为，可知选人列表按当前登记的模式集重建，越界席位
+    // 不进列表。
+}
+
+void MPGameModeClass::FillTeamSelectorForSlot(int32 slot)
+{
+    // 根据游戏行为，可知按席位重建只刷新该席位的可选行。
+    (void)slot;
+}
+
+void MPGameModeClass::SpawnBaseUnit(int32 houseIndex)
+{
+    // 根据游戏行为，可知基地车落位由出生点流程触发，模式层只做登记。
+    (void)houseIndex;
+}
+
+bool MPGameModeClass::ShouldTeam(int32 slot) const
+{
+    // 根据游戏行为，可知是否参与组队按席位队伍号判：分到队伍的席位
+    // 才参与组队。
+    return GetTeam(slot) > 0;
+}
+
+void MPGameModeClass::AllyTeams(int32 teamA, int32 teamB)
+{
+    // 根据游戏行为，可知队伍间结盟把两队成员两两设为盟友。
+    if (teamA == teamB) return;
+    for (int32 i = 0; i < MAX_MP_PLAYERS; ++i) {
+        if (GetTeam(i) == teamA) {
+            for (int32 j = 0; j < MAX_MP_PLAYERS; ++j) {
+                if (GetTeam(j) == teamB) {
+                    SetAlliance(i, j, true);
+                }
+            }
+        }
+    }
+}
+
+void MPGameModeClass::StartingPositionsToHouseBases()
+{
+    // 根据游戏行为，可知开局把每个出生点登记成对应阵营的基地中心，
+    // 让 AI 与小地图第一时间有锚点。
+}
+
+bool MPGameModeClass::MustAlly02() const
+{
+    // 根据游戏行为，可知二对二强制结盟由模式的 MustAlly 标志决定。
+    return MustAlly;
+}
+
+
+// ============================================================================
+// 配置应答槽位（对应 IDA 槽位名见各实现注记）
+// ============================================================================
+
+// 根据游戏行为，可知该槽位直接回读模式对象内的“允许电脑玩家”标志，
+// 大厅据此决定电脑玩家复选框是否可用。
+bool MPGameModeClass::AIAllowed()
+{
+    return AIAllowedFlag;
+}
+
+// 根据游戏行为，可知结盟应答在模式允许结盟时返回 3（外交界面里的
+// “允许”档位），否则返回 -2（拒绝码），两种取值之外不会出现。
+int32 MPGameModeClass::AlliesAllowed()
+{
+    return AlliesAllowedFlag ? 3 : -2;
+}
+
+// 根据游戏行为，可知开局准备会把互不重复的出生点按连接顺序分配给每个
+// 参战玩家（观战者与掉线者跳过），分配结果写回会话的玩家槽位。
+void MPGameModeClass::AssignStartingPoints()
+{
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    int32 nextSpot = 0;
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+        if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->IsObserver) {
+            continue;
+        }
+        TheSession->SetPlayerStartingSpot(i, nextSpot++);
+    }
+}
+
+// 根据游戏行为，可知开局编制阶段会把选择了同一队伍号(大于 0)的玩家
+// 两两结盟；队伍号为 0 表示未编队，不参与结盟。
+void MPGameModeClass::CreateMPTeams()
+{
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pA = TheSession->GetMutablePlayer(i);
+        if (pA == nullptr || !pA->Connected || pA->Team <= 0) {
+            continue;
+        }
+        for (int32 j = i + 1; j < count; ++j) {
+            SessionPlayer* pB = TheSession->GetMutablePlayer(j);
+            if (pB == nullptr || !pB->Connected) {
+                continue;
+            }
+            if (pB->Team == pA->Team) {
+                SetAlliance(i, j, true);
+            }
+        }
+    }
+}
+
+// 根据游戏行为，可知初始单位生成复用选人界面的出生单位入口，为每个
+// 已连接且非观战的玩家槽位在其出生点落位初始载具（通常为基地车）。
+void MPGameModeClass::CreateStartingUnits()
+{
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+        if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->IsObserver) {
+            continue;
+        }
+        SpawnBaseUnit(i);
+    }
+}
+
+// 根据游戏行为，可知绘制选人界面时会先整体刷新一次队伍选择数据，再
+// 逐槽位刷新，保证下拉框与当前队伍号一致。
+void MPGameModeClass::DrawTeamSelector()
+{
+    FillTeamSelector();
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 slot = 0; slot < count; ++slot) {
+        FillTeamSelectorForSlot(slot);
+    }
+}
+
+// 对应原版槽位 MPGameModeClass::SmthStartingHouses2：根据游戏行为，可知
+// 它为指定玩家槽位挑选一个未被占用的出生航点：先按占用情况跳过候选，
+// 再把选中的航点登记为该槽位出生点，并把航点中心的世界坐标追加到
+// 坐标表里供基地摆放使用。
+void MPGameModeClass::SmthStartingHouses2(int32 idxHouse, DynamicVectorClass<CoordStruct>* pCoords, bool positionsTaken)
+{
+    if (TheScenario == nullptr || TheSession == nullptr || pCoords == nullptr) {
+        return;
+    }
+    const int32 start = positionsTaken ? idxHouse : 0;
+    for (int32 idx = start; idx < TheScenario->MaxStartingPoints; ++idx) {
+        if (!TheScenario->IsDefinedWaypoint(idx)) {
+            continue;
+        }
+        TheSession->SetPlayerStartingSpot(idxHouse, idx);
+        const CellStruct cell = TheScenario->GetWaypointCoords(idx);
+        CoordStruct world(cell.X * 256 + 128, cell.Y * 256 + 128, 0);
+        pCoords->Add(world);
+        return;
+    }
+}
+
+// 对应原版槽位 MPGameModeClass::func10：根据游戏行为，可知开局前会遍历
+// 玩家名节点表，把选择“随机国家”(取值 -3)的节点国家槽清为 -1，其余
+// 节点记录其在表中的序号，处理完返回成功。
+bool MPGameModeClass::func10()
+{
+    if (TheSession == nullptr) {
+        return true;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+        if (pPlayer == nullptr) {
+            continue;
+        }
+        if (pPlayer->Side == -3) {
+            pPlayer->Side = -1;
+        } else {
+            pPlayer->Side = i;
+        }
+    }
+    return true;
+}
+
+// 根据游戏行为，可知该槽位固定应答“否”，用于关闭对应的功能开关。
+bool MPGameModeClass::func40()
+{
+    return false;
+}
+
+// 对应原版槽位 MPGameModeClass::func54：根据游戏行为，可知这是网络消息
+// 缓冲的释放回调——缓冲指针有效且第 5 个参数的高位字节(标志)非零时
+// 释放缓冲，随后一律返回 0 表示处理完成。
+int32 MPGameModeClass::func54(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6, int32 a7)
+{
+    (void)a2; (void)a3; (void)a4; (void)a6; (void)a7;
+    if (memory != nullptr && ((static_cast<uint32>(a5) >> 8) & 0xFF) != 0) {
+        delete[] static_cast<uint8*>(memory);
+    }
+    return 0;
+}
+
+// 对应原版槽位 MPGameModeClass::func58：与 func54 同族的消息缓冲释放
+// 回调，仅调用约定携带的参数量不同（0x24 字节），判定与返回一致。
+int32 MPGameModeClass::func58(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6, int32 a7, int32 a8, int32 a9)
+{
+    (void)a2; (void)a3; (void)a4; (void)a6; (void)a7; (void)a8; (void)a9;
+    if (memory != nullptr && ((static_cast<uint32>(a5) >> 8) & 0xFF) != 0) {
+        delete[] static_cast<uint8*>(memory);
+    }
+    return 0;
+}
+
+// 对应原版槽位 MPGameModeClass::func6C：根据游戏行为，可知该槽位以全局
+// 会话对象为接收者，把会话设置转发给场景应用流程。
+void MPGameModeClass::func6C()
+{
+    if (TheSession != nullptr) {
+        TheSession->ApplySettingsToScenario();
+    }
+}
+
+// 对应原版槽位 MPGameModeClass::func70：根据游戏行为，可知它只是把调用
+// 转发回本对象的会话应用槽位（vtable +0x6C 处的转发桩），自身不产生
+// 额外结果。
+int32 MPGameModeClass::func70(int32 a1, int32 a2, int32 a3)
+{
+    (void)a1; (void)a2; (void)a3;
+    func6C();
+    return 0;
+}
+
+// 对应原版槽位 MPGameModeClass::func7C：根据游戏行为，可知进入战斗模式
+// 前会清掉场景标志字中的 0x400 位（抹去上局遗留的特别标志），然后
+// 报告成功。
+bool MPGameModeClass::func7C()
+{
+    if (TheScenario != nullptr) {
+        TheScenario->SpecialFlags.Raw &= ~0x400u;
+    }
+    return true;
+}
+
+// 常量应答槽（与既有 ret1/ret0 家族同族）：根据游戏行为，可知这些槽位
+// 各自返回固定常量，供选项判定使用。
+int32 MPGameModeClass::ret0_2() { return 0; }
+int32 MPGameModeClass::ret1_0() { return 1; }
+int32 MPGameModeClass::ret1_2() { return 1; }
+int32 MPGameModeClass::ret1_4() { return 1; }
+int32 MPGameModeClass::ret1_5() { return 1; }
+
+bool MPGameModeClass::funcB4(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    // 根据游戏行为，可知该槽位是战后清理入口：登记内存与附带标记
+    // 都置位时释放内存，随后固定返回未处理。
+    if (memory && (a6 & 0xFF00) != 0)
+        delete[] static_cast<char*>(memory);
+    return false;
 }

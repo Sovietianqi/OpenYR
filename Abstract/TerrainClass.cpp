@@ -246,7 +246,7 @@ bool TerrainClass::IsSightable() const
 }
 
 // ============================================================================
-// Is_Destroyed
+// 根据游戏行为，可知 Destroyed 负责下面这段逻辑。
 // ============================================================================
 
 bool TerrainClass::Is_Destroyed() const
@@ -338,7 +338,7 @@ void TerrainClass::Update()
 }
 
 // ============================================================================
-// Draw_It
+// 根据游戏行为，可知 It 负责下面这段逻辑。
 //
 //  Renders the terrain object at the given screen origin.  The full binary
 //  blits the terrain SHP frame onto the tactical surface, applying the fire

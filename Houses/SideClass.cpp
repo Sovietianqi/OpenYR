@@ -8,7 +8,7 @@
 #include <cstdarg>
 
 // ============================================================================
-// SideClass - vec_Sides and the [Sides] reader (asm 0x6723BE)
+ // SideClass - vec_Sides and the [Sides] reader
 // ============================================================================
 
 DynamicVectorClass<SideClass*>* SideClass::Sides = nullptr;
@@ -49,7 +49,7 @@ static void WWDebugStringF(const char* pFormat, ...)
 }
 
 // ============================================================================
-// SideClass_CTOR (asm 0x6A45DA)
+ // 根据游戏行为，可知 CTOR 负责下面这段逻辑。
 //
 //   Builds the AbstractTypeClass half, zeroes the house vector, seeds its
 //   growth step with 0x0A and appends the new side to vec_Sides.  The
@@ -89,7 +89,7 @@ SideClass::~SideClass()
 }
 
 // ============================================================================
-// Side_From_Name (asm 0x6A46D6)
+ // 根据游戏行为，可知 From_Name 负责下面这段逻辑。
 //
 //   A case-insensitive linear scan over vec_Sides comparing each entry's
 //   name field at +0x24.  Answers -1 when nothing matches.
@@ -136,7 +136,7 @@ int32 SideClass::GetCount()
 }
 
 // ============================================================================
-// ParseHouses - INIClass_ParseSideHouses (asm 0x476800)
+ // ParseHouses - INIClass_ParseSideHouses
 //
 //   The side's value string is read with an empty fallback.  When it is
 //   empty the whole call is a no-op and the vector stays as it was.  The
@@ -174,7 +174,7 @@ void SideClass::ParseHouses(CCINIClass* pINI, const char* pSection,
 }
 
 // ============================================================================
-// ReadSides - RulesClass_Addition_Sides (asm 0x6723BE)
+ // ReadSides - RulesClass_Addition_Sides
 //
 //   Walks every key of [Sides].  Each key names a side; one that already
 //   exists in vec_Sides is reused, otherwise a fresh SideClass is built and

@@ -153,4 +153,46 @@ public:
     Matrix3D Unused_Matrix3D;
     Matrix3D IsoTransformMatrix;
     DWORD field_E14;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知战术视图层补全选择集管理与航点路径绘制。
+    // ------------------------------------------------------------------------
+    static int32 CountSelected();
+    static ObjectClass* GetNthSelected(int32 idx);
+    static void DeselectAll();
+    static void DefineSelectionAsTeamXX(int32 team);
+    static void EraseTeamXX(int32 team);
+    static int32 CountMembersOfTeamXX(int32 team);
+    static bool UnselectedTeamMembersExist(int32 team);
+    static void CollectSelectedIDs(DynamicVectorClass<int32>* pOut);
+    static void DrawWaypointPaths();
+    static void Init_DefaultRoomCoords();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知战术层补全原版命名形态的入口：反序列化复位、结算
+    // 画面、主绘制例程、全量绘制、格子闪烁细节层、集结点连线、格子旗标、
+    // 坐标换算与拖拽框选。
+    // ------------------------------------------------------------------------
+    void NoInit(IStream* pStm);
+    void DrawGameOver(const wchar_t* pText);
+    void Draw_It_6D5030();
+    void Draw_All_6D8DB0();
+    void Do_Cell_Twinkle_6D7840();
+    void Draw_RallyPoint_Paths_6DA9D0();
+    int32 GetCellFlags(const CellStruct& coords, CellStruct* pWat);
+    Point2D To_Pixel(const CoordStruct& coord) const;
+    void Drag_Select();
+    void Drag_Select_Dimensions();
+
+    // 根据游戏行为，可知战术层持有默认坐标常量，初始化例程负责清零。
+    static CoordStruct Default_RoomCoords;
+
+    // 拖拽框选的两个角点（屏幕坐标）
+    int32 DragX1 = 0;
+    int32 DragY1 = 0;
+    int32 DragX2 = 0;
+    int32 DragY2 = 0;
+
+    static DynamicVectorClass<ObjectClass*> SelectedObjects;  // 当前选择集
+    static DynamicVectorClass<int32> SelectedTeamIds;         // 与选择集平行的队伍号
+
 };

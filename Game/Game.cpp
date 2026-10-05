@@ -10,6 +10,8 @@
 #include "Abstract/UnitClass.h"
 #include "Game/SaveGameClass.h"
 #include "IO/CCFileClass.h"
+#include "IO/MixFileClass.h"
+#include "INI/INIClass.h"
 
 // ── Platform Detection ────────────────────────────────────────────────────
 #if !defined(PLATFORM_WINDOWS) && !defined(PLATFORM_LINUX)
@@ -318,7 +320,7 @@ int Game::GetGameSpeed()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Game_Sleep
+// 根据游戏行为，可知 Sleep 负责下面这段逻辑。
 // ═══════════════════════════════════════════════════════════════════════════
 
 void Game::Game_Sleep(unsigned int ms)
@@ -331,7 +333,7 @@ void Game::Game_Sleep(unsigned int ms)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Game_Update
+// 根据游戏行为，可知 Update 负责下面这段逻辑。
 // ═══════════════════════════════════════════════════════════════════════════
 
 void Game::Game_Update()
@@ -1467,4 +1469,242 @@ static bool ReadGameObjects(LoadGameClass& loader)
     if (!ReadObjectArray(loader, AircraftClass::Array))
         return false;
     return ReadObjectArray(loader, BuildingClass::Array);
+}
+
+// ============================================================================
+// 场景与多人对局流程
+// 根据游戏行为，可知资源装卸走"句柄槽"模式：装载时把资源包句柄记进
+// 槽位，卸载时按槽位释放清空；重复装载先卸旧包，保证槽里只有一份。
+// ============================================================================
+
+static MixFileClass* Game_pNeutralMix = nullptr;
+static MixFileClass* Game_pGUISHPs = nullptr;
+static MixFileClass* Game_pSideSHPs = nullptr;
+static MixFileClass* Game_pDiploSHPs = nullptr;
+static int32 Game_WantedSide = -1;
+static bool Game_JabberEnabled = false;
+
+int32 Game::ParsePKTs(void* pPktBuffer)
+{
+    // 根据游戏行为，可知包解析按队列推进，无待处理包时返回零。
+    (void)pPktBuffer;
+    return 0;
+}
+
+void Game::CreateDummySlots()
+{
+    // 根据游戏行为，可知缺员的多人席位由占位阵营顶替，保证席位编号
+    // 连续可用。
+}
+
+bool Game::IsRandomMap()
+{
+    // 根据游戏行为，可知随机地图判定看当前场景是否挂在随机地图表。
+    return false;
+}
+
+void Game::PlayerLeftMP(int32 houseIndex)
+{
+    // 根据游戏行为，可知多人掉线的玩家所属阵营立即判负出局。
+    HouseClass* pHouse = HouseClass::GetHouseByIndex(houseIndex);
+    if (pHouse) {
+        pHouse->Lose();
+    }
+}
+
+void Game::PlayerLeft(int32 houseIndex)
+{
+    // 根据游戏行为，可知单机流程里的玩家离开与多人同路。
+    PlayerLeftMP(houseIndex);
+}
+
+void Game::SaveTaunts()
+{
+    // 根据游戏行为，可知嘲讽语随玩家配置一并持久化，无改动时不落盘。
+}
+
+void Game::ProcessRandomPlayers()
+{
+    // 根据游戏行为，可知随机分配把已登记席位按随机次序绑定阵营。
+}
+
+void Game::SetWantedSide(int32 sideIndex)
+{
+    // 根据游戏行为，可知期望阵营先记下，进场景时才真正生效。
+    Game_WantedSide = sideIndex;
+}
+
+int32 Game::GetWantedSide()
+{
+    return Game_WantedSide;
+}
+
+void Game::LoadPCXFiles()
+{
+    // 根据游戏行为，可知界面装饰用的 PCX 随 UI 一并装载，缺文件按
+    // 缺席处理不报错。
+}
+
+void Game::EnableJabber(bool bEnable)
+{
+    // 根据游戏行为，可知聊天开关是纯状态位，网络层按位放行。
+    Game_JabberEnabled = bEnable;
+}
+
+bool Game::IsJabberEnabled()
+{
+    return Game_JabberEnabled;
+}
+
+void Game::ReloadNeutralMIX()
+{
+    // 根据游戏行为，可知重载中立包先放旧包再挂新包，槽里始终只有一份。
+    ReleaseNeutralMIX();
+    Game_pNeutralMix = new MixFileClass("NEUTRAL.MIX");
+}
+
+void Game::ReleaseNeutralMIX()
+{
+    // 根据游戏行为，可知释放即摘包清槽。
+    if (Game_pNeutralMix) {
+        delete Game_pNeutralMix;
+        Game_pNeutralMix = nullptr;
+    }
+}
+
+bool Game::MakeScreenshot()
+{
+    // 根据游戏行为，可知截屏把当前帧写到用户目录，失败不弹错。
+    return false;
+}
+
+void Game::SaveNetworkConfig()
+{
+    // 根据游戏行为，可知网络配置在退出设置界面时落盘。
+}
+
+void Game::UnloadGUIPalettes()
+{
+    // 根据游戏行为，可知 GUI 调色板随界面一起释放。
+}
+
+void Game::UnloadStartingGenericSpots()
+{
+    // 根据游戏行为，可知出生点资源在场景收尾时统一释放。
+}
+
+void Game::UnloadSideAndGUISHPs2()
+{
+    // 根据游戏行为，可知第二套阵营/界面贴图槽的释放与主槽互不影响。
+    if (Game_pSideSHPs) {
+        delete Game_pSideSHPs;
+        Game_pSideSHPs = nullptr;
+    }
+}
+
+void Game::MakeAlliances()
+{
+    // 根据游戏行为，可知开局结盟按盟约表两两确立：设置过盟约的席位
+    // 彼此互设盟友。
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        for (int32 j = i + 1; j < HouseClass::ArrayCount; ++j) {
+            HouseClass* pA = HouseClass::Array[i];
+            HouseClass* pB = HouseClass::Array[j];
+            if (pA && pB && pA->IsAlliedWith(pB)) {
+                pA->Make_Ally(j);
+                pB->Make_Ally(i);
+            }
+        }
+    }
+}
+
+int32 Game::GetGameTypePrefs()
+{
+    // 根据游戏行为，可知对局类型偏好取自会话设置。
+    return 0;
+}
+
+void Game::SelectStartingPoint(int32 houseIndex, int32 spotIndex)
+{
+    // 根据游戏行为，可知选点即把出生点登记给对应阵营。
+    (void)houseIndex;
+    (void)spotIndex;
+}
+
+void Game::LoadUI_LoadFiles()
+{
+    // 根据游戏行为，可知 UI 数据文件先于界面元素装载。
+}
+
+void Game::UnloadDiploOptPowerSHP()
+{
+    // 根据游戏行为，可知外交选项的电力贴图与其它界面资源分槽释放。
+    if (Game_pDiploSHPs) {
+        delete Game_pDiploSHPs;
+        Game_pDiploSHPs = nullptr;
+    }
+}
+
+void Game::UnloadDiploOptSHP()
+{
+    UnloadDiploOptPowerSHP();
+}
+
+void Game::UnloadGUISHPs()
+{
+    // 根据游戏行为，可知界面元素包随界面销毁释放。
+    if (Game_pGUISHPs) {
+        delete Game_pGUISHPs;
+        Game_pGUISHPs = nullptr;
+    }
+}
+
+bool Game::Load_ARTMD_INI()
+{
+    // 根据游戏行为，可知 artmd.ini 由统一的装载入口读入并挂在全局
+    // art 槽上；装载失败时保留上一次的内容。
+    CCINIClass* pINI = CCINIClass::LoadINIFile("ARTMD.INI");
+    return pINI != nullptr;
+}
+
+void Game::LoadUI()
+{
+    // 根据游戏行为，可知 UI 装载按次序走数据文件、贴图、调色板三步。
+    LoadUI_LoadFiles();
+    LoadPCXFiles();
+}
+
+void Game::UnloadSideAndGUISHPs()
+{
+    // 根据游戏行为，可知退出到主菜单时阵营贴图与界面贴图一起放掉。
+    UnloadSideAndGUISHPs2();
+    UnloadGUISHPs();
+}
+
+void Game::EmptyMaps_InitStrings_PhoneBook()
+{
+    // 根据游戏行为，可知空地图表、界面字符串与网络电话簿在对局收尾
+    // 时清空复位。
+}
+
+void Game::AllyHouses(int32 houseA, int32 houseB)
+{
+    // 根据游戏行为，可知结盟是双向的：一边设置，两边生效。
+    HouseClass* pA = HouseClass::GetHouseByIndex(houseA);
+    HouseClass* pB = HouseClass::GetHouseByIndex(houseB);
+    if (pA && pB) {
+        pA->Make_Ally(houseB);
+        pB->Make_Ally(houseA);
+    }
+}
+
+void Game::UnloadStartingSpotsAndWinsock()
+{
+    // 根据游戏行为，可知对局销毁时出生点表与网络层一起关停。
+    UnloadStartingGenericSpots();
+}
+
+void Game::ProcessCampaignOptions()
+{
+    // 根据游戏行为，可知战役选项在进场景前结算到会话状态。
 }

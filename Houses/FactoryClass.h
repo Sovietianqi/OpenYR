@@ -49,16 +49,16 @@ public:
     HouseClass*      GetOwner() const { return Owner; }
     TechnoTypeClass* GetCurrentOrder() const { return CurrentType; }
 
-    // FactoryClass_IsOnHold (asm 0x4C9xxx): `mov al, [ecx+OnHold]`.
+ // FactoryClass_IsOnHold (xxx): `mov al, [ecx+OnHold]`.
     //   True while the factory's owner has put the queue on hold.
     bool IsOnHold() const { return OnHold; }
-    // FactoryClass::Has_Changed (asm 0x4C9xxx).
+ // FactoryClass::Has_Changed (xxx).
     //   Reads the "the queue changed since the sidebar last looked" byte and
     //   clears it, so the caller learns about an update exactly once.
     bool Has_Changed() { const bool c = IsDifferent; IsDifferent = false; return c; }
-    // FactoryClass::Get_Product (asm 0x4C9xxx): the type currently on the line.
+ // FactoryClass::Get_Product (xxx): the type currently on the line.
     TechnoTypeClass* Get_Product() const { return CurrentProduction; }
-    // FactoryClass_GetSpecialItem (asm 0x4C9xxx): the side-specific "special"
+ // FactoryClass_GetSpecialItem (xxx): the side-specific "special"
     //   item (a free bonus unit the house can build), cached at +0x68.
     TechnoTypeClass* GetSpecialItem() const { return SpecialItem; }
 

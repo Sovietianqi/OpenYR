@@ -8,7 +8,7 @@ class CCINIClass;
 // ============================================================================
 // TreeView / ListView INI persistence
 //
-//   sub_7768F0 (asm 0x7768F0) is the callback stored in the dialog message
+ //   sub_7768F0 is the callback stored in the dialog message
 //   map for the options screen.  It dispatches on the Win32 class name of the
 //   control it is handed:
 //

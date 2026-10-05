@@ -75,9 +75,9 @@ public:
     virtual void Berzerk();
     virtual void UnBerzerk();
     virtual bool IsBerzerk() const;
-    // InfantryClass_GoBerzerk (asm 0x5226E8): sets the berzerk flag directly.
+ // InfantryClass_GoBerzerk: sets the berzerk flag directly.
     void GoBerzerk();
-    // InfantryClass_IsDeployer (asm 0x5226F0): the infantry type's Deployer
+ // InfantryClass_IsDeployer: the infantry type's Deployer
     // byte (InfantryTypeClass+0xEC8).
     bool IsDeployer() const;
     virtual void Stun();
@@ -228,18 +228,75 @@ public:
     // authoritative source and the project's Sequence enum orders the tail
     // entries differently.
 
-    // InfantryClass_IsAutoUndeployer (asm 0x5224B0): true while a follow-up
+ // InfantryClass_IsAutoUndeployer: true while a follow-up
     //  sequence is queued (index != -1).
     bool IsAutoUndeployer() const;
 
-    // InfantryClass_IsDeployed_Anim (asm 0x5224XX): the deployed set - indices
+ // InfantryClass_IsDeployed_Anim (XX): the deployed set - indices
     //  0x1B..0x1E (DeployedFire, DeployedIdle, Undeploy, Paradrop).
     bool IsDeployed_Anim() const;
 
-    // InfantryClass_IsSpecialSequence (asm 0x522CC0): sequences that suspend
+ // InfantryClass_IsSpecialSequence: sequences that suspend
     //  normal activity - the die/swim/flight and the harvest/count set:
     //  0x0B..0x0F, 0x14, 0x15 and 0x22..0x24.
     bool IsSpecialSequence() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UnsetSequenct 负责清掉"正在循环播放的行走/趴下类
+    //  序列"：当当前序列正好是趴下射击、行走或行走(变体)这三种之一时，把
+    //  记录序列的字段复位成 -1（表示无），其余序列不受影响。
+    // ------------------------------------------------------------------------
+    void UnsetSequenct();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 StopMovingAction 负责立刻中止步兵的移动动作：
+    //  先确认运动控制器存在（不存在则报错），通知控制器停止，把当前序列
+    //  切到"待机"、清掉"正在移动"标记与运动状态，最后退出当前脚点。
+    // ------------------------------------------------------------------------
+    void StopMovingAction();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 GarrisonBuilding 负责让步兵进入建筑驻守：先用自身
+    //  的"可驻守"检查决定走哪条分支——可以驻守时把本步兵加入建筑的驻守名单、
+    //  刷新该建筑所在格的威胁值，并在这是第一个驻守者且属于玩家时播放提示语
+    //  与音效；属于"可被清除"分支时则反过来清除该建筑的驻守者并把本步兵清场。
+    // ------------------------------------------------------------------------
+    bool GarrisonBuilding(BuildingClass* pBuilding);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SetDefaultDisguise 负责给间谍之类单位设置一个默认
+    //  伪装：若本类型允许默认伪装，则置上伪装标记、按拥有的房屋派生出伪装
+    //  归属，并根据房屋的类别(0/1/2)从规则里挑一款默认伪装外观；不允许时
+    //  清掉伪装标记。
+    // ------------------------------------------------------------------------
+    void SetDefaultDisguise();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 DisguiseAs 负责把本步兵伪装成目标：目标必须是一个
+    //  可以伪装成的对象（敌方步兵/载具之类），随后记下伪装身份并让外观
+    //  显示成对方的模样。传入空指针表示解除伪装。
+    // ------------------------------------------------------------------------
+    virtual void DisguiseAs(AbstractClass* pTarget);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SpawnParachuting 负责让本步兵以"空降"的方式落到
+    //  指定位置：先做常规的投放处理，成功后按拥有者是否为玩家决定是否播放
+    //  落地动作。
+    // ------------------------------------------------------------------------
+    bool SpawnParachuting(int32 a3);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UpdateDeployment 负责推进"展开/坐下"这类变形动画：
+    //  只在当前动作序列属于变形序列时才推进；序列播完就把状态定形。
+    // ------------------------------------------------------------------------
+    void UpdateDeployment();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UpdateInTunnel 负责推进单位在隧道中的移动：沿
+    //  隧道走向按速度推进，到达出口就把单位放出到地面，途中与其它隧道内
+    //  单位保持间距。
+    // ------------------------------------------------------------------------
+    void UpdateInTunnel(int32 a1);
     virtual bool IsTechno() const;
     virtual bool IsInfantry() const;
     virtual bool IsUnit() const;

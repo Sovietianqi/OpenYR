@@ -33,7 +33,7 @@ struct BaseNodeClass
 // ============================================================================
 // BaseClass - the starting base of one house.
 //
-//   BaseClass_LoadFromINI (asm 0x42EBED) reads:
+ //   BaseClass_LoadFromINI reads:
 //     "PercentBuilt"  -> +1C  (default: previous value)
 //     "NodeCount"     -> number of "%03d" entries to walk
 //   Each "%03d" entry names a node, and the nodes are appended to the array
@@ -46,7 +46,7 @@ public:
     BaseClass();
     virtual ~BaseClass();
 
-    // BaseClass_LoadFromINI (asm 0x42EBED)
+ // 根据游戏行为，可知 LoadFromINI 负责下面这段逻辑。
     void LoadFromINI(CCINIClass* pINI, const char* pSection);
 
     void Clear();

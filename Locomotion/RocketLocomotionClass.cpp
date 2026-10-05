@@ -1,4 +1,7 @@
 #include "RocketLocomotionClass.h"
+#include "../Abstract/FootClass.h"
+#include "../Particles/ParticleClass.h"
+#include "../Math/Timer.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -438,4 +441,22 @@ double RocketLocomotionClass::GetCurrentSpeed() const
 float RocketLocomotionClass::GetPitch() const
 {
     return CurrentPitch;
+}
+void RocketLocomotionClass::DoStuff()
+{
+    // 根据游戏行为，可知火箭每帧推进：先按目标跟踪刷新朝向，再按加减速
+    // 状态推进推力曲线，沿轨迹前进；并按固定节拍在尾部留下烟雾粒子，
+    // 命中判定交由上层弹体逻辑收口。
+    GetTargetTracking(MovingDestination);
+    if (IsAccelerating)
+        ProcessAcceleration();
+    else if (IsDecelerating)
+        ProcessDeceleration();
+    else
+        ProcessCruise();
+    UpdateTrajectory();
+    if ((FrameTimer::GetTime() % 3) == 0 && LinkedTo) {
+        CoordStruct pos = LinkedTo->GetCoords();
+        ParticleClass::CreateSmokeParticle(pos, CoordStruct(0, 0, 5));
+    }
 }

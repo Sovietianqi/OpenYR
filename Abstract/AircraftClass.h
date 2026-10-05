@@ -50,10 +50,10 @@ public:
     // AircraftClass virtuals
     // ========================================================================
     virtual bool IsFlying() const;
-    // AircraftClass_GetPoseDir (asm 0x4163C8): the shared RulesData pose
+ // AircraftClass_GetPoseDir: the shared RulesData pose
     // direction used to orient parked aircraft.
     int32 GetPoseDir() const;
-    // AircraftClass_IsGroundUnit (asm 0x4163D0): forwards to the OnFloor
+ // AircraftClass_IsGroundUnit: forwards to the OnFloor
     // vtable slot so the aircraft reports as grounded while parked.
     bool IsGroundUnit() const;
     virtual bool IsLandingNow() const;
@@ -176,6 +176,51 @@ public:
     virtual void SetDestination(CoordStruct dest);
     virtual void Stop();
     virtual void Scatter();
+
+    // ========================================================================
+    // 任务处理器
+    //
+    //  飞机的"散开"任务：只有当任务配置表里允许散开时才真正执行，否则原地
+    //  不动。散开的具体动作交给对象自己的散开实现。
+    // ========================================================================
+    void Mi_Scatter(void* pParam);
+
+    // ========================================================================
+    // 飞机专用任务处理器
+    //
+    //  下面这一组是飞机对基础任务的重写：同样的任务名，但飞机的执行方式与
+    //  地面单位不同——它要先决定飞往哪个空域、悬停还是掠过、以及是否要让
+    //  乘员跳伞。每一个入口都在基础任务之上追加了飞机特有的落点与高度处理，
+    //  返回当前任务步进值（0 表示继续，非 0 表示任务已完成）。
+    // ========================================================================
+    int32 Mi_Attack();
+    int32 Mi_Guard();
+    int32 Mi_Hunt();
+    int32 Mi_Move();
+    int32 Mi_Retreat();
+    int32 Mi_Enter();
+    int32 Mi_Unload();
+    int32 Mi_Patrol();
+    int32 Mi_AreaGuard();
+    int32 Mi_ParaDropApproach();
+    int32 Mi_ParaDropOverfly();
+    int32 Mi_SpyPlaneApproach();
+    int32 Mi_SpyPlaneOverfly();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ReplaceDestination 负责设定飞机下一个要去的空域：
+    //  若目的地已经就是目标点则原地不动；否则记下新目的地，并把"已到达"
+    //  标记清掉，让飞机重新朝新点飞。
+    // ------------------------------------------------------------------------
+    void ReplaceDestination(AbstractClass* pDest);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SetNewTarget 负责给飞机换一个攻击目标：先解除与
+    //  原目标的关联，再记下新目标并复位任务步进，使任务从攻击的第一步重新
+    //  开始。
+    // ------------------------------------------------------------------------
+    void SetNewTarget(AbstractClass* pTarget);
+
     virtual void Hold();
     virtual void Deploy();
     virtual void Undeploy();
@@ -221,6 +266,20 @@ public:
     virtual void UnTemporal();
     virtual bool IsTemporalWarped() const;
     virtual void MindControl(TechnoClass* pTarget);
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知飞行控制面板补全原版命名形态的槽位：COM 三槽
+    // 转发，就绪/锁定/载荷/姿态查询读自身状态，着陆朝向取第一个链路的
+    // 朝向。
+    // ------------------------------------------------------------------------
+    HRESULT FlasherClass_QueryInterface(REFIID iid, void** ppvObject);
+    ULONG FlasherClass_AddRef();
+    ULONG FlasherClass_Release();
+    bool FlasherClass_IsFighter() const;
+    bool FlasherClass_IsLocked() const;
+    bool FlasherClass_IsLoaded() const;
+    bool FlasherClass_IsStrafe() const;
+    int32 FlasherClass_LandingAltitude() const;
+    void FlasherClass_LandingDirection(DirStruct* pOut) const;
     virtual void UnMindControl();
     virtual bool IsMindControlled() const;
     virtual void Parasite(TechnoClass* pHost);
@@ -272,6 +331,9 @@ public:
     bool IsFighter;
     bool IsStrafe;
     bool LockedFlag;
+    // 根据游戏行为，可知机体名下挂着一个被运载的乘客对象，载荷查询
+    // 以它为依据。
+    FootClass* Passenger = nullptr;
     bool IsLoaded;
     BYTE align_7E0[3];
     BuildingClass* DockTarget;

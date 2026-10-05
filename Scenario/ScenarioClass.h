@@ -355,6 +355,45 @@ public:
     bool                IsBases;
     int32               RandomSeed;
     int32               FrameCount;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知场景层补全：秘密科技生产分配、航点装卸、全局/
+    // 本地变量装卸、运兵船清单、下一任务推进、留分结算与多人起点变体。
+    // ------------------------------------------------------------------------
+    virtual TechnoTypeClass* AssignSecretProduction(HouseClass* pHouse);
+    virtual void   ClearWaypoints();
+    virtual void   GenerateDropshipLoadout(HouseClass* pHouse);
+    virtual int32  Get_Next_ID();
+    virtual void   InitMoreBuffers();
+    virtual void   LoadWaypoints(CCINIClass* pINI);
+    virtual CellClass* LocateWaypoint(int32 idx);
+    virtual int32  MPIdxToHouseIdx(int32 mpIdx) const;
+    virtual void   PauseForSeconds(int32 seconds);
+    virtual void   ProceedToNextMission();
+    virtual void   PutGlobalFlags(CCINIClass* pINI);
+    virtual void   ReadGlobalVariables(CCINIClass* pINI);
+    virtual void   SaveMap(CCINIClass* pINI) const;
+    virtual void   SaveWaypoints(CCINIClass* pINI) const;
+    virtual void   ShowCredits();
+    virtual void   WriteLocalVariables(CCINIClass* pINI) const;
+
+    // “Scenario 全局入口”族（对应原版 Scenario 池）
+    static void    GenerateRandomCountries();
+    static CellClass* GetWaypointCell(int32 idx);
+    static void    GuestReceiveOptions();
+    static int32   NameToStartingSlot(const char* pName);
+    static bool    ReadBasic(CCINIClass* pINI);
+    static void    ReadLightingAndBasic(CCINIClass* pINI);
+    static void    RecalcTint();
+    static void    ResetAllSuperWeapons();
+    static void    Smth();
+    static void    SmthStartingHouses();
+    static void    SmthStartingHouses5();
+    static void    SmthStartingHouses6();
+    static void    WriteLightingBasic(CCINIClass* pINI);
+
+    int32 PauseTicks = 0;           // 场景暂停剩余秒数（由场景更新递减）
+    DynamicVectorClass<int32> DropshipLoadout;  // 运兵船装载清单
+
 };
 
 // ============================================================================

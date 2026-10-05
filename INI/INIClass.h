@@ -175,10 +175,7 @@ public:
                      const char* pDefault, char* pBuffer, size_t bufferSize);
 
     int32 GetString(const char* pSection, const char* pKey,
-                    char* pBuffer, size_t bufferSize)
-    {
-        return ReadString(pSection, pKey, pBuffer, pBuffer, bufferSize);
-    }
+                    char* pBuffer, size_t bufferSize);
 
     // Write a string value
     bool WriteString(const char* pSection, const char* pKey, const char* pString);
@@ -190,10 +187,7 @@ public:
     // Read an integer value
     int32 ReadInteger(const char* pSection, const char* pKey, int32 nDefault);
 
-    void GetInteger(const char* pSection, const char* pKey, int32& nValue)
-    {
-        nValue = ReadInteger(pSection, pKey, nValue);
-    }
+    void GetInteger(const char* pSection, const char* pKey, int32& nValue);
 
     // Write an integer value
     bool WriteInteger(const char* pSection, const char* pKey, int32 nValue, bool bHex = false);
@@ -210,10 +204,7 @@ public:
     // Read a boolean value
     bool ReadBool(const char* pSection, const char* pKey, bool bDefault);
 
-    void GetBool(const char* pSection, const char* pKey, bool& bValue)
-    {
-        bValue = ReadBool(pSection, pKey, bValue);
-    }
+    void GetBool(const char* pSection, const char* pKey, bool& bValue);
 
     // Write a boolean value
     bool WriteBool(const char* pSection, const char* pKey, bool bValue);
@@ -225,10 +216,7 @@ public:
     // Read a float value
     float ReadFloat(const char* pSection, const char* pKey, float fDefault);
 
-    void GetFloat(const char* pSection, const char* pKey, float& fValue)
-    {
-        fValue = ReadFloat(pSection, pKey, fValue);
-    }
+    void GetFloat(const char* pSection, const char* pKey, float& fValue);
 
     // Write a float value
     bool WriteFloat(const char* pSection, const char* pKey, float fValue);
@@ -236,10 +224,7 @@ public:
     // Read a double value
     double ReadDouble(const char* pSection, const char* pKey, double dDefault);
 
-    void GetDouble(const char* pSection, const char* pKey, double& dValue)
-    {
-        dValue = ReadDouble(pSection, pKey, dValue);
-    }
+    void GetDouble(const char* pSection, const char* pKey, double& dValue);
 
     // Write a double value
     bool WriteDouble(const char* pSection, const char* pKey, double dValue);
@@ -250,19 +235,13 @@ public:
 
     double ReadFixed(const char* pSection, const char* pKey, double dDefault);
 
-    void GetFixed(const char* pSection, const char* pKey, double& dValue)
-    {
-        dValue = ReadFixed(pSection, pKey, dValue);
-    }
+    void GetFixed(const char* pSection, const char* pKey, double& dValue);
 
     bool WriteFixed(const char* pSection, const char* pKey, double dValue);
 
     int32 ReadIntHundredth(const char* pSection, const char* pKey, int32 nDefault);
 
-    void GetIntHundredth(const char* pSection, const char* pKey, int32& nValue)
-    {
-        nValue = ReadIntHundredth(pSection, pKey, nValue);
-    }
+    void GetIntHundredth(const char* pSection, const char* pKey, int32& nValue);
 
     bool WriteIntHundredth(const char* pSection, const char* pKey, int32 nValue);
 
@@ -270,18 +249,15 @@ public:
     // Lepton (fixed point) Reading/Writing
     //========================================================================
 
-    // CCINIClass::Get_Lepton (asm 0x47490F) - the stored value is a floating
+ // CCINIClass::Get_Lepton - the stored value is a floating
     // point fraction of a cell; a missing key yields nDefault.  A stored -1.0
     // is the "unset" sentinel and is returned as nDefault verbatim; every other
     // value is scaled by 256.0 and floored to an integer.
     int32 ReadLepton(const char* pSection, const char* pKey, int32 nDefault);
 
-    void GetLepton(const char* pSection, const char* pKey, int32& nValue)
-    {
-        nValue = ReadLepton(pSection, pKey, nValue);
-    }
+    void GetLepton(const char* pSection, const char* pKey, int32& nValue);
 
-    // CCINIClass::Put_Lepton (asm 0x47497A) - writes value / 256.0 through the
+ // CCINIClass::Put_Lepton - writes value / 256.0 through the
     // "%f" float writer.
     bool WriteLepton(const char* pSection, const char* pKey, int32 nValue);
 
@@ -289,13 +265,13 @@ public:
     // UU Block Reading/Writing
     //========================================================================
 
-    // INIClass::Put_UUBlock (asm 0x526E60) - serialise a binary blob into a
+ // INIClass::Put_UUBlock - serialise a binary blob into a
     // section as numbered "1", "2", ... keys, each holding up to 0x46 (70)
     // base64 characters.  Returns false when pSection / pValue is null or the
     // size is not positive.
     bool WriteUUBlock(const char* pSection, const void* pValue, size_t nSize);
 
-    // INIClass::Get_UUBlock (asm 0x526FAA) - the mirror: walk the section's
+ // INIClass::Get_UUBlock - the mirror: walk the section's
     // numbered keys, base64-decode each and pack the bytes back into pBuffer.
     // Returns the number of decoded bytes, capped at nSize.
     int32 ReadUUBlock(const char* pSection, void* pBuffer, size_t nSize);
@@ -336,10 +312,7 @@ public:
     // Read a pip index (stored as a name, resolved to an index)
     int32 ReadPipIdx(const char* pSection, const char* pKey, int32 nDefault);
 
-    void GetPipIdx(const char* pSection, const char* pKey, int32& nValue)
-    {
-        nValue = ReadPipIdx(pSection, pKey, nValue);
-    }
+    void GetPipIdx(const char* pSection, const char* pKey, int32& nValue);
 
     // Write a pip index
     bool WritePipIdx(const char* pSection, const char* pKey, int32 nValue);
@@ -347,10 +320,7 @@ public:
     // Read a pip scale index
     int32 ReadPipscaleIdx(const char* pSection, const char* pKey, int32 nDefault);
 
-    void GetPipscaleIdx(const char* pSection, const char* pKey, int32& nValue)
-    {
-        nValue = ReadPipscaleIdx(pSection, pKey, nValue);
-    }
+    void GetPipscaleIdx(const char* pSection, const char* pKey, int32& nValue);
 
     //========================================================================
     // Color Reading/Writing
@@ -362,6 +332,56 @@ public:
 
     // Write three byte values
     bool Write3Bytes(const char* pSection, const char* pKey, const uint8* pValues);
+
+    //========================================================================
+    // Section helpers
+    //========================================================================
+
+    // 根据游戏行为，可知这两者是把"按节名找第 N 个键 / 数键数"暴露成
+    //  Section 前缀的便捷入口，找不到节时分别返回空与 0。
+    const char* Section_GetKeyName(const char* pSection, int32 nKeyIndex);
+    int32 Section_GetValueCount(const char* pSection);
+
+    // 根据游戏行为，可知 Get_Hex 走无符号裸十六进制读取，等价于 ReadHex。
+    int32 GetHex(const char* pSection, const char* pKey, int32 nDefault);
+
+    //========================================================================
+    // Pointer-form accessors
+    //========================================================================
+
+    // 根据游戏行为，可知 char** 形式的取值函数把条目值指针直接交给调用者：
+    // 键存在时写入指针并返回真，键不存在时不改写输出并返回假。
+    bool GetInteger_charPP(const char* pSection, const char* pKey, char** pOut);
+    bool GetString_charPP(const char* pSection, const char* pKey, char** pOut);
+
+    // 根据游戏行为，可知宽字符串读取按 UTF-16 解码、按字符数截断，
+    // 键缺失时拷入缺省串。
+    int32 GetUnicodeString(const char* pSection, const char* pKey,
+                           const wchar_t* pDefault, wchar_t* pBuffer, size_t nChars);
+
+    // 根据游戏行为，可知三浮点读取按 "x,y,z" 逗号拆分，缺项保留原值。
+    float* Read3Floats(float* pBuffer, const char* pSection, const char* pKey,
+                       const float* pDefault);
+
+    // 根据游戏行为，可知场景读取把整个场景文件内容并入当前 INI 对象。
+    bool ReadScenario(const char* pFileName);
+
+    // 根据游戏行为，可知地图预览包按 Base64 编码、切成固定宽度的多行写入。
+    bool SaveMapPreview(const char* pSection, const void* pData, int32 nSize);
+
+    // 根据游戏行为，可知阵营房屋表按逗号拆开、去空白后回写规范化串。
+    bool ParseSideHouses(const char* pSection, const char* pKey);
+
+    // 根据游戏行为，可知宽字符写出口中非 ASCII 字符以 \xXXXX 转义。
+    bool WriteUnicodeEscaped(const char* pSection, const char* pKey, const wchar_t* pValue);
+
+    // 根据游戏行为，可知指针形式的写入函数先解引用再走普通写入，
+    // 空指针视为无值可写、返回假。
+    bool WriteBool_charPP(const char* pSection, const char* pKey, const bool* pValue);
+    bool WriteString_charPP(const char* pSection, const char* pKey, char* const* pValue);
+    bool WriteInteger_charPP(const char* pSection, const char* pKey, const int32* pValue);
+    bool Write2Integers_charPP(const char* pSection, const char* pKey, const int32* pValues);
+    bool Write3Floats_charPP(const char* pSection, const char* pKey, const float* pValues);
 
     //========================================================================
     // Utility
@@ -514,7 +534,7 @@ public:
     void ReadRect(const char* pSection, const char* pKey,
                   RectangleStruct* pRect);
 
-    // INIClass::Put_Rect (asm 0x5273DD): writes the rectangle as the
+ // INIClass::Put_Rect: writes the rectangle as the
     // "%d,%d,%d,%d" string via INIClass_WriteString.
     bool WriteRect(const char* pSection, const char* pKey,
                    const RectangleStruct* pRect);
@@ -563,6 +583,83 @@ public:
     static const char*  BuildCatIdxToName(int32 nIndex);
 
     static void         ParseAbilities(const char* pValue, int32* pOut, int32 nCount);
+
+    //========================================================================
+    // Typed getters by name lookup
+    //========================================================================
+
+    // 根据游戏行为，可知类型读取一族都走"读名字 → 在对应类型表里查 →
+    // 校验类别"三步：名字为空或类别不符时一律回落到调用者给的缺省值。
+    TechnoTypeClass*   FindTechnoTypeByName(const char* pSection, const char* pKey);
+    TechnoTypeClass*   GetTechnoPrerequisite(const char* pSection, const char* pKey,
+                                             TechnoTypeClass* pDefault);
+    AircraftTypeClass* GetAircraftType(const char* pSection, const char* pKey,
+                                       AircraftTypeClass* pDefault);
+    BuildingTypeClass* GetBuildingType(const char* pSection, const char* pKey,
+                                       BuildingTypeClass* pDefault);
+    InfantryTypeClass* GetInfantryType(const char* pSection, const char* pKey,
+                                       InfantryTypeClass* pDefault);
+    UnitTypeClass*     GetUnitType(const char* pSection, const char* pKey,
+                                   UnitTypeClass* pDefault);
+    TerrainTypeClass*  GetTerrainType(const char* pSection, const char* pKey,
+                                      TerrainTypeClass* pDefault);
+    WarheadTypeClass*  GetWarheadType(const char* pSection, const char* pKey,
+                                      WarheadTypeClass* pDefault);
+
+    // 根据游戏行为，可知下面一族读的是"名字或索引"，返回表内序号。
+    int32      GetSide(const char* pSection, const char* pKey, int32 nDefault);
+    int32      GetTheme(const char* pSection, const char* pKey, int32 nDefault);
+    int32      GetVoxIndex(const char* pSection, const char* pKey, int32 nDefault);
+    int32      GetColorSchemeIdx(const char* pSection, const char* pKey, int32 nDefault);
+    int32      GetCategoryIdx(const char* pSection, const char* pKey, int32 nDefault);
+    int32      GetSWTypeIndex(const char* pSection, const char* pKey, int32 nDefault);
+    int32      FindHouseIndex(const char* pSection, const char* pKey);
+    LandType   GetLand(const char* pSection, const char* pKey, LandType nDefault);
+    TheaterType GetTheater(const char* pSection, const char* pKey, TheaterType nDefault);
+    AbstractType GetFactory(const char* pSection, const char* pKey, AbstractType nDefault);
+
+    // 根据游戏行为，可知能力名与速度类型名按既知表序映射为位索引，
+    // 纯数字串直接按数取值。
+    static int32 AbilityNameToIdx(const char* pValue);
+    static int32 SpeedTypeNameToIdx(const char* pValue);
+
+    //========================================================================
+    // Typed writers
+    //========================================================================
+
+    // 根据游戏行为，可知下面一族把枚举值以既知名表反查成名字串写入，
+    // 使 INI 文件保持与原版相同的可读形式。
+    bool WriteSpeedType(const char* pSection, const char* pKey, SpeedType nValue);
+    bool WriteMovementZone(const char* pSection, const char* pKey, MovementZone nValue);
+    bool WriteArmor(const char* pSection, const char* pKey, Armor nValue);
+    bool WriteLand(const char* pSection, const char* pKey, LandType nValue);
+    bool WriteFoundation(const char* pSection, const char* pKey, Foundation nValue);
+    bool WriteBuildCat(const char* pSection, const char* pKey, BuildCat nValue);
+    bool WriteTheater(const char* pSection, const char* pKey, TheaterType nValue);
+    bool WriteFactory(const char* pSection, const char* pKey, AbstractType nValue);
+    bool WriteCategoryIdx(const char* pSection, const char* pKey, int32 nIndex);
+    bool WriteColorScheme(const char* pSection, const char* pKey, int32 nIndex);
+    bool WriteHouseIndex(const char* pSection, const char* pKey, int32 nIndex);
+    bool WritePipscaleIdx(const char* pSection, const char* pKey, int32 nIndex);
+
+    //========================================================================
+    // CLSID & string-table & voice-list accessors
+    //========================================================================
+
+    // 根据游戏行为，可知 CLSID 以 "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+    // 完整大写形式存取，缺括号的裸段式同样能读入。
+    bool ReadCLSID(const char* pSection, const char* pKey, GUID* pOut);
+    bool WriteCLSID(const char* pSection, const char* pKey, const GUID* pValue);
+
+    // 根据游戏行为，可知字符串表条目与普通串读取同路，只是按表内
+    // 编号键走。
+    int32 GetStringtableEntry(const char* pSection, const char* pKey,
+                              char* pBuffer, size_t bufferSize);
+
+    // 根据游戏行为，可知语音表按逗号名字串读取，逐个名字在语音表里
+    // 落成索引，未知名跳过。
+    bool Get_Vector_Voc_525430(const char* pSection, const char* pKey,
+                               DynamicVectorClass<int32>& rList);
 
     //========================================================================
     // Typed Getters

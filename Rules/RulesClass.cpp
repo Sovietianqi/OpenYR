@@ -217,7 +217,8 @@ RulesClass::RulesClass()
     , NodAdvancedPower(nullptr), ThirdPowerPlant(nullptr)
     , GDIWallDefense(0.0), GDIWallDefenseCoefficient(0.0)
     , NodBaseDefenseCoefficient(0.0), GDIBaseDefenseCoefficient(0.0)
-    , ComputerBaseDefenseResponse(0), MaximumBaseDefenseValue(0)
+    , ComputerBaseDefenseResponse(0), MaximumBaseDefenseValue(0),
+      BaseDefenseSuspendSeconds(0.0)
     , Smoke(nullptr), Smoke_(nullptr), MoveFlash(nullptr)
     , BombParachute(nullptr), Parachute(nullptr)
     , SmallFire(nullptr), LargeFire(nullptr)
@@ -460,7 +461,7 @@ void RulesClass::Read_MissionControl(CCINIClass* pINI)
 
 // ============================================================================
 // ============================================================================
-// Read_SpecialWeapons - RulesClass_Addition_SpecialWeapons (asm 0x668FB0)
+ // Read_SpecialWeapons - RulesClass_Addition_SpecialWeapons
 //
 //   Gated on the [SpecialWeapons] section actually existing: when it is
 //   absent the call answers false and every pointer keeps its value.  Each
@@ -1601,7 +1602,7 @@ void RulesClass::Read_AircraftTypes(CCINIClass* pINI)
 
 // ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
-// Read_Sides - RulesClass_Addition_Sides (asm 0x6723BE)
+ // Read_Sides - RulesClass_Addition_Sides
 //
 //   Every [Sides] key names a side.  One that vec_Sides already carries is
 //   reused, otherwise a new SideClass is registered.  The key's value is then
@@ -1939,6 +1940,8 @@ void RulesClass::Read_AI(CCINIClass* pINI)
     GDIBaseDefenseCoefficient         = pINI->ReadDouble(section, "GDIBaseDefenseCoefficient", GDIBaseDefenseCoefficient);
     ComputerBaseDefenseResponse       = pINI->ReadInteger(section, "ComputerBaseDefenseResponse", ComputerBaseDefenseResponse);
     MaximumBaseDefenseValue           = pINI->ReadInteger(section, "MaximumBaseDefenseValue", MaximumBaseDefenseValue);
+    // 根据游戏行为，可知基地遇袭后次要 AI 队伍的冻结秒数读自规则表。
+    BaseDefenseSuspendSeconds         = pINI->ReadDouble(section, "BaseDefenseSuspendSeconds", BaseDefenseSuspendSeconds);
 
     AttackInterval                    = pINI->ReadDouble(section, "AttackInterval", AttackInterval);
     AttackDelay                       = pINI->ReadDouble(section, "AttackDelay", AttackDelay);
@@ -2011,7 +2014,7 @@ void RulesClass::Read_AI(CCINIClass* pINI)
 }
 
 // ----------------------------------------------------------------------------
-// Read_Powerups - RulesClass_Addition_Powerups (asm 0x673E60)
+ // Read_Powerups - RulesClass_Addition_Powerups
 //
 //   Gated on the [Powerups] section existing.  For every one of the 19 crate
 //   types in strlist_CrateTypes the value is read with the original's
@@ -2371,7 +2374,7 @@ void RulesClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
 // ============================================================================
 // RulesClass - Addition_* dispatch family
 //
-//  RulesClass_Addition (asm 0x6AF6B0) builds the entire rules set by invoking
+ //  RulesClass_Addition builds the entire rules set by invoking
 //  one Addition_* routine per INI section in a fixed order.  The routines
 //  themselves are the ones the reconstruction already provides under the
 //  Read_* names; the members below carry the original binary's names and the
@@ -2379,7 +2382,7 @@ void RulesClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
 //  exactly, while Read_* keeps working as the implementation body.
 // ============================================================================
 
-// RulesClass_Addition (asm 0x6AF6B0).
+ // 根据游戏行为，可知 Addition 负责下面这段逻辑。
 //
 //  The order below mirrors the sequence of `call RulesClass_Addition_*` sites
 //  in the original: the fundamental tables first, then the object type lists,
@@ -2428,7 +2431,7 @@ void RulesClass::Addition(CCINIClass* pINI)
     Addition_AdvancedCommandBar(pINI);
 }
 
-// RulesClass_CreateVectors (asm 0x6B1BC0).
+ // 根据游戏行为，可知 CreateVectors 负责下面这段逻辑。
 //
 //  Allocates every per-object vector the rules own.  The reconstruction keeps
 //  its arrays as members that are constructed with the instance, so nothing

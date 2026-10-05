@@ -26,21 +26,21 @@ public:
     CrateClass(noinit_t) noexcept {}
     ~CrateClass() {}
 
-    // CrateClass::Remove_It (asm 0x4A174D): if a crate is present, tear down
+ // CrateClass::Remove_It: if a crate is present, tear down
     // its overlay, reset the cell and (when the spawn is due) mark it done.
     // Returns false when there was nothing to remove.
     bool Remove_It();
 
-    // CrateClass::Create_Crate (asm 0x4A17DD): consume any pending spawn,
+ // CrateClass::Create_Crate: consume any pending spawn,
     // place a crate at the requested cell and schedule the next one using
     // RulesClass.CrateRegen * {1800..450}.
     bool Create_Crate(const CellStruct& coords);
 
-    // CrateClass::Put_Crate (asm 0x4A191F): create the overlay on the target
+ // CrateClass::Put_Crate: create the overlay on the target
     // cell when the terrain allows it, then flag the area dirty.
     bool Put_Crate(const CellStruct& coords);
 
-    // CrateClass::Get_Crate (asm 0x4A1A9D): validate the overlay on the cell
+ // CrateClass::Get_Crate: validate the overlay on the cell
     // as a crate image, remove it and flag the area dirty.
     bool Get_Crate(const CellStruct& coords);
 

@@ -11,7 +11,7 @@ class CCINIClass;
 // MapSelection
 //
 //   One selectable map in the single player map chooser.  Built by
-//   sub_5CF8E0 (asm 0x5CF8E0) from a section of the mission INI.
+ //   sub_5CF8E0 from a section of the mission INI.
 //
 //   Layout follows the original:
 //     +00  char*  pScenario            ("Scenario")

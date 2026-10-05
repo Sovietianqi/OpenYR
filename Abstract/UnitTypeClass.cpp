@@ -336,7 +336,7 @@ AbstractType UnitTypeClass::Get_Build_Queue_Type() const
 }
 
 // ============================================================================
-// Resolve_VXL_References
+// 根据游戏行为，可知 VXL_References 负责下面这段逻辑。
 //
 //  Called after the art INI has been loaded.  Binds the voxel model name
 //  (VXL) and the animation hierarchy (HVA) for this unit type.  The full

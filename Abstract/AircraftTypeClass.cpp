@@ -1,4 +1,6 @@
 #include <Abstract/AircraftTypeClass.h>
+#include <IO/MixFileClass.h>
+#include <Abstract/AircraftClass.h>
 #include <Animations/AnimTypeClass.h>
 
 #include <Core/Memory.h>
@@ -349,7 +351,7 @@ AbstractType AircraftTypeClass::Get_Build_Queue_Type() const
 }
 
 // ============================================================================
-// Resolve_VXL_References
+// 根据游戏行为，可知 VXL_References 负责下面这段逻辑。
 //
 //  Binds the voxel model name (VXL) and animation hierarchy (HVA) for this
 //  aircraft type.  Aircraft are typically voxel-rendered.
@@ -776,4 +778,29 @@ AircraftTypeClass* AircraftTypeClass::FindOrAllocate(const char* pID)
     }
     if (newItem && Array) Array->Add(newItem);
     return newItem;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知旋翼图材是两张全局共享的 SHP：左旋翼与右旋翼，
+// 批量数据初始化时从混合文件一次性登记；找不到就用空句柄占位。
+// ------------------------------------------------------------------------
+void AircraftTypeClass::LoadRotorArt()
+{
+    static void* SHP_LROTOR = nullptr;
+    static void* SHP_RROTOR = nullptr;
+    MixFileClass* pLeft = MixFileClass::FindFileByName("LROTOR.SHP");
+    if (pLeft)
+        SHP_LROTOR = pLeft;
+    MixFileClass* pRight = MixFileClass::FindFileByName("RROTOR.SHP");
+    if (pRight)
+        SHP_RROTOR = pRight;
+}
+
+AircraftClass* AircraftTypeClass::CreateAircraft(HouseClass* pOwner)
+{
+    // 根据游戏行为，可知机型工厂先造机体检索对象再把型表挂上。
+    AircraftClass* pAir = new AircraftClass(pOwner);
+    if (pAir)
+        pAir->Type = this;
+    return pAir;
 }

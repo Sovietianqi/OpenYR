@@ -44,6 +44,21 @@ public:
     void PlayStepSound();
     void Movement_AI();
     bool Is_To_Have_Moving_Anim() const;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知步行移位面板补全搭车（IPiggyback）槽位的原版命名
+    // 形态：COM 三槽转发，搭车状态以一个 ILocomotion* 槽承载。
+    // ------------------------------------------------------------------------
+    HRESULT IPiggyback_QueryInterface(REFIID iid, void** ppvObject);
+    ULONG IPiggyback_AddRef();
+    ULONG IPiggyback_Release();
+    bool IPiggyback_IsPiggybacking() const;
+    HRESULT IPiggyback_BeginPiggyback(ILocomotion* pLoco);
+    HRESULT IPiggyback_EndPiggyback(ILocomotion** ppOut);
+    bool IPiggyback_IsOKToEnd();
+    HRESULT IPiggyback_PiggybackCLSID(GUID* pGUID);
+
+    // 搭车槽：被驮载的移位对象，空表示未搭车。
+    ILocomotion* Piggyback = nullptr;
 
     WalkLocomotionClass();
 

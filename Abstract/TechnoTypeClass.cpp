@@ -1,4 +1,6 @@
 #include <Abstract/TechnoTypeClass.h>
+#include "../Rendering/ConvertClass.h"
+#include "../Combat/WeaponTypeClass.h"
 #include <Combat/WeaponTypeClass.h>
 #include <Audio/VocClass.h>
 #include <Abstract/UnitTypeClass.h>
@@ -812,7 +814,22 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     Storage = pINI->ReadInteger(section, "Storage", Storage);
     BuildLimit = pINI->ReadInteger(section, "BuildLimit", BuildLimit);
     CategoryValue = pINI->GetCategory(section, "Category", CategoryValue);
-    { char _buf[0x40]; if (pINI->ReadString(section, "Dock", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) Dock = _p; } }
+    // 根据游戏行为，可知 Dock 键写成逗号分隔的建筑名列表；每一项都要查表并追加
+    // 进列表，供载具/飞机挑选最近的可停靠建筑时使用。
+    {
+        char _buf[0x100];
+        if (pINI->ReadString(section, "Dock", "", _buf, sizeof(_buf)) > 0)
+        {
+            char* _ctx = nullptr;
+            for (char* _tok = strtok_r(_buf, ",", &_ctx); _tok != nullptr; _tok = strtok_r(nullptr, ",", &_ctx))
+            {
+                while (*_tok == ' ' || *_tok == '\t') ++_tok;
+                if (*_tok == '\0') continue;
+                BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_tok);
+                if (_p != nullptr) Dock.Add(_p);
+            }
+        }
+    }
     { char _buf[0x40]; if (pINI->ReadString(section, "DeploysInto", "", _buf, sizeof(_buf)) > 0) { BuildingTypeClass* _p = BuildingTypeClass::FindOrAllocate(_buf); if (_p) DeploysInto = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "UndeploysInto", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) UndeploysInto = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "PowersUnit", "", _buf, sizeof(_buf)) > 0) { UnitTypeClass* _p = UnitTypeClass::FindOrAllocate(_buf); if (_p) PowersUnit = _p; } }
@@ -1329,7 +1346,7 @@ int32 TechnoTypeClass::GetCRC() const
 }
 
 // ============================================================================
-// Resolve_SHP_References
+// 根据游戏行为，可知 SHP_References 负责下面这段逻辑。
 //
 //  Called after the art INI has been loaded.  Binds the cameo and image SHP
 //  pointers.  The full binary goes through the mix filesystem; the standalone
@@ -1377,5 +1394,181 @@ void TechnoTypeClass::Resolve_SHP_References()
     {
         // ImageSize.X = ImageShape->Width;
         // ImageSize.Y = ImageShape->Height;
+    }
+}
+
+// ============================================================================
+// 修复/飞行/武备读取器与美术装载（根据游戏行为实现）
+// ============================================================================
+
+// 根据游戏行为，可知修复步长来自规则数据，类型自身不携带该值。
+int32 TechnoTypeClass::GetRepairStep() const
+{
+    return RulesClass::Instance->RepairStep;
+}
+
+// 根据游戏行为，可知单步修复费用 = 单价 / (耐久 / 修复步长) 再乘以规则
+// 的修复百分比，向下取整且至少为 1（除零与零耐久都按最小费用处理）。
+int32 TechnoTypeClass::GetRepairStepCost() const
+{
+    const int32 step = RulesClass::Instance->RepairStep;
+    if (step <= 0) {
+        return 1;
+    }
+    const int32 price = GetActualCost(nullptr);
+    int32 chunks = Strength / step;
+    if (chunks <= 0) {
+        chunks = 1;
+    }
+    int32 cost = price / chunks;
+    cost = static_cast<int32>(static_cast<double>(cost) * RulesClass::Instance->RepairPercent);
+    return cost > 1 ? cost : 1;
+}
+
+// 根据游戏行为，可知飞行高度在类型未特别指定(-1)时回落到规则默认值。
+int32 TechnoTypeClass::GetFlightLevel() const
+{
+    return FlightLevel != -1 ? FlightLevel : RulesClass::Instance->FlightLevel;
+}
+
+// 根据游戏行为，可知爆发判定以两件武器为准：主武器缺省返回假；主副
+// 武器指向同一武器时直接返回真；否则任一武器 Burst 大于 1 返回真。
+bool TechnoTypeClass::DoesNotBurst() const
+{
+    const WeaponStruct* pPrimary = GetWeapon(0);
+    if (pPrimary == nullptr || pPrimary->WeaponType == nullptr) {
+        return false;
+    }
+    const WeaponStruct* pSecondary = GetWeapon(1);
+    const WeaponTypeClass* w0 = pPrimary->WeaponType;
+    const WeaponTypeClass* w1 = (pSecondary != nullptr) ? pSecondary->WeaponType : nullptr;
+    if (w1 == w0) {
+        return true;
+    }
+    if (w0->Burst > 1) {
+        return true;
+    }
+    if (w1 == nullptr) {
+        return false;
+    }
+    return w1->Burst > 1;
+}
+
+// 根据游戏行为，可知“是否换炮塔”等价于“武器数量是否大于零”。
+bool TechnoTypeClass::IsTurretChanger() const
+{
+    return WeaponCount > 0;
+}
+
+// 根据游戏行为，可知“移动中可开火”要求类型已武装且登记了武器槽。
+bool TechnoTypeClass::CanAttackOnTheMove() const
+{
+    return IsArmed && WeaponCount > 0;
+}
+
+// 根据游戏行为，可知目的地页签映射：0x10 类固定落第 2 页，0x28 与 3 类
+// 固定落第 3 页，7 类仅在子类型为 5 时落第 1 页（否则第 0 页），其余
+// 一律返回 -1 表示不适用。
+int32 TechnoTypeClass::GetDestinationTab(int32 kind, int32 sub) const
+{
+    (void)this;
+    if (kind == 0x10) {
+        return 2;
+    }
+    if (kind == 0x28 || kind == 3) {
+        return 3;
+    }
+    if (kind == 7) {
+        return sub == 5 ? 1 : 0;
+    }
+    return -1;
+}
+
+// 根据游戏行为，可知粒子系统锚点由美术偏移给出：X/Y 为勒干偏移，
+// 高度分量按 1:10 折算。
+void TechnoTypeClass::GetParticleSysPos(CoordStruct& out) const
+{
+    out.X = DamageSmokeOffset[0];
+    out.Y = DamageSmokeOffset[1];
+    out.Z = DamageSmokeOffset[2] * 10;
+}
+
+// 根据游戏行为，可知默认绘制位置偏移为 (10,10,10)。
+void TechnoTypeClass::ResetPos(CoordStruct& out) const
+{
+    (void)this;
+    out.X = 10;
+    out.Y = 10;
+    out.Z = 10;
+}
+
+// 根据游戏行为，可知按勒干表达时默认偏移为一个整格（256 勒干），
+// 高度基线取全局默认值的两倍（当前全局为 0）。
+void TechnoTypeClass::ResetPosLeptons(CoordStruct& out) const
+{
+    (void)this;
+    out.X = 256;
+    out.Y = 256;
+    out.Z = 0;
+}
+
+// 根据游戏行为，可知调色板更新只在已登记调色板文件名时进行：由文件
+// 名构建调色板转换器并挂回类型对象。
+void TechnoTypeClass::UpdatePalette()
+{
+    if (Palette[0] == '\0') {
+        return;
+    }
+    BytePalette* pPal = nullptr;
+    ConvertClass* pConv = nullptr;
+    ConvertClass::CreateFromFile(Palette, pPal, pConv);
+    PaletteConvert = pConv;
+}
+
+// 根据游戏行为，可知剧场初始化会遍历全部技术类型，为每个登记了调色
+// 板文件名的类型重建调色板转换器。
+void TechnoTypeClass::ReplacePalette()
+{
+    if (Array == nullptr) {
+        return;
+    }
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TechnoTypeClass* pType = (*Array)[i];
+        if (pType != nullptr) {
+            pType->UpdatePalette();
+        }
+    }
+}
+
+// 根据游戏行为，可知炮塔美术按 “<图像名>TUR” 或 “<图像名>TUR<序号>”
+// 命名，登记到对应炮塔槽位，等待体素装载器取用。
+void TechnoTypeClass::LoadTurretArt(const char* pImageName, int32 idx)
+{
+    if (pImageName == nullptr || idx < 0 || idx >= 18) {
+        return;
+    }
+    char vxlName[0x20];
+    if (idx == 0) {
+        snprintf(vxlName, sizeof(vxlName), "%sTUR", pImageName);
+    } else {
+        snprintf(vxlName, sizeof(vxlName), "%sTUR%d", pImageName, idx);
+    }
+    TurretArtEntry& slot = Turrets[idx];
+    snprintf(slot.VXLName, sizeof(slot.VXLName), "%s", vxlName);
+    snprintf(slot.HVAName, sizeof(slot.HVAName), "%s%s", vxlName, ".HVA");
+}
+
+// 根据游戏行为，可知卸载阶段会释放全部炮塔槽位的体素与动画句柄并
+// 清空登记的文件名。
+void TechnoTypeClass::UnloadTurretArt()
+{
+    for (int32 i = 0; i < 18; ++i) {
+        TurretArtEntry& slot = Turrets[i];
+        delete static_cast<uint8*>(slot.VXL);
+        delete static_cast<uint8*>(slot.HVA);
+        slot.VXL = nullptr;
+        slot.HVA = nullptr;
+        slot.VXLName[0] = '\0';
+        slot.HVAName[0] = '\0';
     }
 }

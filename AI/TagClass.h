@@ -51,6 +51,19 @@ public:
     void Assign_To_Object(AbstractClass* pObject);
     bool Is_Assigned(AbstractClass* pObject) const;
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知标签补全原版命名形态：沿挂载触发器逐个询问——
+    // 任一可重复、区域检查线命中、路点区域进入、允许胜利；事件上抛按
+    // 事件类型广播到所有挂载触发器。
+    // ------------------------------------------------------------------------
+    bool IsTriggerRepeating() const;
+    bool CrossHorizontal(int32 zone);
+    bool CrossVertical(int32 zone);
+    bool IsWPZoneEntry() const;
+    bool DoesAllowWin() const;
+    bool IsAttachedToTrigger(TriggerClass* pTrigger) const;
+    void RaiseEvent(int32 eventKind, AbstractClass* pTagObject, CellStruct loc, bool isRepeating, AbstractClass* pSource);
+
     void Compute_CRC(CRCEngine& crc) const;
 
     char Name[0x18];

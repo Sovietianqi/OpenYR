@@ -79,6 +79,14 @@ public:
 
     // ── Global dialog list ───────────────────────────────────────────────
     static DynamicVectorClass<VoxClass*>* Array;
+    // 根据游戏行为，可知语音播放面以索引与名字两个入口落地：索引
+    // 直达表项，名字侧先做大小写不敏感的线性定位；优先级为 -1 时
+    // 沿用表内默认档位。
+    static int32 PlayFromIndex(int32 index, int32 typeFlags, int32 priorityFlags);
+    static int32 PlayFromName(const char* pName, int32 typeFlags, int32 priorityFlags);
+    static int32 PlayEVASideSpecific(int32 index, int32 sideIndex);
+    static void StopIndex(int32 index);
+
     static VoxClass* Find(const char* pID);
     static void Clear();
 };

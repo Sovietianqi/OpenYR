@@ -10,7 +10,7 @@
 // SideClass
 //
 //   One entry of the [Sides] section, built by RulesClass_Addition_Sides
-//   (asm 0x6723BE).  The object is an AbstractTypeClass whose ID is the side
+ //.  The object is an AbstractTypeClass whose ID is the side
 //   name, plus the list of houses that belong to it.
 //
 //   Layout, matching the original:
@@ -30,7 +30,7 @@ public:
     SideClass(const char* pID) noexcept;
     virtual ~SideClass();
 
-    // Side_From_Name (asm 0x6A46D6): the ordinal of the side whose name
+ // Side_From_Name: the ordinal of the side whose name
     // matches pName case-insensitively, or -1.  RulesClass_Addition_Sides
     // reuses an existing side through this before allocating a new one.
     static int32 From_Name(const char* pName);
@@ -39,10 +39,10 @@ public:
     static SideClass* FindOrAllocate(const char* pID);
     static int32 GetCount();
 
-    // RulesClass_Addition_Sides (asm 0x6723BE): the whole [Sides] walk.
+ // RulesClass_Addition_Sides: the whole [Sides] walk.
     static void ReadSides(CCINIClass* pINI);
 
-    // INIClass_ParseSideHouses (asm 0x476800): reads the side's value string
+ // INIClass_ParseSideHouses: reads the side's value string
     // out of pINI, splits it on ',' and turns every token into a house
     // ordinal, appending the hits to the vector.  An unset or empty value
     // leaves the vector empty.

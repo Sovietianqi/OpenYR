@@ -60,4 +60,25 @@ protected:
 public:
     RadioCommand LastCommands[3];
     VectorClass<TechnoClass*> RadioLinks;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知链路表查询以原版命名成对暴露（2 号形态为出参版）。
+    // ------------------------------------------------------------------------
+    bool IsArrayEmpty() const;
+    bool ArrayHasAtLeastOneItem() const;
+    bool ContainsEntry(TechnoClass* pTech) const;
+    bool IsObjectInArray(TechnoClass* pTech) const;
+    TechnoClass* GetNthEntry(int32 idx) const;
+    bool GetNthEntry2(int32 idx, TechnoClass** pOut) const;
+    int32 GetIdxOfEntry2(TechnoClass* pTech) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知链路指令与停靠的原版命名形态：SendToFirst 对首
+    // 链路下发，SendToEach 向所有链路广播，SendSmth 携带数据载荷下发，
+    // LinkWith 建立双向链路。
+    // ------------------------------------------------------------------------
+    RadioCommand SendToFirst(RadioCommand command);
+    void SendToEach(RadioCommand command);
+    RadioCommand SendSmth(RadioCommand command, AbstractClass*& pInOut, TechnoClass* pRecipient);
+    bool LinkWith(TechnoClass* pLink);
+
 };

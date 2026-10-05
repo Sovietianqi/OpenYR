@@ -76,3 +76,15 @@ int CopyProtection_Get_Last_Error_Message(char* pBuffer, int32 nBufferSize);
 
 extern bool         g_CopyProtection_Active;
 extern unsigned int g_CopyProtection_LastCheck;
+
+// ============================================================================
+// 根据游戏行为，可知启动器通讯面以四个入口暴露：运行探测、心跳
+// 通知、消息读取与受保护数据校验。
+// ============================================================================
+class CopyProtectionFace {
+public:
+    static bool IsLauncherRunning();
+    static void NotifyLauncher();
+    static bool MessageFromLauncher(void* pMessage, int32 size);
+    static bool CheckProtectedData();
+};

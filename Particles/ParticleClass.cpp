@@ -1512,3 +1512,91 @@ void ClearAllParticles()
 }
 
 } // end anonymous namespace
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知各 BehavesLike 分支的推进差异：火焰抬升且收缩、
+// 毒气偶数帧随机游走、烟雾缓升且膨胀、电磁轨道余辉快速褪色、火花受
+// 重力下坠；二级推进按 BehavesLike 分派，二级毒气在半寿期膨大、二级
+// 烟雾在半寿期转淡；取帧按 BehavesLike 三路给帧序。
+// ------------------------------------------------------------------------
+void ParticleClass::Update_Fire()
+{
+    Velocity.Z += 8;
+    UpdateMotion();
+    Size_ *= 0.98f;
+}
+
+void ParticleClass::Update_Gas()
+{
+    if ((FrameTimer::GetTime() & 1) == 0) {
+        Velocity.X += (std::rand() % 17) - 8;
+        Velocity.Y += (std::rand() % 17) - 8;
+    }
+    UpdateMotion();
+}
+
+void ParticleClass::Update_Smoke()
+{
+    Velocity.Z += 3;
+    UpdateMotion();
+    Size_ *= 1.02f;
+}
+
+void ParticleClass::Update_Railgun()
+{
+    if (Alpha > 16)
+        Alpha = static_cast<uint8>(Alpha - 16);
+    else
+        Alpha = 0;
+    UpdateMotion();
+}
+
+void ParticleClass::Update_Spark()
+{
+    Velocity.Z -= 12;
+    UpdateMotion();
+}
+
+void ParticleClass::Update_2()
+{
+    if (!Type) {
+        UpdateMotion();
+        return;
+    }
+    switch (Type->BehavesLike) {
+    case 0:  Update_Smoke(); break;
+    case 1:  Update_Gas();   break;
+    case 2:  Update_Spark(); break;
+    default: UpdateMotion(); break;
+    }
+}
+
+void ParticleClass::Update2_Gas()
+{
+    // 根据游戏行为，可知毒气的二级推进在半寿期把云团膨大。
+    Update_Gas();
+    if (MaxAge > 0 && Age * 2 >= MaxAge)
+        Size_ *= 1.05f;
+}
+
+void ParticleClass::Update2_Smoke()
+{
+    // 根据游戏行为，可知烟雾的二级推进在半寿期开始转淡。
+    Update_Smoke();
+    if (MaxAge > 0 && Age * 2 >= MaxAge)
+        FadeOut();
+}
+
+int32 ParticleClass::GetImageFrame()
+{
+    if (!Type)
+        return 0;
+    // 根据游戏行为，可知取帧按 BehavesLike 分三路：烟/毒气随年龄推进
+    // 帧序，火花按漂移方向取帧，其余固定取首帧。
+    switch (Type->BehavesLike) {
+    case 0:
+    case 1: return MaxAge > 0 ? (Age * 8) / MaxAge : 0;
+    case 2: return (Velocity.X + Velocity.Y) > 0 ? 1 : 0;
+    default: return 0;
+    }
+}

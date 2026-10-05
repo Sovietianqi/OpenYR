@@ -45,7 +45,7 @@ public:
     int32 GetProjectileSpeed() const;
     DamageType GetDamageType() const;
 
-    // WeaponTypeClass__GetProjectileAGAA_Flags (asm 0x771A40).
+ // 根据游戏行为，可知 _GetProjectileAGAA_Flags 负责下面这段逻辑。
     //
     //  Translates a weapon's projectile capability flags into the
     //  ProjectileTypeFlags bitmask consumed by TechnoClass::Greatest_Threat

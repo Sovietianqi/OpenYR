@@ -28,6 +28,12 @@ public:
 
     // AIScriptClass::SetCurrentLine (asm 0x754E5D): stores idx into the
     // current-line slot (+0x2C) and always reports success.
+    // 根据游戏行为，可知脚本执行面补全行游标的三步推进：回卷、
+    // 读取与步进。
+    void ResetCurrentLine();
+    int32 GetCurrentLine() const;
+    void StepToNextLine();
+
     bool SetCurrentLine(int32 idx);
 
 private:

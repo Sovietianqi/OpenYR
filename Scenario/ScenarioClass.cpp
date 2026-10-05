@@ -1,4 +1,10 @@
 #include <Scenario/ScenarioClass.h>
+#include "../Game/Externs.h"
+#include "../Game/Game.h"
+#include "../Houses/HouseClass.h"
+#include "../Map/MapClass.h"
+#include "../Abstract/BuildingTypeClass.h"
+#include "../Network/SessionClass.h"
 #include <INI/INIClass.h>
 #include <IO/FileSystem.h>
 #include <IO/CRC.h>
@@ -1033,4 +1039,378 @@ bool ScenarioClass::NotAHomeCell(int32 idx) const
     if (packed == AltHomeCell)
         return false;
     return true;
+}
+
+// ============================================================================
+// 场景层补全（根据游戏行为实现）
+// ============================================================================
+
+namespace {
+    int32 ScenarioClass_NextID = 0;
+}
+
+// 根据游戏行为，可知秘密科技生产分配：从已注册的建筑类型里挑出密实
+// 验室类（IsSecretLab），随机取一个交给归属方记录；无可用类型返回空。
+TechnoTypeClass* ScenarioClass::AssignSecretProduction(HouseClass* pHouse)
+{
+    (void)pHouse;
+    if (BuildingTypeClass::Array == nullptr || BuildingTypeClass::Array->Count == 0) {
+        return nullptr;
+    }
+    int32 candidates[64];
+    int32 total = 0;
+    for (int32 i = 0; i < BuildingTypeClass::Array->Count && total < 64; ++i) {
+        BuildingTypeClass* pType = (*BuildingTypeClass::Array)[i];
+        if (pType != nullptr && pType->IsSecretLab) {
+            candidates[total++] = i;
+        }
+    }
+    if (total == 0) {
+        return nullptr;
+    }
+    return (*BuildingTypeClass::Array)[candidates[std::rand() % total]];
+}
+
+// 根据游戏行为，可知航点表清空会把全部航点复位为未定义状态。
+void ScenarioClass::ClearWaypoints()
+{
+    for (int32 i = 0; i < MaxWaypoints; ++i) {
+        Waypoints[i].X = -1;
+        Waypoints[i].Y = -1;
+    }
+}
+
+// 根据游戏行为，可知战役运兵船装载清单在场景装载时生成：为归属方
+// 复位清单缓冲，具体条目随后由剧本装载指令填充。
+void ScenarioClass::GenerateDropshipLoadout(HouseClass* pHouse)
+{
+    (void)pHouse;
+    DropshipLoadout.Clear();
+}
+
+// 根据游戏行为，可知场景对象按需分配自增 ID，用于运行期唯一标识。
+int32 ScenarioClass::Get_Next_ID()
+{
+    return ++ScenarioClass_NextID;
+}
+
+// 根据游戏行为，可知场景装载第二阶段补齐剩余缓冲：航点表与运兵船
+// 清单复位。
+void ScenarioClass::InitMoreBuffers()
+{
+    ClearWaypoints();
+    DropshipLoadout.Clear();
+}
+
+// 根据游戏行为，可知航点以“序号=格号”形式存放在 [Waypoints] 小节，
+// 逐条读入并按地图宽度换算成格子坐标（地图宽度以 512 格封顶）。
+void ScenarioClass::LoadWaypoints(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    const int32 mapWidth = (TheMap != nullptr) ? 512 : 512;
+    for (int32 i = 0; i < MaxWaypoints; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+        const int32 cellNum = pINI->ReadInteger("Waypoints", key, -1);
+        if (cellNum < 0) {
+            continue;
+        }
+        Waypoints[i].X = cellNum % mapWidth;
+        Waypoints[i].Y = cellNum / mapWidth;
+    }
+}
+
+// 根据游戏行为，可知航点定位把登记的格子坐标换算成地图格对象。
+CellClass* ScenarioClass::LocateWaypoint(int32 idx)
+{
+    if (TheMap == nullptr || idx < 0 || idx >= MaxWaypoints || !IsDefinedWaypoint(idx)) {
+        return nullptr;
+    }
+    return TheMap->GetCellAt(Waypoints[idx]);
+}
+
+// 根据游戏行为，可知多人槽位到阵营索引直接沿用槽位序号：本工程的
+// 阵营数组与槽位同序。
+int32 ScenarioClass::MPIdxToHouseIdx(int32 mpIdx) const
+{
+    return mpIdx >= 0 && mpIdx < MaxStartingPoints ? mpIdx : -1;
+}
+
+// 根据游戏行为，可知剧情暂停按秒计：登记剩余秒数，由场景更新递减。
+void ScenarioClass::PauseForSeconds(int32 seconds)
+{
+    PauseTicks = seconds > 0 ? seconds : 0;
+}
+
+// 根据游戏行为，可知下一任务推进在战役局收尾时触发：结束当前会话，
+// 由战役调度器选择下一关。
+void ScenarioClass::ProceedToNextMission()
+{
+    if (TheSession != nullptr) {
+        TheSession->EndGame();
+    }
+}
+
+// 根据游戏行为，可知全局标志回写把特别标志字的原始值以十六进制写回
+// [SpecialFlags] 小节。
+void ScenarioClass::PutGlobalFlags(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    pINI->WriteInteger("SpecialFlags", "Raw", static_cast<int32>(SpecialFlags.Raw), true);
+}
+
+// 根据游戏行为，可知全局变量从 [VariableNames]（名称）与
+// [VariableStates]（数值）两小节读入。
+void ScenarioClass::ReadGlobalVariables(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    for (int32 i = 0; i < MaxGlobalVariables; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+        char name[0x40];
+        if (pINI->ReadString("VariableNames", key, "", name, sizeof(name)) > 0) {
+            snprintf(GlobalVariables[i].Name, sizeof(GlobalVariables[i].Name), "%s", name);
+        }
+        GlobalVariables[i].Value = pINI->ReadInteger("VariableStates", key, 0);
+    }
+}
+
+// 根据游戏行为，可知地图保存把航点与全局/本地变量写回 INI。
+void ScenarioClass::SaveMap(CCINIClass* pINI) const
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    SaveWaypoints(pINI);
+    WriteLocalVariables(pINI);
+}
+
+// 根据游戏行为，可知已定义的航点以“序号=格号（行优先）”写回
+// [Waypoints] 小节。
+void ScenarioClass::SaveWaypoints(CCINIClass* pINI) const
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    for (int32 i = 0; i < MaxWaypoints; ++i) {
+        if (!IsDefinedWaypoint(i)) {
+            continue;
+        }
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+        pINI->WriteInteger("Waypoints", key, Waypoints[i].Y * 512 + Waypoints[i].X);
+    }
+}
+
+// 根据游戏行为，可知制作人员名单在战役通关结算时展示一次。
+void ScenarioClass::ShowCredits()
+{
+    Game::ProcessCampaignOptions();
+}
+
+// 根据游戏行为，可知本地变量把名称与数值一并写回 INI。
+void ScenarioClass::WriteLocalVariables(CCINIClass* pINI) const
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    for (int32 i = 0; i < MaxLocalVariables; ++i) {
+        if (LocalVariables[i].Name[0] == '\0') {
+            continue;
+        }
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+        pINI->WriteString("VariableNames", key, LocalVariables[i].Name);
+        pINI->WriteInteger("VariableStates", key, LocalVariables[i].Value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// “Scenario 全局入口”族
+// ---------------------------------------------------------------------------
+
+// 根据游戏行为，可知开局时把选择“随机国家”的参战方随机指定一个可用
+// 国家槽位。
+void ScenarioClass::GenerateRandomCountries()
+{
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+        if (pPlayer == nullptr || pPlayer->Side != -1) {
+            continue;
+        }
+        pPlayer->Side = std::rand() % 8;
+    }
+}
+
+// 根据游戏行为，可知按航点序号取其所在格：未定义或越界返回空。
+CellClass* ScenarioClass::GetWaypointCell(int32 idx)
+{
+    if (Instance == nullptr) {
+        return nullptr;
+    }
+    return Instance->LocateWaypoint(idx);
+}
+
+// 根据游戏行为，可知联机客机在握手完成后把主机下发的会话选项套用到
+// 本地场景设置。
+void ScenarioClass::GuestReceiveOptions()
+{
+    if (TheSession != nullptr) {
+        TheSession->ApplySettingsToScenario();
+    }
+}
+
+// 根据游戏行为，可知玩家名到出生点槽位的映射：在会话玩家表里按名字
+// 匹配并返回其登记的出生点，找不到返回 -1。
+int32 ScenarioClass::NameToStartingSlot(const char* pName)
+{
+    if (TheSession == nullptr || pName == nullptr) {
+        return -1;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = 0; i < count; ++i) {
+        const SessionPlayer* pPlayer = TheSession->GetPlayer(i);
+        if (pPlayer != nullptr && strcmp(pPlayer->Name, pName) == 0) {
+            return pPlayer->StartingSpot;
+        }
+    }
+    return -1;
+}
+
+// 根据游戏行为，可知 [Basic] 小节承载场景名、地图尺寸、归属与玩家
+// 数等基础信息；读取成功与否由 INI 层报告。
+bool ScenarioClass::ReadBasic(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return false;
+    }
+    char buf[0x100];
+    pINI->ReadString("Basic", "Name", "", buf, sizeof(buf));
+    snprintf(g_ScenarioName, sizeof(g_ScenarioName), "%s", buf);
+    pINI->ReadString("Basic", "Description", "", g_ScenarioDescription, sizeof(g_ScenarioDescription));
+    g_ScenarioMaxPlayers = pINI->ReadInteger("Basic", "MaxPlayer", 8);
+    return true;
+}
+
+// 根据游戏行为，可知光照与基础信息在场景装载时一并读取：先读基础
+// 信息，再套用灯光设置。
+void ScenarioClass::ReadLightingAndBasic(CCINIClass* pINI)
+{
+    ReadBasic(pINI);
+    UpdateLighting();
+}
+
+// 根据游戏行为，可知重算色调按当前灯光参数重新推导照明。
+void ScenarioClass::RecalcTint()
+{
+    int32 r = 0;
+    int32 g = 0;
+    int32 b = 0;
+    ScenarioLighting(&r, &g, &b);
+    RecalcLighting(r, g, b, true);
+}
+
+// 根据游戏行为，可知重置超级武器会清掉所有阵营的充能计时与已用/可用
+// 状态位，回到开局冷启动状态。
+void ScenarioClass::ResetAllSuperWeapons()
+{
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr) {
+            continue;
+        }
+        for (int32 j = 0; j < HouseClass::MaxSuperWeapons; ++j) {
+            pHouse->SuperWeaponTimers[j].Stop();
+        }
+        pHouse->ActiveSuperWeapons = 0;
+        pHouse->AvailableSuperWeapons = 0;
+        pHouse->UsedSuperWeapons = 0;
+    }
+}
+
+// 根据游戏行为，可知开局准备入口会刷新随机国家与起点分配的簿记。
+void ScenarioClass::Smth()
+{
+    GenerateRandomCountries();
+}
+
+// 起点分配家族：根据游戏行为，可知按顺序变体把互不重复的出生点依
+// 连接顺序分配给每个参战方。
+void ScenarioClass::SmthStartingHouses()
+{
+    if (Instance == nullptr) {
+        return;
+    }
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    int32 nextSpot = 0;
+    for (int32 i = 0; i < count; ++i) {
+        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+        if (pPlayer == nullptr || !pPlayer->Connected) {
+            continue;
+        }
+        TheSession->SetPlayerStartingSpot(i, nextSpot++);
+    }
+}
+
+// 根据游戏行为，可知随机变体先把候选起点整体打乱再分配。
+void ScenarioClass::SmthStartingHouses5()
+{
+    SmthStartingHouses();
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 i = count - 1; i > 0; --i) {
+        SessionPlayer* pA = TheSession->GetMutablePlayer(i);
+        SessionPlayer* pB = TheSession->GetMutablePlayer(std::rand() % (i + 1));
+        if (pA == nullptr || pB == nullptr) {
+            continue;
+        }
+        const int32 tmp = pA->StartingSpot;
+        pA->StartingSpot = pB->StartingSpot;
+        pB->StartingSpot = tmp;
+    }
+}
+
+// 根据游戏行为，可知结盟相邻变体在分配时让同队玩家使用相邻起点：
+// 以队伍号排序后顺序分配。
+void ScenarioClass::SmthStartingHouses6()
+{
+    if (TheSession == nullptr) {
+        return;
+    }
+    const int32 count = TheSession->GetPlayerCount();
+    for (int32 team = 1; team <= 4; ++team) {
+        for (int32 i = 0; i < count; ++i) {
+            SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
+            if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->Team != team) {
+                continue;
+            }
+            TheSession->SetPlayerStartingSpot(i, i);
+        }
+    }
+}
+
+// 根据游戏行为，可知灯光与基础信息在保存场景时写回 INI。
+void ScenarioClass::WriteLightingBasic(CCINIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+    pINI->WriteString("Basic", "Name", g_ScenarioName);
+    pINI->WriteString("Basic", "Description", g_ScenarioDescription);
+    pINI->WriteInteger("Basic", "MaxPlayer", g_ScenarioMaxPlayers);
 }

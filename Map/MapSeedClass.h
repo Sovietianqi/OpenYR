@@ -48,6 +48,31 @@ public:
     int32 Resources;
     char  Description[0x80];
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知随机地图生成面板的原版命名形态：总生成入口按
+    // 地图类型分派阶段机（内陆/群岛/岛屿/大陆/团队大陆五种水域分布 +
+    // 城区铺设）；界面字符串键与任务文件管理是固定槽位。
+    // ------------------------------------------------------------------------
+    bool Generate();
+    bool Generate_InitRandomMap();
+    void Generate_SeedWater_Inland();
+    void Generate_SeedWater_Archipelago();
+    void Generate_SeedWater_Islands();
+    void Generate_SeedWater_Continent();
+    void Generate_SeedWater_TeamContinent();
+    void Generate_PlaceUrbanAreas();
+    void AddTechBuildings();
+    const wchar_t* GetUIString_Load() const;
+    const wchar_t* GetUIString_Save() const;
+    const wchar_t* GetUIString_Saved() const;
+    const wchar_t* GetUIString_Delete() const;
+    bool LoadRandomMapDescription();
+    bool SaveMission(const char* pName, const wchar_t* pTitle);
+    static bool DeleteMission(const char* pFileName);
+    static int32 DialogFunc_SetData();
+    static int32 DialogFunc_GetData();
+    static int32 DialogFunc();
+
     // ------------------------------------------------------------------
     // Tiberium seeding
     // ------------------------------------------------------------------

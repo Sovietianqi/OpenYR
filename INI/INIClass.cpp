@@ -1,4 +1,5 @@
 #include "INI/INIClass.h"
+#include "Core/GUID.h"
 
 #include "Core/Memory.h"
 #include "Helpers/StringHelpers.h"
@@ -7,6 +8,11 @@
 #include "IO/Pipes.h"
 #include "Houses/HouseTypeClass.h"
 #include "Houses/HouseClass.h"
+#include "Houses/SideClass.h"
+#include "Combat/WarheadTypeClass.h"
+#include "Audio/ThemeClass.h"
+#include "Audio/VocClass.h"
+#include "SW/SuperWeaponTypeClass.h"
 #include "Rendering/ConvertClass.h"
 #include "IO/MovieClass.h"
 #include "Abstract/TechnoTypeClass.h"
@@ -391,7 +397,7 @@ bool INIClass::WriteInteger(const char* pSection, const char* pKey, int32 nValue
 {
     if (!pSection || !pKey) return false;
 
-    // INIClass_WriteInteger (asm 0x5275D6): the hexadecimal form is written
+ // INIClass_WriteInteger: the hexadecimal form is written
     // as "%Xh" and, when the value is negative, prefixed by a '$' through
     // "$%X" so the sign round-trips.  The decimal path is a plain "%d".
     char buffer[64];
@@ -413,7 +419,7 @@ bool INIClass::WriteInteger(const char* pSection, const char* pKey, int32 nValue
 //----------------------------------------------------------------------
 // INIClass::ReadHex / WriteHex
 //
-//   INIClass_WriteHex (asm 0x5275C0) is the bare-hex sibling of
+ //   INIClass_WriteHex is the bare-hex sibling of
 //   WriteInteger: it holds the literal "%X" (asc_825BD0) and does nothing
 //   more than
 //       sprintf(buffer, "%X", value);
@@ -445,7 +451,7 @@ bool INIClass::WriteHex(const char* pSection, const char* pKey, int32 nValue)
 {
     if (!pSection || !pKey) return false;
 
-    // INIClass_WriteHex (asm 0x5275C0): sprintf(buffer, "%X", value) with no
+ // INIClass_WriteHex: sprintf(buffer, "%X", value) with no
     // sign handling - the value is taken as an unsigned bit pattern, which is
     // what the callers of this writer expect.
     char buffer[64];
@@ -461,7 +467,7 @@ bool INIClass::WriteHex(const char* pSection, const char* pKey, int32 nValue)
 //   The "UU block" pair serialises an arbitrary binary blob into an INI
 //   section as a sequence of numbered keys, each holding one line of base64:
 //
-//     INIClass::Put_UUBlock (asm 0x526E60)
+ //     INIClass::Put_UUBlock
 //       - guards: pSection != null, pValue != null, nSize >= 1;
 //       - wraps the source in a Base64Straw over a memory Buffer;
 //       - loops from key ordinal 1, reading at most 0x46 (70) characters
@@ -470,7 +476,7 @@ bool INIClass::WriteHex(const char* pSection, const char* pKey, int32 nValue)
 //       - stops when the straw returns 0 bytes; always returns true on the
 //         happy path, false from the guards.
 //
-//     INIClass::Get_UUBlock (asm 0x526FAA)
+ //     INIClass::Get_UUBlock
 //       - guards: pSection != null (a null section returns 0);
 //       - reads the section's key count, then for each ordinal (1-based)
 //         fetches the key's string, trims surrounding whitespace, and feeds
@@ -668,7 +674,7 @@ float INIClass::ReadFloat(const char* pSection, const char* pKey, float fDefault
 
 bool INIClass::WriteFloat(const char* pSection, const char* pKey, float fValue)
 {
-    // INIClass_WriteFloat (asm 0x5281F5) uses sprintf(buffer, "%f", value)
+ // INIClass_WriteFloat uses sprintf(buffer, "%f", value)
     // with a 0x200 byte destination before handing the text to WriteString.
     char buffer[0x200];
     snprintf(buffer, sizeof(buffer), "%f", static_cast<double>(fValue));
@@ -722,7 +728,7 @@ bool INIClass::WriteFixed(const char* pSection, const char* pKey, double dValue)
 
 int32 INIClass::ReadLepton(const char* pSection, const char* pKey, int32 nDefault)
 {
-    // CCINIClass::Get_Lepton (asm 0x47490F): the key is read through the signed
+ // CCINIClass::Get_Lepton: the key is read through the signed
     // fixed point accessor seeded with (-1.875, 0.0); a result equal to -1.0 is
     // the "unset" sentinel and is replaced by nDefault, otherwise the value is
     // scaled by 256.0 and floored.
@@ -736,7 +742,7 @@ int32 INIClass::ReadLepton(const char* pSection, const char* pKey, int32 nDefaul
 
 bool INIClass::WriteLepton(const char* pSection, const char* pKey, int32 nValue)
 {
-    // CCINIClass::Put_Lepton (asm 0x47497A): value * 3.90625e-3 (1 / 256) is
+ // CCINIClass::Put_Lepton: value * 3.90625e-3 (1 / 256) is
     // written through the plain "%f" float writer.
     return WriteFloat(pSection, pKey, static_cast<float>(nValue) * 0.00390625f);
 }
@@ -2372,4 +2378,690 @@ uint32 CCINIClass::GetAlliesBitfield(const char* pSection, const char* pKey,
     }
 
     return any ? mask : nDefault;
+}
+
+//========================================================================
+// 根据游戏行为，可知下面一批 Get* 是把既有读取入口暴露成"引用出参"
+// 形式的便捷层：键存在则覆写，不存在则保留调用者带来的现值。
+//========================================================================
+
+int32 INIClass::GetString(const char* pSection, const char* pKey,
+                          char* pBuffer, size_t bufferSize)
+{
+    return ReadString(pSection, pKey, pBuffer, pBuffer, bufferSize);
+}
+
+void INIClass::GetInteger(const char* pSection, const char* pKey, int32& nValue)
+{
+    nValue = ReadInteger(pSection, pKey, nValue);
+}
+
+void INIClass::GetBool(const char* pSection, const char* pKey, bool& bValue)
+{
+    bValue = ReadBool(pSection, pKey, bValue);
+}
+
+void INIClass::GetFloat(const char* pSection, const char* pKey, float& fValue)
+{
+    fValue = ReadFloat(pSection, pKey, fValue);
+}
+
+void INIClass::GetDouble(const char* pSection, const char* pKey, double& dValue)
+{
+    dValue = ReadDouble(pSection, pKey, dValue);
+}
+
+void INIClass::GetFixed(const char* pSection, const char* pKey, double& dValue)
+{
+    dValue = ReadFixed(pSection, pKey, dValue);
+}
+
+void INIClass::GetIntHundredth(const char* pSection, const char* pKey, int32& nValue)
+{
+    nValue = ReadIntHundredth(pSection, pKey, nValue);
+}
+
+void INIClass::GetLepton(const char* pSection, const char* pKey, int32& nValue)
+{
+    nValue = ReadLepton(pSection, pKey, nValue);
+}
+
+void INIClass::GetPipIdx(const char* pSection, const char* pKey, int32& nValue)
+{
+    nValue = ReadPipIdx(pSection, pKey, nValue);
+}
+
+void INIClass::GetPipscaleIdx(const char* pSection, const char* pKey, int32& nValue)
+{
+    nValue = ReadPipscaleIdx(pSection, pKey, nValue);
+}
+
+//========================================================================
+// Section helpers
+//========================================================================
+
+const char* INIClass::Section_GetKeyName(const char* pSection, int32 nKeyIndex)
+{
+    return GetKeyName(pSection, nKeyIndex);
+}
+
+int32 INIClass::Section_GetValueCount(const char* pSection)
+{
+    return GetKeyCount(pSection);
+}
+
+int32 INIClass::GetHex(const char* pSection, const char* pKey, int32 nDefault)
+{
+    return ReadHex(pSection, pKey, nDefault);
+}
+
+//========================================================================
+// Pointer-form accessors
+//========================================================================
+
+bool INIClass::GetInteger_charPP(const char* pSection, const char* pKey, char** pOut)
+{
+    INIEntry* entry = FindEntry(pSection, pKey);
+    if (!entry || !entry->Value || !pOut) return false;
+    *pOut = entry->Value;
+    return true;
+}
+
+bool INIClass::GetString_charPP(const char* pSection, const char* pKey, char** pOut)
+{
+    INIEntry* entry = FindEntry(pSection, pKey);
+    if (!entry || !entry->Value || !pOut) return false;
+    *pOut = entry->Value;
+    return true;
+}
+
+int32 INIClass::GetUnicodeString(const char* pSection, const char* pKey,
+                                 const wchar_t* pDefault, wchar_t* pBuffer, size_t nChars)
+{
+    if (!pBuffer || nChars == 0) return 0;
+
+    // 根据游戏行为，可知宽字符串读取时，文本里的 \xXXXX 转义被还原成
+    // 对应码点，其余字符按 ANSI 逐字节展宽；超长按缓冲截断。
+    INIEntry* entry = FindEntry(pSection, pKey);
+    if (!entry || !entry->Value) {
+        size_t n = 0;
+        if (pDefault) {
+            while (pDefault[n] && n < nChars - 1) { pBuffer[n] = pDefault[n]; ++n; }
+        }
+        pBuffer[n] = L'\0';
+        return static_cast<int32>(n);
+    }
+
+    size_t out = 0;
+    for (const char* p = entry->Value; *p && out < nChars - 1; ++p) {
+        wchar_t wc;
+        if (p[0] == '\\' && p[1] == 'x' &&
+            isxdigit(static_cast<unsigned char>(p[2])) &&
+            isxdigit(static_cast<unsigned char>(p[3])) &&
+            isxdigit(static_cast<unsigned char>(p[4])) &&
+            isxdigit(static_cast<unsigned char>(p[5])))
+        {
+            wc = static_cast<wchar_t>(strtol(p + 2, nullptr, 16));
+            p += 5;
+        } else {
+            wc = static_cast<wchar_t>(static_cast<unsigned char>(*p));
+        }
+        pBuffer[out++] = wc;
+    }
+    pBuffer[out] = L'\0';
+    return static_cast<int32>(out);
+}
+
+float* INIClass::Read3Floats(float* pBuffer, const char* pSection, const char* pKey,
+                             const float* pDefault)
+{
+    if (!pBuffer) return nullptr;
+    if (pDefault) pBuffer[0] = pDefault[0], pBuffer[1] = pDefault[1], pBuffer[2] = pDefault[2];
+
+    INIEntry* entry = FindEntry(pSection, pKey);
+    if (!entry || !entry->Value) return pBuffer;
+
+    // 根据游戏行为，可知三浮点按 "x,y,z" 逗号拆分，缺席的分量保留原值。
+    float v[3] = { pBuffer[0], pBuffer[1], pBuffer[2] };
+    if (sscanf(entry->Value, "%f,%f,%f", &v[0], &v[1], &v[2]) >= 1) {
+        pBuffer[0] = v[0];
+        pBuffer[1] = v[1];
+        pBuffer[2] = v[2];
+    }
+    return pBuffer;
+}
+
+bool INIClass::ReadScenario(const char* pFileName)
+{
+    if (!pFileName) return false;
+
+    // 根据游戏行为，可知场景读取就是把整个场景文件并进当前 INI 对象，
+    // 与既有节合并、重复键以后读入的为准。
+    CCFileClass file(pFileName);
+    if (!file.IsAvailable()) return false;
+    return LoadFile(&file);
+}
+
+bool INIClass::SaveMapPreview(const char* pSection, const void* pData, int32 nSize)
+{
+    if (!pSection || !pData || nSize <= 0) return false;
+
+    // 根据游戏行为，可知预览包按 Base64 编码、切成固定宽度行、以编号键
+    // "1"、"2"... 逐行写入节内。
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    const uint8* pBytes = static_cast<const uint8*>(pData);
+    int32 line = 1;
+    char row[80];
+    int32 col = 0;
+
+    for (int32 i = 0; i < nSize; i += 3) {
+        uint32 trip = static_cast<uint32>(pBytes[i]) << 16;
+        if (i + 1 < nSize) trip |= static_cast<uint32>(pBytes[i + 1]) << 8;
+        if (i + 2 < nSize) trip |= static_cast<uint32>(pBytes[i + 2]);
+
+        row[col++] = b64[(trip >> 18) & 0x3F];
+        row[col++] = b64[(trip >> 12) & 0x3F];
+        row[col++] = (i + 1 < nSize) ? b64[(trip >> 6) & 0x3F] : '=';
+        row[col++] = (i + 2 < nSize) ? b64[trip & 0x3F] : '=';
+
+        if (col >= 72) {
+            row[col] = '\0';
+            char key[16];
+            snprintf(key, sizeof(key), "%d", line++);
+            WriteString(pSection, key, row);
+            col = 0;
+        }
+    }
+    if (col > 0) {
+        row[col] = '\0';
+        char key[16];
+        snprintf(key, sizeof(key), "%d", line);
+        WriteString(pSection, key, row);
+    }
+    return true;
+}
+
+bool INIClass::ParseSideHouses(const char* pSection, const char* pKey)
+{
+    INIEntry* entry = FindEntry(pSection, pKey);
+    if (!entry || !entry->Value) return false;
+
+    // 根据游戏行为，可知回写时把逗号分隔表里的空白剥掉再拼接，
+    // 使后续读取者拿到规范化的名字串。
+    static char buffer[1024];
+    buffer[0] = '\0';
+    size_t len = 0;
+
+    char* context = nullptr;
+    char work[1024];
+    strncpy(work, entry->Value, sizeof(work) - 1);
+    work[sizeof(work) - 1] = '\0';
+
+    for (char* tok = strtok(work, ","); tok; tok = strtok(nullptr, ",")) {
+        while (*tok == ' ' || *tok == '\t') ++tok;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) --end;
+        *end = '\0';
+        if (*tok == '\0') continue;
+
+        size_t n = strlen(tok);
+        if (len + n + 2 >= sizeof(buffer)) break;
+        if (len > 0) buffer[len++] = ',';
+        memcpy(buffer + len, tok, n);
+        len += n;
+        buffer[len] = '\0';
+    }
+
+    return WriteString(pSection, pKey, buffer);
+}
+
+bool INIClass::WriteUnicodeEscaped(const char* pSection, const char* pKey, const wchar_t* pValue)
+{
+    if (!pValue) return false;
+
+    // 根据游戏行为，可知宽字符写出口中，超出 ASCII 范围的字符以
+    // \xXXXX 四位十六进制转义，其余原样通过。
+    char buffer[2048];
+    size_t len = 0;
+    for (const wchar_t* p = pValue; *p; ++p) {
+        if (*p < 0x80) {
+            if (len + 1 >= sizeof(buffer)) break;
+            buffer[len++] = static_cast<char>(*p);
+        } else {
+            if (len + 6 >= sizeof(buffer)) break;
+            snprintf(buffer + len, 7, "\\x%04X", static_cast<uint32>(*p) & 0xFFFF);
+            len += 6;
+        }
+    }
+    buffer[len] = '\0';
+    return WriteString(pSection, pKey, buffer);
+}
+
+bool INIClass::WriteBool_charPP(const char* pSection, const char* pKey, const bool* pValue)
+{
+    if (!pValue) return false;
+    return WriteBool(pSection, pKey, *pValue);
+}
+
+bool INIClass::WriteString_charPP(const char* pSection, const char* pKey, char* const* pValue)
+{
+    if (!pValue || !*pValue) return false;
+    return WriteString(pSection, pKey, *pValue);
+}
+
+bool INIClass::WriteInteger_charPP(const char* pSection, const char* pKey, const int32* pValue)
+{
+    if (!pValue) return false;
+    return WriteInteger(pSection, pKey, *pValue);
+}
+
+bool INIClass::Write2Integers_charPP(const char* pSection, const char* pKey, const int32* pValues)
+{
+    if (!pValues) return false;
+    return Write2Integers(pSection, pKey, pValues);
+}
+
+bool INIClass::Write3Floats_charPP(const char* pSection, const char* pKey, const float* pValues)
+{
+    if (!pValues) return false;
+
+    // 根据游戏行为，可知三浮点写出口与读入口对称："x,y,z" 逗号串。
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "%f,%f,%f",
+             static_cast<double>(pValues[0]),
+             static_cast<double>(pValues[1]),
+             static_cast<double>(pValues[2]));
+    return WriteString(pSection, pKey, buffer);
+}
+
+//========================================================================
+// CCINIClass - typed getters by name lookup
+//========================================================================
+
+TechnoTypeClass* CCINIClass::FindTechnoTypeByName(const char* pSection, const char* pKey)
+{
+    char buffer[256];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nullptr;
+    return TechnoTypeClass::Find(buffer);
+}
+
+TechnoTypeClass* CCINIClass::GetTechnoPrerequisite(const char* pSection, const char* pKey,
+                                                   TechnoTypeClass* pDefault)
+{
+    // 根据游戏行为，可知前置需求读取与普通类型查找同路，只是缺省回落
+    // 语义按调用者给的指针走。
+    TechnoTypeClass* pType = FindTechnoTypeByName(pSection, pKey);
+    return pType ? pType : pDefault;
+}
+
+AircraftTypeClass* CCINIClass::GetAircraftType(const char* pSection, const char* pKey,
+                                               AircraftTypeClass* pDefault)
+{
+    // 根据游戏行为，可知按名字找到科技类型后还要校验它确实属于该类别，
+    // 类别不符视为没找到。
+    TechnoTypeClass* pType = FindTechnoTypeByName(pSection, pKey);
+    if (pType == nullptr || pType->GetClassID() != AbstractType::AircraftType) {
+        return pDefault;
+    }
+    return reinterpret_cast<AircraftTypeClass*>(pType);
+}
+
+BuildingTypeClass* CCINIClass::GetBuildingType(const char* pSection, const char* pKey,
+                                               BuildingTypeClass* pDefault)
+{
+    TechnoTypeClass* pType = FindTechnoTypeByName(pSection, pKey);
+    if (pType == nullptr || pType->GetClassID() != AbstractType::BuildingType) {
+        return pDefault;
+    }
+    return reinterpret_cast<BuildingTypeClass*>(pType);
+}
+
+InfantryTypeClass* CCINIClass::GetInfantryType(const char* pSection, const char* pKey,
+                                               InfantryTypeClass* pDefault)
+{
+    TechnoTypeClass* pType = FindTechnoTypeByName(pSection, pKey);
+    if (pType == nullptr || pType->GetClassID() != AbstractType::InfantryType) {
+        return pDefault;
+    }
+    return reinterpret_cast<InfantryTypeClass*>(pType);
+}
+
+UnitTypeClass* CCINIClass::GetUnitType(const char* pSection, const char* pKey,
+                                       UnitTypeClass* pDefault)
+{
+    TechnoTypeClass* pType = FindTechnoTypeByName(pSection, pKey);
+    if (pType == nullptr || pType->GetClassID() != AbstractType::UnitType) {
+        return pDefault;
+    }
+    return reinterpret_cast<UnitTypeClass*>(pType);
+}
+
+TerrainTypeClass* CCINIClass::GetTerrainType(const char* pSection, const char* pKey,
+                                             TerrainTypeClass* pDefault)
+{
+    char buffer[256];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return pDefault;
+
+    TerrainTypeClass* pType = TerrainTypeClass::Find(buffer);
+    return pType ? pType : pDefault;
+}
+
+WarheadTypeClass* CCINIClass::GetWarheadType(const char* pSection, const char* pKey,
+                                            WarheadTypeClass* pDefault)
+{
+    char buffer[256];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return pDefault;
+
+    WarheadTypeClass* pType = WarheadTypeClass::Find(buffer);
+    return pType ? pType : pDefault;
+}
+
+int32 CCINIClass::GetSide(const char* pSection, const char* pKey, int32 nDefault)
+{
+    // 根据游戏行为，可知阵营按名字在阵营表里查序号，未知名回落缺省。
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    int32 index = SideClass::From_Name(buffer);
+    return (index >= 0) ? index : nDefault;
+}
+
+int32 CCINIClass::GetTheme(const char* pSection, const char* pKey, int32 nDefault)
+{
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    int32 index = ThemeClass::FindIndex(buffer);
+    return (index >= 0) ? index : nDefault;
+}
+
+int32 CCINIClass::GetVoxIndex(const char* pSection, const char* pKey, int32 nDefault)
+{
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    int32 index = VocClass::FindIndexOfName(buffer);
+    return (index >= 0) ? index : nDefault;
+}
+
+int32 CCINIClass::GetColorSchemeIdx(const char* pSection, const char* pKey, int32 nDefault)
+{
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    int32 index = ColorScheme::FindIndex(buffer);
+    return (index >= 0) ? index : nDefault;
+}
+
+int32 CCINIClass::GetCategoryIdx(const char* pSection, const char* pKey, int32 nDefault)
+{
+    return static_cast<int32>(GetCategory(pSection, pKey, static_cast<Category>(nDefault)));
+}
+
+int32 CCINIClass::GetSWTypeIndex(const char* pSection, const char* pKey, int32 nDefault)
+{
+    char buffer[256];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    SuperWeaponTypeClass* pType = SuperWeaponTypeClass::Find(buffer);
+    if (pType == nullptr) return nDefault;
+
+    // 根据游戏行为，可知超级武器按其在类型表中的注册序号对外暴露。
+    for (int32 i = 0; i < SuperWeaponTypeClass::GetCount(); ++i) {
+        if (SuperWeaponTypeClass::FindByIndex(i) == pType) return i;
+    }
+    return nDefault;
+}
+
+int32 CCINIClass::FindHouseIndex(const char* pSection, const char* pKey)
+{
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0') return -1;
+
+    // 根据游戏行为，可知国家按 ID 名在注册表里查序号，未知名得 -1。
+    for (int32 i = 0; i < HouseTypeClass::ArrayCount; ++i) {
+        HouseTypeClass* pType = HouseTypeClass::Array[i];
+        if (pType && pType->ID[0] && strcasecmp(pType->ID, buffer) == 0) return i;
+    }
+    return -1;
+}
+
+LandType CCINIClass::GetLand(const char* pSection, const char* pKey, LandType nDefault)
+{
+    return GetLandType(pSection, pKey, nDefault);
+}
+
+TheaterType CCINIClass::GetTheater(const char* pSection, const char* pKey, TheaterType nDefault)
+{
+    // 根据游戏行为，可知战场环境以既知名字串出现，顺序固定：
+    // 温带、雪地、都市、沙漠、月球、新都市。
+    static const char* const theaters[] = {
+        "TEMPERATE", "SNOW", "URBAN", "DESERT", "LUNAR", "NEWURBAN"
+    };
+
+    char buffer[64];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    for (int32 i = 0; i < 6; ++i) {
+        if (strcasecmp(theaters[i], buffer) == 0) return static_cast<TheaterType>(i);
+    }
+    return nDefault;
+}
+
+AbstractType CCINIClass::GetFactory(const char* pSection, const char* pKey, AbstractType nDefault)
+{
+    // 根据游戏行为，可知生产类别以类型 ID 名串出现，未知名回落缺省。
+    static const struct {
+        const char*  Name;
+        AbstractType Value;
+    } factories[] = {
+        { "BuildingType", AbstractType::BuildingType },
+        { "InfantryType", AbstractType::InfantryType },
+        { "UnitType",     AbstractType::UnitType },
+        { "AircraftType", AbstractType::AircraftType },
+    };
+
+    char buffer[64];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return nDefault;
+
+    for (const auto& f : factories) {
+        if (strcasecmp(f.Name, buffer) == 0) return f.Value;
+    }
+    return nDefault;
+}
+
+int32 CCINIClass::AbilityNameToIdx(const char* pValue)
+{
+    // 根据游戏行为，可知能力值以数字位串出现，位序即能力索引；
+    // 无法解析的名字一律得 0（无能力）。
+    if (!pValue || !*pValue) return 0;
+    return atoi(pValue);
+}
+
+int32 CCINIClass::SpeedTypeNameToIdx(const char* pValue)
+{
+    return static_cast<int32>(ParseSpeedType(pValue));
+}
+
+//========================================================================
+// CCINIClass - typed writers
+//========================================================================
+
+bool CCINIClass::WriteSpeedType(const char* pSection, const char* pKey, SpeedType nValue)
+{
+    return WriteString(pSection, pKey, SpeedTypeIdxToName(static_cast<int32>(nValue)));
+}
+
+bool CCINIClass::WriteMovementZone(const char* pSection, const char* pKey, MovementZone nValue)
+{
+    return WriteString(pSection, pKey, MovementZoneIdxToName(static_cast<int32>(nValue)));
+}
+
+bool CCINIClass::WriteArmor(const char* pSection, const char* pKey, Armor nValue)
+{
+    // 根据游戏行为，可知装甲以既知名表反查成名字串写入。
+    int32 idx = static_cast<int32>(nValue);
+    if (idx < 0 || idx > 10) idx = 0;
+    return WriteString(pSection, pKey, ArmorTypes[idx]);
+}
+
+bool CCINIClass::WriteLand(const char* pSection, const char* pKey, LandType nValue)
+{
+    return WriteString(pSection, pKey, LandTypeIdxToName(static_cast<int32>(nValue)));
+}
+
+bool CCINIClass::WriteFoundation(const char* pSection, const char* pKey, Foundation nValue)
+{
+    return WriteString(pSection, pKey, FoundationIdxToName(static_cast<int32>(nValue)));
+}
+
+bool CCINIClass::WriteBuildCat(const char* pSection, const char* pKey, BuildCat nValue)
+{
+    return WriteString(pSection, pKey, BuildCatIdxToName(static_cast<int32>(nValue)));
+}
+
+bool CCINIClass::WriteTheater(const char* pSection, const char* pKey, TheaterType nValue)
+{
+    // 根据游戏行为，可知战场环境以名字串写回，序号越界视为温带。
+    static const char* const theaters[] = {
+        "TEMPERATE", "SNOW", "URBAN", "DESERT", "LUNAR", "NEWURBAN"
+    };
+    int32 idx = static_cast<int32>(nValue);
+    if (idx < 0 || idx > 5) idx = 0;
+    return WriteString(pSection, pKey, theaters[idx]);
+}
+
+bool CCINIClass::WriteFactory(const char* pSection, const char* pKey, AbstractType nValue)
+{
+    // 根据游戏行为，可知生产类别以类型 ID 名串写回。
+    const char* pName = "BuildingType";
+    switch (nValue) {
+    case AbstractType::InfantryType: pName = "InfantryType"; break;
+    case AbstractType::UnitType:     pName = "UnitType";     break;
+    case AbstractType::AircraftType: pName = "AircraftType"; break;
+    default: break;
+    }
+    return WriteString(pSection, pKey, pName);
+}
+
+bool CCINIClass::WriteCategoryIdx(const char* pSection, const char* pKey, int32 nIndex)
+{
+    return WriteString(pSection, pKey, CategoryIdxToName(nIndex));
+}
+
+bool CCINIClass::WriteColorScheme(const char* pSection, const char* pKey, int32 nIndex)
+{
+    return WriteInteger(pSection, pKey, nIndex);
+}
+
+bool CCINIClass::WriteHouseIndex(const char* pSection, const char* pKey, int32 nIndex)
+{
+    // 根据游戏行为，可知国家以其 ID 名写回，序号越界时清空键值。
+    if (nIndex < 0 || nIndex >= HouseTypeClass::ArrayCount || !HouseTypeClass::Array[nIndex]) {
+        return WriteString(pSection, pKey, "");
+    }
+    return WriteString(pSection, pKey, HouseTypeClass::Array[nIndex]->ID);
+}
+
+bool CCINIClass::WritePipscaleIdx(const char* pSection, const char* pKey, int32 nIndex)
+{
+    return WriteString(pSection, pKey, PipScaleIdxToName(nIndex));
+}
+
+//========================================================================
+// CLSID / string-table / voice-list
+//========================================================================
+
+bool CCINIClass::ReadCLSID(const char* pSection, const char* pKey, GUID* pOut)
+{
+    if (!pOut) return false;
+
+    // 根据游戏行为，可知 CLSID 串支持带花括号与不带两种形态：先剥掉
+    // 花括号，再按标准八段位拆成二进制。
+    char buffer[128];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0') return false;
+
+    char* p = buffer;
+    if (*p == '{') ++p;
+    char* end = p + strlen(p);
+    while (end > p && (end[-1] == '}' || end[-1] == ' ')) --end;
+    *end = '\0';
+
+    unsigned int d1 = 0;
+    unsigned int d2 = 0, d3 = 0;
+    unsigned int b[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (sscanf(p, "%8X-%4hX-%4hX-%2hhX%2hhX-%2hhX%2hhX%2hhX%2hhX%2hhX%2hhX",
+               &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11) {
+        return false;
+    }
+
+    pOut->Data1 = d1;
+    pOut->Data2 = static_cast<uint16>(d2);
+    pOut->Data3 = static_cast<uint16>(d3);
+    for (int i = 0; i < 8; ++i) {
+        pOut->Data4[i] = static_cast<uint8>(b[i]);
+    }
+    return true;
+}
+
+bool CCINIClass::WriteCLSID(const char* pSection, const char* pKey, const GUID* pValue)
+{
+    if (!pValue) return false;
+
+    // 根据游戏行为，可知写出口统一为带花括号的大写完整式。
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer),
+             "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+             pValue->Data1, pValue->Data2, pValue->Data3,
+             pValue->Data4[0], pValue->Data4[1],
+             pValue->Data4[2], pValue->Data4[3], pValue->Data4[4],
+             pValue->Data4[5], pValue->Data4[6], pValue->Data4[7]);
+    return WriteString(pSection, pKey, buffer);
+}
+
+int32 CCINIClass::GetStringtableEntry(const char* pSection, const char* pKey,
+                                      char* pBuffer, size_t bufferSize)
+{
+    return ReadStringTableEntry(pSection, pKey, pBuffer, bufferSize);
+}
+
+bool CCINIClass::Get_Vector_Voc_525430(const char* pSection, const char* pKey,
+                                       DynamicVectorClass<int32>& rList)
+{
+    rList.Clear();
+
+    // 根据游戏行为，可知语音名字串按逗号拆分，逐个落索引；未知名不
+    // 占位直接跳过。
+    char buffer[512];
+    ReadString(pSection, pKey, "", buffer, sizeof(buffer));
+    if (buffer[0] == '\0' || IsBlank(buffer)) return false;
+
+    char* context = nullptr;
+    for (char* tok = strtok(buffer, ","); tok; tok = strtok(nullptr, ",")) {
+        while (*tok == ' ' || *tok == '\t') ++tok;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) --end;
+        *end = '\0';
+        if (*tok == '\0') continue;
+
+        int32 index = VocClass::FindIndexOfName(tok);
+        if (index >= 0) {
+            rList.AddItem(index);
+        }
+    }
+    return rList.Count > 0;
 }

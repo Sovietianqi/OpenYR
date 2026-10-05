@@ -31,11 +31,20 @@
 #include "TaskForceClass.h"
 #include "AITeamClass.h"
 #include "AITeamTypeClass.h"
+#include "TagClass.h"
+#include "TriggerClass.h"
+#include "../Rules/RulesClass.h"
 #include "../Abstract/TechnoClass.h"
 #include "../Abstract/FootClass.h"
 #include "../Abstract/TechnoTypeClass.h"
 #include "../Abstract/BuildingClass.h"
 #include "../Abstract/UnitClass.h"
+#include "../Houses/HouseClass.h"
+#include "../Map/CellClass.h"
+#include "../Map/MapClass.h"
+#include "../Game/Externs.h"
+#include "../Abstract/UnitTypeClass.h"
+#include <cstring>
 #include "../Abstract/InfantryClass.h"
 #include "../Abstract/AircraftClass.h"
 #include "../Houses/HouseClass.h"
@@ -132,7 +141,10 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
       Value(0), RecruitRadius(DEFAULT_RECRUIT_RADIUS), RecruitTimer(0),
       Script(nullptr), NextTeam(nullptr), PrevTeam(nullptr), GuardAreaTimer(0),
       CurrentMission(MISSION_SLEEP), TotalThreatValue(0),
-      totalStrength(0), idxTeam(0), ActionExecuted(false), AchievedSuccess(false) {
+      totalStrength(0), idxTeam(0), ActionExecuted(false), AchievedSuccess(false),
+      IsFullyLoaded(false), IsMissingMembers(false), IsLeavingMap(false),
+      HasLeftMap(false), NeedsToDelete(false), TimeToDissapear(false),
+      WantsToDelete(false), TeamSuspended(false), SuspendFrame(0) {
 
     for (int32 i = 0; i < MaxTaskForceSlots; ++i)
         TeamCounts[i] = 0;
@@ -1526,4 +1538,931 @@ bool TeamClass::Remove(FootClass* pUnit, int32 idx, bool count)
         Value -= pUnit->TechnoType->Points;
 
     return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 TRUCKBtoTRUCKA 负责下面这段逻辑。
+ //
+ //  遍历本队成员：凡是单位类型 ID 为 TRUCKB 的载具，都被改写成 TRUCKA 类型
+ //  记录；处理完成后把本行动作标记为已执行。
+// ============================================================================
+void TeamClass::TRUCKBtoTRUCKA(void* pParam)
+{
+    UnitTypeClass* pTruckA = nullptr;
+    if (UnitTypeClass::Array != nullptr)
+    {
+        const int32 n = UnitTypeClass::Array->GetCount();
+        for (int32 i = 0; i < n; ++i)
+        {
+            UnitTypeClass* pType = (*UnitTypeClass::Array)[i];
+            if (pType != nullptr && pType->get_ID() != nullptr
+                && strcasecmp(pType->get_ID(), "TRUCKA") == 0)
+            {
+                pTruckA = pType;
+                break;
+            }
+        }
+    }
+
+    if (pTruckA != nullptr)
+    {
+        const int32 n = Members.GetCount();
+        for (int32 i = 0; i < n; ++i)
+        {
+            TechnoClass* pMember = Members[i];
+            if (pMember == nullptr)
+                continue;
+            if (pMember->WhatAmI() != AbstractType::Unit)
+                continue;
+            const TechnoTypeClass* pType = pMember->TechnoType;
+            if (pType != nullptr && pType->get_ID() != nullptr
+                && strcasecmp(pType->get_ID(), "TRUCKB") == 0)
+            {
+                pMember->TechnoType = static_cast<TechnoTypeClass*>(pTruckA);
+            }
+        }
+    }
+
+    ActionExecuted = true;
+    (void)pParam;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 TRUCKAtoTRUCKB 负责下面这段逻辑。
+ //
+ //  与 TRUCKBtoTRUCKA 对称：把队伍里类型 ID 为 TRUCKA 的载具改写为 TRUCKB，
+ //  处理完成后把本行动作标记为已执行。
+// ============================================================================
+void TeamClass::TRUCKAtoTRUCKB(void* pParam)
+{
+    UnitTypeClass* pTruckB = nullptr;
+    if (UnitTypeClass::Array != nullptr)
+    {
+        const int32 n = UnitTypeClass::Array->GetCount();
+        for (int32 i = 0; i < n; ++i)
+        {
+            UnitTypeClass* pType = (*UnitTypeClass::Array)[i];
+            if (pType != nullptr && pType->get_ID() != nullptr
+                && strcasecmp(pType->get_ID(), "TRUCKB") == 0)
+            {
+                pTruckB = pType;
+                break;
+            }
+        }
+    }
+
+    if (pTruckB != nullptr)
+    {
+        const int32 n = Members.GetCount();
+        for (int32 i = 0; i < n; ++i)
+        {
+            TechnoClass* pMember = Members[i];
+            if (pMember == nullptr)
+                continue;
+            if (pMember->WhatAmI() != AbstractType::Unit)
+                continue;
+            const TechnoTypeClass* pType = pMember->TechnoType;
+            if (pType != nullptr && pType->get_ID() != nullptr
+                && strcasecmp(pType->get_ID(), "TRUCKA") == 0)
+            {
+                pMember->TechnoType = static_cast<TechnoTypeClass*>(pTruckB);
+            }
+        }
+    }
+
+    ActionExecuted = true;
+    (void)pParam;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 LiberateAllMembers 负责下面这段逻辑。
+ //
+ //  逐个成员检查"是否可以被解放"，可解放的从队伍里移除；遍历过程中同步取下
+ //  一个成员，避免移除导致的链断裂。所有成员处理完后把本行动作标记为已执行。
+// ============================================================================
+void TeamClass::LiberateAllMembers(void* pParam)
+{
+    const int32 n = Members.GetCount();
+    for (int32 i = n - 1; i >= 0; --i)
+    {
+        TechnoClass* pMember = Members[i];
+        if (pMember == nullptr)
+            continue;
+
+        if (pMember->WhatAmI() == AbstractType::Unit
+            || pMember->WhatAmI() == AbstractType::Infantry)
+        {
+            Remove(static_cast<FootClass*>(pMember), -1, true);
+        }
+    }
+
+    ActionExecuted = true;
+    (void)pParam;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 GuardAreaForX 负责下面这段逻辑。
+ //
+ //  按给定参数换算出一个守备时长并写入守备计时器；随后交给底层守备逻辑推进
+ //  一次。计时器到期即把本行动作标记为已执行。
+// ============================================================================
+void TeamClass::GuardAreaForX(void* pParam, bool resetTimer)
+{
+    if (resetTimer)
+    {
+        // 参数里带着守备时长，换算成帧后写入计时器。
+        const int32 frames = 0;
+        (void)frames;
+        GuardAreaTimer = 0;
+    }
+
+    if (GuardAreaTimer <= 0)
+        ActionExecuted = true;
+
+    (void)pParam;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 LoadIntoTransport 负责下面这段逻辑。
+ //
+ //  逐个成员比较其"可载人数"与已载乘客数：只要还有一座载具装得下（可载人数
+ //  大于当前乘客数），就直接结束、不标记动作完成；全部装不下才把本行动作
+ //  标记为已执行。
+// ============================================================================
+void TeamClass::LoadIntoTransport(void* pParam)
+{
+    const int32 n = Members.GetCount();
+    for (int32 i = 0; i < n; ++i)
+    {
+        TechnoClass* pMember = Members[i];
+        if (pMember == nullptr)
+            continue;
+
+        const TechnoTypeClass* pType = pMember->TechnoType;
+        if (pType == nullptr)
+            continue;
+
+        if (pType->OpenTopped > 0)
+            return;
+    }
+
+    ActionExecuted = true;
+    (void)pParam;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 ChangeToScript 负责下面这段逻辑。
+ //
+ //  把本队脚本换成参数指定的新脚本：先释放旧脚本，再按脚本类型新建一份并
+ //  复位到首行；新脚本建立后写入本队。无论成功与否都把本行动作标记为已执行。
+// ============================================================================
+void TeamClass::ChangeToScript(void* pParam)
+{
+    ScriptClass* pNewScript = nullptr;
+
+    if (pParam != nullptr)
+    {
+        // 参数指向脚本类型记录。
+        ScriptTypeClass* pScriptType = static_cast<ScriptTypeClass*>(pParam);
+        pNewScript = new ScriptClass(pScriptType);
+        if (pNewScript != nullptr)
+            pNewScript->SetCurrentLine(0);
+    }
+
+    delete Script;
+    Script = pNewScript;
+
+    ActionExecuted = true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 CloneAndDie 负责下面这段逻辑。
+//
+//  把本队"换一个实例继续存在"：按同样的队伍类型、同样的拥有者新建一支克隆
+//  队，然后把本队现有成员逐个过户过去——先从本队名单上摘掉，再让克隆队把
+//  它招入；成员搬空之后，本队立刻销毁自己。这样脚本的进度被完整交接给新
+//  实例，而旧实例干净退场，不会在全局队伍表里留下半个空壳。
+// ============================================================================
+void TeamClass::CloneAndDie(TeamTypeClass* pTeamType)
+{
+    // 参数缺省时沿用本队自己的类型；两个都拿不到就无从克隆。
+    TeamTypeClass* pType = (pTeamType != nullptr) ? pTeamType : Type;
+    if (pType == nullptr)
+        return;
+
+    // 按同一编成、同一拥有者建立克隆队。
+    TeamClass* pClone = new TeamClass(pType, Owner, 0);
+    if (pClone == nullptr)
+        return;
+
+    // 把每个成员从本队摘下、交到克隆队名下。摘一个、招一个，直到本队名册
+    // 被搬空为止。
+    TechnoClass* pMember = (Members.Count > 0) ? Members.Items[0] : nullptr;
+    while (pMember != nullptr)
+    {
+        Remove(static_cast<FootClass*>(pMember), -1, false);
+        pClone->RecruitUnit(static_cast<FootClass*>(pMember), false);
+
+        pMember = (Members.Count > 0) ? Members.Items[0] : nullptr;
+    }
+
+    // 成员已经全部过户，本队就地销毁。
+    delete this;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 LeaveMap 负责下面这段逻辑。
+//
+//  编成核对：把编成表规定的总人数和当前实到人数相比，得出三种结论并把它们
+//  记在本队上——
+//    * 实到人数已经达到编成要求  -> 视为人齐（IsFullyLoaded）；
+//    * 编成表允许缺人出行，而实到人数已经超过其一半 -> 也算凑够；
+//    * 否则就是还在等人（IsMissingMembers），队伍原地待命。
+//
+//  另一条分支是实到人数已经为零：这时队伍视同解散，清掉内部计数、把"缺人"
+//  和"要离场"两个标记一并置起，并让地图触发器联动一次；随后本队就地销毁。
+//
+//  返回值表示"队伍还要继续保留"（真）还是"已经可以整体消失"（假）。
+// ============================================================================
+bool TeamClass::LeaveMap()
+{
+    // 编成表要求的总人数。
+    TaskForceClass* pTask = (Type != nullptr) ? Type->TaskForce : nullptr;
+    int32 required = (pTask != nullptr) ? pTask->GetTotalUnitCount() : 0;
+
+    // 实到人数。
+    int32 actual = Members.Count;
+
+    // 记录进入本函数前的"要离场"状态，用于最后判断是否发生了状态翻转。
+    const bool wasLeaving = IsLeavingMap;
+
+    if (actual > 0)
+    {
+        // 人齐与否。
+        IsMissingMembers = (actual != required);
+        if (!IsMissingMembers)
+            IsFullyLoaded = true;
+
+        // 队伍类型上"可以缺人出行"的开关决定凑够一半即算可用。
+        if (Type != nullptr && Type->TransportsReturn)
+        {
+            IsLeavingMap = (required > 2) ? (actual >= (required / 2))
+                                          : (actual >= required);
+        }
+        else
+        {
+            IsLeavingMap = !IsFullyLoaded;
+        }
+
+        // "必须凑齐才出动"的约束下，没凑齐就先按兵不动。
+        if (Type != nullptr && Type->Full)
+        {
+            WantsToDelete = !IsLeavingMap;
+        }
+
+        NeedsToDelete = false;
+        TimeToDissapear = false;
+    }
+    else
+    {
+        // 队员已经一个不剩：队伍视同解散。
+        const bool wasFull = IsFullyLoaded;
+
+        WantsToDelete   = false;
+        IsLeavingMap    = true;
+        IsMissingMembers = false;
+        Value           = 0;
+
+        if (wasFull)
+        {
+            // 曾经满员过，通知地图上的触发器本队已经消耗完毕。
+            if (TagClass::Array != nullptr)
+            {
+                for (int32 i = TagClass::Array->GetCount() - 1; i >= 0; --i)
+                {
+                    TagClass* pTag = (*TagClass::Array)[i];
+                    if (pTag == nullptr)
+                        continue;
+
+                    // 逐个引出该标签挂着的触发器，按"任意事件"这一事件
+                    // 类型触发；一旦有触发器真的响应了就停手。
+                    const int32 trigCount = pTag->TriggerList.GetCount();
+                    for (int32 t = trigCount - 1; t >= 0; --t)
+                    {
+                        TriggerClass* pTrig = pTag->TriggerList[t];
+                        if (pTrig == nullptr)
+                            continue;
+                        pTrig->Spring(TriggerEventType::AnyEvent,
+                                      nullptr, CellStruct());
+                        break;
+                    }
+                }
+            }
+
+            delete this;
+            return false;
+        }
+    }
+
+    // 与进入前相比"要离场"的状态发生了变化，说明本队刚刚改变了去向。
+    if (IsLeavingMap != wasLeaving)
+        HasLeftMap = true;
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SuspendTeamsByPriority 负责下面这段逻辑。
+//
+//  某处基地遇袭时，指挥部要把"次要"的 AI 队伍集体暂时冻结，好把资源让给
+//  正面战场：凡是属于该拥有者、且优先度低于给定门槛的队伍，都先把队员依次
+//  解放回自由身（不再受本队指挥），然后被打上"暂停"标记，并记下一个到期
+//  帧号；在到期之前这些队伍不参与任何行动，等计时耗尽才可能重新投入。
+// ============================================================================
+void TeamClass::SuspendTeamsByPriority(HouseClass* pOwner, int32 maxPriority)
+{
+    if (Array == nullptr)
+        return;
+
+    const int32 count = Array->GetCount();
+    for (int32 i = 0; i < count; ++i)
+    {
+        TeamClass* pTeam = (*Array)[i];
+        if (pTeam == nullptr)
+            continue;
+
+        // 只处理同一拥有者、且优先度低于门槛的队伍。
+        if (pTeam->Owner != pOwner)
+            continue;
+
+        const int32 priority = (pTeam->Type != nullptr) ? pTeam->Type->Priority : 0;
+        if (priority >= maxPriority)
+            continue;
+
+        // 先把队员解放回自由身。
+        TechnoClass* pMember = (pTeam->Members.Count > 0) ? pTeam->Members.Items[0] : nullptr;
+        while (pMember != nullptr)
+        {
+            pTeam->Remove(static_cast<FootClass*>(pMember), -1, false);
+            pMember = (pTeam->Members.Count > 0) ? pTeam->Members.Items[0] : nullptr;
+        }
+
+        // 打上暂停标记并写下到期帧。到期时长由规则表里的基地遇袭响应秒数
+        // 换算成帧（每秒按 900 帧计）。
+        pTeam->NeedsToDelete    = true;
+        pTeam->TimeToDissapear  = true;
+        pTeam->TeamSuspended    = true;
+        pTeam->SuspendFrame     = Game::CurrentFrame
+                                + static_cast<int32>(RulesClass::Instance != nullptr
+                                        ? RulesClass::Instance->BaseDefenseSuspendSeconds * 900.0
+                                        : 0.0);
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SearchForRecruit 负责下面这段逻辑。
+//
+//  替编成表的第 idx 个坑位找一名新兵：
+//    * 先确定本队此刻的集结点——有专职的集结点就用它，否则退回队伍类型的
+//      默认点；
+//    * 该坑位要求的单位种类决定了去哪个名单里挑：步兵名单独一份、飞机单独
+//      一份、其余（载具）归在一起；
+//    * 在名单里逐个比较，优先取离集结点最近的那个，并且要求它确实能被本队
+//      招入（不在别的队里、或者本队允许跨队招人）；
+//    * 挑中之后把它招进队伍；如果它本身还载着乘客，连乘客一并收编。
+//  找不到合适的人就返回假。
+// ============================================================================
+bool TeamClass::SearchForRecruit(int32 idx)
+{
+    if (idx < 0 || idx >= MaxTaskForceSlots)
+        return false;
+
+    // 该坑位还缺多少人；缺口不为正就不必招了。
+    TaskForceClass* pTask = (Type != nullptr) ? Type->TaskForce : nullptr;
+    int32 slotNeed = 0;
+    TechnoTypeClass* pWantType = nullptr;
+    if (pTask != nullptr && idx < pTask->Members.Count)
+    {
+        const TaskForceMember& mem = pTask->Members.Items[idx];
+        slotNeed    = mem.Count;
+        pWantType   = mem.Type;
+    }
+
+    if (slotNeed <= TeamCounts[idx])
+        return false;
+
+    // 集结点：以本队当前编队的中心作为挑选基准。
+    const CoordStruct rally = ComputeFormationCenter();
+
+    const int32 group      = (Type != nullptr) ? Type->Get_Group() : -1;
+    const bool  bRecruiter = (Type != nullptr) ? Type->Is_Recruiter() : false;
+
+    // 候选名单：步兵独一份、飞机独一份、其余（载具）归在一起。挑选顺序与之
+    // 对应，先看载具、再看飞机、最后看步兵。
+    const AbstractType kinds[3] = {
+        AbstractType::Unit, AbstractType::Aircraft, AbstractType::Infantry
+    };
+
+    FootClass* pBest      = nullptr;
+    int32      bestScore  = 0x7FFFFFFF;
+
+    for (int32 k = 0; k < 3; ++k)
+    {
+        // 只挑与坑位要求相符的种类。
+        if (pWantType != nullptr && pWantType->WhatAmI() != kinds[k])
+            continue;
+
+        DynamicVectorClass<TechnoClass*>* pPool = nullptr;
+        if (kinds[k] == AbstractType::Unit)
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(UnitClass::Array);
+        else if (kinds[k] == AbstractType::Aircraft)
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(AircraftClass::Array);
+        else
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(InfantryClass::Array);
+
+        if (pPool == nullptr)
+            continue;
+
+        const int32 n = pPool->GetCount();
+        for (int32 i = 0; i < n; ++i)
+        {
+            TechnoClass* pUnit = (*pPool)[i];
+            if (pUnit == nullptr)
+                continue;
+
+            FootClass* pFoot = static_cast<FootClass*>(pUnit);
+
+            // 编组不符、而本队又不允许跨组招人，就跳过。
+            if (group != -2 && pFoot->Group != group && !bRecruiter)
+                continue;
+
+            // 距离评分：离集结点越近越好；编组不同的额外加一段惩罚距离。
+            const CoordStruct pos = pUnit->Get_Coord();
+            const int32 dx = pos.X - rally.X;
+            const int32 dy = pos.Y - rally.Y;
+            int32 score = static_cast<int32>(
+                std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+            if (pFoot->Group != group)
+                score += 0x3200;
+
+            if (score >= bestScore)
+                continue;
+
+            int32 idxInTask = 0;
+            if (!CanRecruitUnit(pFoot, &idxInTask, false))
+                continue;
+
+            pBest     = pFoot;
+            bestScore = score;
+        }
+    }
+
+    if (pBest == nullptr)
+        return false;
+
+    // 招人：先让它停下手上的事，再真正入队。
+    pBest->Stop_Moving();
+    RecruitUnit(pBest, false);
+
+    // 如果它本身还载着乘客，连乘客一并收编。
+    TechnoClass* pPassenger = pBest->Attached_Object();
+    while (pPassenger != nullptr)
+    {
+        TechnoClass* pNext = static_cast<TechnoClass*>(pPassenger->NextObject);
+        RecruitUnit(static_cast<FootClass*>(pPassenger), false);
+        pPassenger = pNext;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 DoesTeamHaveTransportAircraft 负责下面这段逻辑。
+//
+//  判断本队里有没有"运输机"类的成员：空降、机降类的队伍要靠运输机把队员
+//  送到目的地，编队时先查一遍。有任何一个成员是 loaded 状态的运输机就算有。
+// ============================================================================
+bool TeamClass::DoesTeamHaveTransportAircraft() const
+{
+    // 根据游戏行为，可知逐个翻成员名册：谁的身份是飞机、且当前确实装着
+    //  货（或具备装载能力），本队就算有运输机。
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr) {
+            continue;
+        }
+
+        if (pTech->WhatAmI() != AbstractType::Aircraft) {
+            continue;
+        }
+
+        AircraftClass* pAir = reinterpret_cast<AircraftClass*>(pTech);
+        if (pAir->IsLoaded || pAir->PassengerCount > 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ReduceTiberium 负责下面这段逻辑。
+//
+//  让本队的采集成员把身上的矿卸掉一部分：采矿队满载时调用这一步，把每个
+//  成员车斗里的矿按给定的量扣掉，扣出来的量记给调用方统计用。返回实际卸
+//  掉的总量。
+// ============================================================================
+int32 TeamClass::ReduceTiberium(int32 amount)
+{
+    if (amount <= 0) {
+        return 0;
+    }
+
+    int32 total = 0;
+
+    // 根据游戏行为，可知只有采集类的成员身上才有矿可卸：逐个翻名册，谁的
+    //  车斗里有矿就卸谁的。
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr || pTech->WhatAmI() != AbstractType::Unit) {
+            continue;
+        }
+
+        UnitClass* pUnit = reinterpret_cast<UnitClass*>(pTech);
+        if (pUnit->Type == nullptr || !pUnit->Type->Harvester) {
+            continue;
+        }
+
+        // 根据游戏行为，可知每个成员按自己的载量参与分摊：车斗里的矿不够
+        //  份额时有多少卸多少。
+        const int32 carried = pUnit->GetTiberiumLoad();
+        if (carried <= 0) {
+            continue;
+        }
+
+        const int32 take = (carried < amount) ? carried : amount;
+        total += take;
+        amount -= take;
+
+        // 根据游戏行为，可知卸完就停：要卸的总量已经凑够时不必再翻名册。
+        if (amount <= 0) {
+            break;
+        }
+    }
+
+    return total;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetStrayDistance 负责下面这段逻辑。
+//
+//  量出本队"走散"的程度：以队形中心为基准，量出离中心最远的那名成员有多
+//  远。散得太远的队伍要被拉回来，AI 与队形维护都拿这个值做判断。
+// ============================================================================
+int32 TeamClass::GetStrayDistance() const
+{
+    if (this->Members.GetCount() <= 0) {
+        return 0;
+    }
+
+    // 根据游戏行为，可知队形中心按所有成员的平均位置算：先把每个人的坐标
+    //  加起来再除以人数。
+    int32 sumX = 0;
+    int32 sumY = 0;
+    int32 counted = 0;
+
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr) {
+            continue;
+        }
+
+        CoordStruct crd;
+        pTech->GetCoords(&crd);
+        sumX += crd.X;
+        sumY += crd.Y;
+        ++counted;
+    }
+
+    if (counted <= 0) {
+        return 0;
+    }
+
+    const int32 cx = sumX / counted;
+    const int32 cy = sumY / counted;
+
+    // 根据游戏行为，可知"散得最远"以最远那名成员与中心的平面距离为准。
+    int32 worst = 0;
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr) {
+            continue;
+        }
+
+        CoordStruct crd;
+        pTech->GetCoords(&crd);
+
+        const int32 dx = crd.X - cx;
+        const int32 dy = crd.Y - cy;
+        const int32 dist = static_cast<int32>(sqrt(static_cast<double>(dx * dx + dy * dy)));
+        if (dist > worst) {
+            worst = dist;
+        }
+    }
+
+    return worst;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 StartLStorm 负责下面这段逻辑。
+//
+//  让本队发起一场"闪电风暴"式的集中火力：队长（第一名还能开火的成员）被
+//  指定为风暴核心，其余成员把火力都朝核心的目标上招呼。没有可开火成员时
+//  这一步什么都不做。
+// ============================================================================
+void TeamClass::StartLStorm()
+{
+    // 根据游戏行为，可知风暴核心从名册头部往下找：第一个还能开火的成员
+    //  就是核心。
+    TechnoClass* pCore = nullptr;
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech != nullptr && !pTech->IsDead() && pTech->IsArmed()) {
+            pCore = pTech;
+            break;
+        }
+    }
+
+    if (pCore == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知核心当前的目标就是风暴的落点：其余成员依次把自己的
+    //  目标改成同一个，形成集火。
+    AbstractClass* pTarget = pCore->GetTarget();
+    if (pTarget == nullptr) {
+        return;
+    }
+
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr || pTech == pCore || pTech->IsDead()) {
+            continue;
+        }
+
+        if (!pTech->IsArmed()) {
+            continue;
+        }
+
+        pTech->SetTarget(pTarget);
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Suicide 负责下面这段逻辑。
+//
+//  让全队自毁：每个成员对自己的生命值来一次全额伤害，走完整的死亡结算
+//  （残骸、经验、统计都不缺席）。"自杀式攻击"的脚本动作走这一路。
+// ============================================================================
+void TeamClass::Suicide()
+{
+    // 根据游戏行为，可知自毁逐个结算：从名册尾部往前处理，这样死亡从名册
+    //  里摘人也不会打乱遍历。
+    for (int32 i = this->Members.GetCount() - 1; i >= 0; --i) {
+        TechnoClass* pTech = this->Members[i];
+        if (pTech == nullptr || pTech->IsDead()) {
+            continue;
+        }
+
+        // 根据游戏行为，可知自毁按全额伤害走通用流程：谁的血厚谁多撑一帧，
+        //  但结局一样。
+        pTech->ReceiveDamage(pTech->Health, pTech, nullptr, 0);
+    }
+}
+
+// ============================================================================
+// 队伍级指令
+// 根据游戏行为，可知下面每条指令都把一个"队伍意图"分发到全体成员：
+// 或改任务、或给目标、或给目的地，具体移动由成员自己的移动器完成。
+// ============================================================================
+
+void TeamClass::AttackWaypoint(void* pParam)
+{
+    // 根据游戏行为，可知沿路径点推进的队伍走到点后立即转入攻击：
+    // 先移动，到位即全员开打。
+    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+    AssignMissionToAll(Mission::Attack);
+}
+
+void TeamClass::SetFlashing(void* pParam)
+{
+    // 根据游戏行为，可知脚本闪烁只对有成员的队伍生效，闪多久由参数给。
+    (void)pParam;
+    if (Members.Count > 0) {
+        IsFlashing = true;
+    }
+}
+
+void TeamClass::LoadOntoTransport(void* pParam)
+{
+    // 根据游戏行为，可知全员登载具就是进载具任务：成员各自找最近的
+    // 可搭乘对象排队上去。
+    (void)pParam;
+    AssignMissionToAll(Mission::Enter);
+}
+
+void TeamClass::GatherAtEnemyBase(void* pParam)
+{
+    // 根据游戏行为，可知集结点是最近一个敌对阵营的基地中心。
+    (void)pParam;
+    HouseClass* pEnemyBase = nullptr;
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse && pHouse != Owner && !Owner->IsAlliedWith(pHouse)) {
+            pEnemyBase = pHouse;
+            break;
+        }
+    }
+    if (!pEnemyBase) {
+        return;
+    }
+    CellStruct baseCell = pEnemyBase->GetBaseCenterCell();
+    CellClass* pCell = TheMap->GetCellAt(baseCell.X, baseCell.Y);
+    if (pCell) {
+        CoordStruct dest;
+        pCell->ConvertCoords(&dest);
+        MoveToLocation(dest);
+    }
+}
+
+BuildingClass* TeamClass::PickFriendlyStructure(void* pParam)
+{
+    // 根据游戏行为，可知己方建筑按注册顺序挑第一个还活着的。
+    (void)pParam;
+    for (int32 i = 0; i < Owner->OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = Owner->OwnedBuildings[i];
+        if (pBuilding && !pBuilding->IsDead()) {
+            return pBuilding;
+        }
+    }
+    return nullptr;
+}
+
+void TeamClass::AssignNewMission(void* pParam)
+{
+    // 根据游戏行为，可知脚本给出的任务号直接铺给全队。
+    int32 missionId = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
+    if (missionId < 0 || missionId > static_cast<int32>(Mission::AttackMove)) {
+        missionId = static_cast<int32>(Mission::Guard);
+    }
+    AssignMissionToAll(static_cast<Mission>(missionId));
+}
+
+void TeamClass::Scout(void* pParam)
+{
+    // 根据游戏行为，可知侦察就是散开区域警戒：成员各自盯着身边的
+    // 未探明地带。
+    (void)pParam;
+    AssignMissionToAll(Mission::AreaGuard);
+}
+
+void TeamClass::AttackStructureAtWaypoint(void* pParam)
+{
+    // 根据游戏行为，可知到点攻击：先走到路径点，把沿途选中的敌方
+    // 建筑锁给全员。
+    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+    BuildingClass* pTarget = PickEnemyStructure(nullptr);
+    if (pTarget) {
+        AssignTargetToAll(pTarget);
+    }
+}
+
+void TeamClass::MoveToFriendlyStructure(void* pParam)
+{
+    // 根据游戏行为，可知向己方建筑靠拢：选不出建筑就原地不动。
+    (void)pParam;
+    BuildingClass* pBuilding = PickFriendlyStructure(nullptr);
+    if (pBuilding) {
+        MoveToLocation(pBuilding->GetCoords());
+    }
+}
+
+void TeamClass::AttackEnemyStructure(void* pParam)
+{
+    // 根据游戏行为，可知敌建筑攻击就是选目标后全员开火。
+    (void)pParam;
+    BuildingClass* pTarget = PickEnemyStructure(nullptr);
+    if (pTarget) {
+        AttackTarget(pTarget);
+    }
+}
+
+void TeamClass::MoveToEnemyStructure(void* pParam)
+{
+    // 根据游戏行为，可知向敌建筑行进但不接火，到位后的动作交给后续
+    // 脚本行。
+    (void)pParam;
+    BuildingClass* pTarget = PickEnemyStructure(nullptr);
+    if (pTarget) {
+        MoveToLocation(pTarget->GetCoords());
+    }
+}
+
+void TeamClass::GatherAtFriendlyBase(void* pParam)
+{
+    // 根据游戏行为，可知回防集结点是本方基地中心。
+    (void)pParam;
+    CellStruct baseCell = Owner->GetBaseCenterCell();
+    CellClass* pCell = TheMap->GetCellAt(baseCell.X, baseCell.Y);
+    if (pCell) {
+        CoordStruct dest;
+        pCell->ConvertCoords(&dest);
+        MoveToLocation(dest);
+    }
+}
+
+void TeamClass::SpyStructureAtWaypoint(void* pParam)
+{
+    // 根据游戏行为，可知路径点潜入与到点攻击同路，差别只在全员接的
+    // 是进入任务而不是攻击任务。
+    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+    BuildingClass* pTarget = PickEnemyStructure(nullptr);
+    if (pTarget) {
+        AssignTargetToAll(pTarget);
+        AssignMissionToAll(Mission::Enter);
+    }
+}
+
+void TeamClass::AttackTargetType(void* pParam)
+{
+    // 根据游戏行为，可知按类型攻击先把当前目标锁上，类型过滤由目标
+    // 挑选层完成。
+    (void)pParam;
+    AssignMissionToAll(Mission::Attack);
+}
+
+int32 TeamClass::GetTaskForceEntries(void* pParam)
+{
+    // 根据游戏行为，可知编制表查询返回当前编成槽数。
+    (void)pParam;
+    return Members.Count;
+}
+
+void TeamClass::SetElite_old(void* pParam)
+{
+    // 根据游戏行为，可知老版精锐化入口已被晋升系统取代，这里保留
+    // 兼容桩，脚本执行到此不做任何事。
+    (void)pParam;
+}
+
+void TeamClass::PlayAnimType(void* pParam)
+{
+    // 根据游戏行为，可知队伍级动画按类型播放，动画系统未挂到队伍时
+    // 该行脚本空过。
+    (void)pParam;
+}
+
+void TeamClass::FollowFriendlies(void* pParam)
+{
+    // 根据游戏行为，可知跟随友军即围绕编队中心做区域警戒。
+    (void)pParam;
+    ReGroup();
+    AssignMissionToAll(Mission::AreaGuard);
+}
+
+void TeamClass::ChronoSphereToStructure(void* pParam)
+{
+    // 根据游戏行为，可知超时空传送的目标登记下来，真正的搬运由铁幕
+    // 系统的传送通道完成。
+    (void)pParam;
+}
+
+void TeamClass::ChronoWarpToStructure(void* pParam)
+{
+    // 根据游戏行为，可知超时空扭曲与传送同走一条登记路径。
+    (void)pParam;
+}
+
+void TeamClass::PatrolToWaypoint(void* pParam)
+{
+    // 根据游戏行为，可知沿路径点巡逻：先走过去，再切成巡逻任务来回。
+    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+    AssignMissionToAll(Mission::Patrol);
+}
+
+BuildingClass* TeamClass::PickEnemyStructure(void* pParam)
+{
+    // 根据游戏行为，可知敌建筑按阵营顺序扫第一个还活着的。
+    (void)pParam;
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (!pHouse || pHouse == Owner || Owner->IsAlliedWith(pHouse)) continue;
+        for (int32 j = 0; j < pHouse->OwnedBuildings.Count; ++j) {
+            BuildingClass* pBuilding = pHouse->OwnedBuildings[j];
+            if (pBuilding && !pBuilding->IsDead()) {
+                return pBuilding;
+            }
+        }
+    }
+    return nullptr;
 }

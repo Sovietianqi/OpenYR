@@ -34,6 +34,19 @@ public:
     void ProcessEvents();
     void ClearEvents();
     void ExecuteEvent(const NetworkEvent& evt);
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知网络事件添加的原版命名形态是通用 AddEvent 的
+    // 便捷封装：把不同玩家指令按各自事件码与参数布局打包进队列。
+    // ------------------------------------------------------------------------
+    void AddEvent_Generic(NetworkEventType type, int32 playerID, int32 v1, int32 v2, int32 v3, int32 v4);
+    void AddEvent_Place(int32 playerID, int32 objectID, int32 cellX, int32 cellY, int32 facing);
+    void AddEvent_Animation(int32 playerID, int32 animID, int32 cellX, int32 cellY);
+    void AddEvent_Waypoints(int32 playerID, int32 waypointID);
+    void AddEvent_ProduceAbandonSuspend(int32 playerID, int32 kind, int32 factoryID);
+    void AddEvent_SWPlace(int32 playerID, int32 superIndex, int32 cellX, int32 cellY);
+    void AddEvent_Noopt(int32 playerID);
+    void PreparePacket(void* pPacket, int32 size);
+    void RespondTo_PlanningEvent(const NetworkEvent& evt);
 
     // Serialization
     bool SerializeEvent(const NetworkEvent& evt, PacketData& pkt);

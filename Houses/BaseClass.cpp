@@ -34,7 +34,7 @@ void BaseClass::Clear()
 }
 
 // ============================================================================
-// BaseClass_LoadFromINI - asm 0x42EBED
+ // BaseClass_LoadFromINI -
 //
 //   "PercentBuilt" keeps its current value when the key is absent.  The
 //   "NodeCount" entries are then read from the "%03d" keys; each one is a

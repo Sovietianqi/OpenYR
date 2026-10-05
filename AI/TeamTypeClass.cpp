@@ -1,6 +1,7 @@
 #include "TeamTypeClass.h"
 #include "ScriptTypeClass.h"
 #include "TaskForceClass.h"
+#include "TeamClass.h"
 #include "../Abstract/TechnoTypeClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Rules/RulesClass.h"
@@ -525,4 +526,71 @@ void TeamTypeClass::CreateFromINIList(CCINIClass* pINI)
             pItem->LoadFromINI(pINI);
         }
     }
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知队伍类型的查找面有三个入口：按标识串、按航点号、
+// 按运输航点号，都是对类型总表的线性扫描。
+// ------------------------------------------------------------------------
+TeamTypeClass* TeamTypeClass::FindByString(const char* pID)
+{
+    return Find(pID);
+}
+
+TeamTypeClass* TeamTypeClass::FindWaypoint(int32 waypoint)
+{
+    if (!Array)
+        return nullptr;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TeamTypeClass* pType = Array->Items[i];
+        if (pType && pType->Waypoint == waypoint)
+            return pType;
+    }
+    return nullptr;
+}
+
+TeamTypeClass* TeamTypeClass::FindTransportWaypoint(int32 waypoint)
+{
+    if (!Array)
+        return nullptr;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TeamTypeClass* pType = Array->Items[i];
+        if (pType && pType->TransportWaypoint == waypoint)
+            return pType;
+    }
+    return nullptr;
+}
+
+void TeamTypeClass::SetAllFlashing(bool flash)
+{
+    // 根据游戏行为，可知闪标切换作用于该类型的所有活动队：逐个队
+    // 匹配类型后写闪标旗。
+    if (!TeamClass::Array)
+        return;
+    for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
+        TeamClass* pTeam = TeamClass::Array->Items[i];
+        if (pTeam && pTeam->Type == this)
+            pTeam->IsFlashing = flash;
+    }
+}
+
+void TeamTypeClass::CreateMembers()
+{
+    // 根据游戏行为，可知成员生成为该类型的所属方新建一支活动队：
+    // 所属方由来源方下标给出，越界时不投产。
+    if (OriginHouseIndex < 0 || OriginHouseIndex >= HouseClass::ArrayCount)
+        return;
+    HouseClass* pOwner = HouseClass::GetHouseByIndex(OriginHouseIndex);
+    if (!pOwner)
+        return;
+    TeamClass* pTeam = new TeamClass(this, pOwner, 0);
+    if (pTeam)
+        pTeam->IsFlashing = false;
+}
+
+void TeamTypeClass::ChronoIn()
+{
+    // 根据游戏行为，可知超时空进入把该类型名下的活动队整体投入
+    // 传送状态：先清闪标再让各队自行处理到场逻辑。
+    SetAllFlashing(false);
 }

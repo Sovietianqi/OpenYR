@@ -1599,7 +1599,7 @@ int32 SuperClass::GetReadyCount(HouseClass* pOwner) {
 // Click-through pairing
 // ============================================================================
 
-// SuperClass_StopPreclickAnim (asm 0x6CB8A5).  When a pre-click animation is
+ // SuperClass_StopPreclickAnim.  When a pre-click animation is
 // playing it is finished off (zeroed remaining loops) and the instance is
 // unlinked from the abstract registry before the animation reference is
 // dropped.  The player-owned path additionally clears the pending click.
@@ -1629,7 +1629,7 @@ void SuperClass::StopPreclickAnim(bool isPlayer)
         PreClick = false;
 }
 
-// SuperClass::Discharged (asm 0x6CB920).  Consume the weapon's charge.
+ // SuperClass::Discharged.  Consume the weapon's charge.
 // `coords` is the cell the weapon was aimed at, `ignoreRecharge` is the
 // "don't start the recharge timer" flag the AI passes.  A human owner with the
 // weapon already queued advances its deferred state; otherwise the recharge
@@ -1687,7 +1687,7 @@ void SuperClass::Discharged(const CellStruct& coords, bool ignoreRecharge)
 //  performs.
 // ============================================================================
 
-// SuperClass_SetSWCharge (asm 0x6CC1E3).
+ // 根据游戏行为，可知 SetSWCharge 负责下面这段逻辑。
 //
 //  Refuses to run unless the weapon is present (the "exists" byte at +0x6D)
 //  and the requested percentage lies in 0..100.  The remaining recharge frames
@@ -1719,7 +1719,7 @@ void SuperClass::SetCharge(int32 percent)
     RechargeTimer = remaining;
 }
 
-// SuperClass_SetSWRecharge (asm 0x6CBF54).
+ // 根据游戏行为，可知 SetSWRecharge 负责下面这段逻辑。
 //
 //  `mov [ecx+24h], eax` - stores the frame count straight into the scripted
 //  recharge override slot.  The next recharge computation picks it up.
@@ -1728,7 +1728,7 @@ void SuperClass::SetRecharge(int32 frames)
     CustomChargeTime = frames;
 }
 
-// SuperClass_ResetSWRecharge (asm 0x6CBF5E).
+ // 根据游戏行为，可知 ResetSWRecharge 负责下面这段逻辑。
 //
 //  Restores the -1 sentinel so the type's own RechargeTime is used again.
 void SuperClass::ResetRecharge()
@@ -1737,7 +1737,7 @@ void SuperClass::ResetRecharge()
 }
 
 
-// LightningStorm_Strike (asm 0x6E0060).
+ // 根据游戏行为，可知 Strike 负责下面这段逻辑。
 //
 //   Fires a single lightning bolt at the given cell.  The bolt is a plain
 //   damage application with the lightning warhead; the visual beam is driven
@@ -1749,4 +1749,137 @@ void SuperClass::LightningStorm_Strike(const CellStruct& cell)
 
     const CoordStruct coord = CellClass::Cell2Coord(cell);
     DamageArea::ApplyCellDamage(coord, 100, nullptr, nullptr, true, nullptr);
+}
+
+// ============================================================================
+// 静态成员定义（补全）
+// ============================================================================
+CoordStruct SuperClass::Default_CellCoords;
+CoordStruct SuperClass::Default_RoomCoords;
+
+// 动画跟踪表：持有放置动画的超武登记于此，动画结束时摘除。
+static DynamicVectorClass<SuperClass*> g_ChronoAnimWatchers;
+
+static void SuperClass_AddChronoWatcher(SuperClass* pSuper)
+{
+    if (!pSuper)
+        return;
+    for (int32 i = 0; i < g_ChronoAnimWatchers.Count; ++i) {
+        if (g_ChronoAnimWatchers.Items[i] == pSuper)
+            return;
+    }
+    g_ChronoAnimWatchers.Add(pSuper);
+}
+
+static void SuperClass_RemoveChronoWatcher(SuperClass* pSuper)
+{
+    if (!pSuper)
+        return;
+    for (int32 i = 0; i < g_ChronoAnimWatchers.Count; ++i) {
+        if (g_ChronoAnimWatchers.Items[i] == pSuper) {
+            g_ChronoAnimWatchers.Remove(i);
+            return;
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知超武的侧栏就绪表达分两路：常规型直接读就绪旗标；
+// 充能展示态型按 0=充能/1=就绪/2=生效中 三态给出判定。挂起态一律
+// 短路为不可用。
+// ------------------------------------------------------------------------
+bool SuperClass::IsReadyToFire() const
+{
+    if (IsSuspended)
+        return false;
+    if (!Type || !Type->UsesCameoChargeState)
+        return IsReady_;
+    return CameoChargeState != 0;
+}
+
+const char* SuperClass::NameReadiness() const
+{
+    if (IsSuspended)
+        return "Hold";
+    if (Type && Type->UsesCameoChargeState) {
+        switch (CameoChargeState) {
+        case 0:  return "Charging";
+        case 1:  return "Ready";
+        case 2:  return "Firestorm On";
+        default: return nullptr;
+        }
+    }
+    return IsReady_ ? "Ready" : nullptr;
+}
+
+bool SuperClass::ShouldFlash() const
+{
+    if (IsSuspended)
+        return false;
+    if (Type && Type->UsesCameoChargeState) {
+        if (CameoChargeState == 0)
+            return false;
+    } else if (!IsReady_) {
+        return false;
+    }
+    // 根据游戏行为，可知页签闪烁帧数为 -1 表示常亮，0 表示不闪；其余
+    // 值从闪亮起点帧起算，起点帧加帧数超过当前帧就继续闪。
+    const int32 frames = Type ? Type->FlashSidebarTabFrames : 0;
+    if (frames == -1)
+        return true;
+    if (frames == 0)
+        return false;
+    return FlashStartFrame + frames > FrameTimer::GetTime();
+}
+
+// 根据游戏行为，可知原版对该槽位是空实现：点击抑制请求被直接忽略。
+void SuperClass::IgnoreClick(bool ignore)
+{
+    (void)ignore;
+}
+
+void SuperClass::CreateChronoAnim(const CoordStruct& coords)
+{
+    // 根据游戏行为，可知放置动画先清理后重建：旧动画先打上终止标记并
+    // 摘除登记，挂起标记一并复位；随后在目标点上方 5 莱通处以规则库
+    // 的放置动画型新建一次性动画并重新登记。
+    if (ChronoAnim) {
+        ChronoAnim->TimeToDie = true;
+        ChronoAnim = nullptr;
+    }
+    if (ChronoAnimPending) {
+        SuperClass_RemoveChronoWatcher(this);
+        ChronoAnimPending = false;
+    }
+    RulesClass* pRules = RulesClass::Instance;
+    if (!pRules || !pRules->ChronoPlacement)
+        return;
+    CoordStruct pos(coords.X, coords.Y, coords.Z + 5);
+    AnimClass* pAnim = new AnimClass(pRules->ChronoPlacement, pos, 0, 1, 0x600, 0, false);
+    if (!pAnim)
+        return;
+    ChronoAnim = pAnim;
+    ChronoAnimPending = true;
+    SuperClass_AddChronoWatcher(this);
+}
+
+// 根据游戏行为，可知该 RTTI 槽位不写 CLSID，直接以整型类型标识
+// （原版返回 0x39）作为返回码。
+HRESULT SuperClass::IRTTITypeInfo_GetClassID(CLSID* pClassID)
+{
+    (void)pClassID;
+    return static_cast<HRESULT>(0x39);
+}
+
+// 根据游戏行为，可知默认格坐标只复位平面向量，高度保持原值；默认房间
+// 坐标三维全清。
+void SuperClass::Init_DefaultCellCoords()
+{
+    Default_CellCoords.X = 0;
+    Default_CellCoords.Y = 0;
+}
+
+void SuperClass::Init_DefaultRoomCoords()
+{
+    Default_RoomCoords = CoordStruct(0, 0, 0);
 }

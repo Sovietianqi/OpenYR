@@ -2112,7 +2112,7 @@ bool TActionClass::TriggerNukeStrike(HouseClass* pOwner, int32 a3,
     }
     if (!pBullet) return false;
 
-    // BulletClass_SetWeaponType
+    // 根据游戏行为，可知 SetWeaponType 负责下面这段逻辑。
     pBullet->SetWeaponType(pWeapon);
 
     // Launch displacement: +0x4E20 (= 20000 leptons) along Z.
@@ -2191,4 +2191,12 @@ bool TActionClass::FireChemLauncher(HouseClass* pOwner, int32 a3,
 
     pBullet->SetMovement(pos, vel, pWeapon->Projectile ? pWeapon->GetProjectileSpeed() : 0);
     return true;
+}
+
+
+// 根据游戏行为，可知胜利类动作在注册时打标，执行链据此判定能否宣告
+// 胜利；未打标的动作一律返回假。
+bool TActionClass::IsVictoryAction() const
+{
+    return IsAllowWinFlag;
 }

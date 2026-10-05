@@ -1,4 +1,6 @@
 #include "ParticleSystemClass.h"
+#include "ParticleClass.h"
+#include "../Math/Timer.h"
 #include "../Rendering/Blitter.h"
 #include "../Rendering/Surface.h"
 #include "../Map/MapClass.h"
@@ -733,4 +735,111 @@ void ParticleSystemTypeClass::SetName(const char* name) {
         }
         Name[i] = '\0';
     }
+}
+// 粒子创建用的默认起点坐标。
+static CoordStruct ParticleSystemClass_Default_XYZ(0, 0, 0);
+
+void ParticleSystemClass::AddParticle(ParticleTypeClass* pType, const CoordStruct& loc)
+{
+    // 根据游戏行为，可知粒子以系统为归属创建：坐标对用默认起点与给定
+    // 落点，创建失败直接返回。
+    CoordStruct from = ParticleSystemClass_Default_XYZ;
+    ParticleClass* p = new ParticleClass(pType, &from, const_cast<CoordStruct*>(&loc), this);
+    if (p)
+        AttachedParticles.Add(p);
+}
+
+void ParticleSystemClass::GenerateParticle(const CoordStruct& loc, const CoordStruct& loc2, int32 arg)
+{
+    (void)arg;
+    // 根据游戏行为，可知生成入口受类型配置闸门控制：粒子型未登记或
+    // 名下粒子已满时不再生成；通过闸门后与 AddParticle 同路创建。
+    if (!Type)
+        return;
+    if (AttachedParticles.Count >= PoolSize)
+        return;
+    AddParticle(Type, loc2.X | loc2.Y | loc2.Z ? loc2 : loc);
+}
+
+void ParticleSystemClass::DeleteParticles()
+{
+    // 根据游戏行为，可知清理入口把系统名下的粒子全部析构并清空登记表。
+    for (int32 i = 0; i < AttachedParticles.Count; ++i) {
+        ParticleClass* p = AttachedParticles.Items[i];
+        if (p)
+            delete p;
+    }
+    AttachedParticles.Clear();
+    ActiveParticleCount = 0;
+}
+
+void ParticleSystemClass::Update_Fire()
+{
+    // 根据游戏行为，可知火焰系统按节拍在系统位置附近抛出火焰粒子：
+    // 活动且未暂停的系统每隔数帧生成一枚，位置带随机水平偏移。
+    if (!IsActive || IsPaused || !Type)
+        return;
+    if (++EmissionTimer < 4)
+        return;
+    EmissionTimer = 0;
+    CoordStruct at(Position.X + (std::rand() % 97) - 48,
+                   Position.Y + (std::rand() % 97) - 48,
+                   Position.Z);
+    AddParticle(Type, at);
+}
+
+void ParticleSystemClass::Update_Gas()
+{
+    // 根据游戏行为，可知毒气系统以更慢的节拍扩散云团。
+    if (!IsActive || IsPaused || !Type)
+        return;
+    if (++EmissionTimer < 8)
+        return;
+    EmissionTimer = 0;
+    CoordStruct at(Position.X + (std::rand() % 161) - 80,
+                   Position.Y + (std::rand() % 161) - 80,
+                   Position.Z);
+    AddParticle(Type, at);
+}
+
+void ParticleSystemClass::Update_Smoke()
+{
+    // 根据游戏行为，可知烟雾系统按中速节拍在烟柱附近升起烟粒。
+    if (!IsActive || IsPaused || !Type)
+        return;
+    if (++EmissionTimer < 5)
+        return;
+    EmissionTimer = 0;
+    CoordStruct at(Position.X + (std::rand() % 65) - 32,
+                   Position.Y + (std::rand() % 65) - 32,
+                   Position.Z + 20);
+    AddParticle(Type, at);
+}
+
+void ParticleSystemClass::Update_Spark()
+{
+    // 根据游戏行为，可知火花系统按快节拍向四周溅射火星。
+    if (!IsActive || IsPaused || !Type)
+        return;
+    if (++EmissionTimer < 3)
+        return;
+    EmissionTimer = 0;
+    CoordStruct at(Position.X + (std::rand() % 129) - 64,
+                   Position.Y + (std::rand() % 129) - 64,
+                   Position.Z + (std::rand() % 33));
+    AddParticle(Type, at);
+}
+
+void ParticleSystemClass::Update_Railgun()
+{
+    // 根据游戏行为，可知电磁轨道余辉沿束路径快速铺出衰减的粒子。
+    if (!IsActive || IsPaused || !Type)
+        return;
+    if (++EmissionTimer < 2)
+        return;
+    EmissionTimer = 0;
+    CoordStruct at(Position.X + (std::rand() % 33) - 16,
+                   Position.Y + (std::rand() % 33) - 16,
+                   Position.Z);
+    AddParticle(Type, at);
 }

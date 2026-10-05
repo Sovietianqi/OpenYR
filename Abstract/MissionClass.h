@@ -92,19 +92,19 @@ public:
     // ========================================================================
     // Mission-layer queries (asm: all read the fields below)
     // ========================================================================
-    // MissionClass_FindNameByIdx (asm 0x5B3730): the INI section name of the
+ // MissionClass_FindNameByIdx: the INI section name of the
     //   *current* mission, or "<none>" when none is set (-1).
     const char* FindNameByIdx() const;
-    // MissionClass_IsRecruitable (asm 0x5B36D0): whether the current mission
+ // MissionClass_IsRecruitable: whether the current mission
     //   lets the owner recruit this object into an AI team.  An unset mission
     //   (-1) is recruitable by default; otherwise the MissionControlClass
     //   table supplies the answer.
     bool IsRecruitable() const;
-    // MissionClass_ResetMission (asm 0x5B36C0): promotes a queued mission into
+ // MissionClass_ResetMission: promotes a queued mission into
     //   the current slot, clearing the queue and the step counter.  Returns
     //   false when nothing was queued.
     bool ResetMission();
-    // MissionClass_LoadMissionControlFromINI (asm 0x5B3760): loads the whole
+ // MissionClass_LoadMissionControlFromINI: loads the whole
     //   MissionControlClass table out of the [MissionControl] sections.
     static void LoadMissionControlFromINI(CCINIClass* pINI);
 
@@ -150,4 +150,19 @@ public:
     int32         CurrentMissionStartTime;
     DWORD         unknown_C0;
     CDTimerClass  UpdateTimer;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 Mi_ 系列与 Mission_ 系列状态处理器一一对应，
+    // 为原版命名形态的转发入口。
+    // ------------------------------------------------------------------------
+    virtual int32 Mi_Sleep();
+    virtual int32 Mi_Harmless();
+    virtual int32 Mi_Ambush();
+    virtual int32 Mi_Harvest();
+    virtual int32 Mi_Return();
+    virtual int32 Mi_Stop();
+    virtual int32 Mi_Wait();
+    virtual int32 Mi_Open();
+    virtual int32 Mi_Construction();
+    virtual int32 Mi_Selling();
+
 };

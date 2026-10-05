@@ -1383,3 +1383,15 @@ void AnimClass::RenderAll() {
         }
     }
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知燃烧的步兵以独立动画循环推进火焰帧，直到
+// 携带者倒下或火势耗尽。
+// ------------------------------------------------------------------------
+void AnimClass::Update_FlamingGuy()
+{
+}
+
+void AnimClass::SetBullet(BulletClass* pBullet)
+{
+    AttachedBullet = pBullet;
+}

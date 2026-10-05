@@ -89,21 +89,21 @@ public:
     // ------------------------------------------------------------------
     // ObjectTypeClass vtable probes (asm one-liners)
     // ------------------------------------------------------------------
-    // ObjectTypeClass_GetImage (asm 0x718xxx): the loaded SHP the type draws
+ // ObjectTypeClass_GetImage (xxx): the loaded SHP the type draws
     //   itself with, cached at +0x10 by Resolve_SHP_References.
     virtual SHPStruct* GetImage() const;
-    // ObjectTypeClass_GetPipMax (asm 0x716xxx): base answers 0 - only the
+ // ObjectTypeClass_GetPipMax (xxx): base answers 0 - only the
     //   types that actually render pips (buildings, harvesters) override it.
     virtual int32 GetPipMax() const;
-    // ObjectTypeClass_GetActualCost (asm 0x716xxx): the cost after the
+ // ObjectTypeClass_GetActualCost (xxx): the cost after the
     //   owner's modifiers; at type level nothing is applied, so 0.
     virtual int32 GetActualCost(HouseClass* pOwner) const;
-    // ObjectTypeClass_GetBuildSpeed (asm 0x716xxx): base build-speed factor.
+ // ObjectTypeClass_GetBuildSpeed (xxx): base build-speed factor.
     int32 GetBuildSpeed() const;
-    // ObjectTypeClass_GetCameo (asm 0x716xxx): the sidebar cameo index; base
+ // ObjectTypeClass_GetCameo (xxx): the sidebar cameo index; base
     //   has no cameo of its own.
     virtual int32 GetCameo() const;
-    // ObjectTypeClass_Generic (asm 0x716xxx): stamps the 'G' marker byte that
+ // ObjectTypeClass_Generic (xxx): stamps the 'G' marker byte that
     //   the sidebar uses to flag a generic (non-faction) cameo.
     void Generic();
 
@@ -173,4 +173,17 @@ public:
     bool         Theater;
     bool         NewTheater;
     bool         Voxel;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知对象类型层补全地基数据读取、三维/剧场美术装载
+    // 与卸载、建筑建造分类判定与剧场文件名修正等入口。
+    // ------------------------------------------------------------------------
+    virtual void   GetFoundationData(int32& w, int32& h);
+    virtual bool   IsBuildingBuildCat5();
+    virtual void   Load3DArt(int32 idxTheater);
+    virtual void   LoadBarrelArt();
+    virtual void   LoadTurret3DArt();
+    virtual void   Load_Theater_Art(int32 idxTheater);
+    virtual void   Unload_5F77F0();
+    virtual void   TheaterSpecificID(const char* pBase, int32 idxTheater, char* pOut) const;
+
 };

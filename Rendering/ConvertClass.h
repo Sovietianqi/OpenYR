@@ -113,6 +113,18 @@ public:
     // Apply the light conversion to a buffer
     void Apply(BYTE* buffer, int32 length) const;
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知光照转换面板的原版命名形态：两种提笔器按
+    // 标志位选择，批量建提笔器在首次取用时触发；查建入口按 RGB 找
+    // 现有转换器或新建一个；调色微调重建明暗表。
+    // ------------------------------------------------------------------------
+    void* SelectBlitter0(BlitterFlags flags);
+    void* SelectBlitter1(BlitterFlags flags);
+    void AllocAllTheFuckingBlitters();
+    static LightConvertClass* FindOrAlloc(BYTE* pBuffer, int32 a2, void* pSurface, int32 a5,
+                                          int32 red, int32 green, int32 blue, int32 a9);
+    void FiddleColours(int32 a1, int32 a2, int32 a3, int32 a4);
+
 protected:
     explicit LightConvertClass(int)
         : ConvertClass(0) {}

@@ -504,3 +504,90 @@ bool TeleportLocomotionClass::Is_Really_Moving_Now() const
 {
     return IsTeleportingNow;
 }
+// 传送面板的默认登记点（复位槽位写回该值）。
+static CoordStruct TeleportLocomotionClass_Default_Pos(0, 0, 0);
+
+bool TeleportLocomotionClass::ILocomotion_718080() const
+{
+    // 根据游戏行为，可知该槽位判定传送状态机是否处于传送中。
+    return IsTeleportingNow;
+}
+
+void TeleportLocomotionClass::ILocomotion_7180A0(CoordStruct* pOut) const
+{
+    // 根据游戏行为，可知取坐标分两路：传送中给登记的目标点，否则给
+    // 载体的现行坐标。
+    if (!pOut)
+        return;
+    if (IsTeleportingNow)
+        *pOut = TargetCell;
+    else if (LinkedTo)
+        LinkedTo->GetCoords(pOut);
+    else
+        *pOut = CoordStruct(0, 0, 0);
+}
+
+void TeleportLocomotionClass::ILocomotion_718100(const CoordStruct& to)
+{
+    // 根据游戏行为，可知传送起步：先对载体做许可检查（滞留虚位、阵亡、
+    // 身处封闭载具任一命中即放弃）；目标格被占用时原版会先驱散占位内容，
+    // 重构的占用位模型以拒绝进入表达同一约束；随后登记目标点并归零
+    // 传送相位。
+    if (!LinkedTo)
+        return;
+    if (LinkedTo->IsInLimbo || LinkedTo->IsDead() || LinkedTo->InOpenTopped)
+        return;
+    CellClass* pCell = TheMap->GetCellAt(to.X >> 8, to.Y >> 8);
+    if (pCell && pCell->IsOccupied())
+        return;
+    TargetCell = to;
+    IsTeleportingNow = true;
+    WarpPhase = 0;
+}
+
+void TeleportLocomotionClass::ILocomotion_718230()
+{
+    // 根据游戏行为，可知复位把登记点归回默认值并清两个状态旗标。
+    TargetCell = TeleportLocomotionClass_Default_Pos;
+    IsTeleportingNow = false;
+    HasArrived = false;
+}
+
+void TeleportLocomotionClass::ILocomotion_7192C0(DirStruct dir)
+{
+    // 根据游戏行为，可知转向槽位把期望朝向写进载体的朝向机。
+    if (LinkedTo)
+        LinkedTo->SetFacing(dir);
+}
+
+int32 TeleportLocomotionClass::ILocomotion_719E20() const
+{
+    // 根据游戏行为，可知该槽位固定返回 2（传送移动的组别值）。
+    return 2;
+}
+
+void TeleportLocomotionClass::ILocomotion_71A090(CoordStruct* pCoord)
+{
+    // 根据游戏行为，可知放置槽位只在未带坐标参数时动作：把当前登记点
+    // 回写给载体位置；带坐标参数时直接返回。
+    if (pCoord)
+        return;
+    if (LinkedTo)
+        LinkedTo->SetLocation(TargetCell);
+}
+
+HRESULT TeleportLocomotionClass::ILocomotion_71A160(REFIID iid, void** ppvObject)
+{
+    // 根据游戏行为，可知 COM 三槽是本体接口的转发形态。
+    return QueryInterface(iid, ppvObject);
+}
+
+ULONG TeleportLocomotionClass::ILocomotion_71A170()
+{
+    return AddRef();
+}
+
+ULONG TeleportLocomotionClass::ILocomotion_71A180()
+{
+    return Release();
+}

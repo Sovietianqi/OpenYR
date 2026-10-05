@@ -125,6 +125,13 @@ public:
     MouseClass();
     virtual ~MouseClass();
 
+    // 根据游戏行为，可知指针样式表驱动了热区与动画帧的选择：
+    // 带小地图变体的样式在小地图态选用备用帧，其余沿用主帧。
+    bool SetPointer(int idxPointer, bool minimap);
+    static int32 GetMPStartFrame(int idx);
+    static int32 GetStartFrameOrMinimap(int idx, bool minimap);
+    static int32 GetMPFrameCount(int idx);
+
     // GScreenClass methods
     virtual bool SetCursor(MouseCursorType idxCursor, bool miniMap);
     virtual bool UpdateCursor(MouseCursorType idxCursor, bool miniMap);

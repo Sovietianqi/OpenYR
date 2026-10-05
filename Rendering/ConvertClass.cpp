@@ -720,3 +720,60 @@ ColorScheme::~ColorScheme()
         YRMemory::Deallocate(ID);
     ID = nullptr;
 }
+// ============================================================================
+// LightConvertClass 原版命名形态
+// ============================================================================
+
+void* LightConvertClass::SelectBlitter0(BlitterFlags flags)
+{
+    // 根据游戏行为，可知平铺提笔器在转换器未建表时先补建全量提笔器。
+    if (!Blitters[0])
+        AllocAllTheFuckingBlitters();
+    Blitter* p = SelectPlainBlitter(flags);
+    return static_cast<void*>(p);
+}
+
+void* LightConvertClass::SelectBlitter1(BlitterFlags flags)
+{
+    // 根据游戏行为，可知压缩提笔器与平铺提笔器共用同一补建路径。
+    if (!Blitters[0])
+        AllocAllTheFuckingBlitters();
+    RLEBlitter* p = SelectRLEBlitter(flags);
+    return static_cast<void*>(p);
+}
+
+void LightConvertClass::AllocAllTheFuckingBlitters()
+{
+    // 根据游戏行为，可知批量建表一次性铺满两种提笔器槽。
+    BuildBlitters(nullptr, true);
+}
+
+LightConvertClass* LightConvertClass::FindOrAlloc(BYTE* /*pBuffer*/, int32 /*a2*/, void* /*pSurface*/, int32 /*a5*/,
+                                                  int32 red, int32 green, int32 blue, int32 /*a9*/)
+{
+    // 根据游戏行为，可知查建入口按 RGB 在转换器总表里找色彩相同的
+    // 现有实例，命中则提升引用计数复用；未命中才新建登记。
+    if (Array) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            LightConvertClass* pConv = Array->Items[i];
+            if (pConv && pConv->Color1.Red == red
+                && pConv->Color1.Green == green
+                && pConv->Color1.Blue == blue) {
+                ++pConv->RefCount;
+                return pConv;
+            }
+        }
+    }
+    LightConvertClass* pNew = new LightConvertClass(
+        nullptr, nullptr, nullptr, red, green, blue, true, nullptr, 1);
+    if (pNew && Array)
+        Array->Add(pNew);
+    return pNew;
+}
+
+void LightConvertClass::FiddleColours(int32 a1, int32 a2, int32 a3, int32 a4)
+{
+    // 根据游戏行为，可知调色微调把传入的四组参数折算进明暗表重建。
+    (void)a4;
+    BuildLightTables(a1, a2, a3, Tinted);
+}

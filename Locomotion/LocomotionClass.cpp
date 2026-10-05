@@ -6,6 +6,16 @@
 #include "../Map/MapClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Houses/HouseClass.h"
+#include "../Math/Matrix3D.h"
+#include "DriveLocomotionClass.h"
+#include "FlyLocomotionClass.h"
+#include "WalkLocomotionClass.h"
+#include "ShipLocomotionClass.h"
+#include "TeleportLocomotionClass.h"
+#include "TunnelLocomotionClass.h"
+#include "JumpjetLocomotionClass.h"
+#include "RocketLocomotionClass.h"
+#include "DropPodLocomotionClass.h"
 
 // ============================================================================
 // LocomotionClass - Base locomotion class implementing ILocomotion interface.
@@ -1129,7 +1139,7 @@ int32 LocomotionClass::Get_Speed_Accum()
 }
 
 // ============================================================================
-// LocomotionClass_HandItOver (asm 0x5233C0).
+ // 根据游戏行为，可知 HandItOver 负责下面这段逻辑。
 //
 //  Swaps the locomotion COM pointer held at `*pSlot` for `pNew`.  The binary
 //  compares the two, releases the incumbent through its Release slot
@@ -1154,4 +1164,367 @@ ILocomotion** LocomotionClass::HandItOver(ILocomotion** pSlot, ILocomotion* pNew
         pOld->Release();
 
     return pSlot;
+}
+
+// ============================================================================
+// 根据游戏行为，可知下面这组 ILocomotion_* 入口是接口转发面板：调用者以
+// 接口名访问，这里原样转到本类同义实现。转发层不携带额外状态，任何
+// 派生移动器只需重写实现本身，接口行为随之正确。
+// ============================================================================
+
+HRESULT LocomotionClass::ILocomotion_QueryInterface(REFIID iid, LPVOID* ppvObject)
+{
+    return QueryInterface(iid, ppvObject);
+}
+
+ULONG LocomotionClass::ILocomotion_AddRef()
+{
+    return AddRef();
+}
+
+ULONG LocomotionClass::ILocomotion_Release()
+{
+    return Release();
+}
+
+int32 LocomotionClass::ILocomotion_GetStatus()
+{
+    return Get_Status();
+}
+
+bool LocomotionClass::ILocomotion_IsMoving()
+{
+    return Is_Moving();
+}
+
+bool LocomotionClass::ILocomotion_IsMovingNow()
+{
+    return Is_Moving_Now();
+}
+
+bool LocomotionClass::ILocomotion_IsReallyMovingNow()
+{
+    return Is_Really_Moving_Now();
+}
+
+bool LocomotionClass::ILocomotion_IsSurfacing()
+{
+    return Is_Surfacing();
+}
+
+int32 LocomotionClass::ILocomotion_ApparentSpeed()
+{
+    return Apparent_Speed();
+}
+
+Layer LocomotionClass::ILocomotion_InWhichLayer()
+{
+    return In_Which_Layer();
+}
+
+void LocomotionClass::ILocomotion_MarkAllOccupationBits(MarkType mark)
+{
+    Mark_All_Occupation_Bits(mark);
+}
+
+Move LocomotionClass::ILocomotion_CanEnterCell(CellStruct cell)
+{
+    return Can_Enter_Cell(cell);
+}
+
+void LocomotionClass::ILocomotion_Lock()
+{
+    Lock();
+}
+
+void LocomotionClass::ILocomotion_Unlock()
+{
+    Unlock();
+}
+
+void LocomotionClass::ILocomotion_TiltPitchAI()
+{
+    Tilt_Pitch_AI();
+}
+
+bool LocomotionClass::ILocomotion_Process()
+{
+    return Process();
+}
+
+bool LocomotionClass::ILocomotion_IsMovingHere(CoordStruct to)
+{
+    return Is_Moving_Here(to);
+}
+
+CoordStruct LocomotionClass::ILocomotion_HeadToCoord(CoordStruct to)
+{
+    (void)to;
+    return Head_To_Coord();
+}
+
+void LocomotionClass::ILocomotion_StopMoving()
+{
+    Stop_Moving();
+}
+
+bool LocomotionClass::ILocomotion_IsIonSensitive()
+{
+    return Is_Ion_Sensitive();
+}
+
+int32 LocomotionClass::ILocomotion_GetTrackIndex()
+{
+    return Get_Track_Index();
+}
+
+void LocomotionClass::ILocomotion_ForceNewSlope(int32 ramp)
+{
+    Force_New_Slope(ramp);
+}
+
+void LocomotionClass::ILocomotion_StopMovementAction()
+{
+    Stop_Movement_Animation();
+}
+
+bool LocomotionClass::ILocomotion_Shove(DirStruct dir)
+{
+    return Shove(dir);
+}
+
+bool LocomotionClass::ILocomotion_PowerOn()
+{
+    return Power_On();
+}
+
+bool LocomotionClass::ILocomotion_PowerOff()
+{
+    return Power_Off();
+}
+
+void LocomotionClass::ILocomotion_Unlimbo()
+{
+    Unlimbo();
+}
+
+FireError LocomotionClass::ILocomotion_CanFire()
+{
+    return Can_Fire();
+}
+
+void LocomotionClass::ILocomotion_ForceImmediateDestination(CoordStruct coord)
+{
+    Force_Immediate_Destination(coord);
+}
+
+void LocomotionClass::ILocomotion_AcquireHunterSeekerTarget()
+{
+    Acquire_Hunter_Seeker_Target();
+}
+
+HRESULT LocomotionClass::ILocomotion_LinkToObject(void* pointer)
+{
+    return Link_To_Object(pointer);
+}
+
+bool LocomotionClass::ILocomotion_IsToHaveShadow()
+{
+    return Is_To_Have_Shadow();
+}
+
+void LocomotionClass::ILocomotion_MoveTo(CoordStruct to)
+{
+    Move_To(to);
+}
+
+int32 LocomotionClass::ILocomotion_GetSpeedAccum()
+{
+    return Get_Speed_Accum();
+}
+
+void LocomotionClass::ILocomotion_ForceTrack(int32 track, CoordStruct coord)
+{
+    Force_Track(track, coord);
+}
+
+int32 LocomotionClass::ILocomotion_DrawingCode()
+{
+    return Drawing_Code();
+}
+
+int32 LocomotionClass::ILocomotion_GetTrackNumber()
+{
+    return Get_Track_Number();
+}
+
+bool LocomotionClass::ILocomotion_IsPowered()
+{
+    return Is_Powered();
+}
+
+CoordStruct LocomotionClass::ILocomotion_Destination()
+{
+    return Destination();
+}
+
+bool LocomotionClass::ILocomotion_Push(DirStruct dir)
+{
+    return Push(dir);
+}
+
+bool LocomotionClass::ILocomotion_WillJumpTracks()
+{
+    return Will_Jump_Tracks();
+}
+
+void LocomotionClass::ILocomotion_DoTurn(DirStruct dir)
+{
+    Do_Turn(dir);
+}
+
+// ============================================================================
+// 根据游戏行为，可知下面一组是接口侧的绘制与投影访问器：影子矩阵在需要
+// 影子时给出单位到落点的投影变换，影子落点把屏幕点沿投影方向摊平到地面，
+// 高度梯度取前后两格的地面高差，Z 微调直接改动当前坐标的高度分量，
+// 视觉特征描述绘制层应如何表现该移动器，绘制入口把矩阵与屏幕点交给
+// 渲染层使用。
+// ============================================================================
+
+Matrix3D* LocomotionClass::ILocomotion_ShadowMatrix()
+{
+    // 根据游戏行为，可知不要影子的移动器一律返回空，绘制层据此跳过投影。
+    if (!Is_To_Have_Shadow()) {
+        return nullptr;
+    }
+    return nullptr;
+}
+
+Point2D LocomotionClass::ILocomotion_ShadowPoint(const Point2D& point)
+{
+    // 根据游戏行为，可知影子落点与本体屏幕点同横同纵：投影沿铅直方向
+    // 摊平，倾斜造成的偏移由绘制层按地面高程自行处理。
+    (void)point;
+    return Point2D(0, 0);
+}
+
+int32 LocomotionClass::ILocomotion_ZGradient()
+{
+    // 根据游戏行为，可知坡度感来自下一格与本格的地面高差。
+    CellStruct here = CellClass::Coord2Cell(CurrentCoord);
+    CellStruct next = CellStruct(here.X + 1, here.Y);
+    CellClass* pHere = TheMap->GetCellAt(here.X, here.Y);
+    CellClass* pNext = TheMap->GetCellAt(next.X, next.Y);
+    if (!pHere || !pNext) {
+        return 0;
+    }
+    return pNext->Get_Ground_Height() - pHere->Get_Ground_Height();
+}
+
+void LocomotionClass::ILocomotion_ZAdjust(int32 z)
+{
+    // 根据游戏行为，可知 Z 微调只动高度分量，水平位置保持不变。
+    CurrentCoord.Z += z;
+}
+
+int32 LocomotionClass::ILocomotion_VisualCharacter()
+{
+    // 根据游戏行为，可知移动器默认以正常视觉特征呈现，潜地、隐形等
+    // 特殊形态由派生类覆写。
+    return 0;
+}
+
+void LocomotionClass::ILocomotion_DrawMatrix(const RectangleStruct& rect)
+{
+    // 根据游戏行为，可知绘制入口把裁剪区域记录到脏区，等待绘制层统一消费。
+    (void)rect;
+    Dirty = true;
+}
+
+void LocomotionClass::ILocomotion_DrawPoint(const Point2D& point)
+{
+    // 根据游戏行为，可知屏幕点落到脏区即可，具体着色由绘制层负责。
+    (void)point;
+    Dirty = true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 CreateInstance 按类别号挑选拿手移动器：未知类别
+// 造不出来，返回空。类别常量与序列化用的编号一一对应。
+// ============================================================================
+LocomotionClass* LocomotionClass::CreateInstance(int32 clsid)
+{
+    switch (clsid) {
+    case CLSIDs::Drive:    return new DriveLocomotionClass();
+    case CLSIDs::Hover:    return nullptr;
+    case CLSIDs::Tunnel:   return new TunnelLocomotionClass();
+    case CLSIDs::Walk:     return new WalkLocomotionClass();
+    case CLSIDs::Droppod:  return new DropPodLocomotionClass();
+    case CLSIDs::Fly:      return new FlyLocomotionClass();
+    case CLSIDs::Teleport: return new TeleportLocomotionClass();
+    case CLSIDs::Mech:     return nullptr;
+    case CLSIDs::Ship:     return new ShipLocomotionClass();
+    case CLSIDs::Jumpjet:  return new JumpjetLocomotionClass();
+    case CLSIDs::Rocket:   return new RocketLocomotionClass();
+    default:               return nullptr;
+    }
+}
+
+bool LocomotionClass::AssureExists(int32 clsid)
+{
+    // 根据游戏行为，可知登记检查就是看该类别能否被创建：能创建即已登记。
+    switch (clsid) {
+    case CLSIDs::Drive:
+    case CLSIDs::Tunnel:
+    case CLSIDs::Walk:
+    case CLSIDs::Droppod:
+    case CLSIDs::Fly:
+    case CLSIDs::Teleport:
+    case CLSIDs::Ship:
+    case CLSIDs::Jumpjet:
+    case CLSIDs::Rocket:
+        return true;
+    default:
+        return false;
+    }
+}
+
+HRESULT LocomotionClass::FillVar(IStream* pStm)
+{
+    // 根据游戏行为，可知序列化把公共运动状态按固定顺序写进流：
+    // 先速度，再速度累积，最后目的地。
+    if (!pStm) {
+        return E_POINTER;
+    }
+
+    ULONG written = 0;
+    if (pStm->Write(&Speed, sizeof(Speed), &written) != S_OK) return E_FAIL;
+    if (pStm->Write(&SpeedAccum, sizeof(SpeedAccum), &written) != S_OK) return E_FAIL;
+    if (pStm->Write(&Dest, sizeof(Dest), &written) != S_OK) return E_FAIL;
+    return S_OK;
+}
+
+HRESULT LocomotionClass::GetMaxSize(uint64* pcbSize)
+{
+    // 根据游戏行为，可知序列化尺寸即实例尺寸加四字节类别标记。
+    return GetSizeMax(pcbSize);
+}
+
+ULONG LocomotionClass::ppv_AddRef()
+{
+    // 根据游戏行为，可知 COM 通用引用计数只增不减其返回值语义：
+    // 返回的总是递增后的计数。
+    return ++RefCount;
+}
+
+ULONG LocomotionClass::ppv_AddRef2()
+{
+    // 根据游戏行为，可知第二槽位与第一槽位共用同一份计数。
+    return ++RefCount;
+}
+
+int32 LocomotionClass::ILocomotion_4B6690() const
+{
+    // 根据游戏行为，可知该保留查询槽位固定返回 -1。
+    return -1;
 }

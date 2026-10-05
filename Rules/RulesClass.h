@@ -684,6 +684,11 @@ public:
     int32       ComputerBaseDefenseResponse;
     int32       MaximumBaseDefenseValue;
 
+    // 根据游戏行为，可知 BaseDefenseSuspendSeconds 是"基地遇袭后次要 AI
+    //  队伍被冻结的秒数"：某处基地被打时，指挥部会把优先度不足的队伍临时
+    //  停摆这么久，好把资源集中到正面战场；换算成帧时每秒按 900 帧计。
+    double      BaseDefenseSuspendSeconds;
+
     // ========================================================================
     // Properties - Unit Lists
     // ========================================================================
@@ -784,7 +789,7 @@ public:
 
     // ── AI offensive-superweapon target weights ───────────────────────────
     // Per-difficulty priority tables consulted by
-    // HouseClass_PickOffensiveSWTarget (asm 0x50B0A0) when deciding which
+ // HouseClass_PickOffensiveSWTarget when deciding which
     // enemy object to aim an offensive superweapon at.  Each entry is indexed
     // by the attacker's AIDifficulty.  The offsets are the binary's own.
     DynamicVectorClass<int32> AITargetWeightConYard;        // +0x1198

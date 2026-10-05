@@ -52,6 +52,8 @@ public:
     bool ProcessDescending();
     bool ProcessCrash();
     void FindLandingZone();
+    // 根据游戏行为，可知跳跃喷气移位在挪位前确认目标点上空无占用。
+    static bool LocationClear(const CoordStruct& coord);
     bool IsValidLandingCell() const;
 
     JumpjetLocomotionClass();

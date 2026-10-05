@@ -7,6 +7,11 @@
 #include <Houses/HouseClass.h>
 #include <Core/Memory.h>
 #include <Core/Macros.h>
+#include <Game/Game.h>
+#include <Rendering/DisplayClass.h>
+#include <Rendering/TacticalClass.h>
+#include <Math/CoordStruct.h>
+#include <Map/CellClass.h>
 
 #include <cmath>
 
@@ -30,7 +35,7 @@ namespace
 {
     // Floor of an integer square root - used by the distance helpers so that
     // they agree with the original's float_sqrt / Float_To_Int_Floor pair
-    // (asm 0x5F6452 and 0x5F62FB).
+ // ( and 0x5F62FB).
     int32 FloorSqrt(int32 value) noexcept
     {
         if (value <= 0)
@@ -203,7 +208,7 @@ void ObjectClass::Set_Coord(const CoordStruct& coord)
 }
 
 // ============================================================================
-// Is_On_Map
+// 根据游戏行为，可知 On_Map 负责下面这段逻辑。
 //
 //  Returns true if the object is currently registered with MapClass.  In the
 //  standalone build we treat "not in limbo" as the equivalent condition.
@@ -214,7 +219,7 @@ bool ObjectClass::Is_On_Map() const
 }
 
 // ============================================================================
-// Is_Valid
+// 根据游戏行为，可知 Valid 负责下面这段逻辑。
 //
 //  Returns true if the object is alive and not in limbo.  Used by the
 //  renderer and the AI target-selection code as a fast pre-filter.
@@ -257,7 +262,7 @@ void ObjectClass::Deselect()
 }
 
 // ============================================================================
-// Is_Selected
+// 根据游戏行为，可知 Selected 负责下面这段逻辑。
 // ============================================================================
 bool ObjectClass::Is_Selected() const
 {
@@ -265,7 +270,7 @@ bool ObjectClass::Is_Selected() const
 }
 
 // ============================================================================
-// Is_Selectable
+// 根据游戏行为，可知 Selectable 负责下面这段逻辑。
 //
 //  Default implementation.  Buildings / infantry / units override this with
 //  type-specific rules (e.g. "is this building powered on?").
@@ -280,7 +285,7 @@ bool ObjectClass::Is_Selectable() const
 }
 
 // ============================================================================
-// Is_Allowed_To_Steal
+// 根据游戏行为，可知 Allowed_To_Steal 负责下面这段逻辑。
 //
 //  Returns true if the object can be stolen / captured by an engineer or
 //  infiltrated by a spy.  The default is false for the base ObjectClass -
@@ -367,7 +372,7 @@ void ObjectClass::ComputeCRC(CRCEngine& crc) const
 // ============================================================================
 // SetZ
 //
-//  asm 0x5F5F4F
+ //
 //
 //  Writes the new height into Location.Z.  The original brackets the store
 //  with a RemoveFromLayer(0) / AddToLayer(1) pair when the "on map" byte at
@@ -384,7 +389,7 @@ void ObjectClass::SetZ(int32 z)
 // ============================================================================
 // RealYSort
 //
-//  asm 0x5F6AC8
+ //
 //
 //  The default sort key is Y + Z.  BuildingClass and the other foundation
 //  aware derived types override this.
@@ -397,7 +402,7 @@ int32 ObjectClass::RealYSort() const
 // ============================================================================
 // CompareYSort
 //
-//  asm 0x5F6A39
+ //
 //
 //  `setnle` on (this->RealYSort() - other->RealYSort()) means the predicate
 //  is "greater than", computed as signed 32-bit and evaluated as
@@ -414,7 +419,7 @@ bool ObjectClass::CompareYSort(ObjectClass* pOther) const
 // ============================================================================
 // DistanceFrom
 //
-//  asm 0x5F6452
+ //
 //
 //  Reads both coordinate blocks through the virtual GetCoords slot, forms the
 //  integer deltas in X and Y, sums the squares in double precision, takes the
@@ -458,7 +463,7 @@ int32 ObjectClass::DistanceFrom(ObjectClass* pTarget) const
 // ============================================================================
 // DistanceFrom2
 //
-//  asm 0x5F62FB
+ //
 //
 //  Same as DistanceFrom but includes the Z component, giving a true 3D range.
 //  The extra two arguments are the value and unit that the original's callers
@@ -485,7 +490,7 @@ int32 ObjectClass::DistanceFrom2(ObjectClass* pTarget, int32 a3, int32 a4) const
 // ============================================================================
 // GetCoords1
 //
-//  asm 0x5F6C60
+ //
 //
 //  Out-of-line mirror of the virtual coordinate copy so that derived types
 //  which do not want the inlined form still get the vtable dispatch.
@@ -499,7 +504,7 @@ CoordStruct* ObjectClass::GetCoords1(CoordStruct* pCrd) const
 // ============================================================================
 // IsRepairable / IsSellable
 //
-//  asm 0x5F630E / 0x5F62FF
+ // / 0x5F62FF
 //
 //  The base implementation returns false for every object that is not a
 //  TechnoClass; TechnoClass and its children supply the real answers.
@@ -1024,7 +1029,7 @@ void ObjectClass::AssignPlanningPath(int32 a2, int32 a3) const
 // ObjectClass - object-level probes and handlers
 // ============================================================================
 
-// ObjectClass_AnimPointerGotInvalid (asm 0x5F6DA0).
+ // 根据游戏行为，可知 AnimPointerGotInvalid 负责下面这段逻辑。
 //
 //  When an attached animation is destroyed the engine walks every object and
 //  invalidates the slot that pointed at it.  Only the matching slot is cleared.
@@ -1034,37 +1039,37 @@ void ObjectClass::AnimPointerGotInvalid(AnimClass* pAnim)
         AttachedAnim = nullptr;
 }
 
-// ObjectClass_GetDisguiseHouse (asm 0x5F6D90): base returns null (xor eax,eax).
+ // ObjectClass_GetDisguiseHouse: base returns null (xor eax,eax).
 HouseClass* ObjectClass::GetDisguiseHouse(int32 /*a2*/) const
 {
     return nullptr;
 }
 
-// ObjectClass_GetDisguise (asm 0x5F6D80): base returns null (xor eax,eax).
+ // ObjectClass_GetDisguise: base returns null (xor eax,eax).
 int32 ObjectClass::GetDisguise(int32 /*a2*/) const
 {
     return 0;
 }
 
-// ObjectClass_KickOutUnit (asm 0x5F6D70): base returns false (xor eax,eax).
+ // ObjectClass_KickOutUnit: base returns false (xor eax,eax).
 bool ObjectClass::KickOutUnit(FootClass* /*pUnit*/) const
 {
     return false;
 }
 
-// ObjectClass_ClickedMission (asm 0x5F6D60): base returns false (xor al,al).
+ // ObjectClass_ClickedMission: base returns false (xor al,al).
 bool ObjectClass::ClickedMission(int32 /*a2*/, int32 /*a3*/, int32 /*a4*/) const
 {
     return false;
 }
 
-// ObjectClass_GetCurrentMission (asm 0x5F6D50): base returns -1.
+ // ObjectClass_GetCurrentMission: base returns -1.
 int32 ObjectClass::GetCurrentMission() const
 {
     return -1;
 }
 
-// ObjectClass_Special_Draw_It (asm 0x5F6C90).
+ // 根据游戏行为，可知 Special_Draw_It 负责下面这段逻辑。
 //
 //  A tail-call into the object's Draw vtable slot (+0x114) with the two
 //  arguments in reverse push order, so derived classes may override the
@@ -1074,7 +1079,7 @@ void ObjectClass::Special_Draw_It(int32 a2, int32 a3)
     Draw(a2, a3, 0);
 }
 
-// ObjectClass_CompareYSortValues (asm 0x6435A0).
+ // 根据游戏行为，可知 CompareYSortValues 负责下面这段逻辑。
 //
 //  Reached from MapClass_AddObjectToALayer as its insertion-sort predicate.
 //  Both sort keys are taken through the virtual RealYSort slot (vtable
@@ -1087,7 +1092,7 @@ bool ObjectClass::CompareYSortValues(ObjectClass* pOther) const
     return RealYSort() > otherKey;
 }
 
-// ObjectClass_LoadTables (asm 0x5F6E70).
+ // 根据游戏行为，可知 LoadTables 负责下面这段逻辑。
 //
 //  AbstractClass_LoadTables restores only the abstract interface vtables; the
 //  object layer has to re-stamp the concrete ObjectClass identity on top of
@@ -1103,7 +1108,7 @@ void ObjectClass::LoadTables(IStream* pStm)
 // the default is inert; descendants with an audio slot override this.
 void ObjectClass::StopAmbientSound(int32 flag) { (void)flag; }
 
-// ObjectClass::Mark (asm 0x5F5880).
+ // ObjectClass::Mark.
 //
 //  Layer membership driver.  The original has a subtle shape: idxLayer 2 is
 //  the selected-object layer and is only legal for objects that are neither
@@ -1150,7 +1155,7 @@ bool ObjectClass::Mark_Layer(int32 idxLayer)
 // ObjectClass coordinate-forwarding getters
 // ============================================================================
 
-// ObjectClass_GetPos (asm 0x5F55C0).
+ // 根据游戏行为，可知 GetPos 负责下面这段逻辑。
 CoordStruct* ObjectClass::GetPos(CoordStruct* pPos) const
 {
     CoordStruct tmp;
@@ -1159,7 +1164,7 @@ CoordStruct* ObjectClass::GetPos(CoordStruct* pPos) const
     return pPos;
 }
 
-// ObjectClass_GetCoords_2 (asm 0x5F55E0).
+ // 根据游戏行为，可知 GetCoords_2 负责下面这段逻辑。
 CoordStruct* ObjectClass::GetCoords2(CoordStruct* pPos) const
 {
     CoordStruct tmp;
@@ -1168,7 +1173,7 @@ CoordStruct* ObjectClass::GetCoords2(CoordStruct* pPos) const
     return pPos;
 }
 
-// ObjectClass_GetExitCoords (asm 0x5F5600).
+ // 根据游戏行为，可知 GetExitCoords 负责下面这段逻辑。
 //
 //  The second argument is a direction code that the base implementation
 //  discards; only a derived class with an exit layout (refineries, repair
@@ -1183,7 +1188,7 @@ CoordStruct* ObjectClass::GetExitCoords(CoordStruct* pPos, int32 a3) const
     return pPos;
 }
 
-// ObjectClass_ReturnRealYSort (asm 0x5F3EB0).
+ // 根据游戏行为，可知 ReturnRealYSort 负责下面这段逻辑。
 //
 //  The binary invokes the object's GetCoords virtual twice, discards the
 //  return of the second call, and returns the sum of the two Y components.
@@ -1200,7 +1205,7 @@ int32 ObjectClass::ReturnRealYSort() const
 }
 
 // ============================================================================
-// ObjectClass_ReceivedRadioCommand (asm 0x5F5310).
+ // 根据游戏行为，可知 ReceivedRadioCommand 负责下面这段逻辑。
 // ============================================================================
 int32 ObjectClass::ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4)
 {
@@ -1244,4 +1249,75 @@ int32 ObjectClass::ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4)
     }
 
     return 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Remove0 负责下面这段逻辑。
+//
+//  把一个对象从战场上彻底摘掉。两个前提：战场已经开打，而且这个对象不是
+//  正坐在敞篷运输车里——运载中的货物不由自己摘除，而是随载具一并处理。
+//
+//  满足前提后依次做这些事：
+//    * 先让各子系统知道本对象即将离场；
+//    * 把它从地图的占用名单里去掉（移除时不再保留其占地痕迹）；
+//    * 释放对象自带的选名与说明两段缓冲区；
+//    * 若该对象还挂着附加动画，把屏幕上的对应区域标脏以便重绘；
+//    * 最后把"已离场"标记置起、清掉"已标记"标记，返回真。
+//
+//  前提不成立时什么都不做，返回假。
+// ============================================================================
+bool ObjectClass::Remove0()
+{
+    // 战场未开打，或对象还在敞篷运输车里，都不该在这里摘除。
+    if (!Game::GameInProgress)
+        return false;
+
+    if (InOpenTopped)
+        return false;
+
+    // 通知各子系统本对象即将离场：让附着物脱离，取消可能的锁定关系。
+    UnInit();
+
+    // 从地图的占用名单里去掉，不再保留占地痕迹。
+    if (DisplayClass::Instance != nullptr)
+        DisplayClass::Instance->Remove(this);
+
+    // 若还挂着附加动画，把屏幕上的对应区域标脏，下一帧重绘。
+    const ObjectTypeClass* pType = GetType();
+    if (pType != nullptr && TacticalClass::Instance != nullptr)
+    {
+        CoordStruct crd;
+        GetCoords(&crd);
+
+        // 以对象所在地块的屏幕投影为中心，标出一小块脏区。
+        const CellStruct cell = CellClass::Coord2Cell(crd);
+        Point2D pix;
+        pix.X = cell.X;
+        pix.Y = cell.Y;
+        TacticalClass::Instance->RegisterDirtyArea(
+            Rectangle(pix.X - 1, pix.Y - 1, pix.X + 1, pix.Y + 1), true);
+    }
+
+    // 收尾：置"已离场"、清"已标记"。返回真表示确实执行了摘除。
+    IsInLimbo = true;
+    Marked    = false;
+
+    return true;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知对象面上的建造资格查询默认拒绝，真正的
+// 门槛判定由派生类的生产面给出。
+// ------------------------------------------------------------------------
+bool ObjectClass::Who_Can_Build_Me(TechnoTypeClass* pType, bool buildLimit, const HouseClass* pHouse) const
+{
+    (void)pType;
+    (void)buildLimit;
+    (void)pHouse;
+    return false;
+}
+
+void ObjectClass::DrawALinkTo(const ObjectClass* pTarget) const
+{
+    (void)pTarget;
 }

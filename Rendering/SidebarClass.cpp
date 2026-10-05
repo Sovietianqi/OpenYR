@@ -473,6 +473,7 @@ wchar_t SidebarClass::TooltipBuffer[0x42] = {0};
 SidebarClass::SidebarClass()
     : unknown_5394(0)
     , unknown_5398(0)
+    , PlayerInfiltrated(0)
     , ActiveTabIndex(0)
     , unknown_53A0(0)
     , HideObjectNameInTooltip(false)

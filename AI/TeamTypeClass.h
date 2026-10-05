@@ -74,6 +74,22 @@ public:
     bool Is_Transports_Return() const;
     bool Is_Allowed_Difficulty(int32 difficulty) const;
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知队伍类型补全原版命名形态：按字符串/航点号/
+    // 运输航点号查找类型；把名下所有活动队闪标切换；成员生成与超时空
+    // 进入是队伍投产的两个入口。
+    // ------------------------------------------------------------------------
+    static TeamTypeClass* FindByString(const char* pID);
+    static TeamTypeClass* FindWaypoint(int32 waypoint);
+    static TeamTypeClass* FindTransportWaypoint(int32 waypoint);
+    void SetAllFlashing(bool flash);
+    void CreateMembers();
+    void ChronoIn();
+
+    // 航点登记：-1 表示未与航点挂钩。
+    int32 Waypoint = -1;
+    int32 TransportWaypoint = -1;
+
     ScriptTypeClass* ScriptType;
     ScriptTypeClass* ReplayScriptType;
     TaskForceClass*  TaskForce;

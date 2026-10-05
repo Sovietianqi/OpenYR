@@ -46,7 +46,7 @@ public:
     virtual bool SaveToINI(CCINIClass* pINI) override;
     virtual int32 Size() const override;
     virtual HRESULT __stdcall GetClassID(CLSID* pClassID) override;
-    // HouseTypeClass_IsDirty (asm 0x4E9xxx): the stream is never dirty - a type
+ // HouseTypeClass_IsDirty (xxx): the stream is never dirty - a type
     //   record is rebuilt from the INI rather than round-tripped through a save.
     virtual HRESULT __stdcall IsDirty() override { return 0; }
     virtual AbstractType WhatAmI() const override;
@@ -62,6 +62,7 @@ public:
     // Static factory methods
     // ========================================================================
     static HouseTypeClass* FindOrAllocate(const char* pID);
+    static HouseTypeClass* FindOrAllocate_YesMP(const char* pID);
     static HouseTypeClass* Find(const char* pID);
     static int32 FindIndex(const char* pID);
     static int32 FindIndexOfName(const char* pName);
@@ -381,6 +382,16 @@ inline HouseTypeClass* HouseTypeClass::Find(const char* pID) {
             return Array[i];
     }
     return nullptr;
+}
+
+inline HouseTypeClass* HouseTypeClass::FindOrAllocate_YesMP(const char* pID) {
+    // 根据游戏行为，可知多人变体在"找到即用"的同时顺手把可用多人标志
+    // 置真：没有可用项就分配一个新的，同样置真后返回。
+    HouseTypeClass* pType = FindOrAllocate(pID);
+    if (pType) {
+        pType->Multiplay = true;
+    }
+    return pType;
 }
 
 inline int32 HouseTypeClass::FindIndex(const char* pID) {

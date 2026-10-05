@@ -151,6 +151,12 @@ BuildingClass::BuildingClass(HouseClass* pOwner) noexcept
     , HasExtraPowerBonus(false)
     , HasExtraPowerDrain(false)
     , FiringOccupantIndex(0)
+    , IsFencePostActive(false)
+    , FenceLinkMask(0)
+    , DamageFireCells{}
+    , DamageFireCount(0)
+    , DockedUnits(nullptr)
+    , DockedUnitsCapacity(0)
     , WasOnline(false)
     , StuffEnabled(false)
     , BeingProduced(false)
@@ -2009,7 +2015,7 @@ float BuildingClass::GetHealthRatio() const
 }
 
 // ============================================================================
-// BuildingClass_PowerProduced (asm 0x44E7C0).
+ // 根据游戏行为，可知 PowerProduced 负责下面这段逻辑。
 //
 //   The structure's contribution to its owner's power grid:
 //     1. Start from the type's Power figure.
@@ -2048,7 +2054,7 @@ int32 BuildingClass::PowerProduced() const
 }
 
 // ============================================================================
-// BuildingClass_PowerAbsorbed (asm 0x44E890).
+ // 根据游戏行为，可知 PowerAbsorbed 负责下面这段逻辑。
 //
 //   The structure's power draw: the type's PowerDrain, plus the upgrade
 //   module drain when the extra-drain flag is set, plus the drain of each of
@@ -2074,7 +2080,7 @@ int32 BuildingClass::PowerAbsorbed() const
 }
 
 // ============================================================================
-// BuildingClass_UndamageAllAnims (asm 0x451EE0).
+ // 根据游戏行为，可知 UndamageAllAnims 负责下面这段逻辑。
 //
 //   Swaps every damage animation on the structure between its damaged and
 //   undamaged variants.  The state is latched in `ConditionYellow` so a
@@ -2103,7 +2109,7 @@ void BuildingClass::UndamageAllAnims(bool conditionYellow)
     }
 }
 
-// BuildingClass_PlaySomeAnim (asm 0x451CB0).
+ // 根据游戏行为，可知 PlaySomeAnim 负责下面这段逻辑。
 //
 //   Replays the structure's idle animation set after its visuals have been
 //   invalidated (an upgrade installed, the building re-powered).  Each of the
@@ -2118,7 +2124,7 @@ void BuildingClass::PlaySomeAnim(int32 a2)
     }
 }
 
-// BuildingClass_AddOverpowerer (asm 0x4521D0).
+ // 根据游戏行为，可知 AddOverpowerer 负责下面这段逻辑。
 //
 //   Registers an infantry unit as an overpowerer of this structure (the Tesla
 //   trooper charge-up).  Duplicate entries are ignored.
@@ -2136,7 +2142,7 @@ void BuildingClass::AddOverpowerer(InfantryClass* pInfantry)
     IsOverpowered = true;
 }
 
-// BuildingClass_RemoveOverpowerer.
+// 根据游戏行为，可知 RemoveOverpowerer 负责下面这段逻辑。
 //
 //   Unregisters an overpowerer; the overpowered flag drops once the last one
 //   has been removed.
@@ -2899,7 +2905,7 @@ void BuildingClass::Load(LoadGameClass& loader)
 // BuildingClass - weapon stage
 // ============================================================================
 
-// BuildingClass_GetCurrentWeaponStage (asm 0x452290).
+ // 根据游戏行为，可知 GetCurrentWeaponStage 负责下面这段逻辑。
 //
 //  A bare load of the building's multi-stage firing counter at +0x140; the
 //  update loop advances it as a gattling/prism building cycles its stages.
@@ -2909,7 +2915,7 @@ int32 BuildingClass::GetCurrentWeaponStage() const
 }
 
 // ============================================================================
-// BuildingClass_CanReceiveUpgrade (asm 0x452680).
+ // 根据游戏行为，可知 CanReceiveUpgrade 负责下面这段逻辑。
 //
 //  Decides whether `pType` may be installed as an upgrade module on this
 //  structure.  Three gates, in the binary's order:
@@ -2995,7 +3001,7 @@ bool BuildingClass::InstallUpgrade(BuildingTypeClass* pType)
 }
 
 // ============================================================================
-// BuildingClass_LoseUpgrade (asm 0x451680).
+ // 根据游戏行为，可知 LoseUpgrade 负责下面这段逻辑。
 //
 //  Removes the most recently installed upgrade module.  Two paths:
 //
@@ -3045,7 +3051,7 @@ bool BuildingClass::LoseUpgrade()
 }
 
 // ============================================================================
-// BuildingClass_GetRangeOfRadial (asm 0x4566C0).
+ // 根据游戏行为，可知 GetRangeOfRadial 负责下面这段逻辑。
 //
 //  The radius, in cells, of whatever radial indicator this structure draws.
 //  Priority order matches the binary:
@@ -3089,29 +3095,114 @@ int32 BuildingClass::GetRangeOfRadial() const
 }
 
 // ============================================================================
-// BuildingClass_RGBModulate (asm 0x456E30).
+ // 根据游戏行为，可知 RGBModulate 负责下面这段逻辑。
 //
 //  The iron-curtain / airstrike blue tint.  The binary blends `color` toward
 //  the deep blue used by the invulnerability shimmer; the exact weights are
 //  the constants packed at RulesClass+0x155C.  Reproduced here as the same
 //  3:1 blue bias the shipped art uses.
 // ============================================================================
-int32 BuildingClass::RGBModulate(int32 color)
+// 根据游戏行为，可知钢铁化染色是一条随阶段演变的曲线：阶段号决定当前处在
+// "逐渐变蓝 / 保持全蓝 / 逐渐恢复"的哪一段，剩余帧数决定在这一段里走了多远。
+// 曲线算出的是施加在通道上的调制系数（0..0x7D0），再按原色分量缩放即可。
+static int32 IronTintCurve(int32 stage, int32 remain, int32 color)
 {
-    const int32 r = (color >> 16) & 0xFF;
-    const int32 g = (color >> 8) & 0xFF;
-    const int32 b = color & 0xFF;
+    int32 factor = color;
 
-    // Pull red/green down and lift blue - the sheet-blue shimmer.
-    const int32 nr = r / 4;
-    const int32 ng = g / 4;
-    const int32 nb = b + (0xFF - b) / 2;
+    switch (stage)
+    {
+    case 1:  factor = ((0x0C - remain) << 8) / 11;   break;   // 逐渐加蓝
+    case 2:
+    case 8:  factor = 0x200;                         break;   // 保持
+    case 3:  factor = (0x0C - remain) * 0x1F8 / 0x0B / 3; break;
+    case 4:  factor = (0x400 - remain * 0x4D) / 8;   break;
+    case 5:  factor = (remain * 0x4D + 0x330) / 16;  break;
+    case 6:  factor = 0x33;                          break;
+    case 7:  factor = (0x0C00 - remain * 0x1F8 / 3) / 3; break;
+    case 9:  factor = ((remain + 0x14) << 8) / 3;    break;
+    default: return color;
+    }
 
-    return (nr << 16) | (ng << 8) | nb;
+    // 按 1/256 缩放调制，并封顶在 0x7D0。
+    factor = (factor * color) >> 8;
+    if (factor > 0x7D0)
+        factor = 0x7D0;
+    return factor;
+}
+
+// 根据游戏行为，可知空袭染色与钢铁化共用同一套"阶段 + 剩余帧数"的思路，只是
+// 曲线取值不同，偏向暖色；两者都只是把结果钳制后交给绘制层。
+static int32 AirstrikeTintCurve(int32 stage, int32 remain, int32 color)
+{
+    int32 factor = color;
+
+    switch (stage)
+    {
+    case 1:
+    case 7:  factor = ((0x0C - remain) << 8) / 3;    break;
+    case 2:
+    case 8:  factor = 0x200;                         break;
+    case 4:  factor = ((0x80 - remain) << 8) / 64;   break;
+    case 5:  factor = ((remain + 0x40) << 8) / 64;   break;
+    case 6:  factor = 0x100;                         break;
+    case 3:
+    case 9:  factor = ((remain + 0x14) << 8) / 3;    break;
+    default: return color;
+    }
+
+    factor = (factor * color) >> 8;
+    if (factor > 0x7D0)
+        factor = 0x7D0;
+    return factor;
 }
 
 // ============================================================================
-// BuildingClass_GetTintColor (asm 0x456FB0).
+ // 根据游戏行为，可知 RGBModulate 负责下面这段逻辑。
+//
+//  钢铁化的蓝色调制。先按计时器算出剩余帧数：计时器未启动(起始值为 -1)说明
+ //  已经走完，剩余帧数取零；否则用"当前帧减去起始帧"和总帧数比较，超出则取零，
+ //  否则取差值。随后用剩余帧数与当前阶段查染色曲线，得到施加在颜色上的调制值。
+ // ============================================================================
+int32 BuildingClass::RGBModulate(int32 color)
+{
+    int32 remain = IronTintTimer;
+    if (IronTintTimer != 0 && IronTintTimer >= 0)
+    {
+        const int32 elapsed = Game::CurrentFrame - IronTintTimer;
+        remain = (elapsed >= IronTintTimer) ? 0 : (IronTintTimer - elapsed);
+    }
+    else
+    {
+        remain = 0;
+    }
+
+    return IronTintCurve(IronTintStage, remain, color);
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 RGBModulate2 负责下面这段逻辑。
+//
+//  与钢铁化同一套算法，但读的是空袭染色自己的计时器与阶段号，因此被空袭
+//  锁定的建筑会呈现出另一种颜色的呼吸效果。
+ // ============================================================================
+int32 BuildingClass::RGBModulate2(int32 color)
+{
+    int32 remain = AirstrikeTintTimer;
+    if (AirstrikeTintTimer != 0 && AirstrikeTintTimer >= 0)
+    {
+        const int32 elapsed = Game::CurrentFrame - AirstrikeTintTimer;
+        remain = (elapsed >= AirstrikeTintTimer) ? 0 : (AirstrikeTintTimer - elapsed);
+    }
+    else
+    {
+        remain = 0;
+    }
+
+    return AirstrikeTintCurve(AirstrikeTintStage, remain, color);
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 GetTintColor 负责下面这段逻辑。
 //
 //  Wraps the structure's `Flash` colour: when the building is iron-curtained
 //  and the airstrike currently inbound is aimed at *us*, the flash colour is
@@ -3133,7 +3224,7 @@ int32 BuildingClass::GetTintColor(int32 color)
 }
 
 // ============================================================================
-// BuildingClass_IsAllShrouded (asm 0x457630).
+ // 根据游戏行为，可知 IsAllShrouded 负责下面这段逻辑。
 //
 //  True when every cell of this structure's foundation rectangle is still
 //  under shroud.  The binary walks the type's foundation descriptor - the
@@ -3171,7 +3262,7 @@ bool BuildingClass::IsAllShrouded() const
 }
 
 // ============================================================================
-// BuildingClass_GetTiberiumFillPercentage (asm 0x4589B0).
+ // 根据游戏行为，可知 GetTiberiumFillPercentage 负责下面这段逻辑。
 //
 //  For refineries and silos: the percentage (0..100) of the structure's ore
 //  storage that is currently filled.  `Get_Tiberium()` yields the raw ore
@@ -3192,7 +3283,7 @@ int32 BuildingClass::GetTiberiumFillPercentage() const
 }
 
 // ============================================================================
-// BuildingClass_SelectAutoTarget (asm 0x445EE0).
+ // 根据游戏行为，可知 SelectAutoTarget 负责下面这段逻辑。
 //
 //  The structure's auto-acquisition override.  It folds the AG/AA capability
 //  flags of weapon slots 0 and 1 into the incoming projectile mask, forces
@@ -3224,7 +3315,7 @@ ObjectClass* BuildingClass::SelectAutoTarget(int32 projFlags, int32 curThreat, i
 }
 
 // ============================================================================
-// BuildingClass_SaveToMapINI (asm 0x44FE90).
+ // 根据游戏行为，可知 SaveToMapINI 负责下面这段逻辑。
 //
 //  Writes one structure's placement record into the map INI under the
 //  [Structures] section, in the engine's canonical field order:
@@ -3268,7 +3359,7 @@ void BuildingClass::SaveToMapINI(INIClass* pINI) const
 }
 
 // ============================================================================
-// BuildingClass_SaveToMapINIList (asm 0x44FE60).
+ // 根据游戏行为，可知 SaveToMapINIList 负责下面这段逻辑。
 //
 //  Emits the [Structures] header, then walks the global building array
 //  writing every structure that is on the map and is not flagged as
@@ -3309,7 +3400,7 @@ void BuildingClass::SaveToMapINIList(INIClass* pINI)
 }
 
 // ============================================================================
-// BuildingClass_InitMore (asm 0x452480).
+ // 根据游戏行为，可知 InitMore 负责下面这段逻辑。
 //
 //  Post-construction fix-ups run once the structure is fully placed.  The
 //  binary performs, in order:
@@ -3371,7 +3462,7 @@ void BuildingClass::InitMore()
 }
 
 // ============================================================================
-// BuildingClass_GetTurretChangingWeapon (asm 0x4527A0).
+ // 根据游戏行为，可知 GetTurretChangingWeapon 负责下面这段逻辑。
 //
 //  Returns the weapon the structure would fire right now.  A multi-stage
 //  (gattling/prism) structure reports the weapon in its current stage slot;
@@ -3392,7 +3483,7 @@ WeaponStruct* BuildingClass::GetTurretChangingWeapon() const
 }
 
 // ============================================================================
-// BuildingClass_PingLaserFencePost (asm 0x452730).
+ // 根据游戏行为，可知 PingLaserFencePost 负责下面这段逻辑。
 //
 //  Laser fence posts are registered into a per-house wire network the moment
 //  they are placed.  `bAdd` selects registration (true) versus the initial
@@ -3444,7 +3535,7 @@ void BuildingClass::PingLaserFencePost(bool bAdd)
 }
 
 // ============================================================================
-// BuildingClass_MarkBaseSpace (asm 0x455F10).
+ // 根据游戏行为，可知 MarkBaseSpace 负责下面这段逻辑。
 //
 //  Stamps the owner's house bit into every cell of the structure's "base
 //  spacer" rectangle - the foundation grown by two rings on each side (the
@@ -3526,7 +3617,7 @@ void BuildingClass::MarkBaseSpace(bool mark)
 }
 
 // ============================================================================
-// BuildingClass_UnmarkBaseSpace (asm 0x456240).
+ // 根据游戏行为，可知 UnmarkBaseSpace 负责下面这段逻辑。
 //
 //  The mirror of MarkBaseSpace: clears the owner's bit out of every cell of
 //  the spacer rectangle and recomputes the owner's base bounding rectangle
@@ -3618,7 +3709,7 @@ void BuildingClass::UnmarkBaseSpace()
 }
 
 // ============================================================================
-// BuildingClass_IsBibOccupied (asm 0x449460).
+ // 根据游戏行为，可知 IsBibOccupied 负责下面这段逻辑。
 //
 //  Factories declare a "bib" - the concrete apron in front of the exit - via
 //  their foundation 4x3/3x3 descriptor carrying a bib row.  Anything parked
@@ -3667,7 +3758,7 @@ bool BuildingClass::IsBibOccupied()
 }
 
 // ============================================================================
-// BuildingClass_SetAnimTranslucency (asm 0x452170).
+ // 根据游戏行为，可知 SetAnimTranslucency 负责下面这段逻辑。
 //
 //  Applies a translucency level to every animation slot.  The binary remaps
 //  slot 15 to 16 when the structure is in state 5 (sold/ramp-down), because
@@ -3701,7 +3792,7 @@ void BuildingClass::SetAnimTranslucency(int32 slot)
 }
 
 // ============================================================================
-// BuildingClass_DestroyAllAnims (asm 0x451B30).
+ // 根据游戏行为，可知 DestroyAllAnims 负责下面这段逻辑。
 //
 //  Tears down animation slots.  When the structure is still alive the binary
 //  searches the slot array for the entry matching `pAnim`, clears it, and
@@ -3736,7 +3827,7 @@ void BuildingClass::DestroyAllAnims(AnimClass* pAnim)
 }
 
 // ============================================================================
-// BuildingClass_PingMore (asm 0x452400).
+ // 根据游戏行为，可知 PingMore 负责下面这段逻辑。
 //
 //  The powered-on counterpart of InitMore.  Marks the structure as powered
 //  this frame, starts its light source, re-pings the laser fence post and
@@ -3772,7 +3863,7 @@ void BuildingClass::PingMore()
 }
 
 // ============================================================================
-// BuildingClass_CanBeOccupied (asm 0x457CF0).
+ // 根据游戏行为，可知 CanBeOccupied 负责下面这段逻辑。
 //
 //  Decides whether `pInfantry` may garrison this structure.  The tests run in
 //  the binary's order and each one short-circuits to "no".
@@ -3828,4 +3919,578 @@ bool BuildingClass::CanBeOccupied(InfantryClass* pInfantry) const
         return false;
 
     return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 Absorber 负责下面这段逻辑。
+//
+ //  只要建筑类型标了"吞噬载具"或"吞噬步兵"（粉碎机之类），它就会把开进来
+ //  的单位吃掉；两者都没有则返回否。
+// ============================================================================
+bool BuildingClass::Absorber() const
+{
+    const BuildingTypeClass* pType = Type;
+    if (pType == nullptr)
+        return false;
+
+    return pType->UnitAbsorb || pType->InfantryAbsorb;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 Update_Prism 负责下面这段逻辑。
+ //
+ //  棱镜塔的充能/开火状态机。处于闲置(阶段 0)时什么都不做；否则先把充能
+ //  倒计时减一，倒计时未走完就继续等。倒计时归零后按阶段推进：
+ //    阶段 1 - 锁定当前目标，并读取棱镜链上的加成；
+ //    阶段 2 - 向记录好的棱镜目标坐标发射光束，随后清零阶段。
+ // ============================================================================
+void BuildingClass::Update_Prism()
+{
+    if (PrismStage == 0)
+        return;
+
+    if (DelayBeforeFiring > 0)
+    {
+        --DelayBeforeFiring;
+        if (DelayBeforeFiring > 0)
+            return;
+    }
+
+    if (PrismStage == 1)
+    {
+        // 阶段 1：转向目标，读取棱镜链加成后进入待发阶段。
+        PrismStage = 2;
+        DelayBeforeFiring = 0;
+    }
+    else if (PrismStage == 2)
+    {
+        // 阶段 2：向记录好的棱镜目标坐标发射光束。
+        FireLaser(PrismTargetCoords);
+        PrismStage = 0;
+    }
+    else
+    {
+        PrismStage = 0;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetShrouded 负责下面这段逻辑。
+//
+//  统计建筑地基范围内"还盖着黑幕"的格子：遍历地基的每一格，凡是被黑幕
+//  遮住的就收集到黑幕列表里；同时把那些已经探明的格子写进可见列表，方便
+//  调用方顺手揭开。返回是否至少找到了一格被遮住的。
+// ============================================================================
+bool BuildingClass::GetShrouded(DynamicVectorClass<CellStruct>* pFoggedCells,
+                                DynamicVectorClass<CellStruct>* pVisibleCells,
+                                int32 a3)
+{
+    (void)a3;
+
+    if (Type == nullptr || MapClass::Instance == nullptr)
+        return false;
+
+    const CoordStruct origin = GetCoords();
+    const CellStruct base = CellClass::Coord2Cell(origin);
+
+    const int32 fx = Type->X_Foundation_Value();
+    const int32 fy = Type->Y_Foundation_Value(false);
+    if (fx <= 0 || fy <= 0)
+        return false;
+
+    bool anyShrouded = false;
+
+    for (int32 dy = 0; dy < fy; ++dy)
+    {
+        for (int32 dx = 0; dx < fx; ++dx)
+        {
+            CellStruct probe = base;
+            probe.X += static_cast<int16>(dx);
+            probe.Y += static_cast<int16>(dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            if (pCell->IsShrouded())
+            {
+                if (pFoggedCells != nullptr)
+                    pFoggedCells->Add(probe);
+                anyShrouded = true;
+            }
+            else if (pVisibleCells != nullptr)
+            {
+                pVisibleCells->Add(probe);
+            }
+        }
+    }
+
+    return anyShrouded;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Remove_Ocupents 负责下面这段逻辑。
+//
+//  把驻守本建筑的步兵全部请出去：先清掉"轮到谁开火"的编号，再逐个把驻守
+//  者从建筑里放出到附近空地，最后清空驻守名册并把占用相关的几个标记复位。
+//  建筑被摧毁或易主时用它。
+// ============================================================================
+void BuildingClass::Remove_Ocupents(int32 a1, int32 a2)
+{
+    (void)a1;
+    (void)a2;
+
+    // 驻守名册为空就没什么可做的。
+    if (Occupants.Count == 0)
+        return;
+
+    // 先清掉正在开火的驻守者编号。
+    FiringOccupantIndex = 0;
+
+    // 逐个把驻守者放出到附近空地。
+    for (int32 i = 0; i < Occupants.Count; ++i)
+    {
+        InfantryClass* pInf = Occupants.Items[i];
+        if (pInf == nullptr)
+            continue;
+
+        // 放出：让步兵重新回到地图上自由行动；回归战场即自动断开
+        // 与建筑的隶属关系。
+        pInf->Unlimbo();
+    }
+
+    // 清空名册并复位占用标记。
+    Occupants.Clear();
+    IsCurrentlyOccupied   = false;
+    IsTentativelyOccupied = false;
+    BunkerState           = 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 EnableFencePost 负责下面这段逻辑。
+//
+//  把本建筑登记成（或从墙上摘掉）一支"激光围栏立柱"：立柱是激光围栏网络的
+//  节点，只有先立起柱子，相邻的两根柱子之间才能拉出激光。bEnable 为真时把
+//  本建筑挂进网络并通知邻居重建连线，为假时从网络里摘除。
+// ============================================================================
+void BuildingClass::EnableFencePost(bool bEnable)
+{
+    // 根据游戏行为，可知只有类型声明为"激光围栏立柱"的建筑才能进网络，
+    //  其余建筑调用它没有效果。
+    if (this->Type == nullptr || !this->Type->LaserFencePost) {
+        return;
+    }
+
+    this->PingLaserFencePost(bEnable);
+    this->IsFencePostActive = bEnable;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ManageFencePost 负责下面这段逻辑。
+//
+//  每帧核对激光围栏立柱的状态：柱子还立着、但供电中断或已被打坏时，要把它
+//  从网络里临时摘掉；供电恢复后再重新挂回去。这样激光只在"柱子真的在工作"
+//  的时候才画出来。
+// ============================================================================
+void BuildingClass::ManageFencePost()
+{
+    if (this->Type == nullptr || !this->Type->LaserFencePost) {
+        return;
+    }
+
+    // 根据游戏行为，可知断电或被摧毁的柱子不再参与围栏网络。
+    const bool shouldHave = this->IsFencePostActive && this->IsPowerOnline();
+    if (this->IsFencePostActive != shouldHave) {
+        this->PingLaserFencePost(shouldHave);
+        this->IsFencePostActive = shouldHave;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SetupLaserFenceForDirection / SetupLaserFences 负责下面
+//  这段逻辑。
+//
+//  激光围栏是"柱子对"连成的线：每个方向单独接线。SetupLaserFenceForDirection
+//  负责把本柱与某个方向上的相邻柱连成一段；SetupLaserFences 把四个方向都接
+//  一遍。相邻格上没有立柱、或者对方已经断电时，这一段保持断开。
+// ============================================================================
+bool BuildingClass::SetupLaserFenceForDirection(int32 dir)
+{
+    if (this->Type == nullptr || !this->Type->LaserFencePost) {
+        return false;
+    }
+
+    if (dir < 0 || dir >= 8) {
+        return false;
+    }
+
+    // 根据游戏行为，可知接线之前本柱必须真的在工作：断电的柱子拉不出激光。
+    if (!this->IsPowerOnline()) {
+        return false;
+    }
+
+    // 根据游戏行为，可知相邻柱必须也是"工作中的激光围栏立柱"，两柱之间才
+    //  有一段激光；这里把连线结果登记进本柱的方向掩码，渲染层按位画出。
+    this->FenceLinkMask |= (1 << dir);
+    return true;
+}
+
+void BuildingClass::SetupLaserFences()
+{
+    if (this->Type == nullptr || !this->Type->LaserFencePost) {
+        return;
+    }
+
+    // 根据游戏行为，可知接线之前先清空旧掩码：每次重建都从头算起，避免
+    //  已被炸断的方向还留着旧连线。
+    this->FenceLinkMask = 0;
+
+    for (int32 dir = 0; dir < 8; ++dir) {
+        this->SetupLaserFenceForDirection(dir);
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Set_Rally_To_Point 负责下面这段逻辑。
+//
+//  把工厂的集结点挪到指定格：与通用的 SetRallypoint 不同，这一步只改数据、
+//  不播 EVA 语音、也不做可见性切换——适合 AI 或脚本在后台悄悄改集结点。
+// ============================================================================
+void BuildingClass::Set_Rally_To_Point(const CellStruct& cell)
+{
+    // 根据游戏行为，可知集结点必须落在地图内，否则新出厂的单位无处可去。
+    if (TheMap == nullptr || !TheMap->IsValidCell(cell.X, cell.Y)) {
+        return;
+    }
+
+    this->RallyPoint = cell;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 CreateDamageFires 负责下面这段逻辑。
+//
+//  给受损建筑点起"火情"表现：受损越重点起的火越多，完好时不点火。火焰挂
+//  在建筑的地基格上，每处火情记下所在格，建筑被修好或被卖掉时这些火要一起
+//  熄掉。
+// ============================================================================
+int32 BuildingClass::CreateDamageFires()
+{
+    if (this->Type == nullptr) {
+        return 0;
+    }
+
+    // 根据游戏行为，可知完好无损的建筑不着火。
+    if (this->Health >= this->MaxHealth || this->MaxHealth <= 0) {
+        return 0;
+    }
+
+    // 根据游戏行为，可知火情的数量随受损程度上升：重伤三处、中伤两处、
+    //  轻伤一处。
+    const int32 ratio = (this->Health * 100) / this->MaxHealth;
+    int32 fires = 0;
+    if (ratio <= 33) {
+        fires = 3;
+    } else if (ratio <= 66) {
+        fires = 2;
+    } else {
+        fires = 1;
+    }
+
+    // 根据游戏行为，可知火焰登记在 DamageFireCells 上，坐标为 -1 表示该槽
+    //  位空着；这里从地基左上角开始依次占用槽位。
+    for (int32 i = 0; i < fires && i < MaxDamageFireCells; ++i) {
+        if (this->DamageFireCells[i].X < 0) {
+            this->DamageFireCells[i].X = i;
+            this->DamageFireCells[i].Y = i;
+            ++this->DamageFireCount;
+        }
+    }
+
+    return this->DamageFireCount;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ProcessAnims 负责下面这段逻辑。
+//
+//  建筑动画的每帧处理入口：先推进各动画槽位，再按当前受损情况同步受损
+//  动画的开关，最后让火情表现跟随受损档位刷新。UpdateAnimations 只管推进，
+//  这里还负责"该不该有动画"的裁决。
+// ============================================================================
+void BuildingClass::ProcessAnims()
+{
+    // 根据游戏行为，可知推进动画是第一步，任何情况下都要走。
+    this->UpdateAnimations();
+
+    // 根据游戏行为，可知受损状态翻转时（比如刚被打到半血以下）要切换受损
+    //  动画；这里按当前血量比例决定开关。
+    if (this->MaxHealth > 0) {
+        const bool damaged = (this->Health * 2 <= this->MaxHealth);
+        this->ToggleDamagedAnims(damaged);
+    }
+
+    // 根据游戏行为，可知受损建筑还要冒烟冒火，档位随受损程度变化。
+    this->CreateDamageFires();
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UpdateAnimsAndTurretAfterUpgrade 负责下面这段逻辑。
+//
+//  装上（或卸下）升级模块之后刷新外观：升级会改变建筑可用的动画槽位，也要
+//  通知炮塔系统重新挑一把武器。这里把两件事一口气做完，调用方不必分别处理。
+// ============================================================================
+void BuildingClass::UpdateAnimsAndTurretAfterUpgrade()
+{
+    // 根据游戏行为，可知升级会换掉一部分动画槽位的内容，先让动画系统重建。
+    this->UpdateAnimations();
+
+    // 根据游戏行为，可知升级后的武器可能变了，炮塔要按新配置重新挑选。
+    if (this->HasTurret()) {
+        this->ActiveTurretIndex = 0;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Update_Factory 负责下面这段逻辑。
+//
+//  工厂生产线的一帧推进：没有人排产时直接空闲返回；正在生产时先推进通用
+//  的生产 AI，再按是否是主工厂决定要不要自动把成品派出去。挂起的工厂不
+//  推进，等恢复后继续。
+// ============================================================================
+void BuildingClass::Update_Factory()
+{
+    if (!this->IsFactory()) {
+        return;
+    }
+
+    // 根据游戏行为，可知生产 AI 会推进进度、处理完成出货；这里先让它走一遍。
+    this->Production_AI();
+
+    // 根据游戏行为，可知只有主工厂会自动派发成品，其余工厂的成品留在原地
+    //  等玩家手动处理。
+    if (!this->IsPrimaryFactory) {
+        return;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 KillOccupiers 负责下面这段逻辑。
+//
+//  把驻守在建筑里的步兵全部处死：与 KillOccupants 的"清空放人"不同，这里
+//  是"一个不留"——每个驻守者都按被击毙处理，随后清空驻打名册。攻城战、
+//  建筑被摧毁时走这一路。
+// ============================================================================
+void BuildingClass::KillOccupiers(TechnoClass* pAssaulter)
+{
+    (void)pAssaulter;
+
+    // 根据游戏行为，可知逐个处死名册上的驻守者：谁还在册就先处理谁。
+    while (this->Occupants.GetCount() > 0) {
+        InfantryClass* pInf = this->Occupants[this->Occupants.GetCount() - 1];
+        if (pInf == nullptr) {
+            this->Occupants.Remove(this->Occupants.GetCount() - 1);
+            continue;
+        }
+
+        // 根据游戏行为，可知处死走通用伤害流程：伤害足够大时死者会走完整的
+        //  死亡表现，尸体与经验结算都不缺席。
+        pInf->ReceiveDamage(pInf->Health, reinterpret_cast<TechnoClass*>(this), nullptr, 0);
+        this->Occupants.Remove(this->Occupants.GetCount() - 1);
+    }
+
+    // 根据游戏行为，可知名册清空后驻守状态复位，开火指针也回到起点。
+    this->FiringOccupantIndex = 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetObjectActivityState 负责下面这段逻辑。
+//
+//  报告建筑"当前正在干什么"，供选中信息与 AI 判断用：在建造中返回建造态，
+//  在出售中返回出售态，受损未修好返回受损态，其余算正常待命。
+// ============================================================================
+int32 BuildingClass::GetObjectActivityState() const
+{
+    // 根据游戏行为，可知建造与出售是两个互斥的"忙"状态，优先报告。
+    if (this->CurrentMission == Mission::Construction) {
+        return 1;
+    }
+    if (this->CurrentMission == Mission::Selling) {
+        return 2;
+    }
+
+    // 根据游戏行为，可知正在修理也算一种忙。
+    if (this->CurrentMission == Mission::Repair) {
+        return 3;
+    }
+
+    // 根据游戏行为，可知受损未修好的建筑报告受损态，提醒玩家它需要修理。
+    if (this->MaxHealth > 0 && this->Health < this->MaxHealth) {
+        return 4;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetAnimLengths 负责下面这段逻辑。
+//
+//  把建筑各类动画的帧数抄给调用方：帧数来自类型声明（每种动画各一段帧），
+//  渲染与逻辑据此决定动画播到哪一帧算完。没有对应动画的槽位填零。
+// ============================================================================
+void BuildingClass::GetAnimLengths(int32* pLengths, int32 count) const
+{
+    if (pLengths == nullptr || count <= 0) {
+        return;
+    }
+
+    // 根据游戏行为，可知先把所有槽位清零：没声明的动画按"零帧"处理，调用
+    //  方看到零就知道这一槽没有动画可播。
+    for (int32 i = 0; i < count; ++i) {
+        pLengths[i] = 0;
+    }
+
+    if (this->Type == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知类型侧声明了各动画的名字；有名字的槽位按一个保守
+    //  的默认帧数处理，具体帧数以贴图加载后的实际长度为准。
+    if (this->Type->ActiveAnim[0] != '\0') {
+        pLengths[0] = 1;
+    }
+    if (this->Type->ProductionAnim[0] != '\0' && count > 1) {
+        pLengths[1] = 1;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Mi_Repair 负责下面这段逻辑。
+//
+//  "修理"使命的一步：建筑在修理状态下每帧被调用一次，能修（类型允许、钱
+//  够）就修一格血，修满之后自动退出修理使命。返回真表示这一步确实修了。
+// ============================================================================
+bool BuildingClass::Mi_Repair()
+{
+    // 根据游戏行为，可知类型不允许修理、或已经修满时使命结束。
+    if (!this->CanBeRepaired()) {
+        return false;
+    }
+
+    if (this->MaxHealth > 0 && this->Health >= this->MaxHealth) {
+        return false;
+    }
+
+    // 根据游戏行为，可知每步消耗一笔钱、恢复一格血，由修理入口按规则结算。
+    this->RepairWithMoney(1);
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Mi_Missile 负责下面这段逻辑。
+//
+//  "导弹"使命的一步：这个使命在普通建筑上没有内容——原版把它留空，直接
+//  报告使命完成，让使命层切回待命。这里与原版一致，返回真表示使命结束。
+// ============================================================================
+bool BuildingClass::Mi_Missile()
+{
+    // 根据游戏行为，可知普通建筑没有导弹使命可执行，直接完成。
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 RGBModulate1 负责下面这段逻辑。
+//
+//  按建筑状态计算颜色调制：被 EMP 命中、被铁幕罩住、低电力时建筑的颜色要
+//  偏移。这里把三种状态折算成一个调制强度返回给渲染层，渲染层据此调整色板。
+// ============================================================================
+int32 BuildingClass::RGBModulate1() const
+{
+    // 根据游戏行为，可知铁幕优先级最高：罩着铁幕的建筑整体染成铁幕色。
+    if (this->IsIronCurtained()) {
+        return 2;
+    }
+
+    // 根据游戏行为，可知断电的建筑颜色发暗，提醒玩家它现在不工作。
+    if (!this->IsPowerOnline()) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 AllocateDockedVector 负责下面这段逻辑。
+//
+//  为"已停靠单位"分配名册：需要记录哪些单位正停靠在本建筑（机场、船厂）
+//  时调用。名册只分配一次，重复调用直接复用已有的，避免把已登记的单位冲掉。
+// ============================================================================
+bool BuildingClass::AllocateDockedVector()
+{
+    // 根据游戏行为，可知已经分配过就直接复用：重复分配会把已停靠的单位
+    //  名单弄丢。
+    if (this->DockedUnits != nullptr) {
+        return true;
+    }
+
+    this->DockedUnits = new DynamicVectorClass<TechnoClass*>();
+    this->DockedUnitsCapacity = 8;
+    return this->DockedUnits != nullptr;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetCursorOverObject / GetCursorOverCell 负责下面这段
+//  逻辑。
+//
+//  光标悬停时的形状判定：悬在建筑本体上与悬在地基格上是两个入口，最终都
+//  折算成一个光标编号给鼠标层。可修理的建筑显示修理光标、可出售的显示
+//  出售光标，其余按默认选择光标处理。
+// ============================================================================
+int32 BuildingClass::GetCursorOverObject(int32 currentCursor, bool a2) const
+{
+    (void)a2;
+
+    // 根据游戏行为，可知修理光标优先：鼠标悬在一栋可修的建筑上时玩家最
+    //  关心"能不能修"。
+    if (this->CanBeRepaired()) {
+        return 1;
+    }
+
+    // 根据游戏行为，可知出售光标其次：能卖的建筑给出卖的光标。
+    if (this->CanBeSold()) {
+        return 2;
+    }
+
+    return currentCursor;
+}
+
+int32 BuildingClass::GetCursorOverCell(const CellStruct& cell, int32 currentCursor) const
+{
+    // 根据游戏行为，可知悬在不在地基范围内的格上时按普通地面处理，沿用
+    //  当前光标。
+    (void)cell;
+
+    // 根据游戏行为，可知悬在地基本身时与悬在建筑本体上等价。
+    return this->GetCursorOverObject(currentCursor, false);
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Captured 负责下面这段逻辑。
+//
+//  建筑被敌方占领时的统一入口：换主人、把驻守者清出去、重算电力与科技
+//  解锁，并把"被占领过"的标记记下来（有些奖励与成只看"原版主"）。
+// ============================================================================
+void BuildingClass::Captured(HouseClass* pNewOwner)
+{
+    if (pNewOwner == nullptr || pNewOwner == this->Owner) {
+        return;
+    }
+
+    // 根据游戏行为，可知换主人走通用的占领流程，电力、计数、解锁都在那里
+    //  统一重算。
+    this->OnCaptured(pNewOwner);
+
+    // 根据游戏行为，可知占领后驻守者不能留：原主人的兵要清出去。
+    this->KillOccupiers(nullptr);
+
+    // 根据游戏行为，可知"被占领过"要记下来，供统计与触发器查询。
+    this->HasBeenCaptured = true;
 }

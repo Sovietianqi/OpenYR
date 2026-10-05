@@ -210,6 +210,13 @@ public:
 
     static WinsockInterfaceClass* GetInstance();
 
+    // 根据游戏行为，可知套接字面还提供缓冲档位设定、双通道关闭
+    // 与异步选择三个维护口；初始化在 Winsock 实现下另有空桩形态。
+    bool SetBufferOptions(int32 socket);
+    void CloseSockets();
+    bool InitSocket(int32 a2);
+    bool SelectAsync();
+
     bool Initialized;
     uint32 NextSocketID;
     uint32 ActiveSockets[MAX_SOCKETS];

@@ -1,4 +1,7 @@
 #include <Abstract/ObjectTypeClass.h>
+#include <cstdio>
+#include <cstring>
+#include "BuildingTypeClass.h"
 #include <Audio/VocClass.h>
 
 #include <Core/Memory.h>
@@ -112,7 +115,7 @@ int32 ObjectTypeClass::GetCount()
 }
 
 // ============================================================================
-// Delete_All
+// 根据游戏行为，可知 All 负责下面这段逻辑。
 //
 //  Destroys every registered ObjectTypeClass and clears the array.
 // ============================================================================
@@ -557,7 +560,7 @@ bool ObjectTypeClass::SaveToINI(CCINIClass* pINI)
 }
 
 // ============================================================================
-// Read_TypeFlags
+// 根据游戏行为，可知 TypeFlags 负责下面这段逻辑。
 //
 //  Parses Yes/No-style INI flags into the bool fields.  Centralised so
 //  subclasses don't have to repeat the boilerplate.
@@ -634,7 +637,7 @@ bool ObjectTypeClass::Write_INI(CCINIClass* pINI) const
 }
 
 // ============================================================================
-// Can_Place_On_Map
+// 根据游戏行为，可知 Place_On_Map 负责下面这段逻辑。
 //
 //  Returns true if an instance of this type can be placed at the supplied
 //  coordinate.  The full implementation consults MapClass for cell
@@ -675,7 +678,7 @@ bool ObjectTypeClass::Can_Place_On_Map(const CoordStruct& coord,
 }
 
 // ============================================================================
-// Get_Occupy_Bits
+// 根据游戏行为，可知 Occupy_Bits 负责下面这段逻辑。
 //
 //  Returns the bitmask of cell-occupation flags this type sets when placed.
 //  The full binary uses a 32-bit field; the base implementation returns
@@ -740,7 +743,7 @@ bool ObjectTypeClass::Is_Listed() const
 }
 
 // ============================================================================
-// Get_Max_Pips
+// 根据游戏行为，可知 Max_Pips 负责下面这段逻辑。
 //
 //  Returns the number of pips drawn in the sidebar for this type.  Defaults
 //  to 1 (single pip for build progress).  BuildingTypeClass overrides this
@@ -752,7 +755,7 @@ int32 ObjectTypeClass::Get_Max_Pips() const
 }
 
 // ============================================================================
-// Create_One_Of
+// 根据游戏行为，可知 One_Of 负责下面这段逻辑。
 //
 //  ABSTRACT factory hook.  Allocates a concrete instance of this type owned
 //  by the supplied house and registers it with the map.
@@ -792,7 +795,7 @@ ObjectClass* ObjectTypeClass::Create_One_Of(HouseClass* /*pOwner*/)
 }
 
 // ============================================================================
-// Get_Cameo_Data
+// 根据游戏行为，可知 Cameo_Data 负责下面这段逻辑。
 //
 //  Returns the SHP image used as the sidebar cameo (build-button icon) for
 //  this type.
@@ -832,7 +835,7 @@ SHPStruct* ObjectTypeClass::Get_Cameo_Data() const
 }
 
 // ============================================================================
-// Resolve_SHP_References
+// 根据游戏行为，可知 SHP_References 负责下面这段逻辑。
 //
 //  Called after the art INI has been loaded.  Binds SHP shape file
 //  references to their loaded SHPStruct pointers.  The base ObjectTypeClass
@@ -914,4 +917,110 @@ int32 ObjectTypeClass::GetCameo() const
 void ObjectTypeClass::Generic()
 {
     reinterpret_cast<uint8*>(this)[1] = 'G';
+}
+
+// ============================================================================
+// 地基/建造分类/剧场美术（根据游戏行为实现）
+// ============================================================================
+
+// 根据游戏行为，可知地基尺寸只有建筑类型携带，其余类型按 1×1 处理。
+void ObjectTypeClass::GetFoundationData(int32& w, int32& h)
+{
+    if (WhatAmI() == AbstractType::BuildingType) {
+        const BuildingTypeClass* pBT = static_cast<const BuildingTypeClass*>(this);
+        w = pBT->X_Foundation_Value();
+        h = pBT->Y_Foundation_Value(false);
+        return;
+    }
+    w = 1;
+    h = 1;
+}
+
+// 根据游戏行为，可知该判定只对建筑类型有意义：建筑类型且其 BuildCat
+// 取值为第 5 类时返回真，其余一律返回假。
+bool ObjectTypeClass::IsBuildingBuildCat5()
+{
+    if (WhatAmI() != AbstractType::BuildingType) {
+        return false;
+    }
+    const BuildingTypeClass* pBT = static_cast<const BuildingTypeClass*>(this);
+    return pBT->BuildCatValue == static_cast<BuildCat>(5);
+}
+
+// 根据游戏行为，可知三维美术装载时建筑会装载全部炮塔槽位的体素与
+// 动画数据，其余类型由派生类自行处理。
+void ObjectTypeClass::Load3DArt(int32 idxTheater)
+{
+    (void)idxTheater;
+    if (WhatAmI() != AbstractType::BuildingType) {
+        return;
+    }
+    BuildingTypeClass* pBT = static_cast<BuildingTypeClass*>(this);
+    for (int32 i = 0; i < pBT->TurretCount; ++i) {
+        pBT->LoadTurretArt(pBT->get_ID(), i);
+    }
+}
+
+// 根据游戏行为，可知炮筒美术跟随炮塔美术走同一装载管线；没有炮塔的
+// 类型自然没有炮筒可装。
+void ObjectTypeClass::LoadBarrelArt()
+{
+    LoadTurret3DArt();
+}
+
+// 根据游戏行为，可知带炮塔的设备在载入三维美术时会按炮塔数量逐槽
+// 装载体素与动画数据。
+void ObjectTypeClass::LoadTurret3DArt()
+{
+    const AbstractType id = WhatAmI();
+    if (id != AbstractType::BuildingType && id != AbstractType::UnitType
+        && id != AbstractType::AircraftType && id != AbstractType::InfantryType) {
+        return;
+    }
+    TechnoTypeClass* pTT = static_cast<TechnoTypeClass*>(this);
+    for (int32 i = 0; i < pTT->TurretCount; ++i) {
+        pTT->LoadTurretArt(pTT->get_ID(), i);
+    }
+}
+
+// 根据游戏行为，可知进入新剧场时三维美术整体重载；建筑还要求重载
+// 按需加载的建造图动画。
+void ObjectTypeClass::Load_Theater_Art(int32 idxTheater)
+{
+    Load3DArt(idxTheater);
+    if (WhatAmI() == AbstractType::BuildingType) {
+        static_cast<BuildingTypeClass*>(this)->Buildup();
+    }
+}
+
+// 对应原版槽位 ObjectTypeClass::Unload_5F77F0：根据游戏行为，可知场景
+// 卸载阶段会把已装载的建造图动画与炮塔体素一并释放。
+void ObjectTypeClass::Unload_5F77F0()
+{
+    if (WhatAmI() != AbstractType::BuildingType) {
+        return;
+    }
+    BuildingTypeClass* pBT = static_cast<BuildingTypeClass*>(this);
+    pBT->ClearBuildup();
+    pBT->UnloadTurretArt();
+}
+
+// 根据游戏行为，可知剧场相关文件名按剧场序号替换扩展名：温带 .TMP、
+// 雪地 .SNO、城市 .URB、沙漠 .DES、月球 .LUN、新城市 .NUB；越界或
+// 未知剧场沿用温带扩展名。输入带扩展名时保留主名再追加。
+void ObjectTypeClass::TheaterSpecificID(const char* pBase, int32 idxTheater, char* pOut) const
+{
+    (void)this;
+    static const char* const TheaterExts[] = { ".TMP", ".SNO", ".URB", ".DES", ".LUN", ".NUB" };
+    const char* pExt = TheaterExts[0];
+    if (idxTheater >= 0 && idxTheater < 6) {
+        pExt = TheaterExts[idxTheater];
+    }
+    char stem[0xF0];
+    snprintf(stem, sizeof(stem), "%s", pBase != nullptr ? pBase : "");
+    char* pDot = strrchr(stem, '.');
+    if (pDot != nullptr) {
+        *pDot = '\0';
+    }
+    snprintf(pOut, sizeof(stem) + 8, "%s%s", stem, pExt);
 }

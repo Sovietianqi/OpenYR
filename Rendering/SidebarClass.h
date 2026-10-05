@@ -81,6 +81,9 @@ struct StripClass
     BYTE unknown_3D;
     BYTE unknown_3E;
     BYTE unknown_3F;
+    // 根据游戏行为，可知 +0x3C 这一字节是"本标签页需要闪烁提示"的标记，
+    // 由渗透事件等外部原因点亮。
+    BYTE NeedsFlash;
     DWORD unknown_40;
     int32 TopRowIndex;          // Scroll position
     DWORD unknown_48;
@@ -93,6 +96,7 @@ struct StripClass
         : Progress(0), AllowedToDraw(false), Location(0, 0)
         , Bounds(0, 0, 0, 0), Index(0), NeedsRedraw(false)
         , unknown_3D(0), unknown_3E(0), unknown_3F(0)
+        , NeedsFlash(0)
         , unknown_40(0), TopRowIndex(0), unknown_48(0)
         , unknown_4C(0), unknown_50(0), CameoCount(0)
     {
@@ -161,6 +165,11 @@ public:
     StripClass Tabs[MaxTabs];
     DWORD unknown_5394;
     DWORD unknown_5398;
+    // ------------------------------------------------------------------
+    // 根据游戏行为，可知 +0x539C 保存"最近一次因间谍渗透而被点亮的房屋编号"，
+    // 供 SetAircraftTab 判定本次渗透事件是否命中本机控制的房屋。
+    // ------------------------------------------------------------------
+    int32 PlayerInfiltrated;
     int32 ActiveTabIndex;
     DWORD unknown_53A0;
     bool HideObjectNameInTooltip;

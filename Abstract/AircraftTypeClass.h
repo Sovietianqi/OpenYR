@@ -43,6 +43,9 @@ public:
 
     // Extended aircraft accessors
     bool   Is_Fighter() const;
+    // 根据游戏行为，可知旋翼图材在批量数据初始化时一次性登记。
+    static void LoadRotorArt();
+    AircraftClass* CreateAircraft(HouseClass* pOwner);
     bool   Is_Bomber() const;
     int32  Get_Landing_Spot_Type() const;
     virtual void Resolve_VXL_References();

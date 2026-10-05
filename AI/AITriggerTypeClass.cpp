@@ -666,3 +666,59 @@ void AITriggerTypeClass::FormatForSaving(char* buffer, size_t size) const {
         static_cast<uint32>(this->Enabled_Normal),
         static_cast<uint32>(this->Enabled_Hard));
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知资金比较以六种比较算子查表分派：取参战方当前
+// 资金与条件操作数逐档比较后回填布尔结果。
+// ------------------------------------------------------------------------
+bool AITriggerTypeClass::CompareHouseMoney(HouseClass* pHouse)
+{
+    if (pHouse == nullptr) {
+        return false;
+    }
+
+    const int32 credits = pHouse->Credits;
+    const int32 comparator = Conditions[0].ComparatorType;
+    const int32 operand = Conditions[0].ComparatorOperand;
+
+    switch (comparator) {
+        case 0:
+            return credits < operand;
+        case 1:
+            return credits <= operand;
+        case 2:
+            return credits == operand;
+        case 3:
+            return credits != operand;
+        case 4:
+            return credits > operand;
+        case 5:
+            return credits >= operand;
+        default:
+            break;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知两个超武充能判定都沿参战方的特殊武器建筑清单
+// 巡查充能余量，命中即视为就绪；这里转调既有的充能判定面。
+// ------------------------------------------------------------------------
+bool AITriggerTypeClass::IronCurtainPercentReady(HouseClass* pHouse)
+{
+    return IronCurtainCharged(pHouse, pHouse);
+}
+
+bool AITriggerTypeClass::ChronospherePercentReady(HouseClass* pHouse)
+{
+    return ChronoSphereCharged(pHouse, pHouse);
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知场景保存时触发器的启停状态要回写进触发数据，
+// 使能位与全局旗标一起落盘。
+// ------------------------------------------------------------------------
+void AITriggerTypeClass::WriteToTriggerEnable(bool enable)
+{
+    IsEnabled = enable;
+    IsGlobal = enable ? IsGlobal : 0;
+}

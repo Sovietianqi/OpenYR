@@ -40,6 +40,20 @@ public:
     bool Delete();
     bool Create();
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知原版文件层以原始 WW 命名暴露同一组操作；这里
+    // 与工程内语义化接口一一对应。
+    // ------------------------------------------------------------------------
+    virtual int32 FileSize();
+    virtual int32 GetFileTime();
+    virtual bool  SetFileTime(int32 nTime);
+    virtual bool  HasHandle() const;
+    virtual int32 MoveFilePointer(int32 nOffset, FileSeekMode mode);
+    virtual int32 SetFilePointer(int32 nOffset);
+    virtual bool  OpenFile(FileAccessMode mode);
+    virtual int32 ReadNextBytes(void* pBuffer, int32 nSize);
+    virtual bool  SetFileName(const char* pName);
+
     char FileName[MAX_PATH_LEN];
     void* Handle;
 };
@@ -93,6 +107,13 @@ public:
 
     bool Exists() const;
     int64 Size() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 CC 层还提供缓冲分配、光盘源校验与扩展打开。
+    // ------------------------------------------------------------------------
+    virtual void* AllocateMemory(int32 nSize);
+    virtual bool  CDCheck();
+    virtual bool  OpenEx(const char* pFilename, int32 nMode);
 
     char FileName[MAX_PATH_LEN];
     bool IsFileOpen;
@@ -153,7 +174,7 @@ public:
 // ============================================================================
 // CD - the forced-drive selector
 //
-//   CD::Set_Volume (asm 0x47909D) is a two-line setter:
+ //   CD::Set_Volume is a two-line setter:
 //
 //       if (CD::CD_Files_Local == 1) { ForcedCDNumber = 0xFFFFFFFE; return; }
 //       if (volume >= 0)             ForcedCDNumber = volume;
@@ -162,7 +183,7 @@ public:
 //   discs and 2 names Yuri's Revenge.  Game_ParsePKTs forces 0xFFFFFFFE for
 //   the duration of its ".YRO" scan so the archives are read from the working
 //   directory rather than a CD, then restores the previous value.  The
-//   CD::Is_Available predicate (asm 0x4790EA) tests the same selector.
+ //   CD::Is_Available predicate tests the same selector.
 // ============================================================================
 namespace CD {
     void Set_Volume(int32 nVolume);
@@ -200,7 +221,7 @@ int32 CD_GetCDIndex();
 //   in OldRequiredCDNumber so the previous selection can be restored.
 void CD_SetRequiredCDIndex(int32 nVolume);
 
-// Get_CD_Index (asm 0x4A80D0): probes drive letters for the "YR1" volume
+ // Get_CD_Index: probes drive letters for the "YR1" volume
 //   label.  `startLetter` is the ASCII drive letter to begin at ('A'), and
 //   `timeout` bounds how long the scan keeps retrying a busy drive (in
 //   GetTickCount units).  Returns the zero-based drive index, or -1.

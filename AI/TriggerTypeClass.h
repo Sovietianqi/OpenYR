@@ -48,6 +48,12 @@ public:
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual int32 GetCRC() const;
 
+    // 根据游戏行为，可知触发类型面还承担区域穿越的旗标写入、全局
+    // 检查判定与实例定位三件事。
+    void CrossVerticalZone(int32 zone);
+    bool InvolvesGlobalChecking() const;
+    static TriggerTypeClass* FindInstance(const char* pID);
+
     void AttachEvent(TEventClass* pEvent);
     void AttachAction(TActionClass* pAction);
 

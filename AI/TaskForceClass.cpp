@@ -491,3 +491,87 @@ void TaskForceClass::CreateFromINIList(CCINIClass* pINI)
         }
     }
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知特遣支队的成员盘点是逐项累加各条目的数量字段；
+// 过时查找面则按标识符做大小写不敏感的线性比对。
+// ------------------------------------------------------------------------
+int32 TaskForceClass::CountObjects() const
+{
+    int32 total = 0;
+    const int32 count = Members.GetCount();
+    for (int32 i = 0; i < count; ++i) {
+        total += Members[i].Count;
+    }
+    return total;
+}
+
+TaskForceClass* TaskForceClass::Find_obsolete(const char* pID)
+{
+    if (pID == nullptr) {
+        return nullptr;
+    }
+
+    const int32 count = Array->GetCount();
+    for (int32 i = 0; i < count; ++i) {
+        TaskForceClass* pTF = (*Array)[i];
+        if (pTF != nullptr && strcasecmp(pID, pTF->ID) == 0) {
+            return pTF;
+        }
+    }
+    return nullptr;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知成员清单以"数量,类型"成对读取，遇到空段或
+// 截断的键即停止；类型表驱动逐项展开。
+// ------------------------------------------------------------------------
+void TaskForceClass::LoadObjects(CCINIClass* pINI, const char* pSection)
+{
+    if (pINI == nullptr || pSection == nullptr) {
+        return;
+    }
+
+    Members.Clear();
+    for (int32 i = 0; i < 128; ++i) {
+        char value[256];
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+        if (pINI->ReadString(pSection, key, "", value, sizeof(value)) <= 0) {
+            break;
+        }
+
+        int32 count = 0;
+        char typeName[64];
+        typeName[0] = '\0';
+        if (sscanf(value, "%d,%63s", &count, typeName) != 2) {
+            break;
+        }
+
+        TaskForceMember member;
+        member.Count = count;
+        member.MinCount = count;
+        member.MaxCount = count;
+        member.Type = TechnoTypeClass::Find(typeName);
+        Members.AddItem(member);
+    }
+}
+
+bool TaskForceClass::SaveListToINI(CCINIClass* pINI, const char* pSection)
+{
+    if (pINI == nullptr || pSection == nullptr) {
+        return false;
+    }
+
+    const int32 count = Members.GetCount();
+    for (int32 i = 0; i < count; ++i) {
+        char key[16];
+        char value[128];
+        snprintf(key, sizeof(key), "%d", i);
+        const TaskForceMember& member = Members[i];
+        const char* pName = (member.Type != nullptr) ? member.Type->ID : "";
+        snprintf(value, sizeof(value), "%d,%s", member.Count, pName);
+        pINI->WriteString(pSection, key, value);
+    }
+    return count > 0;
+}

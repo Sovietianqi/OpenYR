@@ -44,6 +44,8 @@ public:
     Move Can_Enter_Cell(CellStruct cell);
     int32 GetCurrentHeight() const;
     float GetDropProgress() const;
+    // 根据游戏行为，可知空投舱的每帧推进入口。
+    void ILocomotion_Update();
 
     DropPodLocomotionClass();
 

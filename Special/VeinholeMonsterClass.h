@@ -16,6 +16,13 @@ public:
     VeinholeMonsterClass();
     ~VeinholeMonsterClass();
 
+    // 根据游戏行为，可知巨噬 monsters 的初始化分两段：先立骨架
+    // 再铺触须；细胞查找沿所在格与邻格两路进行。
+    void Initialize1(const CoordStruct& pos);
+    void Initialize2(int32 radius, int32 lifetime);
+    bool FindWhat(int32 kind);
+    bool FindInCell(const struct CellStruct& cell);
+
     void Initialize(const CoordStruct& pos, int32 radius, int32 lifetime);
     void Release();
     void ReleaseVeinCells();

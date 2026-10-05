@@ -10,7 +10,7 @@ class CCINIClass;
 // ============================================================================
 // KeyboardClass - the keyboard command binding table.
 //
-//   KeyboardClass_LoadFromINI (asm 0x533E05) opens "KEYBOARDMD.INI" and walks
+ //   KeyboardClass_LoadFromINI opens "KEYBOARDMD.INI" and walks
 //   the [Hotkey] section.  Each key names a command and each value is the
 //   scan-code the command is bound to; the entry is only kept when the key
 //   matches a command already present in vec_Commands and the value is not
@@ -40,7 +40,7 @@ public:
     KeyboardClass();
     ~KeyboardClass();
 
-    // KeyboardClass_LoadFromINI (asm 0x533E05)
+ // 根据游戏行为，可知 LoadFromINI 负责下面这段逻辑。
     static bool LoadFromINI();
 
     // Clear the binding table.

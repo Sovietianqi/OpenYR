@@ -277,7 +277,7 @@ void SmudgeClass::Update()
 }
 
 // ============================================================================
-// Draw_It
+// 根据游戏行为，可知 It 负责下面这段逻辑。
 //
 //  Renders the smudge at the given screen origin.  The full binary blits the
 //  smudge SHP frame onto the tactical surface; the standalone build is a
@@ -299,7 +299,7 @@ void SmudgeClass::Draw_It(int32 /*originX*/, int32 /*originY*/) const
 }
 
 // ============================================================================
-// Is_Visible
+// 根据游戏行为，可知 Visible 负责下面这段逻辑。
 //
 //  Returns whether the smudge is visible to the local player.  Smudges that
 //  are inactive, in limbo or hidden by fog/shroud are not visible.

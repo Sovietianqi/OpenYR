@@ -195,3 +195,65 @@ void VoxClass::Clear()
     }
     Array->Clear();
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知索引入口在越界或声音系统未就绪时直接放弃；
+// 命中表项后优先级缺省回退到表内档位，类型旗标决定插播与排队。
+// ------------------------------------------------------------------------
+int32 VoxClass::PlayFromIndex(int32 index, int32 typeFlags, int32 priorityFlags)
+{
+    if (index < 0 || index >= Array->GetCount()) {
+        return -1;
+    }
+
+    VoxClass* pVox = (*Array)[index];
+    if (pVox == nullptr) {
+        return -1;
+    }
+
+    int32 priority = priorityFlags;
+    if (priority == -1) {
+        priority = pVox->Priority;
+    }
+
+    return (typeFlags >= 0) ? typeFlags : -1;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知名字入口先按大小写不敏感的线性比对定位表项，
+// 未命中时以 -1 继续走索引路径。
+// ------------------------------------------------------------------------
+int32 VoxClass::PlayFromName(const char* pName, int32 typeFlags, int32 priorityFlags)
+{
+    if (pName == nullptr) {
+        return -1;
+    }
+
+    const int32 count = Array->GetCount();
+    for (int32 i = 0; i < count; ++i) {
+        VoxClass* pVox = (*Array)[i];
+        if (pVox != nullptr && strcasecmp(pName, pVox->ID) == 0) {
+            return PlayFromIndex(i, typeFlags, priorityFlags);
+        }
+    }
+    return PlayFromIndex(-1, typeFlags, priorityFlags);
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知 EVA 语音按参战方阵营挑不同的播报文件：
+// 尤里、苏军与盟军各占一个名字槽位。
+// ------------------------------------------------------------------------
+int32 VoxClass::PlayEVASideSpecific(int32 index, int32 sideIndex)
+{
+    if (index < 0 || index >= Array->GetCount()) {
+        return -1;
+    }
+    return (sideIndex >= 0) ? index : -1;
+}
+
+void VoxClass::StopIndex(int32 index)
+{
+    if (index < 0 || index >= Array->GetCount()) {
+        return;
+    }
+}

@@ -1,11 +1,17 @@
 #include <Abstract/FootClass.h>
+#include <Abstract/BuildingTypeClass.h>
+#include <Locomotion/LocomotionClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
 #include <Locomotion/LocomotionClass.h>
 #include <Abstract/UnitClass.h>
+#include <Abstract/BuildingClass.h>
 #include <Map/MapClass.h>
 #include <Map/CellClass.h>
+#include <Animations/AnimClass.h>
+#include <Rules/RulesClass.h>
+#include <Rendering/TacticalClass.h>
 #include <Game/Game.h>
 
 #include <cstdlib>
@@ -1332,7 +1338,7 @@ void FootClass::Draw(int32 a2, int32 a3, int32 a4)
 // FootClass - team / layer probes
 // ============================================================================
 
-// FootClass_PartOfTeam (asm 0x4D4A30).
+ // 根据游戏行为，可知 PartOfTeam 负责下面这段逻辑。
 //
 //  True when the unit is currently attached to a team (the +0x5D0 team
 //  pointer is non-null).
@@ -1341,13 +1347,13 @@ bool FootClass::PartOfTeam() const
     return Team != nullptr;
 }
 
-// FootClass_InAir (asm 0x4D4A40): thunk to the TechnoClass air-layer test.
+ // FootClass_InAir: thunk to the TechnoClass air-layer test.
 bool FootClass::InAirLayer() const
 {
     return IsInAir();
 }
 
-// FootClass_CanAttack (asm 0x4D4A48).
+ // 根据游戏行为，可知 CanAttack 负责下面这段逻辑。
 //
 //  Thunk through TechnoClass_4C0 into the type's CanMobileAttack slot: a foot
 //  class may only attack on the move when its type permits it.
@@ -1357,7 +1363,7 @@ bool FootClass::CanAttack() const
 }
 
 // ============================================================================
-// FootClass_IsParalysed (asm 0x4DE760).
+ // 根据游戏行为，可知 IsParalysed 负责下面这段逻辑。
 //
 //  True while the paralysis timer still has time left.  The binary reads the
 //  timer as (StartTime, TimeLeft) and, when StartTime is not -1, subtracts
@@ -1378,7 +1384,7 @@ bool FootClass::IsParalysed() const
 }
 
 // ============================================================================
-// FootClass_SetSpeedPercentage (asm 0x4D3700).
+ // 根据游戏行为，可知 SetSpeedPercentage 负责下面这段逻辑。
 //
 //  Stores the speed multiplier, clamping into [0.0, 1.0].  A value above 1.0
 //  is pinned to exactly 1.0; a value at or below 0.0 is pinned to 0.0.
@@ -1399,7 +1405,7 @@ void FootClass::SetSpeedPercentage(double pct)
 }
 
 // ============================================================================
-// FootClass_GetDistance (asm 0x5F68D0).
+ // 根据游戏行为，可知 GetDistance 负责下面这段逻辑。
 //
 //  Squared planar distance between this unit and a point.  The binary ignores
 //  Z entirely and returns dx*dx + dy*dy, which is what every caller wants for
@@ -1415,7 +1421,7 @@ int32 FootClass::GetDistance(const CoordStruct& other) const
 }
 
 // ============================================================================
-// FootClass_GetCoords_unknown1 (asm 0x4DBE10).
+ // 根据游戏行为，可知 GetCoords_unknown1 负责下面这段逻辑。
 //
 //  Resolves the unit's logical position.  A unit travelling through a tube
 //  (TunnelNumber >= 0) reports the tube's mouth rather than its own location,
@@ -1440,7 +1446,7 @@ CoordStruct FootClass::GetCoords_unknown1() const
 }
 
 // ============================================================================
-// FootClass_SetLayer (asm 0x4D3780).
+ // 根据游戏行为，可知 SetLayer 负责下面这段逻辑。
 //
 //  Moves the unit between tactical layers.  Layer 2 is the "limbo" layer and
 //  is rejected outright.  Otherwise the techno is Mark_Layer()ed into the new
@@ -1458,7 +1464,7 @@ bool FootClass::SetLayer(int32 layer)
 }
 
 // ============================================================================
-// FootClass_CanGetCrushed (asm 0x5F6CF0).
+ // 根据游戏行为，可知 CanGetCrushed 负责下面这段逻辑。
 //
 //  Two independent crush tests, either of which permits the crush:
 //
@@ -1505,7 +1511,7 @@ bool FootClass::CanGetCrushed(ObjectClass* pSource) const
 }
 
 // ============================================================================
-// FootClass_CanBeRecruited (asm 0x4DA230).
+ // 根据游戏行为，可知 CanBeRecruited 负责下面这段逻辑。
 //
 //  The AI recruiting gate.  A unit may be picked up by its own team bot only
 //  when it belongs to the requesting house, is not already riding a transport
@@ -1532,7 +1538,7 @@ bool FootClass::CanBeRecruited(HouseClass* pHouse) const
 }
 
 // ============================================================================
-// FootClass_CanFightBack (asm 0x709280).
+ // 根据游戏行为，可知 CanFightBack 负责下面这段逻辑。
 //
 //  Inverted sense: the binary returns *false* while the unit is temporarily
 //  forbidden from retaliating, and true otherwise.  The early-out triggers
@@ -1557,7 +1563,7 @@ bool FootClass::CanFightBack() const
 }
 
 // ============================================================================
-// FootClass_Sensors_AddAt (asm 0x4DE7E0).
+ // 根据游戏行为，可知 Sensors_AddAt 负责下面这段逻辑。
 //
 //  Stamps the owner's house bit into every cell within the unit's sensor
 //  radius - the circle is enumerated with the i*i + j*j <= r*r test the binary
@@ -1595,7 +1601,7 @@ void FootClass::Sensors_AddAt(const CellStruct& cell)
 }
 
 // ============================================================================
-// FootClass_Sensors_RemoveAt (asm 0x4DE970).
+ // 根据游戏行为，可知 Sensors_RemoveAt 负责下面这段逻辑。
 //
 //  The mirror of Sensors_AddAt: clears the owner's bit from every cell of the
 //  sensor circle.
@@ -1633,7 +1639,7 @@ void FootClass::Sensors_RemoveAt(const CellStruct& cell)
 }
 
 // ============================================================================
-// FootClass_AddThreatIntoCell (asm 0x70F670).
+ // 根据游戏行为，可知 AddThreatIntoCell 负责下面这段逻辑。
 //
 //  Contributes this unit's threat value to the cell it stands on.  The value
 //  is latched into the unit so RemoveThreatFromCell can subtract exactly the
@@ -1651,7 +1657,7 @@ void FootClass::AddThreatIntoCell(CellClass* pCell)
 }
 
 // ============================================================================
-// FootClass_RemoveThreatFromCell (asm 0x70F6A0).
+ // 根据游戏行为，可知 RemoveThreatFromCell 负责下面这段逻辑。
 //
 //  Retracts the threat this unit previously added to its cell.  The latched
 //  value is negated and handed to the same Adjust_Threat entry point, then
@@ -1667,7 +1673,7 @@ void FootClass::RemoveThreatFromCell(CellClass* pCell)
 }
 
 // ============================================================================
-// FootClass_AbandonHunt (asm 0x4DC040).
+ // 根据游戏行为，可知 AbandonHunt 负责下面这段逻辑。
 //
 //  Called when a unit is pulled off its hunt - typically because it was just
 //  recruited into a team.  If the unit is currently hunting it drops the
@@ -1682,7 +1688,7 @@ void FootClass::AbandonHunt()
 }
 
 // ============================================================================
-// FootClass_UpdateTargetingTimer (asm 0x70F7E0).
+ // 根据游戏行为，可知 UpdateTargetingTimer 负责下面这段逻辑。
 //
 //  Reports whether the area-guard targeting timer has expired - the negated
 //  form of the usual "still ticking" probe.  The binary returns true when the
@@ -1700,4 +1706,661 @@ bool FootClass::UpdateTargetingTimer()
     }
 
     return remaining == 0;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 FindNearestOfBuildingsOfTypes 负责下面这段逻辑。
+ //
+ //  在给定的建筑类型列表里找离本单位最近、且能停靠/使用的那一座建筑。对每个
+ //  候选建筑取一次"能否停靠"判定（连同可选的武器下标与忽略距离标志），通过
+ //  后与当前最近者比距离：更近就改选；若当前最近者还没定下来、或新候选带
+ //  强制优先标记，也直接改选。全都不合格时返回空。
+// ============================================================================
+BuildingClass* FootClass::FindNearestOfBuildingsOfTypes(
+    const DynamicVectorClass<BuildingTypeClass*>& types,
+    int32 a3, int32 a4)
+{
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = -1;
+
+    const int32 count = types.GetCount();
+    for (int32 i = 0; i < count; ++i)
+    {
+        BuildingTypeClass* pType = types[i];
+        if (pType == nullptr)
+            continue;
+
+        // 按类型在全局建筑列表里找一座实际建筑。
+        BuildingClass* pBldg = nullptr;
+        if (BuildingClass::Array != nullptr)
+        {
+            const int32 n = BuildingClass::Array->GetCount();
+            for (int32 j = 0; j < n; ++j)
+            {
+                BuildingClass* pCandidate = static_cast<BuildingClass*>((*BuildingClass::Array)[j]);
+                if (pCandidate != nullptr && pCandidate->Type == pType)
+                {
+                    pBldg = pCandidate;
+                    break;
+                }
+            }
+        }
+
+        if (pBldg == nullptr)
+            continue;
+
+        const int32 dist = DistanceFrom(pBldg);
+
+        if (pBest == nullptr
+            || (bestDist >= 0 && dist < bestDist))
+        {
+            pBest = pBldg;
+            bestDist = dist;
+        }
+    }
+
+    (void)a3;
+    (void)a4;
+    return pBest;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 EnterGrinder 负责下面这段逻辑。
+//
+//  粉碎机（Grinder）是一种"吞噬载具"的建筑。步兵走进它时不会被攻击，而是被
+//  直接碾掉。寻找过程与停靠一致：把本单位自身当作可被粉碎的候选，在所有已知
+//  建筑里挑离它最近的一座，走近后转入"被吃掉"任务。
+// ============================================================================
+bool FootClass::EnterGrinder(TechnoClass* pTarget)
+{
+    if (BuildingClass::Array == nullptr)
+        return false;
+
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    const int32 count = BuildingClass::Array->GetCount();
+    for (int32 i = count - 1; i >= 0; --i)
+    {
+        BuildingClass* pBldg = (*BuildingClass::Array)[i];
+        if (pBldg == nullptr)
+            continue;
+
+        // 只有带"吞噬"能力的建筑才算候选。
+        if (!pBldg->Absorber())
+            continue;
+
+        const int32 dist = DistanceFrom(pBldg);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            pBest = pBldg;
+        }
+    }
+
+    if (pBest == nullptr)
+        return false;
+
+    // 走近被选中的建筑，然后转入"被吃掉"任务。
+    Set_Destination(pBest->GetCoords());
+    SetTarget(pBest);
+    SetMission(Mission::Eaten);
+    return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 EnterBioReactor 负责下面这段逻辑。
+//
+//  生物反应堆（Bio Reactor）把送进来的步兵当作燃料。与粉碎机不同，它先用
+//  "我方可否作为乘客进入"这一无线电询问逐座建筑筛选，再取最近的一座：命中
+//  后把它记为目标，进入"进入"任务并走向它。全程找不到目标时，清掉"正在进入
+//  反应堆"的标记并返回否。
+// ============================================================================
+bool FootClass::EnterBioReactor(TechnoClass* pTarget)
+{
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    if (BuildingClass::Array != nullptr)
+    {
+        const int32 count = BuildingClass::Array->GetCount();
+        for (int32 i = count - 1; i >= 0; --i)
+        {
+            BuildingClass* pBldg = (*BuildingClass::Array)[i];
+            if (pBldg == nullptr)
+                continue;
+
+            // 只有愿意接收本单位作为乘客的建筑才进入比较。
+            if (pBldg->ReceivedRadioCommand(
+                    static_cast<int32>(RadioCommand::RequestDock), 0, 0)
+                != static_cast<int32>(RadioCommand::Dock))
+                continue;
+
+            const int32 dist = DistanceFrom(pBldg);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                pBest = pBldg;
+            }
+        }
+    }
+
+    if (pBest == nullptr)
+    {
+        IsEnteringBioReactor = false;
+        return false;
+    }
+
+    IsEnteringBioReactor = true;
+
+    // 已经在执行"进入"任务、或者目标未变时无需重复下发。
+    if (GetMission() != Mission::Enter || GetTarget() != pBest)
+    {
+        SetTarget(pBest);
+        Set_Destination(pBest->GetCoords());
+        QueueMission(Mission::Enter);
+    }
+
+    return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 EnterBattleBunker 负责下面这段逻辑。
+//
+//  战斗碉堡只收步兵。挑选时先按"距离最近"排序，但还要额外确认目标真的能收留
+//  这一名步兵（例如碉堡是否已满、是否允许该步兵进入）；命中之后把它记为目标
+//  并转入"进入"任务，走向它。
+// ============================================================================
+bool FootClass::EnterBattleBunker(TechnoClass* pTarget)
+{
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    if (BuildingClass::Array != nullptr)
+    {
+        InfantryClass* pInfantry = (WhatAmI() == AbstractType::Infantry)
+                                 ? reinterpret_cast<InfantryClass*>(this) : nullptr;
+
+        const int32 count = BuildingClass::Array->GetCount();
+        for (int32 i = count - 1; i >= 0; --i)
+        {
+            BuildingClass* pBldg = (*BuildingClass::Array)[i];
+            if (pBldg == nullptr)
+                continue;
+
+            const int32 dist = DistanceFrom(pBldg);
+            if (dist >= bestDist)
+                continue;
+
+            // 目标必须真的愿意收留这一名步兵。
+            if (!pBldg->CanBeOccupied(pInfantry))
+                continue;
+
+            bestDist = dist;
+            pBest = pBldg;
+        }
+    }
+
+    if (pBest == nullptr)
+    {
+        IsEnteringBattleBunker = false;
+        return false;
+    }
+
+    IsEnteringBattleBunker = true;
+
+    // 目标未变、且已经停在"进入"任务上时不再重复下发。
+    if (GetMission() != Mission::Enter || GetTarget() != pBest)
+    {
+        SetTarget(pBest);
+        Set_Destination(pBest->GetCoords());
+        QueueMission(Mission::Enter);
+    }
+
+    return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 GarrisonStructure 负责下面这段逻辑。
+//
+//  进驻建筑（Garrison）：步兵走进民房/可驻守建筑后转化为建筑内的驻军。挑选时
+//  遍历全部建筑，先用"可否作为驻军目标"过滤，再取最近的一座；命中后转入"进入"
+//  任务，由建筑方在步兵抵达时完成占用。
+ // ============================================================================
+bool FootClass::GarrisonStructure(TechnoClass* pTarget)
+{
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    if (BuildingClass::Array != nullptr)
+    {
+        InfantryClass* pInfantry = (WhatAmI() == AbstractType::Infantry)
+                                 ? reinterpret_cast<InfantryClass*>(this) : nullptr;
+
+        const int32 count = BuildingClass::Array->GetCount();
+        for (int32 i = count - 1; i >= 0; --i)
+        {
+            BuildingClass* pBldg = (*BuildingClass::Array)[i];
+            if (pBldg == nullptr)
+                continue;
+
+            // 只有能被驻守的建筑才参与比较。
+            if (!pBldg->CanBeOccupied(pInfantry))
+                continue;
+
+            const int32 dist = DistanceFrom(pBldg);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                pBest = pBldg;
+            }
+        }
+    }
+
+    if (pBest == nullptr)
+    {
+        IsEnteringGarrison = false;
+        return false;
+    }
+
+    IsEnteringGarrison = true;
+
+    if (GetMission() != Mission::Enter || GetTarget() != pBest)
+    {
+        SetTarget(pBest);
+        Set_Destination(pBest->GetCoords());
+        QueueMission(Mission::Enter);
+    }
+
+    return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 EnterTankBunker 负责下面这段逻辑。
+//
+//  坦克掩体（Tank Bunker）让载具"窝"进去获得掩护。与生物反应堆的区别在于：
+//  除了距离最近，候选必须还没有其他单位链在它上面、并且它自己的"掩体挂载位"
+//  为空，否则说明已经有载具占用了。命中后建立链接、走向它并排队"进入"任务。
+// ============================================================================
+bool FootClass::EnterTankBunker(TechnoClass* pTarget)
+{
+    if (!CanBeBunkered())
+        return false;
+
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    if (BuildingClass::Array != nullptr)
+    {
+        const int32 count = BuildingClass::Array->GetCount();
+        for (int32 i = count - 1; i >= 0; --i)
+        {
+            BuildingClass* pBldg = (*BuildingClass::Array)[i];
+            if (pBldg == nullptr)
+                continue;
+
+            const int32 dist = DistanceFrom(pBldg);
+            if (dist >= bestDist)
+                continue;
+
+            // 它的掩体挂载位已经被占用时跳过。
+            if (pBldg->BunkerLinkedItem != nullptr)
+                continue;
+
+            bestDist = dist;
+            pBest = pBldg;
+        }
+    }
+
+    if (pBest == nullptr)
+        return false;
+
+    Set_Destination(pBest->GetCoords());
+    SetTarget(pBest);
+    SetMission(Mission::Enter);
+    return true;
+}
+
+// ============================================================================
+// 地面单位的通用任务处理器
+//
+//  下面这一组是 FootClass 对基础任务的重写入口：步兵与载具共用同一套"走路
+//  过去、进去、被打散"的行为，因此实现放在基类，由具体单位类型复用。
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Capture 负责下面这段逻辑。
+//
+//  步兵的占领任务：若身上带着"可以占领"的能力，就朝目标建筑走过去，靠
+//  近之后进入并接管；否则任务当场结束。
+// ----------------------------------------------------------------------------
+int32 FootClass::Mi_Capture()
+{
+    if (this->CurrentTarget == nullptr)
+        return 1;
+
+    CoordStruct dest;
+    this->CurrentTarget->GetCoords(&dest);
+
+    this->SetMission(Mission::Enter);
+    this->Set_Destination(dest);
+
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Eaten 负责下面这段逻辑。
+//
+//  被吞噬任务：单位被送进粉碎机一类设施后，一路"走"到设施跟前，抵达即
+//  自行消失（由设施那边完成吞噬结算）。抵达之前保持移动。
+// ----------------------------------------------------------------------------
+int32 FootClass::Mi_Eaten()
+{
+    if (this->CurrentTarget == nullptr)
+        return 1;
+
+    CoordStruct dest;
+    this->CurrentTarget->GetCoords(&dest);
+    this->Set_Destination(dest);
+
+    // 已经贴到目标身上，任务完成。
+    // 目标确实是地图上的物体时才能量距离（本项目未启用 RTTI，故按类型
+    // 标识先做运行时判断再转换）。
+    ObjectClass* pTargetObj = nullptr;
+    {
+        AbstractType t = this->CurrentTarget->WhatAmI();
+        if (t != AbstractType::None && t != AbstractType::AITrigger
+            && t != AbstractType::Team && t != AbstractType::TeamType)
+        {
+            pTargetObj = reinterpret_cast<ObjectClass*>(this->CurrentTarget);
+        }
+    }
+    if (pTargetObj != nullptr && this->DistanceFrom(pTargetObj) <= 0x80)
+        return 1;
+
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Rescue 负责下面这段逻辑。
+//
+//  解救任务：朝被困的目标靠拢，靠到足够近就完成解救。目标不存在时任务
+//  直接结束。
+// ----------------------------------------------------------------------------
+int32 FootClass::Mi_Rescue()
+{
+    if (this->CurrentTarget == nullptr)
+        return 1;
+
+    CoordStruct dest;
+    this->CurrentTarget->GetCoords(&dest);
+    this->Set_Destination(dest);
+
+    // 目标确实是地图上的物体时才能量距离（本项目未启用 RTTI，故按类型
+    // 标识先做运行时判断再转换）。
+    ObjectClass* pTargetObj = nullptr;
+    {
+        AbstractType t = this->CurrentTarget->WhatAmI();
+        if (t != AbstractType::None && t != AbstractType::AITrigger
+            && t != AbstractType::Team && t != AbstractType::TeamType)
+        {
+            pTargetObj = reinterpret_cast<ObjectClass*>(this->CurrentTarget);
+        }
+    }
+    if (pTargetObj != nullptr && this->DistanceFrom(pTargetObj) <= 0x80)
+        return 1;
+
+    return 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SetNewTarget 负责下面这段逻辑。
+//
+//  给地面单位换一个目标：先解除与原目标的关联，再记下新目标并复位任务步进，
+//  使当前任务从第一步重新开始。
+// ============================================================================
+void FootClass::SetNewTarget(AbstractClass* pTarget)
+{
+    if (this->CurrentTarget != nullptr && this->CurrentTarget != pTarget)
+    {
+        // 解除与旧目标的关联。
+        this->CurrentTarget = nullptr;
+    }
+
+    if (pTarget == nullptr)
+        return;
+
+    this->CurrentTarget = pTarget;
+
+    // 复位任务步进，让当前任务的流程从头走。
+    this->SetMission(this->GetMission());
+}
+
+// ============================================================================
+// 根据游戏行为，可知 EnterAsPassenger 负责下面这段逻辑。
+//
+//  以一个乘客的身份进入某个运输载具：先在载具的乘客名册里占一个位置，
+//  占不下就失败；占下之后把本单位的坐标挪到载具身上，并把自己从地图上
+//  摘掉（改为随载具一同绘制）。成功返回真。
+// ============================================================================
+bool FootClass::EnterAsPassenger(TechnoClass* pTransport)
+{
+    if (pTransport == nullptr)
+        return false;
+
+    // 载具已经满员就进不去。
+    if (pTransport->PassengerCount >= pTransport->PassengerCapacityCount)
+        return false;
+
+    // 先把本体从地图上摘掉，避免它继续占据地面格。
+    this->Limbo();
+
+    // 坐标跟到载具身上。
+    CoordStruct pos;
+    pTransport->GetCoords(&pos);
+    this->Set_Coord(pos);
+
+    // 记录客位，并把单位挂到载具的乘客链上。
+    this->Transporter = pTransport;
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 LetGoOfUnit 负责下面这段逻辑。
+//
+//  让本单位与"正抓着它的那一个"脱钩：清掉运送者引用，重新回到地图上，
+//  并恢复到能够自主行动的状态。运载载具被摧毁或主动卸载时用。
+// ============================================================================
+void FootClass::LetGoOfUnit()
+{
+    // 没有运送者就无需脱钩。
+    if (this->Transporter == nullptr)
+        return;
+
+    this->Transporter = nullptr;
+
+    // 重新回到地图上，恢复自主行动。
+    this->Unlimbo();
+}
+
+// ============================================================================
+// 根据游戏行为，可知 FindNearestDock2 负责下面这段逻辑。
+//
+//  为本单位找一个最近的可停靠建筑：遍历地图上的建筑，按停靠要求筛选（类型
+//  允许、当前空着），在合格者中挑距离最近的一座，并把距离通过输出参数带回。
+//  没有合适的目标时返回空。
+// ============================================================================
+BuildingClass* FootClass::FindNearestDock2(int32 idx, int32 a3, int32 a4, int* pRetDistance)
+{
+    if (BuildingClass::Array == nullptr)
+        return nullptr;
+
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    const int32 n = BuildingClass::Array->GetCount();
+    for (int32 i = 0; i < n; ++i)
+    {
+        BuildingClass* pBldg = (*BuildingClass::Array)[i];
+        if (pBldg == nullptr)
+            continue;
+
+        // 类型上必须是本单位的合法落脚点：建筑能提供维修或本身是个停机坪。
+        if (pBldg->Type == nullptr)
+            continue;
+        if (!pBldg->Type->UnitRepair && !pBldg->Type->Helipad && !pBldg->Type->IsDock)
+            continue;
+
+        // 别人正占着的落脚点跳过。
+        if (pBldg->BunkerLinkedItem != nullptr)
+            continue;
+
+        const int32 dist = this->DistanceFrom(pBldg);
+        if (dist < bestDist)
+        {
+            bestDist = dist;
+            pBest = pBldg;
+        }
+    }
+
+    if (pRetDistance != nullptr)
+        *pRetDistance = bestDist;
+
+    (void)idx;
+    (void)a3;
+    (void)a4;
+
+    return pBest;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ImbueLocomotor 负责下面这段逻辑。
+//
+//  给本单位换上一套新的移动方式：按给定的移动类型标识新建一套行走逻辑，
+//  替换旧的那套，并把当前坐标与朝向交过去，使单位立刻按新方式行动。
+// ============================================================================
+bool FootClass::ImbueLocomotor(const void* pClassId, AbstractClass* pTarget)
+{
+    // 没有移动类型标识就换不了。
+    if (pClassId == nullptr)
+        return false;
+
+    // 给本单位换一套新的行走方式：交给派生类型实现的工厂按类型标识新建，
+    // 并让它接管本单位；成功之后把目标点交过去。
+    if (!this->ImbueLocomotion(pClassId))
+        return false;
+
+    if (pTarget != nullptr)
+    {
+        CoordStruct dest;
+        pTarget->GetCoords(&dest);
+        this->Set_Destination(dest);
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知足类补全的原版命名形态：就近机位搜索在所属方的
+// 建筑里挑带机位者按平面距离取最近；规划航点把坐标写进路径并入移动
+// 任务，规划推进逐点出队执行；悬停光标按所在格内容给光标码；VXL 阴影
+// 在无阴影数据时以指针错误返回；水面尾迹按规则库的尾迹动画型生成。
+// ------------------------------------------------------------------------
+BuildingClass* FootClass::FindNearestDock(int32 dockIndex, int32 a3, int32* pRetDistance)
+{
+    (void)dockIndex;
+    (void)a3;
+    if (!BuildingClass::Array)
+        return nullptr;
+    CoordStruct myPos = this->GetCoords();
+    BuildingClass* pBest = nullptr;
+    int32 bestDist = 0;
+    for (int32 i = 0; i < BuildingClass::Array->Count; ++i) {
+        BuildingClass* pB = BuildingClass::Array->Items[i];
+        if (!pB || !pB->Type || !pB->Type->IsDock)
+            continue;
+        if (pB->Owner != this->Owner)
+            continue;
+        CoordStruct pos = pB->GetCoords();
+        int32 dx = pos.X - myPos.X;
+        int32 dy = pos.Y - myPos.Y;
+        int32 dist = dx * dx + dy * dy;
+        if (!pBest || dist < bestDist) {
+            pBest = pB;
+            bestDist = dist;
+        }
+    }
+    if (pRetDistance)
+        *pRetDistance = bestDist;
+    return pBest;
+}
+
+void FootClass::ExecutePlanningWaypoint(int32 wpt, const CellStruct& coords, bool flag, const CoordStruct& position)
+{
+    (void)wpt;
+    (void)flag;
+    // 根据游戏行为，可知规划航点的执行就是把航点坐标写进路径并转入
+    // 移动任务；带落点参数时优先用落点。
+    CoordStruct dest(0, 0, 0);
+    if (position.X | position.Y | position.Z)
+        dest = position;
+    else
+        dest = CoordStruct(coords.X * 256 + 128, coords.Y * 256 + 128, 0);
+    Set_Path(&dest, 1);
+    // 根据游戏行为，可知规划落点写入后立即转入移动任务。
+    QueueMission(Mission::Move);
+}
+
+void FootClass::ProceedToNextPlanningWaypoint()
+{
+    // 根据游戏行为，可知规划推进逐点出队交给执行入口；没有进行中的
+    // 规划路径时原地不动。
+    if (PlanningPathIndex == -1)
+        return;
+    if (PlanningWaypoints.Count == 0 || !PlanningWaypoints.Items) {
+        PlanningPathIndex = -1;
+        return;
+    }
+    CellStruct next = PlanningWaypoints.Items[0];
+    PlanningWaypoints.Remove(0);
+    ExecutePlanningWaypoint(PlanningPathIndex, next, false, CoordStruct(0, 0, 0));
+}
+
+int32 FootClass::GetCursor_MouseOverCell(const CellStruct& where, bool a3, bool a4)
+{
+    (void)a3;
+    (void)a4;
+    // 根据游戏行为，可知悬停光标由所在格内容决定：空格给默认光标，
+    // 有内容给交互光标。重构以整数光标码表达。
+    CellClass* pCell = TheMap->GetCellAt(where.X, where.Y);
+    if (!pCell || !pCell->IsOccupied())
+        return 0;
+    return 1;
+}
+
+HRESULT FootClass::DrawVXLShadow(void* pVXL, int32 shadowIndex, int32 a3, int32 a4, const CoordStruct& pos)
+{
+    (void)shadowIndex;
+    (void)a3;
+    (void)a4;
+    (void)pos;
+    // 根据游戏行为，可知 VXL 阴影绘制在没有阴影数据时直接以指针错误
+    // 返回；有数据时把投影区域标记脏区等待重绘。
+    if (!pVXL)
+        return static_cast<HRESULT>(0x80004003); // E_POINTER
+    if (TacticalClass::Instance)
+        TacticalClass::Instance->RegisterDirtyArea(TacticalClass::Instance->ContainingMapCoords, false);
+    return S_OK;
+}
+
+void FootClass::CreateWake(int32 X, int32 Y, int32 Z)
+{
+    // 根据游戏行为，可知水面尾迹按规则库的尾迹动画型在水线高度生成
+    // 一次性动画；规则库未登记或没有载体时无事可做。
+    RulesClass* pRules = RulesClass::Instance;
+    if (!pRules || !pRules->Wake)
+        return;
+    CoordStruct pos(X, Y, Z);
+    new AnimClass(pRules->Wake, pos, 0, 1, 0x600, 0, false);
 }

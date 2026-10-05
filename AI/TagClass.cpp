@@ -332,3 +332,83 @@ void TagClass::Compute_CRC(CRCEngine& crc) const {
         }
     }
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知标签的查询面沿挂载触发器逐个询问：可重复看触发器
+// 的重复旗标；检查线命中把区域值交给触发器判定；允许胜利由触发器的
+// 动作链回答；事件上抛按事件类型广播到每个挂载触发器。
+// ------------------------------------------------------------------------
+bool TagClass::IsTriggerRepeating() const
+{
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger && pTrigger->Repeatable)
+            return true;
+    }
+    return false;
+}
+
+bool TagClass::CrossHorizontal(int32 zone)
+{
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger && pTrigger->CrossHorizontalZone(zone))
+            return true;
+    }
+    return false;
+}
+
+bool TagClass::CrossVertical(int32 zone)
+{
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger && pTrigger->CrossedVertical(zone))
+            return true;
+    }
+    return false;
+}
+
+bool TagClass::IsWPZoneEntry() const
+{
+    // 根据游戏行为，可知“路点区域进入”也是标签的配置属性：挂载的
+    // 触发器里任一带事件登记即视作配置了区域检查。
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger && pTrigger->Event)
+            return true;
+    }
+    return false;
+}
+
+bool TagClass::DoesAllowWin() const
+{
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger && pTrigger->InvolvesAllowWin())
+            return true;
+    }
+    return false;
+}
+
+bool TagClass::IsAttachedToTrigger(TriggerClass* pTrigger) const
+{
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        if (TriggerList.Items[i] == pTrigger)
+            return true;
+    }
+    return false;
+}
+
+void TagClass::RaiseEvent(int32 eventKind, AbstractClass* pTagObject, CellStruct loc, bool isRepeating, AbstractClass* pSource)
+{
+    (void)isRepeating;
+    (void)pSource;
+    // 根据游戏行为，可知事件上抛把事件按类型广播给每个挂载触发器，
+    // 由触发器各自做事件匹配与动作执行。
+    const auto kind = static_cast<TriggerEventType>(eventKind);
+    for (int32 i = 0; i < TriggerList.Count; ++i) {
+        TriggerClass* pTrigger = TriggerList.Items[i];
+        if (pTrigger)
+            pTrigger->Spring(kind, pTagObject, loc);
+    }
+}

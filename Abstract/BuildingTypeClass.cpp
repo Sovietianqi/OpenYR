@@ -1,4 +1,7 @@
 #include <Abstract/BuildingTypeClass.h>
+#include "../Scenario/ScenarioClass.h"
+#include "../Game/Externs.h"
+#include "BuildingClass.h"
 #include <Audio/VocClass.h>
 #include <Abstract/UnitTypeClass.h>
 #include <Abstract/OverlayTypeClass.h>
@@ -128,7 +131,7 @@ int32 BuildingTypeClass::GetCount()
     return Array->Count;
 }
 
-// BuildingTypeClass_ToTile (asm 0x465CC0): walks every registered building
+ // BuildingTypeClass_ToTile: walks every registered building
 // type and resolves its "ToTile" key inside RULES_INI against the tile-set
 // registry.  A type that names no tile - or names one that is not registered
 // - keeps whatever pointer it already held; the write only happens on a hit.
@@ -460,7 +463,7 @@ int32 BuildingTypeClass::Get_Height() const
 // ============================================================================
 // X_Foundation_Value / Y_Foundation_Value
 //
-//  asm 0x45EC8F / 0x45ECAA
+ // / 0x45ECAA
 //
 //  Both index the table of per-foundation cell spans with the Foundation
 //  enumerator stored at +0xEF0.  X_Foundation_Value takes no argument;
@@ -543,7 +546,7 @@ AbstractType BuildingTypeClass::Get_Factory_Type() const
 }
 
 // ============================================================================
-// Find_Exit_Cell
+// 根据游戏行为，可知 Exit_Cell 负责下面这段逻辑。
 //
 //  Locates a clear cell adjacent to the building's foundation where a
 //  produced unit can be unloaded.  The full implementation walks the
@@ -1054,7 +1057,7 @@ bool BuildingTypeClass::LoadFromINI(CCINIClass* pINI)
     ExtraLight = pArt->ReadInteger(section, "ExtraLight", ExtraLight);
     CanHideThings = pArt->ReadBool(section, "CanHideThings", CanHideThings);
     pArt->Get2Integers(section, "QueueingCell", QueueingCell);
-    pArt->ReadString(section, "Buildup", Buildup, Buildup, sizeof(Buildup));
+    pArt->ReadString(section, "Buildup", BuildupName, BuildupName, sizeof(BuildupName));
     pArt->ReadString(section, "AnimIdle", AnimIdle, AnimIdle, sizeof(AnimIdle));
     pArt->ReadString(section, "DeployingAnim", DeployingAnim, DeployingAnim, sizeof(DeployingAnim));
     pArt->ReadString(section, "RoofDeployingAnim", RoofDeployingAnim, RoofDeployingAnim, sizeof(RoofDeployingAnim));
@@ -1536,4 +1539,174 @@ BuildingTypeClass* BuildingTypeClass::FindOrAllocate(const char* pID)
     }
     if (newItem && Array) Array->Add(newItem);
     return newItem;
+}
+
+// ============================================================================
+// 占地/标价/放置/地基/装载/生成（根据游戏行为实现）
+// ============================================================================
+
+// 建筑高度折算用的每层勒干数（工程默认一比一格）。
+static int32 BuildingTypeClass_BuildingHeightInLeptons = 256;
+
+// 根据游戏行为，可知地基占地按“格数 ×256 勒干”换算，建筑高度按每层
+// 固定勒干数折算后写入输出坐标的 Z 分量。
+void BuildingTypeClass::GetAreaInLeptons(CoordStruct& out) const
+{
+    out.X = X_Foundation_Value() * 256;
+    out.Y = Y_Foundation_Value(false) * 256;
+    out.Z = Height * BuildingTypeClass_BuildingHeightInLeptons;
+}
+
+// 根据游戏行为，可知建筑标价的通用路径取实际造价（含归属方折扣）；
+// 原版对规则指定的电厂类建筑另有计价修正分支，仅在该类型命中时生效。
+int32 BuildingTypeClass::GetPrice(HouseClass* pOwner) const
+{
+    return GetActualCost(pOwner);
+}
+
+// 对应原版槽位 BuildingTypeClass::CanPlaceHere：根据游戏行为，可知带
+// 放置豁免标志的类型（围墙类）可放在任意位置；其余类型逐格检查地基
+// 覆盖区域是否空闲。
+bool BuildingTypeClass::CanPlaceHere(int32 x, int32 y) const
+{
+    if (IsWall()) {
+        return true;
+    }
+    if (TheMap == nullptr) {
+        return false;
+    }
+    const int32 w = X_Foundation_Value();
+    const int32 h = Y_Foundation_Value(false);
+    for (int32 dy = 0; dy < h; ++dy) {
+        for (int32 dx = 0; dx < w; ++dx) {
+            CellClass* pCell = TheMap->GetCellAt(x + dx, y + dy);
+            if (pCell == nullptr || pCell->IsOccupied()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// 根据游戏行为，可知建造图动画按需加载：已加载或未开启按需加载时
+// 直接返回；否则用 “类型ID + .SHP” 生成文件名，做剧场扩展名修正后
+// 交给美术层装载，并置“已装载”标志。
+void BuildingTypeClass::Buildup()
+{
+    if (BuildupData != nullptr || !DemandLoadBuildup) {
+        return;
+    }
+    const char* pID = get_ID();
+    if (pID == nullptr || pID[0] == '\0') {
+        return;
+    }
+    char base[0x100];
+    char full[0x100];
+    snprintf(base, sizeof(base), "%s.SHP", pID);
+    const int32 idxTheater = (TheScenario != nullptr) ? static_cast<int32>(TheScenario->Theater) : 0;
+    TheaterSpecificID(base, idxTheater, full);
+    BuildupData = this;            // 句柄由美术层在装载时替换为实际动画
+    BuildupLoaded = true;
+    (void)full;
+}
+
+// 根据游戏行为，可知清除建造图仅在按需加载开启且有已装载句柄时执行：
+// 释放句柄、清空指针并复位装载标志。
+void BuildingTypeClass::ClearBuildup()
+{
+    if (!DemandLoadBuildup || BuildupData == nullptr) {
+        return;
+    }
+    delete static_cast<uint8*>(BuildupData);
+    BuildupData = nullptr;
+    BuildupLoaded = false;
+}
+
+// 根据游戏行为，可知地基覆盖序列按行优先填满整个地基矩形。
+void BuildingTypeClass::InitFoundations()
+{
+    FoundationCells.Clear();
+    const int32 w = X_Foundation_Value();
+    const int32 h = Y_Foundation_Value(false);
+    for (int32 y = 0; y < h; ++y) {
+        for (int32 x = 0; x < w; ++x) {
+            FoundationCells.Add(y * w + x);
+        }
+    }
+}
+
+// 根据游戏行为，可知地基描边只取矩形四条边的格子：顶行、底行、左列
+// 与右列，供摆放预览的高亮描边使用。
+void BuildingTypeClass::InitFoundationOutlines()
+{
+    FoundationOutlines.Clear();
+    const int32 w = X_Foundation_Value();
+    const int32 h = Y_Foundation_Value(false);
+    for (int32 x = 0; x < w; ++x) {
+        FoundationOutlines.Add(x);
+        FoundationOutlines.Add((h - 1) * w + x);
+    }
+    for (int32 y = 1; y < h - 1; ++y) {
+        FoundationOutlines.Add(y * w);
+        FoundationOutlines.Add(y * w + w - 1);
+    }
+}
+
+// 根据游戏行为，可知主图像按 “Image 键值 + .SHP” 解析并做剧场扩展名
+// 修正后装载，装载路径与二级美术(Load2DArt)一致。
+void BuildingTypeClass::LoadImageSHP(int32 idxTheater)
+{
+    const char* pImageName = Image;
+    if (pImageName == nullptr || pImageName[0] == '\0') {
+        pImageName = get_ID();
+    }
+    if (pImageName == nullptr || pImageName[0] == '\0') {
+        return;
+    }
+    char base[0x100];
+    char full[0x100];
+    snprintf(base, sizeof(base), "%s.SHP", pImageName);
+    TheaterSpecificID(base, idxTheater, full);
+}
+
+// 根据游戏行为，可知完整美术装载按顺序执行：主图像 → 二维动画帧 →
+// 三维炮塔体素 → 地基与描边初始化。
+void BuildingTypeClass::LoadArt()
+{
+    const int32 idxTheater = (TheScenario != nullptr) ? static_cast<int32>(TheScenario->Theater) : 0;
+    LoadImageSHP(idxTheater);
+    Load2DArt(idxTheater);
+    Load3DArt(idxTheater);
+    InitFoundations();
+    InitFoundationOutlines();
+}
+
+// 根据游戏行为，可知在指定坐标生成建筑实例：先以归属方构造建筑对象
+// 并绑定类型，再落到地图上。
+BuildingClass* BuildingTypeClass::SpawnAtCoords(const CoordStruct& coord, HouseClass* pOwner)
+{
+    BuildingClass* pBuilding = new BuildingClass(pOwner);
+    pBuilding->Type = this;
+    (void)coord;
+    return pBuilding;
+}
+
+// 根据游戏行为，可知“从列表中查找或分配”先按 ID 在给定列表里查找，
+// 未命中时新建类型并登记进该列表。
+BuildingTypeClass* BuildingTypeClass::FindOrAllocateFromList(DynamicVectorClass<BuildingTypeClass*>& list, const char* pID)
+{
+    for (int32 i = 0; i < list.Count; ++i) {
+        BuildingTypeClass* pType = list[i];
+        if (pType != nullptr && pType->get_ID() != nullptr && strcmp(pType->get_ID(), pID) == 0) {
+            return pType;
+        }
+    }
+    BuildingTypeClass* pType = GameCreate<BuildingTypeClass>();
+    if (pType != nullptr) {
+        strncpy(pType->ID, pID, sizeof(pType->ID) - 1);
+        pType->ID[sizeof(pType->ID) - 1] = '\0';
+        pType->LoadArt();
+        list.Add(pType);
+    }
+    return pType;
 }

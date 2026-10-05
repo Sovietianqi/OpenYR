@@ -536,3 +536,12 @@ float DropPodLocomotionClass::GetDropProgress() const
 
     return 1.0f - static_cast<float>(CurrentHeight) / static_cast<float>(DropHeight);
 }
+void DropPodLocomotionClass::ILocomotion_Update()
+{
+    // 根据游戏行为，可知空投舱的每帧推进入口就是下坠状态机的一步：
+    // 下坠阶段报告完成即转入冲击处理。
+    if (HasImpacted)
+        return;
+    if (ProcessDescent())
+        Impact();
+}

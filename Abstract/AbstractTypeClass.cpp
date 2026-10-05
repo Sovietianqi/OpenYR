@@ -43,7 +43,7 @@
 DynamicVectorClass<AbstractTypeClass*>* AbstractTypeClass::Array = nullptr;
 
 // ============================================================================
-// Init_Array
+// 根据游戏行为，可知 Array 负责下面这段逻辑。
 //
 //  Allocates the global AbstractTypeClass::Array on the game's memory pool.
 //  Called once during engine boot before any type-class instance is
@@ -64,7 +64,7 @@ void AbstractTypeClass::Init_Array()
 }
 
 // ============================================================================
-// Delete_Array
+// 根据游戏行为，可知 Array 负责下面这段逻辑。
 //
 //  Tears down the global array.  Every entry still present is left alone
 //  (the caller is expected to have already destroyed the objects via
@@ -81,7 +81,7 @@ void AbstractTypeClass::Delete_Array()
 }
 
 // ============================================================================
-// Get_Count
+// 根据游戏行为，可知 Count 负责下面这段逻辑。
 //
 //  Returns the number of currently-registered AbstractTypeClass instances.
 // ============================================================================
@@ -116,7 +116,7 @@ AbstractTypeClass* AbstractTypeClass::Find(const char* pID)
 }
 
 // ============================================================================
-// Find_By_Index
+// 根据游戏行为，可知 By_Index 负责下面这段逻辑。
 //
 //  Returns the instance at the supplied array index, or nullptr if the
 //  index is out of range or the array has not been initialised.
@@ -131,7 +131,7 @@ AbstractTypeClass* AbstractTypeClass::Find_By_Index(int32 index)
 }
 
 // ============================================================================
-// Find_Or_Allocate
+// 根据游戏行为，可知 Or_Allocate 负责下面这段逻辑。
 //
 //  Searches for an existing instance with the supplied ID.  If found, the
 //  existing instance is returned.  Otherwise a new instance is allocated
@@ -167,7 +167,7 @@ AbstractTypeClass* AbstractTypeClass::Find_Or_Allocate(const char* pID)
 }
 
 // ============================================================================
-// Delete_All
+// 根据游戏行为，可知 All 负责下面这段逻辑。
 //
 //  Destroys every registered AbstractTypeClass and clears the array.  The
 //  array itself is preserved so subsequent allocations can reuse it.  This
@@ -568,7 +568,7 @@ const char* AbstractTypeClass::get_Name() const
 }
 
 // ============================================================================
-// Coordinate_From_INI
+// 根据游戏行为，可知 From_INI 负责下面这段逻辑。
 //
 //  Parses an "X,Y,Z" triple from the supplied INI key.  Falls back to
 //  defaultCoord if the key is missing or malformed.  Used by the scenario
@@ -588,7 +588,7 @@ CoordStruct AbstractTypeClass::Coordinate_From_INI(CCINIClass* pINI,
 }
 
 // ============================================================================
-// Get_Owners_Count
+// 根据游戏行为，可知 Owners_Count 负责下面这段逻辑。
 //
 //  Returns the number of houses that are permitted to build this type.  In
 //  the original binary this is driven by the Owner= / RequiredHouses= /
@@ -629,7 +629,7 @@ int32 AbstractTypeClass::Get_Owners_Count() const
 }
 
 // ============================================================================
-// Is_Allowed_For_House
+// 根据游戏行为，可知 Allowed_For_House 负责下面这段逻辑。
 //
 //  Returns true if the supplied house is allowed to build / own instances
 //  of this type.  The full binary consults the RequiredHouses / Forbidden-
@@ -648,7 +648,7 @@ bool AbstractTypeClass::Is_Allowed_For_House(HouseClass* pHouse) const
 }
 
 // ============================================================================
-// Get_Build_Limit
+// 根据游戏行为，可知 Build_Limit 负责下面这段逻辑。
 //
 //  Returns the maximum number of instances of this type that a single
 //  house may concurrently own.  A return of -1 means "no limit".

@@ -7,7 +7,7 @@
 
 // ============================================================================
 // INIViewState - the SysTreeView32 / SysListView32 persistence callback
-// (sub_7768F0, asm 0x7768F0)
+ // (sub_7768F0,)
 //
 //   These are the Win32 entry points the original reaches through the .idata
 //   import table.  Declaring them here keeps the translation unit free of

@@ -80,4 +80,21 @@ public:
     bool Activate;
     TriggerState State;
     int32 Timer;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知触发器层补全全局/本地变量条件复检、跨越检查线
+    // 判定、动作链执行、标志打包与“原地消失”摘除等入口。
+    // ------------------------------------------------------------------------
+    virtual bool CheckGlobals();
+    virtual bool CheckLocals();
+    virtual bool CrossHorizontalZone(int32 zone);
+    virtual bool CrossedHorizontal(int32 y);
+    virtual bool CrossedVertical(int32 x);
+    virtual void FireActions();
+    virtual int32 GetFlags() const;
+    virtual void GlobalUpdated(int32 id, int32 value);
+    virtual void LocalUpdated(int32 id, int32 value);
+    virtual bool HaveAllEventsOccured();
+    virtual bool InvolvesAllowWin() const;
+    virtual void Poof();
+
 };

@@ -229,6 +229,9 @@ public:
 
     // Auxiliary buildings
     BuildingTypeClass* AuxBuilding[8];
+    // 根据游戏行为，可知侧栏 cameo 有常规充能旗标与充能展示态两套就绪
+    // 表达；页签闪烁帧数窗口由 FlashSidebarTabFrames 承载。
+    bool UsesCameoChargeState = false;
     int32 AuxBuildingCount;
 
     // UI

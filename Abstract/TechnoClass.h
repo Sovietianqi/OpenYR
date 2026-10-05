@@ -37,6 +37,8 @@ public:
         , RepairRate(0)
         , IronCurtainTimer(0)
         , ForceShieldTimer(0)
+        , IronTintTimer(0), IronTintStage(0)
+        , AirstrikeTintTimer(0), AirstrikeTintStage(0)
         , LastFireFrame(-0x7FFFFFFF)
         , FireDamageTimer(0)
         , SparkyCounter(0)
@@ -46,6 +48,18 @@ public:
         , RadiationTimer(0)
         , Tunnel(false)
         , ActiveTurretIndex(0)
+        , WeaponStageFrame(0)
+        , RecoilAmount(0)
+        , RecoilStartFrame(0)
+        , IsDyingNow(false)
+        , KilledBy(nullptr)
+        , IsTalking(false)
+        , TalkBubbleText(nullptr)
+        , TalkBubbleEnd(0)
+        , LastTalkFrame(0)
+        , PlanningDestination()
+        , SmokeSystemActive(false)
+        , SmokeSystemStage(0)
         , CurrentWeaponNumber(-1)
         , OrigOwner(nullptr)
         , Captured(false)
@@ -55,6 +69,9 @@ public:
         , IsWarpingOutFlag(false)
         , DisguiseCreationFrame(-1)
         , DisguiseBlinkTimer()
+        , DisguiseTypeId(-1), DisguiseHouse(nullptr)
+        , BunkerLinkedItem(nullptr)
+        , PassengerCount(0), PassengerHead(nullptr), PassengerCapacityCount(0)
         , PrimaryFacing()
         , GroundHeight(0)
         , DrainTimer(0)
@@ -81,7 +98,7 @@ public:
     HouseClass* GetOwningHouse() const { return Owner; }
     int32 GetOwningHouseIndex() const { return 0; }
 
-    // TechnoClass_GetThreatPosed (asm 0x708B50).  The threat this object
+ // TechnoClass_GetThreatPosed.  The threat this object
     // presents to the enemy, counted into the owning house's threat grid.
     //
     //   * Without a type the answer is zero.
@@ -114,6 +131,112 @@ public:
     void Update_Repair();
     void Update_Veterancy();
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UpdateTint_IronCurtain 负责推进"铁幕"染色动画：
+    //  单位不在铁幕之下时什么都不做；在铁幕之下则按阶段计时，从一个阶段
+    //  逐步走到下一个阶段，阶段切换的同时重设本阶段的持续时间，从而形成
+    //  金属光泽循环闪烁的观感。
+    // ------------------------------------------------------------------------
+    void UpdateTint_IronCurtain();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UpdateTint_Airstrike 负责推进"空袭标记"染色动画：
+    //  只有正被空袭击中的目标才需要闪烁；按阶段计时逐个推进，闪烁一轮后
+    //  若空袭已经结束就把阶段复位，否则重新开始下一轮。
+    // ------------------------------------------------------------------------
+    void UpdateTint_Airstrike();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ClearPlanningNodes 负责清掉本单位所属的行军规划
+    //  令牌：找到本阵营当前使用的规划令牌后，把令牌上记录的节点清空，使
+    //  单位不再沿既有路线行动。单位被俘获或易主时用它。
+    // ------------------------------------------------------------------------
+    void ClearPlanningNodes();
+
+    // ========================================================================
+    // 根据游戏行为，可知 DrawVeterancy 在单位头顶按军衔画出升阶标记（老兵
+    //  一枚、精锐两枚），新兵不画。
+    // ========================================================================
+    void DrawVeterancy(Point2D* pCoord, RectangleStruct* pRect);
+
+    // ========================================================================
+    // 根据游戏行为，可知 DisplayTalkBubble 让单位在头顶冒出一个带文本的气泡，
+    //  UpdateTalkBubble 负责在到点后把气泡收掉。
+    // ========================================================================
+    bool DisplayTalkBubble(const wchar_t* pText, int32 duration);
+    void UpdateTalkBubble();
+
+    // ========================================================================
+    // 根据游戏行为，可知 CreatePlanningToken 为一个将要执行的行军规划点分配
+    //  一个规划令牌槽位；已有未消费令牌时复用。
+    // ========================================================================
+    int32 CreatePlanningToken(const CoordStruct& dest);
+
+    // ========================================================================
+    // 根据游戏行为，可知 GetNextMission 在没有外部指令时为单位挑一件"下一该
+    //  做的事"（脚本/队列优先，其余进入警戒）。
+    // ========================================================================
+    Mission GetNextMission() const;
+
+    // ========================================================================
+    // 根据游戏行为，可知 PrintSelectedTip 把单位的名称与状态填进选中提示，
+    //  供界面的信息栏显示。
+    // ========================================================================
+    void PrintSelectedTip(wchar_t* pBuffer, int32 bufferLength) const;
+
+    // ========================================================================
+    // 根据游戏行为，可知 ShouldSuppress 判断本次开火是否该被压住（目标已死、
+    //  已不在有效打击范围）。
+    // ========================================================================
+    bool ShouldSuppress(AbstractClass* pTarget) const;
+
+    // ========================================================================
+    // 根据游戏行为，可知 PredictTargetCoords 按目标当前位置与速度推算炮弹
+    //  抵达时刻目标会在哪，用于带提前量的武器。
+    // ========================================================================
+    CoordStruct PredictTargetCoords(AbstractClass* pTarget, int32 flightTime) const;
+
+    // ========================================================================
+    // 根据游戏行为，可知 FireEBolt 朝目标打出一道电弧并在命中时结算伤害。
+    // ========================================================================
+    bool FireEBolt(AbstractClass* pTarget, int32 damage);
+
+    // ========================================================================
+    // 根据游戏行为，可知 DistributeFire 把一轮火力按"离中心越远衰减越多"的
+    //  方式分摊到目标附近区域内的敌人身上。
+    // ========================================================================
+    int32 DistributeFire(AbstractClass* pTarget, int32 damage, int32 radius);
+
+    // ========================================================================
+    // 根据游戏行为，可知 UpdateGattling_ 推进转管机枪类武器的射速档位：
+    //  连射升档、停火降档。
+    // ========================================================================
+    void UpdateGattling_(int32 stages, int32 rate);
+
+    // ========================================================================
+    // 根据游戏行为，可知 Drain 处理吸取类效果：把本单位当前的能量/生命按
+    //  额度转走一部分给发起者。
+    // ========================================================================
+    int32 Drain(int32 amount, TechnoClass* pSource);
+
+    // ========================================================================
+    // 根据游戏行为，可知 Die 是所有战斗单位死亡的统一入口：残骸、经验、
+    //  统计都在这里结算，子类按各自的表现扩展它。
+    // ========================================================================
+    virtual void Die(TechnoClass* pKiller);
+
+    // ========================================================================
+    // 根据游戏行为，可知 Recoil 推进炮管后座的表现状态：开火瞬间后座拉满，
+    //  随后按帧复位；复位期间渲染层把炮管画在偏后的位置。
+    // ========================================================================
+    void Recoil(int32 amount);
+
+    // ========================================================================
+    // 根据游戏行为，可知 GetThreatPosed 给出"本单位对某个阵营构成的威胁
+    //  值"：AI 挑目标时用它排序，威胁越大的单位越优先被打。
+    // ========================================================================
+    int32 GetThreatPosed(HouseClass* pToHouse) const;
+
     // ========================================================================
     // Fire weapon implementation
     // ========================================================================
@@ -124,6 +247,15 @@ public:
     // ========================================================================
     bool TakeDamage_Impl(int32 damage, ObjectClass* pSource,
                          WarheadTypeClass* pWarhead);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ReceiveDamage 是单位承受伤害的统一入口：它把
+    //  "打在身上多少伤害、来自谁、用什么弹头、是否忽略防御" 这组参数整理好，
+    //  再交给底层结算。护盾、铁幕、免疫等判定都在底层完成。
+    //  返回实际是否造成了伤害。
+    // ------------------------------------------------------------------------
+    int32 ReceiveDamage(int32 damage, TechnoClass* pSource,
+                        WarheadTypeClass* pWarhead, int32 a4);
 
     // ========================================================================
     // Repair logic
@@ -184,7 +316,7 @@ public:
     VisualType VisualCharacter(bool raw);
     void   CreateGap();
     void   DeleteGap();
-    // TechnoClass_UpdatePowered (asm 0x70ED20): re-evaluates whether this
+ // TechnoClass_UpdatePowered: re-evaluates whether this
     // techno still receives the power feed it depends on.  Called by an
     // owning structure's BuildingClass_InitMore for each powered unit slot.
     void   UpdatePowered();
@@ -216,89 +348,89 @@ public:
     virtual bool OnBridge() const;
 
     // ── TechnoClass state probes / accessors ──────────────────────────────
-    // TechnoClass_IsCrewed (asm 0x6F3B30): mirrors the type's Crewed flag.
+ // TechnoClass_IsCrewed: mirrors the type's Crewed flag.
     virtual bool IsCrewed() const;
-    // TechnoClass_IsFactory (asm 0x102414): base-class answer is false.
+ // TechnoClass_IsFactory: base-class answer is false.
     virtual bool IsFactory() const;
-    // TechnoClass_HasMultipleTurrets (asm 0x70DC90).
+ // 根据游戏行为，可知 HasMultipleTurrets 负责下面这段逻辑。
     virtual bool HasMultipleTurrets() const;
-    // TechnoClass_GetZ (asm 0x5F3C70).
+ // 根据游戏行为，可知 GetZ 负责下面这段逻辑。
     virtual int32 GetZ() const;
-    // TechnoClass_GetActiveTurretIndex (asm 0x70DCB0).
+ // 根据游戏行为，可知 GetActiveTurretIndex 负责下面这段逻辑。
     virtual int32 GetActiveTurretIndex() const;
-    // TechnoClass_GetTurretIndex (asm 0x70DD30).
+ // 根据游戏行为，可知 GetTurretIndex 负责下面这段逻辑。
     virtual int32 GetTurretIndex() const;
-    // TechnoClass_CurrentWeaponSelected (asm 0x70DCA0).
+ // 根据游戏行为，可知 CurrentWeaponSelected 负责下面这段逻辑。
     virtual bool CurrentWeaponSelected() const;
-    // TechnoClass_GetOwner (asm 0x70F810).
+ // 根据游戏行为，可知 GetOwner 负责下面这段逻辑。
     HouseClass* Get_Owner() const;
     // ── Disguise ──────────────────────────────────────────────────────────
-    // TechnoClass_IsDisguised (asm 0x1905A8): reads the type/instance disguise
+ // TechnoClass_IsDisguised: reads the type/instance disguise
     // flag.  The two-argument form adds a range parameter the original accepts
     // and ignores.
     virtual bool IsDisguised() const;
     virtual bool IsDisguised2(int32 a2) const;
-    // TechnoClass_ClearDisguise (asm 0x1905C0): drops the disguise.
+ // TechnoClass_ClearDisguise: drops the disguise.
     virtual void ClearDisguise();
 
     // ── Cloak / warp / temporal state ─────────────────────────────────────
-    // TechnoClass_IsCloakable (asm 0x708C40).
+ // 根据游戏行为，可知 IsCloakable 负责下面这段逻辑。
     virtual bool IsCloakable() const;
-    // TechnoClass_IsBeingWarpedOut (asm 0x708C50).
+ // 根据游戏行为，可知 IsBeingWarpedOut 负责下面这段逻辑。
     virtual bool IsBeingWarpedOut() const;
-    // TechnoClass_IsWarpingOut (asm 0x708C5E).
+ // 根据游戏行为，可知 IsWarpingOut 负责下面这段逻辑。
     virtual bool IsWarpingOut() const;
-    // TechnoClass_IsNotTemporalLocked (asm 0x708C8E).
+ // 根据游戏行为，可知 IsNotTemporalLocked 负责下面这段逻辑。
     virtual bool IsNotTemporalLocked() const;
-    // TechnoClass_IsNotWarpingIn (asm 0x5F3E31).
+ // 根据游戏行为，可知 IsNotWarpingIn 负责下面这段逻辑。
     virtual bool IsNotWarpingIn() const;
-    // TechnoClass_IsDraining (asm 0x70F5B5).
+ // 根据游戏行为，可知 IsDraining 负责下面这段逻辑。
     virtual bool IsDraining() const;
 
     // ── Temporal / weapon-legal probes ────────────────────────────────────
-    // TechnoClass_IsTemporalSource (asm 0x70C5D0): true when this techno is
+ // TechnoClass_IsTemporalSource: true when this techno is
     // currently the source of a temporal weapon that has a victim.
     bool IsTemporalSource() const;
-    // TechnoClass_IsLegalWeapon (asm 0x70E245): true when the weapon container
+ // TechnoClass_IsLegalWeapon: true when the weapon container
     // is non-null and holds a weapon id.
     bool IsLegalWeapon(const void* pWeapon) const;
-    // TechnoClass_GetNonSprayWeapon (asm 0x70DDC8-adjacent): returns the weapon
+ // TechnoClass_GetNonSprayWeapon (-adjacent): returns the weapon
     // in the slot that IsNoSprayAttack selects.
     void* GetNonSprayWeapon() const;
-    // TechnoClass_CanAreaFire (asm 0x70DD40): true when the current weapon is
+ // TechnoClass_CanAreaFire: true when the current weapon is
     // flagged as an area-effect weapon.
     bool CanAreaFire() const;
 
     // ── Weapon selection helpers ──────────────────────────────────────────
-    // TechnoClass_CanPassiveAquire (asm 0x70917A).
+ // 根据游戏行为，可知 CanPassiveAquire 负责下面这段逻辑。
     virtual bool CanPassiveAquire() const;
-    // TechnoClass_CanTraverse (asm 0x802612).
+ // 根据游戏行为，可知 CanTraverse 负责下面这段逻辑。
     virtual bool CanTraverse() const;
-    // TechnoClass_CanSetWaypoint (asm 0x700C40).
+ // 根据游戏行为，可知 CanSetWaypoint 负责下面这段逻辑。
     virtual bool CanSetWaypoint() const;
 
     // ── Miscellaneous probes ──────────────────────────────────────────────
-    // TechnoClass_NeedsToSelfHeal (asm 0x70BE80).
+ // 根据游戏行为，可知 NeedsToSelfHeal 负责下面这段逻辑。
     virtual bool NeedsToSelfHeal() const;
-    // TechnoClass_GetHealthState (asm 0x5F5DF0): 0 = healthy, 1 = damaged,
+ // TechnoClass_GetHealthState: 0 = healthy, 1 = damaged,
     // 2 = critical, matching the rules-side health thresholds.
     virtual int32 GetHealthState() const;
-    // TechnoClass_GetXYDistanceFrom (asm 0x5F6500): planar distance to another
+ // TechnoClass_GetXYDistanceFrom: planar distance to another
     // object, in leptons.
     virtual double GetXYDistanceFrom(const AbstractClass* pOther) const;
     // ── Panic / idle / power probes ───────────────────────────────────────
-    // TechnoClass_Panic (asm 0x41B3xx): the zero-argument form does nothing at
+ // TechnoClass_Panic (xx): the zero-argument form does nothing at
     // this layer; the mission-controller entry point is FootClass::Panic.
     virtual void Panic();
     // TechnoClass_Unpanic: the counterpart that returns the object to normal
     // morale; the base class does nothing.
     virtual void Unpanic();
     virtual void Scatter(const CoordStruct& crd, bool ignoreMission, bool ignoreDestination) {}
-    // TechnoClass_IdleAction (asm 0x41B5A4): returns false - derived missions
+ // TechnoClass_IdleAction: returns false - derived missions
     // override it to report that they have finished idling.
     virtual bool IdleAction();
     virtual void UpdateIdleAction() {}
-    // TechnoClass_IsPowerOnline (asm 0x41B57x): true only for powered
+ // TechnoClass_IsPowerOnline (x): true only for powered
     // structures; the base class answers false.
     virtual bool IsPowerOnline() const;
     virtual bool IsArmed() const { return false; }
@@ -306,6 +438,20 @@ public:
     virtual bool IsCurrentlyBeingSold() const { return false; }
     virtual bool IsPowered() const { return false; }
     virtual bool IsSelling() const { return false; }
+
+    // ========================================================================
+    // 任务调度入口（对应原版 vt 偏移 0x1E8 一带的mission层）
+    //
+    //  原版把"设定任务 / 排队任务 / 读取任务 / 设定目标 / 读取目标"这一组操作
+    //  放在任务层，任何 Techno 都可以通过虚表统一下发。载具、步兵、建筑各自
+    //  覆盖它们以实现自己的副作用（换序列、切换匍匐或待发状态等）。基类只提供
+    //  空实现，让未被覆盖的对象也能安全接收调用。
+    // ========================================================================
+    virtual void SetMission(Mission /*mission*/) {}
+    virtual Mission GetMission() const { return Mission::Sleep; }
+    virtual void QueueMission(Mission /*mission*/) {}
+    virtual void SetTarget(AbstractClass* /*pTarget*/) {}
+    virtual AbstractClass* GetTarget() const { return nullptr; }
     virtual bool IsFiring() const { return false; }
     virtual bool IsDeploying() const { return false; }
     virtual bool IsBeingDrained() const { return false; }
@@ -324,7 +470,7 @@ public:
     virtual bool IsLight() const { return false; }
     virtual bool IsVehicle() const { return false; }
     virtual bool IsTiberium() const { return false; }
-    // TechnoClass_GetTiberium (asm 0x6C9640).  Sums the four tiberium storage
+ // TechnoClass_GetTiberium.  Sums the four tiberium storage
     // floats carried by a harvesting techno and floors the running total.  The
     // base implementation carries no storage and therefore reports zero.
     virtual double Get_Tiberium() const { return 0.0; }
@@ -333,7 +479,7 @@ public:
     // True while this object is already under an external mind controller.
     virtual bool IsBeingMindControlled() const { return false; }
 
-    // TechnoClass_CanBePermaMC (asm 0x53C445).  Whether this object may be
+ // TechnoClass_CanBePermaMC.  Whether this object may be
     // permanently mind controlled by a psychic dominator:
     //
     //   * buildings never qualify (WhatAmI() == Building);
@@ -358,55 +504,96 @@ public:
 
         return !IsDead();
     }
-    // TechnoClass_CanOccupyFire (asm 0x41B534): only buildings and the infantry
+ // TechnoClass_CanOccupyFire: only buildings and the infantry
     // that garrison them answer true; the base class returns false.
     virtual bool CanOccupyFire() const;
-    // TechnoClass_GetOccupantCount (asm 0x41B53C): number of occupants garrisoned.
+ // TechnoClass_GetOccupantCount: number of occupants garrisoned.
     virtual int32 GetOccupantCount() const;
 
     // ── Layer / cell helpers ──────────────────────────────────────────────
-    // TechnoClass_InWhichLayer (asm 0x41ADCB): asks the locomotor which draw
+ // TechnoClass_InWhichLayer: asks the locomotor which draw
     // layer this techno currently occupies.
     virtual int32 InWhichLayer() const;
-    // TechnoClass_GetCellCoords (asm 0x41BEBE): converts the world coordinates
+ // TechnoClass_GetCellCoords: converts the world coordinates
     // into the owning cell's X/Y, dividing by 0x100 (one leptons-per-cell unit).
     virtual CellStruct GetCellCoords() const;
 
-    // ── Threat / value ratings (asm 0x41B547 / 0x41B54F / 0x41B557) ──────
+ // ── Threat / value ratings ( / 0x41B54F / 0x41B557) ──────
     virtual int32 GetAntiAirValue() const;
     virtual int32 GetAntiArmorValue() const;
     virtual int32 GetAntiInfantryValue() const;
 
-    // TechnoClass_UpdateRefinerySmokeSystems (asm 0x41B5C0): no-op at this layer.
-    virtual void UpdateRefinerySmokeSystems() {}
+ // TechnoClass_UpdateRefinerySmokeSystems: 根据游戏行为，可知建筑受损后开始
+    //  冒烟，受损越重烟越浓；完好时不冒烟。
+    virtual void UpdateRefinerySmokeSystems();
 
     // ========================================================================
     // Planning-token and type-flag probes
     // ========================================================================
-    // TechnoClass_GetPlanningToken (asm 0x70DDC0): the waypoint token slot
+ // TechnoClass_GetPlanningToken: the waypoint token slot
     // (+0x514).
     int32 GetPlanningToken() const;
-    // TechnoClass_AttachPlanningToken (asm 0x70DDC8): stores token into the
+ // TechnoClass_AttachPlanningToken: stores token into the
     // waypoint token slot (+0x514).
     void AttachPlanningToken(int32 token);
-    // TechnoClass_Assign_Destination_Cell (asm 0x70DDD5): stores the target
+ // TechnoClass_Assign_Destination_Cell: stores the target
     // building into the "focus on unit" slot.
     void Assign_Destination_Cell(BuildingClass* pTarget);
-    // TechnoClass_NotSubmerged (asm 0x70DDE0): true when the object's height is
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 PresumeMissionComplete 负责在任务被打断时收尾：
+    //  先松开正在施加的时间武器（若有），再检查对象是否还能继续执行任务，
+    //  能在必要时请求下一个任务。返回是否"任务确已完成"。
+    // ------------------------------------------------------------------------
+    bool PresumeMissionComplete();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 IsNotCloakedByOthers 负责判断"这个单位此刻并没有
+    //  被别人掩蔽"：它自身要么本来就能隐形，要么带隐形标记；并且不受 EMP、
+    //  瘫痪、正在传送出入等影响；老兵/精英级的"不可被探测"能力会直接否决；
+    //  最后要求所在格子上没有掩蔽该单位的隐身发生器（非本方的那一种）。
+    // ------------------------------------------------------------------------
+    bool IsNotCloakedByOthers() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 IsCloakedByOthers 负责判断"这个单位此刻正被别的
+    //  东西掩蔽"，它是 IsNotCloakedByOthers 的补集。
+    // ------------------------------------------------------------------------
+    bool IsCloakedByOthers() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 DeselectIfNotPlayerOwned 负责在只剩一个选中对象时，
+    //  若它的拥有方不是玩家则把它取消选中。返回是否真的执行了取消选中。
+    // ------------------------------------------------------------------------
+    bool DeselectIfNotPlayerOwned();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ExpireDrain 负责清理"抽能"状态：让正在被抽取的
+    //  目标松开抽能源，并且通知施加方的抽能对象解除关联。
+    // ------------------------------------------------------------------------
+    void ExpireDrain();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 UpdateThreatToCell 负责把本单位当前的威胁值写进
+    //  它所在格子的威胁记录，供寻路与 AI 使用。
+    // ------------------------------------------------------------------------
+    void UpdateThreatToCell();
+
+ // TechnoClass_NotSubmerged: true when the object's height is
     // above the submarine threshold (-20).
     bool NotSubmerged() const;
-    // TechnoClass_IsNotSprayAttack (asm 0x70DD00).
+ // 根据游戏行为，可知 IsNotSprayAttack 负责下面这段逻辑。
     bool IsNotSprayAttack() const;
-    // TechnoClass_IsNotSprayAttack2 (asm 0x70DD20).
+ // 根据游戏行为，可知 IsNotSprayAttack2 负责下面这段逻辑。
     bool IsNotSprayAttack2() const;
-    // TechnoClass_SetCurrentWeaponStage (asm 0x70DDD4): stores idx into the
+ // TechnoClass_SetCurrentWeaponStage: stores idx into the
     // multi-stage weapon counter (+0x140) when it is non-negative.
     void SetCurrentWeaponStage(int32 idx);
-    // TechnoClass_HasTurretTooltips (asm 0x70DDA6): the type's turret-tooltip
+ // TechnoClass_HasTurretTooltips: the type's turret-tooltip
     // flag.
     bool HasTurretTooltips() const;
 
-    // TechnoClass::Greatest_Threat (asm 0x6F8DA0).  The engine's universal
+ // TechnoClass::Greatest_Threat.  The engine's universal
     // target-acquisition entry point.  `projFlags` is the projectile-
     // capability bitmask (ProjectileTypeFlags); `curThreat` seeds the best
     // threat so a caller can require a strictly better candidate; `a4`
@@ -414,12 +601,12 @@ public:
     // Returns the best target found, or null.
     virtual ObjectClass* Greatest_Threat(int32 projFlags, int32 curThreat, int32 a4);
 
-    // TechnoClass_Combat_Damage (asm 0x6F8CB0).  Weapon-slot damage query used
+ // TechnoClass_Combat_Damage.  Weapon-slot damage query used
     // by Greatest_Threat to decide whether a special movement class (engineer
     // / terrorist) should ignore military targets.
     int32 Combat_Damage(int32 idxWeapon) const;
 
-    // TechnoClass_Techno_31C (asm 0x7087D0).  Vtable +0x31C - resolves the
+ // TechnoClass_Techno_31C.  Vtable +0x31C - resolves the
     // techno's current target object honouring the requested slot.
     ObjectClass* Techno_31C(int32 which) const;
 
@@ -427,15 +614,15 @@ public:
     // Position / altitude probes
     // ========================================================================
 
-    // TechnoClass_GetCellCoords1 (asm 0x5F6A50).  Writes the techno's owning
+ // TechnoClass_GetCellCoords1.  Writes the techno's owning
     // map cell (floored to the cell grid) into `pOut` and returns it.
     CellStruct* GetCellCoords1(CellStruct* pOut) const;
 
-    // TechnoClass_GetCell1 (asm 0x5F6A90).  The CellClass the techno is
+ // TechnoClass_GetCell1.  The CellClass the techno is
     // standing on, or null off-map.
     CellClass* GetCell1() const;
 
-    // TechnoClass_OnFloor (asm 0x5F6B60) / _InAir (asm 0x5F6B90).  True when
+ // TechnoClass_OnFloor / _InAir.  True when
     // the techno's Z puts it on the ground / in the air.  Both test the
     // "has height" flag at +0x74 first, then compare the current Z against
     // twice the ObjectClass::HeightAtSpawn offset (the parked-on-ground
@@ -443,22 +630,22 @@ public:
     bool OnFloor() const;
     bool InAir() const;
 
-    // TechnoClass_GetZFudgeCliff (asm 0x704270) / _Column (asm 0x703E60) /
-    // _Tunnel (asm 0x703F00).  FootClass::Get_ZAdjustment consults these to
+ // TechnoClass_GetZFudgeCliff / _Column /
+ // _Tunnel.  FootClass::Get_ZAdjustment consults these to
     // snap a unit's draw height to the terrain in front of it.  Each returns
     // a fudge value in pixels.
     int32 GetZFudgeCliff() const;
     int32 GetZFudgeColumn() const;
     int32 GetZFudgeTunnel() const;
 
-    // TechnoClass_GetElevationRangeBonus (asm 0x6F6FA0) /
-    // _GetElevationBonusNoSqrt (asm 0x6F7090).  The extra weapon range a
+ // TechnoClass_GetElevationRangeBonus /
+ // _GetElevationBonusNoSqrt.  The extra weapon range a
     // height advantage confers.  The NoSqrt variant skips the square root and
     // is used by the cheaper proximity test.
     double GetElevationRangeBonus(ObjectClass* pTarget) const;
     double GetElevationBonusNoSqrt(ObjectClass* pTarget) const;
 
-    // TechnoClass_TimeForCellInset (asm 0x6F7690).  True when the distance to
+ // TechnoClass_TimeForCellInset.  True when the distance to
     // the target exceeds (warhead CellSpread - CellInset), i.e. the shot has
     // already cleared the minimum arming distance.
     bool TimeForCellInset(TechnoClass* pTarget) const;
@@ -467,45 +654,82 @@ public:
     // Combat / role classifiers
     // ========================================================================
 
-    // TechnoClass_CanLobber (asm 0x6F9CB0).  True when the techno's current
+ // TechnoClass_CanLobber.  True when the techno's current
     // weapon is flagged as a lobber (arcing artillery).
     bool CanLobber() const;
 
-    // TechnoClass_HasAbility (asm 0x6F9BE0).  True when the type carries the
+ // TechnoClass_HasAbility.  True when the type carries the
     // requested special ability flag.
     bool HasAbility(int32 ability) const;
 
-    // TechnoClass_CanBeBunkered (asm 0x6FB5E0).  True when this techno may be
+ // TechnoClass_CanBeBunkered.  True when this techno may be
     // loaded into a battle bunker / tank bunker.
     bool CanBeBunkered() const;
 
-    // TechnoClass_CanBePermaMC (asm 0x5B1080).  True when this techno may be
+    // 根据游戏行为，可知 BunkerLinkedItem 是"掩体"与"窝在掩体里的单位"之间的
+    // 双向链接指针：掩体这一端存着里面的单位，单位这一端反过来存着它所在的掩体。
+    // 建立链接时两侧同时写入，拆除时两侧同时清空；它既是占用标记，也是反查入口。
+    TechnoClass* BunkerLinkedItem;
+
+    // ========================================================================
+    // 乘客链（对应原版的 cPassengerNode）：{ 数量, 首节点 }
+    //
+    //  运输载具用它挂载乘员：首节点是一个 TechnoClass 指针，乘员之间再用
+    //  自身的 NextObject 串成单向链。数量字段只做快速判空与容量判断用。
+    // ========================================================================
+    int32         PassengerCount;
+    TechnoClass*  PassengerHead;
+
+    // 根据游戏行为，可知 PassengerCapacityCount 是本单位作为运输载具时
+    // 能装下的乘客数；非运输单位恒为零，满员判断据此进行。
+    int32         PassengerCapacityCount;
+
+    // 返回链条上的第一个乘客（无乘客时为空）。
+    TechnoClass* Attached_Object() const { return PassengerHead; }
+
+    // 把整个乘客链全部"封口"：逐一点掉每位乘客的对外射击许可。
+    void BlockAllOpenToppedPassengers();
+
+ // TechnoClass_CanBePermaMC.  True when this techno may be
     // permanently mind-controlled (Yuri Prime's capture).
     bool CanBePermaMC() const;
 
-    // TechnoClass_BelongsToPlayer (asm 0x6FBF40) /
-    // _PlayerOwnedAliveAndNamed (asm 0x6FBFF0).  Ownership probes used by the
+ // TechnoClass_BelongsToPlayer /
+ // _PlayerOwnedAliveAndNamed.  Ownership probes used by the
     // damage text / EVA paths.
     bool BelongsToPlayer() const;
     bool PlayerOwnedAliveAndNamed() const;
 
-    // TechnoClass_GetPointsValue (asm 0x707DC0).  The score value this techno
+ // TechnoClass_GetPointsValue.  The score value this techno
     // contributes when destroyed: the type's PointValue, plus the value of
     // everything it carries, plus the locomotor's contributed value.
     int32 GetPointsValue() const;
 
-    // TechnoClass_GetTiberiumPercentage (asm 0x708B90).  Ore storage fill
+ // TechnoClass_GetTiberiumPercentage.  Ore storage fill
     // fraction (0.0..1.0).  Zero when the type has no storage.
     double GetTiberiumPercentage() const;
 
-    // TechnoClass_GetFacingAgain (asm 0x70ED90).  Writes the current facing
+ // TechnoClass_GetFacingAgain.  Writes the current facing
     // through the out-pointer and returns it.
     DirStruct* GetFacingAgain(DirStruct* pOut) const;
 
-    // TechnoClass_GetDisguiseFlags (asm 0x70ED60) /
-    // _IsDisguisedAgainst (asm 0x70EE40).  Disguise-blinking state helpers.
+ // TechnoClass_GetDisguiseFlags /
+ // _IsDisguisedAgainst.  Disguise-blinking state helpers.
     int32 GetDisguiseFlags(int32 flags) const;
     bool IsDisguisedAgainst(HouseClass* pHouse) const;
+
+    // 根据游戏行为，可知 BlinkDisguise 负责重设"伪装即将被识破"的闪烁计时器：
+    //  当该单位对玩家呈现为伪装身份、并且此刻展示的不是玩家自己的伪装外貌
+    //  时，把传入时长写入闪烁计时器，让伪装在随后若干帧内周期性地闪现真身；
+    //  其余情况下忽略这次写入。闪烁计时器随后由 IsDisguisedAgainst 读取。
+    void BlinkDisguise(int32 duration);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 +0x518/+0x51C 这一对保存"当前伪装"的两个分量：
+    //  前者是伪装所冒充的外观编号，后者是伪装所归属的房屋指针。
+    // ------------------------------------------------------------------------
+    int32         DisguiseTypeId;    // +0x518 冒充的外观编号
+    HouseClass*   DisguiseHouse;     // +0x51C 伪装归属的房屋
 
 
     virtual double GetStoragePercentage() const { return 0.0; }
@@ -546,7 +770,7 @@ public:
     bool IsTemporalized() const { return TemporalTimer > 0; }
     void SetTemporal(int32 frames) { if (frames > TemporalTimer) TemporalTimer = frames; }
 
-    // TechnoClass_Reload (asm 0x6FB000).
+ // 根据游戏行为，可知 Reload 负责下面这段逻辑。
     //
     //  Ticks the ammo counter up by one once the reload timer has run out and
     //  the magazine is not yet full.  A type with Ammo == -1 never reloads
@@ -556,12 +780,12 @@ public:
     //  for the next round.
     void Reload();
 
-    // Techno_Update_Reloading (asm 0x6FB0D0): recomputes and restarts the
+ // Techno_Update_Reloading: recomputes and restarts the
     //  reload delay after a round has been loaded.
     void Update_Reloading();
 
-    // TechnoClass_StartAirstrikeTimer (asm 0x6FC930) / _StopAirstrikeTimer
-    //  (asm 0x6FC950): arm / disarm the frame window during which a follow-up
+ // TechnoClass_StartAirstrikeTimer / _StopAirstrikeTimer
+ //: arm / disarm the frame window during which a follow-up
     //  airstrike may be requested.  Start also zeroes the generation counter.
     void StartAirstrikeTimer(int32 duration);
     void StopAirstrikeTimer();
@@ -593,6 +817,15 @@ public:
     // Iron Curtain / Force Shield invulnerability timers (frames remaining).
     int32         IronCurtainTimer;
     int32         ForceShieldTimer;
+
+    // 根据游戏行为，可知钢铁化与空袭都会给单位叠上一层随时间变化的染色：
+    // 计时器记录这一段染色的剩余帧数，阶段号记录当前处在染色曲线的哪一段
+    // （上色、保持、褪色……）。绘制时按阶段与剩余帧数算出调制系数，再乘到
+    // 本体颜色上，于是钢铁单位泛蓝、被空袭锁定的单位泛红。
+    int32         IronTintTimer;
+    int32         IronTintStage;
+    int32         AirstrikeTintTimer;
+    int32         AirstrikeTintStage;
 
     // Frame stamp of the last successful weapon discharge (Game::CurrentFrame).
     // Used by Fire_Impl to gate firing on the weapon's rate of fire.
@@ -633,6 +866,45 @@ public:
 
     // Multi-stage weapon counter at +0x140 (gattling / prism style weapons).
     int32         WeaponStage;
+
+    // 根据游戏行为，可知 WeaponStageFrame 记录射速档位最近一次变化的帧，
+    //  用于判断升档/降档是否已经到点。
+    int32         WeaponStageFrame;
+
+    // ── 炮管后座状态 ──────────────────────────────────────────────────────
+    // 根据游戏行为，可知开火瞬间后座拉满（RecoilAmount 为正），随后按帧
+    //  复位；RecoilStartFrame 记录后座开始的那一帧。
+    int32         RecoilAmount;
+    int32         RecoilStartFrame;
+
+    // ── 死亡记账 ──────────────────────────────────────────────────────────
+    // 根据游戏行为，可知死亡判重靠 IsDyingNow：Die 進来先看它，置位后重复
+    //  调用直接返回；KilledBy 记"谁杀的"，供经验与战果统计使用。
+    bool          IsDyingNow;
+    TechnoClass*  KilledBy;
+
+    // ── 说话气泡状态 ──────────────────────────────────────────────────────
+    // 根据游戏行为，可知单位正在显示气泡时 IsTalking 为真，气泡文本与结束
+    //  帧分别记在 TalkBubbleText / TalkBubbleEnd 上；LastTalkFrame 是说话
+    //  的最短间隔基准，避免连续触发刷屏。
+    bool          IsTalking;
+    const wchar_t* TalkBubbleText;
+    int32         TalkBubbleEnd;
+    int32         LastTalkFrame;
+
+    // 根据游戏行为，可知行军规划令牌除了槽位编号，还要记住该令牌指向的目的
+    //  地，单位每帧据此决定下一步往哪走。
+    CoordStruct   PlanningDestination;
+
+    // ── 冒烟表现状态 ──────────────────────────────────────────────────────
+    // 根据游戏行为，可知建筑受损后冒烟系统被拉起，SmokeSystemStage 表示烟的
+    //  浓淡档位；完好时 SmokeSystemActive 复位。
+    bool          SmokeSystemActive;
+    int32         SmokeSystemStage;
+
+    // 根据游戏行为，可知规划令牌的槽位编号由全局计数器统一分配，保证同一
+    //  时刻不会有两条规划撞到同一个槽位。
+    static int32  sNextPlanningToken;
 
     // The building this techno is currently focused on (asm FocusOnUnit).
     BuildingClass* FocusOnUnit;

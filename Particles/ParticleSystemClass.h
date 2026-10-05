@@ -9,6 +9,7 @@
 
 class BlitterClass;
 class DSurface;
+class ParticleClass;
 
 struct Particle {
     bool IsAlive;
@@ -60,6 +61,19 @@ public:
     void SetRenderOrder(RenderOrderType order);
     void SetOwner(ObjectClass* owner);
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知粒子系统补全原版命名形态：粒子创建/生成/清理与
+    // 各 BehavesLike 分支的发射推进。
+    // ------------------------------------------------------------------------
+    void AddParticle(ParticleTypeClass* pType, const CoordStruct& loc);
+    void GenerateParticle(const CoordStruct& loc, const CoordStruct& loc2, int32 arg);
+    void DeleteParticles();
+    void Update_Fire();
+    void Update_Gas();
+    void Update_Smoke();
+    void Update_Spark();
+    void Update_Railgun();
+
     bool IsActiveSystem() const;
     bool IsPausedSystem() const;
     bool IsCompleted() const;
@@ -87,6 +101,9 @@ public:
     int32 SortingOrder;
     RenderOrderType RenderOrder;
     ObjectClass* OwnerObject;
+
+    // 根据游戏行为，可知粒子系统名下登记其生成的粒子对象。
+    DynamicVectorClass<ParticleClass*> AttachedParticles;
     int32 SystemID;
     bool Prewarmed;
     bool PrewarmComplete;

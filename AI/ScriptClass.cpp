@@ -581,3 +581,21 @@ bool ScriptClass::IsActive() const {
 void ScriptClass::SetActive(bool active) {
     IsScriptActive = active;
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知脚本执行面的行游标三步推进：回卷置为队首之外
+// 的哨位、读取当前行号、步进后报告是否仍有可用行。
+// ------------------------------------------------------------------------
+void ScriptClass::ResetCurrentLine()
+{
+    CurrentLine = -1;
+}
+
+int32 ScriptClass::GetCurrentLine() const
+{
+    return CurrentLine;
+}
+
+void ScriptClass::StepToNextLine()
+{
+    ++CurrentLine;
+}

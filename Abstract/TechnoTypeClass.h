@@ -3,8 +3,10 @@
 #include <Abstract/AbstractTypeClass.h>
 #include <Abstract/ObjectTypeClass.h>
 #include <Containers/DynamicVectorClass.h>
+#include <Containers/VectorClass.h>
 
 class CCINIClass;
+class ConvertClass;
 class CRCEngine;
 class InfantryTypeClass;
 class SHPStruct;
@@ -291,7 +293,11 @@ public:
     int32        Storage;
     int32        BuildLimit;
     Category     CategoryValue;
-    BuildingTypeClass* Dock;
+    // 根据游戏行为，可知 Dock 是一份"可停靠建筑类型"的列表，而不是单一指针：
+    // 规则文件里该键写成以逗号分隔的多个建筑名，每一项都要单独解析并追加进
+    // 列表；载具/飞机在执行进入建筑、返回维修或装弹时，会遍历这份列表来挑选
+    // 最近且允许停靠的目标。故此处按列表建模。
+    VectorClass<BuildingTypeClass*> Dock;
     BuildingTypeClass* DeploysInto;
     UnitTypeClass* UndeploysInto;
     UnitTypeClass* PowersUnit;
@@ -538,4 +544,28 @@ public:
     int32        RefinerySmokeOffset[4][3];
     DynamicVectorClass<int32> Prerequisite;
     DynamicVectorClass<int32> PrerequisiteOverride;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知类型层还提供修复步长/飞行高度/炮塔识别等读取器，
+    // 以及调色板与炮塔体素美术的装载入口；调色板转换器与炮塔美术槽位
+    // 跟随类型对象生命周期。
+    // ------------------------------------------------------------------------
+    virtual int32  GetRepairStep() const;
+    virtual int32  GetRepairStepCost() const;
+    virtual int32  GetFlightLevel() const;
+    virtual bool   DoesNotBurst() const;
+    virtual bool   IsTurretChanger() const;
+    virtual bool   CanAttackOnTheMove() const;
+    virtual int32  GetDestinationTab(int32 kind, int32 sub) const;
+    virtual void   GetParticleSysPos(CoordStruct& out) const;
+    virtual void   ResetPos(CoordStruct& out) const;
+    virtual void   ResetPosLeptons(CoordStruct& out) const;
+    virtual void   UpdatePalette();
+    static  void   ReplacePalette();
+    virtual void   LoadTurretArt(const char* pImageName, int32 idx);
+    virtual void   UnloadTurretArt();
+
+    ConvertClass* PaletteConvert = nullptr;   // 按 Palette 文件名构建的调色板转换器
+    struct TurretArtEntry { void* VXL; void* HVA; char VXLName[0x20]; char HVAName[0x20]; };
+    TurretArtEntry Turrets[18] = {};     // 每个炮塔槽位的体素/动画句柄与文件名
+
 };

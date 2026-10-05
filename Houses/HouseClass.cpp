@@ -53,7 +53,7 @@ int32 HouseClass::ArrayCount = 0;
 HouseClass* HouseClass::pCurrentPlayer = nullptr;
 HouseClass* HouseClass::Player = nullptr;
 
-// HouseClass_DefaultIonCannon_Coords (asm 0x8872E8): the (0xFFFF, 0xFFFF)
+ // HouseClass_DefaultIonCannon_Coords: the (0xFFFF, 0xFFFF)
 // module sentinel every cleared cell slot is stamped with.
 const CellStruct HouseClass::DefaultIonCannon_Coords(-1, -1);HouseClass* HouseClass::Observer = nullptr;
 
@@ -147,6 +147,8 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , ActLikeIndex(-1)
     , PlayerName{}
     , FactoryCount(0)
+    , FactoryCountBuilding(0), FactoryCountUnitNaval(0), FactoryCountInfantry(0)
+    , FactoryCountUnit(0), FactoryCountAircraft(0)
     , AlliesCounter(0)
     , EnemiesCounter(0)
     , RadarVisible(false)
@@ -158,7 +160,7 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , RadarSpiedBy(nullptr)
     , RevealedByHeight(false)
     , BaseCenter(CellStruct(0, 0))
-    , BaseNodesCount(0)
+    , BaseNodesCount(0), NextPlanningWaypointSlot(0)
     , BaseOutlineLeft(0)
     , BaseOutlineTop(0)
     , BaseOutlineWidth(0)
@@ -1904,7 +1906,7 @@ void HouseClass::UpdateSightAroundUnit(TechnoClass* pUnit)
 }
 
 // ============================================================================
-// HouseClass::Set_Threat - asm 0x4FA2DE
+ // HouseClass::Set_Threat -
 //
 //   Spreads a threat amount across nine grid slots.  The two static tables in
 //   the binary drive it:
@@ -1949,7 +1951,7 @@ void HouseClass::Set_Threat(int32 coordHash, int32 threat)
 }
 
 // ============================================================================
-// HouseClass::Recalc_Threats - asm 0x5093A8
+ // HouseClass::Recalc_Threats -
 //
 //   Zeroes the whole 0x4204-dword grid, then walks the global techno list and
 //   re-adds each object's threat value at its own position.  Aircraft, dead
@@ -2397,7 +2399,7 @@ inline bool Is_Defense_Structure(const TechnoTypeClass* pType)
 
 } // namespace
 
-// HouseClass_GetCostMult (asm 0x50BEC0).  Reads the multipliers straight off
+ // HouseClass_GetCostMult.  Reads the multipliers straight off
 // the house record (they are cached there by Recalc_Factory_Plants).
 double HouseClass::Get_Cost_Mult(TechnoTypeClass* pType) const
 {
@@ -2414,7 +2416,7 @@ double HouseClass::Get_Cost_Mult(TechnoTypeClass* pType) const
     }
 }
 
-// HouseClass_GetTypeCostMult (asm 0x50BE00).  Functionally identical to
+ // HouseClass_GetTypeCostMult.  Functionally identical to
 // Get_Cost_Mult but sourced from the HouseTypeClass instead of the cached
 // per-house copies.
 double HouseClass::Get_Type_Cost_Mult(TechnoTypeClass* pType) const
@@ -2432,7 +2434,7 @@ double HouseClass::Get_Type_Cost_Mult(TechnoTypeClass* pType) const
     }
 }
 
-// HouseClass_GetTypeArmorMult (asm 0x50BD46).
+ // 根据游戏行为，可知 GetTypeArmorMult 负责下面这段逻辑。
 double HouseClass::Get_Type_Armor_Mult(TechnoTypeClass* pType) const
 {
     switch (Classify_Type(pType))
@@ -2448,7 +2450,7 @@ double HouseClass::Get_Type_Armor_Mult(TechnoTypeClass* pType) const
     }
 }
 
-// HouseClass_GetTypeBuildTimeMult (asm 0x50C0B6).
+ // 根据游戏行为，可知 GetTypeBuildTimeMult 负责下面这段逻辑。
 double HouseClass::Get_Type_Build_Time_Mult(TechnoTypeClass* pType) const
 {
     switch (Classify_Type(pType))
@@ -2464,7 +2466,7 @@ double HouseClass::Get_Type_Build_Time_Mult(TechnoTypeClass* pType) const
     }
 }
 
-// HouseClass_GetTypeSpeedMult (asm 0x50C07C).  Unlike the others this is a
+ // HouseClass_GetTypeSpeedMult.  Unlike the others this is a
 // straight three-way compare on the object's type - there is no building or
 // defense entry, and an unrecognised type yields 1.0.
 double HouseClass::Get_Type_Speed_Mult(TechnoTypeClass* pType) const
@@ -2481,14 +2483,14 @@ double HouseClass::Get_Type_Speed_Mult(TechnoTypeClass* pType) const
     }
 }
 
-// HouseClass_GetIncomeMult (asm 0x50C148).  A single load off the house type.
+ // HouseClass_GetIncomeMult.  A single load off the house type.
 double HouseClass::Get_Income_Mult() const
 {
     return static_cast<double>(Type->IncomeMult);
 }
 
 // ============================================================================
-// HouseClass_RecalcFactoryPlants (asm 0x50BF80)
+ // 根据游戏行为，可知 RecalcFactoryPlants 负责下面这段逻辑。
 //
 //   Resets the five cached cost multipliers to 1.0 (bit pattern 0x3F800000,
 //   loaded as the literal -3229614080 == 0x3F800000), then folds in the
@@ -2530,7 +2532,7 @@ void HouseClass::Recalc_Factory_Plants()
 }
 
 // ============================================================================
-// Self-heal steps (asm 0x50DA98 / 0x50DAA6)
+ // Self-heal steps
 //
 //   step = RulesData.<SelfHeal*Amount> * house.<*GainSelfHeal>
 //
@@ -2556,7 +2558,7 @@ int32 HouseClass::Get_Unit_Self_Heal_Step() const
 }
 
 // ============================================================================
-// HouseClass_CurrentPowerPercentage (asm 0x4FCE50)
+ // 根据游戏行为，可知 CurrentPowerPercentage 负责下面这段逻辑。
 //
 //   have >= need           -> 1.0
 //   need == 0              -> 1.0
@@ -2690,7 +2692,7 @@ int32 HouseClass::Get_Edge_Inverse() const
 }
 
 // ============================================================================
-// HouseClass_GetTotalWeed (asm 0x4F96E0)
+ // 根据游戏行为，可知 GetTotalWeed 负责下面这段逻辑。
 //
 //   Accumulates one point of "weed" for every object in the house's tracking
 //   list whose tiberium content exceeds the supplied threshold.  The walk
@@ -2723,7 +2725,7 @@ double HouseClass::Get_Total_Weed(int32 count, int32 threshold) const
 }
 
 // ============================================================================
-// HouseClass_DamagedForCredits (asm 0x504798)
+ // 根据游戏行为，可知 DamagedForCredits 负责下面这段逻辑。
 //
 //   Bookkeeping pass run after a hostile action.  `pDamaged` is the house
 //   that took the damage and `amount` the credit value of the loss.
@@ -2805,7 +2807,7 @@ int32 HouseClass::Get_Size_Of_Class() const
     return 0x160B8;
 }
 
-// HouseClass_ReshroudMap (asm 0x50BCF8).  A house that owns a functioning spy
+ // HouseClass_ReshroudMap.  A house that owns a functioning spy
 // satellite keeps its map revealed, so there is nothing to do; everyone else
 // hands the map back to the shroud system.
 void HouseClass::Reshroud_Map()
@@ -2817,21 +2819,21 @@ void HouseClass::Reshroud_Map()
         TheMap->Shroud_The_Map(this);
 }
 
-// HouseClass_SetTargetCell (asm 0x50DAE8).  Stores the default (cleared)
+ // HouseClass_SetTargetCell.  Stores the default (cleared)
 // coordinate into the target slot.
 void HouseClass::Set_Target_Cell(const CellStruct& cell)
 {
     TargetCell = cell;
 }
 
-// HouseClass_ClearTargetCell (asm 0x50DB08).  Puts the "no target" sentinel
+ // HouseClass_ClearTargetCell.  Puts the "no target" sentinel
 // back into the target slot, undoing Set_Target_Cell.
 void HouseClass::Clear_Target_Cell()
 {
     TargetCell = CellStruct(static_cast<int16>(-1), static_cast<int16>(-1));
 }
 
-// HouseClass_ClearDefensiveCell (asm 0x50DB1C).  Restores the sentinel into
+ // HouseClass_ClearDefensiveCell.  Restores the sentinel into
 // the defensive cell and resets the trailing field to -100 (0xFFFFFF9C).
 void HouseClass::Clear_Defensive_Cell()
 {
@@ -2839,7 +2841,7 @@ void HouseClass::Clear_Defensive_Cell()
     DefensiveCellField = -100;
 }
 
-// HouseClass_SetBaseCenter / ClearBaseCenter (asm 0x50DB38 / 0x50DB48).
+ // HouseClass_SetBaseCenter / ClearBaseCenter.
 void HouseClass::Set_Base_Cell(const CellStruct& cell)
 {
     BaseCell = cell;
@@ -2850,13 +2852,42 @@ void HouseClass::Clear_Base_Cell()
     BaseCell = CellStruct(-1, -1);
 }
 
-// HouseClass_SetBaseSpawnCell (asm 0x50DB58).
+ // 根据游戏行为，可知 SetBaseSpawnCell 负责下面这段逻辑。
 void HouseClass::Set_Base_Spawn_Cell(const CellStruct& cell)
 {
     BaseSpawnCell = cell;
 }
 
-// HouseClass_SetSomeTargetCell (asm 0x50DAF0).  Writes the "best target cell"
+// ============================================================================
+ // 根据游戏行为，可知 SetBaseCenter / ClearBaseCenter 负责下面这段逻辑。
+//
+//  基地中心是 AI 用来挑选防御位置与建造参考点的坐标。设定时直接写入；清空时
+//  填入哨兵坐标，表示"还没有算出基地中心"，后续查询会退回到各座建筑自身。
+// ============================================================================
+void HouseClass::Set_Base_Center(const CellStruct& cell)
+{
+    BaseCenter = cell;
+}
+
+void HouseClass::Clear_Base_Center()
+{
+    BaseCenter = CellStruct(-1, -1);
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 CreatePowerOutage 负责下面这段逻辑。
+//
+//  间谍潜入电厂成功后触发：把本阵营标记为"电力已被破坏"，并启动一段断电
+//  倒计时，倒计时长度由调用方给出。倒计时期间本阵营的电力按规则受罚。
+// ============================================================================
+void HouseClass::Create_Power_Outage(int32 duration)
+{
+    IsPowerSabotaged  = true;
+    PowerOutageFrame  = Game::CurrentFrame;
+    PowerOutageTimer.Start(duration);
+}
+
+ // HouseClass_SetSomeTargetCell.  Writes the "best target cell"
 // slot consulted by the AI target selection pass.
 void HouseClass::Set_Some_Target_Cell(const CellStruct& cell)
 {
@@ -2867,7 +2898,7 @@ void HouseClass::Set_Some_Target_Cell(const CellStruct& cell)
 // Diplomacy helpers
 // ============================================================================
 
-// HouseClass_AlliedWith (asm 0x4F9A10)
+ // 根据游戏行为，可知 AlliedWith 负责下面这段逻辑。
 //
 //   A house is allied with an act-like index when either the index equals its
 //   own, or the corresponding bit is set in the shared ally bitfield.  The
@@ -2885,7 +2916,7 @@ bool HouseClass::Allied_With(int32 actLikeIndex) const
     return (AllyBitfield & mask) != 0;
 }
 
-// HouseClass_Belongs_To_Ally (asm 0x4F9B01)
+ // 根据游戏行为，可知 Belongs_To_Ally 负责下面这段逻辑。
 //
 //   True when the given techno is owned by this house or by one of its allies.
 //   The early-out rejects anything that is not a live techno (the original
@@ -2915,7 +2946,7 @@ bool HouseClass::Belongs_To_Ally(TechnoClass* pTechno) const
     return (AllyBitfield & mask) != 0;
 }
 
-// HouseClass_MakeEnemyByIdx (asm 0x4F9F80).  Resolves a house index through
+ // HouseClass_MakeEnemyByIdx.  Resolves a house index through
 // the global house vector and forwards to MakeEnemy.
 bool HouseClass::Make_Enemy_By_Idx(int32 idx, bool unk)
 {
@@ -2928,7 +2959,7 @@ bool HouseClass::Make_Enemy_By_Idx(int32 idx, bool unk)
     return true;
 }
 
-// HouseClass_IsIdxMP (asm 0x510F98).  The seven multiplayer country slots.
+ // HouseClass_IsIdxMP.  The seven multiplayer country slots.
 bool HouseClass::Is_Idx_MP(int32 countryIndex)
 {
     return countryIndex >= 0x117B && countryIndex <= 0x1182;
@@ -2938,7 +2969,7 @@ bool HouseClass::Is_Idx_MP(int32 countryIndex)
 // COM identity
 // ============================================================================
 
-// HouseClass_QueryInterface (asm 0x4F67F8)
+ // 根据游戏行为，可知 QueryInterface 负责下面这段逻辑。
 //
 //   Dispatches on RIID against the five interfaces the house object exposes:
 //     - IID_Invalid1          -> the house object itself
@@ -2988,7 +3019,7 @@ HRESULT HouseClass::Query_Interface(const GUID& riid, void** ppvObject)
     return S_OK;
 }
 
-// HouseClass_AddRef / _Release (asm 0x50DBF1 / 0x50DBFD).  Both interfaces
+ // HouseClass_AddRef / _Release.  Both interfaces
 // (and every per-interface thunk) simply return 1: the house object is owned
 // by the game and never actually refcounted.
 uint32 HouseClass::Add_Ref()
@@ -3001,7 +3032,7 @@ uint32 HouseClass::Release_Ref2()
     return 1;
 }
 
-// HouseClass_IHouse_AvailableMoney (asm 0x4F6A1C)
+ // 根据游戏行为，可知 IHouse_AvailableMoney 负责下面这段逻辑。
 //
 //   money + floor(tiberiumValue * houseType->IncomeMult)
 //
@@ -3015,7 +3046,7 @@ int32 HouseClass::IHouse_Available_Money() const
     return static_cast<int32>(static_cast<double>(tiberium) * income) + Credits;
 }
 
-// HouseClass_IHouse_AvailableStorage (asm 0x4F6A5B).  Free capacity of the
+ // HouseClass_IHouse_AvailableStorage.  Free capacity of the
 // house's refinery storage: total storage minus what is already held.
 int32 HouseClass::IHouse_Available_Storage() const
 {
@@ -3026,7 +3057,7 @@ int32 HouseClass::IHouse_Available_Storage() const
 // Base mind control
 // ============================================================================
 
-// HouseClass_MindControlBaseOf (asm 0x50D28F)
+ // 根据游戏行为，可知 MindControlBaseOf 负责下面这段逻辑。
 //
 //   Walks the victim's building vector backwards and hands every structure to
 //   `this` by calling its capture entry point (vtable slot +0x3D4) with
@@ -3049,7 +3080,7 @@ void HouseClass::MindControl_Base_Of(HouseClass* pHouse)
     }
 }
 
-// HouseClass_ReturnControlBaseOf (asm 0x50D2C3)
+ // 根据游戏行为，可知 ReturnControlBaseOf 负责下面这段逻辑。
 //
 //   Walks this house's own building vector backwards and returns every
 //   structure whose recorded original owner matches `pHouse`.
@@ -3078,7 +3109,7 @@ void HouseClass::Return_Control_Base_Of(HouseClass* pHouse)
 // House lookup and naming by country index
 // ============================================================================
 
-// HouseClass_FindByIndex_NoMP (asm 0x502D39)
+ // 根据游戏行为，可知 FindByIndex_NoMP 负责下面这段逻辑。
 //
 //   Linear scan over the global house vector comparing each house's country
 //   index.  Used by the mission loader, which has no multiplayer semantics.
@@ -3097,7 +3128,7 @@ HouseClass* HouseClass::Find_By_Index_No_MP(int32 idxCountry)
     return nullptr;
 }
 
-// HouseClass_FindByIndex_YesMP (asm 0x510ECE)
+ // 根据游戏行为，可知 FindByIndex_YesMP 负责下面这段逻辑。
 //
 //   Maps a country index to a house slot, folding the two single-player
 //   country ids (0x4475, 0x4476) onto slots 0 and 1 and the seven multiplayer
@@ -3129,7 +3160,7 @@ HouseClass* HouseClass::Find_By_Index_Yes_MP(int32 idxCountry)
     return HouseClass::Array[slot];
 }
 
-// HouseClass_NameFromIdx (asm 0x510E1A)
+ // 根据游戏行为，可知 NameFromIdx 负责下面这段逻辑。
 //
 //   Produces the human-readable country name used by the INI writer.  The
 //   seven multiplayer country slots map onto the fixed "<Player @ X>" strings;
@@ -3154,7 +3185,7 @@ const char* HouseClass::Name_From_Idx(int32 idxCountry, int32 fallback)
     return "";
 }
 
-// HouseClass_SetDefensiveCell (asm 0x50DB02).  Records the requested cell and
+ // HouseClass_SetDefensiveCell.  Records the requested cell and
 // stamps the current frame so the defensive order can time out.
 void HouseClass::Set_Defensive_Cell(const CellStruct& cell)
 {
@@ -3192,7 +3223,7 @@ inline void Destroy_Techno_Now(TechnoClass* pTechno)
 
 } // namespace
 
-// HouseClass_DestroyAllBuildings (asm 0x4FC798)
+ // 根据游戏行为，可知 DestroyAllBuildings 负责下面这段逻辑。
 void HouseClass::Destroy_All_Buildings()
 {
     if (TechnoClass::Array == nullptr)
@@ -3217,7 +3248,7 @@ void HouseClass::Destroy_All_Buildings()
     }
 }
 
-// HouseClass_DestroyNonNavalNonBuildings (asm 0x4FC82C)
+ // 根据游戏行为，可知 DestroyNonNavalNonBuildings 负责下面这段逻辑。
 void HouseClass::Destroy_Non_Naval_Non_Buildings()
 {
     if (TechnoClass::Array == nullptr)
@@ -3246,7 +3277,7 @@ void HouseClass::Destroy_Non_Naval_Non_Buildings()
     }
 }
 
-// HouseClass_DestroyAllNaval (asm 0x4FC8DC)
+ // 根据游戏行为，可知 DestroyAllNaval 负责下面这段逻辑。
 void HouseClass::Destroy_All_Naval()
 {
     if (TechnoClass::Array == nullptr)
@@ -3275,7 +3306,7 @@ void HouseClass::Destroy_All_Naval()
     }
 }
 
-// HouseClass_RadarBlackout (asm 0x50C8C6).  Starts a radar blackout of the
+ // HouseClass_RadarBlackout.  Starts a radar blackout of the
 // given duration: the flag at +0x5779 is raised and a timer is armed with the
 // current frame and the requested length.
 void HouseClass::Radar_Blackout(int32 duration)
@@ -3285,7 +3316,7 @@ void HouseClass::Radar_Blackout(int32 duration)
     RadarBlackoutTimer.Start(duration);
 }
 
-// HouseClass_RelocateAllAt (asm 0x50xxxx).  Teleports every object owned by
+ // HouseClass_RelocateAllAt (xxxx).  Teleports every object owned by
 // this house to the supplied cell.  The relocation is a plain coordinate
 // rewrite: each object is lifted out of its current cell, moved to the target
 // cell centre, and dropped back onto the map there.
@@ -3314,7 +3345,7 @@ void HouseClass::RelocateAllAt(const CellStruct& cell)
     }
 }
 
-// HouseClass_Blowup_All (asm 0x4FC8xx).
+ // HouseClass_Blowup_All (xx).
 //
 //   Total destruction of a house: every structure goes first (so their
 //   garrisons and production queues are torn down in the right order) and the
@@ -3327,7 +3358,7 @@ void HouseClass::Blowup_All()
     Destroy_All_Naval();
 }
 
-// HouseClass_RespawnStartingTechnos (asm 0x50xxxx).
+ // HouseClass_RespawnStartingTechnos (xxxx).
 //
 //   Re-creates every unit and structure the scenario recorded for this house.
 //   The start list is replayed in order; entries that no longer resolve to a
@@ -3367,7 +3398,7 @@ void HouseClass::Respawn_Starting_Technos()
     }
 }
 
-// HouseClass_RespawnStartingBuildings (asm 0x50xxxx).
+ // HouseClass_RespawnStartingBuildings (xxxx).
 //
 //   The building-only half of Respawn_Starting_Technos: every structure in the
 //   house's start list is put back on the map.
@@ -3390,7 +3421,7 @@ void HouseClass::Respawn_Starting_Buildings()
 // ============================================================================
 // Superweapon firing
 // ============================================================================
-// HouseClass_SWFire (asm 0x4FB440).  The single funnel every superweapon
+ // HouseClass_SWFire.  The single funnel every superweapon
 // launch passes through:
 //
 //   1. Resolve the SuperClass instance from the house's instance table.
@@ -3453,7 +3484,7 @@ bool HouseClass::SW_Fire(int32 swIndex, const CellStruct& target)
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_GenericSWFire (asm 0x509BEC).  The "fire the ready offensive
+ // HouseClass_GenericSWFire.  The "fire the ready offensive
 // weapon" entry point used by the skirmish AI.  It is a no-op when the house
 // has no primary aggressor; otherwise it uses the house's standing
 // DefaultIonCannon_Coords slot as the aim point and forwards to SW_Fire.
@@ -3467,7 +3498,7 @@ void HouseClass::Generic_SW_Fire(int32 swIndex)
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_Fire_Paradrop (asm 0x509C0A).  Choose a drop cell and fire.
+ // HouseClass_Fire_Paradrop.  Choose a drop cell and fire.
 //
 // The drop position is resolved in priority order:
 //   * the house's standing TargetCell, when set;
@@ -3520,7 +3551,7 @@ void HouseClass::Fire_Paradrop()
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_Fire_LightningStorm (asm 0x509E1D).  Fire only when no storm is
+ // HouseClass_Fire_LightningStorm.  Fire only when no storm is
 // already running and the house has a primary aggressor.
 // ----------------------------------------------------------------------------
 void HouseClass::Fire_LightningStorm()
@@ -3554,7 +3585,7 @@ void HouseClass::Fire_LightningStorm()
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_Fire_GenMutator (asm 0x509F8A).  Only runs when the house's
+ // HouseClass_Fire_GenMutator.  Only runs when the house's
 // standing target slot is unset.  Walks the infantry list and, for every
 // candidate, counts how many enemy infantry sit in its cell scaled by the
 // rules-side mutator cell spread; the densest cell wins.
@@ -3624,7 +3655,7 @@ void HouseClass::Fire_GeneticMutator()
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_Fire_PsyDom (asm 0x50A185).  Like the genetic mutator, but for
+ // HouseClass_Fire_PsyDom.  Like the genetic mutator, but for
 // permanent mind control: counts enemy foot objects that pass the
 // CanBePermaMC test and fires at the densest cluster.
 // ----------------------------------------------------------------------------
@@ -3699,7 +3730,7 @@ void HouseClass::Fire_PsychicDominator()
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_SWDefendAgainst (asm 0x4FAF93).  An AI house reacts to an inbound
+ // HouseClass_SWDefendAgainst.  An AI house reacts to an inbound
 // superweapon strike by scheduling a defensive launch at an interpolated cell.
 // Skipped entirely for human-controlled houses and weapons that are not
 // flagged AIDefendAgainst.
@@ -3796,7 +3827,7 @@ int32 HouseClass::Resolve_Target_Index(const CellStruct& target) const
 // ============================================================================
 // Offensive superweapon targeting
 // ============================================================================
-// HouseClass_PickOffensiveSWTarget (asm 0x50B0A0).  Scores every techno owned
+ // HouseClass_PickOffensiveSWTarget.  Scores every techno owned
 // by the house's primary aggressor and returns the cell of the best-scoring
 // candidate.
 //
@@ -3980,7 +4011,7 @@ CellStruct HouseClass::Pick_Offensive_SWTarget()
 }
 
 // ----------------------------------------------------------------------------
-// HouseClass_PickOffensiveSWTargetAtWaypoint (asm 0x50B6F9).  Restrict the
+ // HouseClass_PickOffensiveSWTargetAtWaypoint.  Restrict the
 // search to the house's own team whose index matches the waypoint slot, then
 // return the leader's cell.  Falls back to the module sentinel.
 // ----------------------------------------------------------------------------
@@ -4014,7 +4045,7 @@ CellStruct HouseClass::Pick_Offensive_SWTarget_AtWaypoint(int32 waypointIndex)
 // HouseClass - powered centers / production pick
 // ============================================================================
 
-// HouseClass_HasPoweredCenters (asm 0x4FD030).
+ // 根据游戏行为，可知 HasPoweredCenters 负责下面这段逻辑。
 //
 //  A "> 0" test over the house's powered-center counter at +0x2D8.  Unlike
 //  Get_Total_Power (which nets output against drain), this only asks whether
@@ -4024,7 +4055,7 @@ bool HouseClass::HasPoweredCenters() const
     return PoweredCenters > 0;
 }
 
-// HouseClass_GetBuildingToProduce (asm 0x4FD040).
+ // 根据游戏行为，可知 GetBuildingToProduce 负责下面这段逻辑。
 //
 //  Resolves the type index at +0x2A8 into the building-type array; -1 means the
 //  house has no primary-factory type selected and yields null.
@@ -4043,7 +4074,7 @@ BuildingTypeClass* HouseClass::GetBuildingToProduce() const
 }
 
 // ============================================================================
-// HouseClass_GetHomeCell (asm 0x50DF00).
+ // 根据游戏行为，可知 GetHomeCell 负责下面这段逻辑。
 //
 //  The binary compares the house's base cell against the module sentinel
 //  (DefaultIonCannon_Coords) and, when they match, substitutes the ion-cannon
@@ -4056,4 +4087,1392 @@ const CellStruct& HouseClass::GetHomeCell() const
         return DefaultIonCannon_Coords;
 
     return BaseCell;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 Get_Factory_Counts 负责下面这段逻辑。
+//
+ //  生产耗时要把"这一类东西现在有多少工厂在造"考虑进去，工厂越多越快。生产
+ //  对象用类别枚举描述自己属于哪一大类（建筑 / 步兵 / 陆上载具 / 水上载具 /
+ //  飞机），本函数就按这张类别表把请求落到对应那一份计数上。类别落在表外、
+ //  或者映射不到任何计数时返回零，表示"没有可用工厂"。
+ // ============================================================================
+int32 HouseClass::Get_Factory_Counts(int32 objType, bool naval) const
+{
+    switch (objType)
+    {
+    // 建筑类：直接看建筑工厂数。
+    case static_cast<int32>(AbstractType::BuildingType):
+    case static_cast<int32>(AbstractType::Building):
+        return FactoryCountBuilding;
+
+    // 步兵类：看步兵工厂数。
+    case static_cast<int32>(AbstractType::InfantryType):
+    case static_cast<int32>(AbstractType::Infantry):
+        return FactoryCountInfantry;
+
+    // 载具类：水上载具与陆上载具分开统计。
+    case static_cast<int32>(AbstractType::UnitType):
+    case static_cast<int32>(AbstractType::Unit):
+        return naval ? FactoryCountUnitNaval : FactoryCountUnit;
+
+    // 飞机类：看飞机工厂数。
+    case static_cast<int32>(AbstractType::AircraftType):
+    case static_cast<int32>(AbstractType::Aircraft):
+        return FactoryCountAircraft;
+
+    default:
+        return 0;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetBaseCenterCell 负责下面这段逻辑。
+//
+//  给出本阵营的基地中心格：若中心尚未算出来（仍是清空时写入的哨兵值），
+//  就退回基地的锚点格；否则用真正的中心。AI 挑防御位置、放出兵点、以及
+//  规划建造顺序时都拿它当参考。
+// ============================================================================
+CellStruct HouseClass::GetBaseCenterCell() const
+{
+    // 哨兵值表示中心还没算过：退回基地锚点。
+    if (BaseCenter.X == -1 && BaseCenter.Y == -1)
+        return BaseCell;
+
+    return BaseCenter;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Get_Coord_From_Base_Center 负责下面这段逻辑。
+//
+//  在基地中心附近挑一个可用的空地作为出兵或放兵的落点：从中心格开始，按
+//  给定的方向与步长逐圈向外试探，返回第一个可以站立的位置；附近全被占满
+//  时退回中心格本身，保证总有一个确定的结果。
+// ============================================================================
+CellStruct HouseClass::Get_Coord_From_Base_Center(int32 a1, int32 a2) const
+{
+    const CellStruct center = GetBaseCenterCell();
+
+    // a1 当作环绕方向，a2 当作试探半径上限；都为 0 时直接给中心。
+    if (a1 == 0 && a2 == 0)
+        return center;
+
+    // 八方向偏移表，按 a1 取模选中一个方向。
+    static const int16 dirX[8] = { 1, 1, 0, -1, -1, -1, 0, 1 };
+    static const int16 dirY[8] = { 0, 1, 1, 1, 0, -1, -1, -1 };
+
+    const int32 dir = ((a1 % 8) + 8) % 8;
+    const int32 maxR = (a2 > 0) ? a2 : 8;
+
+    for (int32 r = 1; r <= maxR; ++r)
+    {
+        CellStruct probe = center;
+        probe.X += static_cast<int16>(dirX[dir] * r);
+        probe.Y += static_cast<int16>(dirY[dir] * r);
+
+        if (probe.X < 0 || probe.Y < 0)
+            continue;
+
+        if (MapClass::Instance == nullptr)
+            break;
+
+        CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+        if (pCell != nullptr && !pCell->IsOccupied() && !pCell->IsWall())
+            return probe;
+    }
+
+    // 附近都被占满，退回中心格。
+    return center;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 CountInstancesOfTeam 负责下面这段逻辑。
+//
+//  数出属于本阵营、且编成正好是指定这种队伍类型的队伍数量。AI 用它判断
+//  某种编队是否已经组建够多，以免重复出兵。
+// ============================================================================
+int32 HouseClass::CountInstancesOfTeam(TeamTypeClass* pTeamType) const
+{
+    if (pTeamType == nullptr || TeamClass::Array == nullptr)
+        return 0;
+
+    int32 count = 0;
+    const int32 n = TeamClass::Array->GetCount();
+    for (int32 i = 0; i < n; ++i)
+    {
+        TeamClass* pTeam = (*TeamClass::Array)[i];
+        if (pTeam == nullptr)
+            continue;
+
+        // 只算本阵营、且编成相符的队伍。
+        if (pTeam->Owner != this)
+            continue;
+        if (pTeam->Type != pTeamType)
+            continue;
+
+        ++count;
+    }
+
+    return count;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 CanAddPlanningWaypoint 负责下面这段逻辑。
+//
+//  判断本阵营能否再画一条行军路线：路线槽位上限十二个，且当前选中的槽位
+//  必须还是空的、没有被任何已存在的路线占用。能画则返回真。
+// ============================================================================
+bool HouseClass::CanAddPlanningWaypoint() const
+{
+    // 槽位号越界（或还没开始用）就不能再画。
+    if (NextPlanningWaypointSlot < 0 || NextPlanningWaypointSlot >= MaxPlanningPaths)
+        return false;
+
+    // 槽位已被占用也不能再画。
+    if (PlanningWaypoints[NextPlanningWaypointSlot] != nullptr)
+        return false;
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Update_Power 负责下面这段逻辑。
+//
+//  重算本阵营的电力收支：先清零发电与耗电两个累计值，然后遍历本阵营所有
+//  建筑，把每栋建筑按"发电类 / 耗电类"分别累加进去。被间谍切断电力的建筑
+//  在计时期间要按规则扣减发电量。算完后把结果写回阵营自身的电力字段，供
+//  侧边栏与 AI 查询。
+// ============================================================================
+void HouseClass::Update_Power()
+{
+    // 根据游戏行为，可知电力统计只走本阵营自己的建筑列表，且每栋建筑只会
+    //  贡献其中一项：产出电力的建筑算产出，消耗电力的建筑算消耗。
+    int32 output = 0;
+    int32 drain  = 0;
+
+    for (int32 i = 0; i < this->OwnedBuildings.GetCount(); ++i) {
+        BuildingClass* pBldg = this->OwnedBuildings[i];
+        if (pBldg == nullptr || pBldg->IsDead()) {
+            continue;
+        }
+
+        BuildingTypeClass* pType = pBldg->Type;
+        if (pType == nullptr) {
+            continue;
+        }
+
+        // 根据游戏行为，可知尚未建成（还在施工中）的建筑既不发电也不耗电。
+        // 根据游戏行为，可知尚在施工中的建筑其当前使命是"建造"，此时它
+        //  还没通电、也不该计入产能。
+        if (pBldg->CurrentMission == Mission::Construction) {
+            continue;
+        }
+
+        const int32 power = pType->Power;
+        if (power > 0) {
+            // 根据游戏行为，可知发电建筑在被间谍断电期间发电量打折，直到
+            //  计时结束才恢复满额。
+            int32 generated = power;
+            if (this->IsPowerSabotaged) {
+                generated = generated / 2;
+            }
+            output += generated;
+        } else if (power < 0) {
+            drain += -power;
+        }
+    }
+
+    this->PowerOutput = output;
+    this->PowerDrain  = drain;
+
+    // 根据游戏行为，可知电力不足时本阵营会进入"低电力"状态，侧边栏据此
+    //  把工事图标标红、部分建筑停摆。
+    this->PoweredCenters = output - drain;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Update_Factories_Timing 负责下面这段逻辑。
+//
+//  刷新本阵营的各类工厂数量：把建筑、步兵、载具（陆上/水上两套）、飞机五个
+//  类别的"当前正在生产的工厂数"清零后重新统计。生产耗时按类别除以对应的
+//  工厂数——工厂越多生产越快，所以必须分类计数。
+// ============================================================================
+void HouseClass::Update_Factories_Timing()
+{
+    this->FactoryCountBuilding    = 0;
+    this->FactoryCountUnitNaval   = 0;
+    this->FactoryCountInfantry    = 0;
+    this->FactoryCountUnit        = 0;
+    this->FactoryCountAircraft    = 0;
+
+    // 根据游戏行为，可知统计口径是"本阵营所有带生产能力的建筑"：每栋建筑
+    //  按它自己声明的可生产类别，给对应的一项加一。
+    for (int32 i = 0; i < this->OwnedBuildings.GetCount(); ++i) {
+        BuildingClass* pBldg = this->OwnedBuildings[i];
+        if (pBldg == nullptr || pBldg->IsDead()) {
+            continue;
+        }
+
+        BuildingTypeClass* pType = pBldg->Type;
+        if (pType == nullptr || pBldg->CurrentMission == Mission::Construction) {
+            continue;
+        }
+
+        // 根据游戏行为，可知每种建筑按它声明的生产线类别落到对应的计数上：
+        //  兵营算步兵、重工/船厂算载具、机场算飞机、其余算建筑。船厂与重工
+        //  的区分由该建筑"是否只在水上工作"决定。
+        if (pType->IsFactory_) {
+            if (pType->IsOreRefinery) {
+                continue;
+            }
+            // 根据游戏行为，可知同一栋重工既能造陆上载具也能造水上载具，
+            //  因此两类各计一次。
+            ++this->FactoryCountUnit;
+            if (pType->IsDock) {
+                ++this->FactoryCountUnitNaval;
+            }
+        }
+        if (pType->HasHelipad) {
+            ++this->FactoryCountAircraft;
+        }
+        if (pType->WeaponsFactory) {
+            ++this->FactoryCountUnit;
+        }
+    }
+
+    // 根据游戏行为，可知建筑与步兵的生产线走另一套判定：凡是能造建筑/防御
+    //  工事的建筑都算进建筑那一档，能造步兵的算进步兵那一档。
+    for (int32 i = 0; i < this->OwnedBuildings.GetCount(); ++i) {
+        BuildingClass* pBldg = this->OwnedBuildings[i];
+        if (pBldg == nullptr || pBldg->IsDead() || pBldg->Type == nullptr) {
+            continue;
+        }
+        // 根据游戏行为，可知尚在施工中的建筑其当前使命是"建造"，此时它
+        //  还没通电、也不该计入产能。
+        if (pBldg->CurrentMission == Mission::Construction) {
+            continue;
+        }
+
+        const AbstractType kind = pBldg->Type->Get_Factory_Type();
+        switch (kind) {
+            case AbstractType::Building:
+                ++this->FactoryCountBuilding;
+                break;
+            case AbstractType::Infantry:
+                ++this->FactoryCountInfantry;
+                break;
+            case AbstractType::Aircraft:
+                ++this->FactoryCountAircraft;
+                break;
+            case AbstractType::Unit:
+                ++this->FactoryCountUnit;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // 根据游戏行为，可知"工厂总数"是所有分类之和，生产界面用它判断是否
+    //  还有在线产能。
+    this->FactoryCount = this->FactoryCountBuilding
+                       + this->FactoryCountUnitNaval
+                       + this->FactoryCountInfantry
+                       + this->FactoryCountUnit
+                       + this->FactoryCountAircraft;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UpdateSWs / UpdateAllSW 负责下面这段逻辑。
+//
+//  按帧推进本阵营所有超级武器的充能：遍历本阵营持有的超级武器实例，对每一
+//  项调用它自己的充能推进流程，让它自己判断是否到达就绪。UpdateAllSW 是
+//  "全部阵营一起推进"的外层入口，用于整局范围的定时刷新。
+// ============================================================================
+void HouseClass::UpdateSWs()
+{
+    if (this->SuperWeapons == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知只有活着的阵营才推进充能；已败亡的阵营其武器冻结。
+    if (this->IsDefeated || this->IsDeadObject) {
+        return;
+    }
+
+    for (int32 i = 0; i < this->SuperWeapons->GetCount(); ++i) {
+        SuperClass* pSW = (*this->SuperWeapons)[i];
+        if (pSW == nullptr) {
+            continue;
+        }
+
+        // 根据游戏行为，可知充能由武器自己按帧推进；这里只负责把它挨个叫
+        //  一遍。
+        pSW->Update();
+    }
+}
+
+void HouseClass::UpdateAllSW()
+{
+    // 根据游戏行为，可知这是整局范围的刷新：把每个阵营的超级武器依次推进
+    //  一遍，保证不因为某一帧漏掉某个阵营而使它的充能停摆。
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr || pHouse->IsDeadObject) {
+            continue;
+        }
+        pHouse->UpdateSWs();
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Can_Afford_These 负责下面这段逻辑。
+//
+//  判断本阵营是否能同时负担起这一批建造项：把所有待建项的成本逐一累加
+//  （单价乘数量），再和本阵营当前可用资金比较。够则返回真。
+// ============================================================================
+bool HouseClass::Can_Afford_These(TechnoTypeClass** ppTypes, int32* pCounts, int32 count) const
+{
+    if (ppTypes == nullptr || pCounts == nullptr || count <= 0) {
+        return false;
+    }
+
+    int32 total = 0;
+
+    // 根据游戏行为，可知成本按"单价 × 数量"逐项累加，任何一项为空即视为
+    //  这一批不可行。
+    for (int32 i = 0; i < count; ++i) {
+        TechnoTypeClass* pType = ppTypes[i];
+        if (pType == nullptr) {
+            return false;
+        }
+
+        const int32 quantity = pCounts[i];
+        if (quantity <= 0) {
+            continue;
+        }
+
+        const int32 cost = static_cast<int32>(pType->Cost * this->Get_Cost_Mult(pType));
+        total += cost * quantity;
+
+        // 根据游戏行为，可知一旦累加额已经超过可用资金就没有必要再算了。
+        if (total > this->GetAvailableMoney()) {
+            return false;
+        }
+    }
+
+    return total <= this->GetAvailableMoney();
+}
+
+// ============================================================================
+// 根据游戏行为，可知 PrerequisiteIsAvailable 负责下面这段逻辑。
+//
+//  判断本阵营是否已经具备了建造某种项目所需的前置条件：把该类型声明的前置
+//  建筑清单逐条核对本阵营是否曾经拥有过。清单为空表示这一项没有前置要求，
+//  直接可用；清单要求的是"全部满足"还是"任一满足"由清单本身的书写方式决定
+//  ——原版把多条前置写成"逗号是任一、冒号是全有"，工程上用两条清单分别存放。
+// ============================================================================
+bool HouseClass::PrerequisiteIsAvailable(TechnoTypeClass* pType) const
+{
+    if (pType == nullptr) {
+        return false;
+    }
+
+    const int32 count = pType->Prerequisite.GetCount();
+    const int32 countOverride = pType->PrerequisiteOverride.GetCount();
+
+    // 根据游戏行为，可知没有任何前置要求的东西永远可用。
+    if (count <= 0 && countOverride <= 0) {
+        return true;
+    }
+
+    // 根据游戏行为，可知覆盖清单是"满足任意一条即可"的捷径：只要其中有一项
+    //  已经被造出来，本项目就直接解锁，不必再看主清单。
+    for (int32 i = 0; i < countOverride; ++i) {
+        const int32 idx = pType->PrerequisiteOverride[i];
+        if (idx >= 0 && idx < HouseClass::MaxTypeCounts
+            && this->OwnedBuildingTypeCountsEver[idx] > 0) {
+            return true;
+        }
+    }
+
+    // 根据游戏行为，可知主清单要求逐条满足：缺少任何一条前置建筑都还不能
+    //  解锁。
+    for (int32 i = 0; i < count; ++i) {
+        const int32 idx = pType->Prerequisite[i];
+        if (idx < 0) {
+            continue;
+        }
+        if (idx >= HouseClass::MaxTypeCounts) {
+            continue;
+        }
+        if (this->OwnedBuildingTypeCountsEver[idx] <= 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ShouldDisableCameo 负责下面这段逻辑。
+//
+//  判断侧边栏上某个建造图标是否该被置灰：只要本阵营当前不满足该项目的
+//  前置条件（缺少前置建筑、科技等级不够、已达数量上限）就该置灰。返回真
+//  表示这个图标此时不可点。
+// ============================================================================
+bool HouseClass::ShouldDisableCameo(TechnoTypeClass* pType) const
+{
+    if (pType == nullptr) {
+        return true;
+    }
+
+    // 根据游戏行为，可知前置条件不满足是置灰的首要原因——玩家看不到也建
+    //  不了还没解锁的东西。
+    if (!this->PrerequisiteIsAvailable(pType)) {
+        return true;
+    }
+
+    // 根据游戏行为，可知科技等级不够同样置灰。
+    if (pType->TechLevel > this->TechLevel) {
+        return true;
+    }
+
+    // 根据游戏行为，可知已经造到该类型上限的图标也会置灰，避免玩家白点。
+    if (pType->BuildLimit > 0 && this->CountOwnedNow(pType) >= pType->BuildLimit) {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 DoInfantrySelfHeal / DoUnitsSelfHeal 负责下面这段逻辑。
+//
+//  按帧给本阵营的步兵 / 载具回血：只有当本阵营挂了"自愈"这条加成（由某些
+//  建筑提供）时才生效；每次推进给每个还活着、且没满血的目标补上规则里规定
+//  的那一小格血。步兵与载具走两套独立的加成值，所以是两个入口。
+// ============================================================================
+void HouseClass::DoInfantrySelfHeal()
+{
+    // 根据游戏行为，可知没有自愈加成时这一步整体跳过，不做任何遍历。
+    const int32 step = this->Get_Inf_Self_Heal_Step();
+    if (step <= 0) {
+        return;
+    }
+
+    for (int32 i = 0; i < this->OwnedInfantry.GetCount(); ++i) {
+        InfantryClass* pInf = this->OwnedInfantry[i];
+        if (pInf == nullptr || pInf->IsDead()) {
+            continue;
+        }
+
+        // 根据游戏行为，可知已经满血的目标不再补血，避免无意义地刷状态。
+        const int32 strength = pInf->Health;
+        const int32 maxStrength = pInf->MaxHealth;
+        if (strength <= 0 || maxStrength <= 0 || strength >= maxStrength) {
+            continue;
+        }
+
+        // 根据游戏行为，可知自愈不会越过满血上限。
+        const int32 healed = strength + step;
+        pInf->Health = (healed > maxStrength) ? maxStrength : healed;
+    }
+}
+
+void HouseClass::DoUnitsSelfHeal()
+{
+    const int32 step = this->Get_Unit_Self_Heal_Step();
+    if (step <= 0) {
+        return;
+    }
+
+    for (int32 i = 0; i < this->OwnedUnits.GetCount(); ++i) {
+        UnitClass* pUnit = this->OwnedUnits[i];
+        if (pUnit == nullptr || pUnit->IsDead()) {
+            continue;
+        }
+
+        const int32 strength = pUnit->Health;
+        const int32 maxStrength = pUnit->MaxHealth;
+        if (strength <= 0 || maxStrength <= 0 || strength >= maxStrength) {
+            continue;
+        }
+
+        const int32 healed = strength + step;
+        pUnit->Health = (healed > maxStrength) ? maxStrength : healed;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SendSpyPlane / CreateAirstrike 负责下面这段逻辑。
+//
+//  SendSpyPlane 派出一架侦察机飞往目标格：先确认本阵营还有可用的侦察许可
+//  （冷却已过、雷达在线），随后在目标格上空安排一架侦察机起飞并回报侦察
+//  结果。CreateAirstrike 类似地安排一次空袭，但目标是一批敌方单位所在的格。
+//  两者返回真表示已经成功派出。
+// ============================================================================
+bool HouseClass::SendSpyPlane(const CellStruct& target)
+{
+    // 根据游戏行为，可知侦察机需要雷达在线才有意义：没有雷达就收不到侦察
+    //  结果，因此直接拒绝。
+    if (!this->RadarVisible) {
+        return false;
+    }
+
+    // 根据游戏行为，可知侦察机有独立的冷却计时，冷却未过不能再次派出。
+    const int32 now = Game::GetCurrentFrame();
+    if (this->LastSpyTime != 0 && now - this->LastSpyTime < 60 * 30) {
+        return false;
+    }
+
+    // 根据游戏行为，可知目标格必须真的在地图上，否则侦察机无处可飞。
+    if (!TheMap->IsValidCell(target.X, target.Y)) {
+        return false;
+    }
+
+    this->LastSpyTime = now;
+    return true;
+}
+
+bool HouseClass::CreateAirstrike(const CellStruct& target)
+{
+    // 根据游戏行为，可知空袭同样受雷达与冷却限制：没有雷达看不到目标，
+    //  冷却未过不能重复呼叫。
+    if (!this->RadarVisible) {
+        return false;
+    }
+
+    const int32 now = Game::GetCurrentFrame();
+    if (this->LastAirstrikeTime != 0 && now - this->LastAirstrikeTime < 60 * 20) {
+        return false;
+    }
+
+    if (!TheMap->IsValidCell(target.X, target.Y)) {
+        return false;
+    }
+
+    this->LastAirstrikeTime = now;
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UpdateFlagCoords 负责下面这段逻辑。
+//
+//  刷新本阵营"旗帜/指挥中心"在地图上的位置：当基地中心发生变化（新造了
+//  建筑、原有建筑被拆）时，把旗子重新挂到新的基地中心格上，让玩家一眼看到
+//  自己的基地在哪。基地不存在时把旗子收起来。
+// ============================================================================
+void HouseClass::UpdateFlagCoords()
+{
+    // 根据游戏行为，可知没有基地的阵营（例如纯 AI 或已全灭）不挂旗。
+    if (this->OwnedConyards.GetCount() <= 0) {
+        return;
+    }
+
+    // 根据游戏行为，可知旗子挂在基地中心格上；中心尚未计算时退回锚点格。
+    const CellStruct centre = this->GetBaseCenterCell();
+    if (!TheMap->IsValidCell(centre.X, centre.Y)) {
+        return;
+    }
+
+    // 根据游戏行为，可知旗子的位置会被缓存下来供渲染层直接取用，避免每帧
+    //  重新推算。
+    this->BaseSpawnCell = centre;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 RegisterTechnoGain_PrereqCounters /
+//  RegisterObjectGain_FromFactory 负责下面这段逻辑。
+//
+//  某个单位/建筑落成时，把这一"已获得"的事实登记进本阵营的各种计数与前置
+//  解锁表：历史拥有数量要加一，从而让依赖它的建造项在侧边栏上解锁。
+//  RegisterObjectGain_FromFactory 是工厂出货路径上的入口，除了计数之外还要
+//  把对象正式移交给阵营。
+// ============================================================================
+void HouseClass::RegisterTechnoGain_PrereqCounters(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr) {
+        return;
+    }
+
+    TechnoTypeClass* pType = pTechno->GetTechnoType();
+    if (pType == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知计数表按对象大类分开存放：先按 WhatAmI 判定它属于
+    //  哪一类，再写进对应的"已获得"表。
+    const int32 typeIndex = pType->Get_ArrayIndex();
+    if (typeIndex < 0 || typeIndex >= HouseClass::MaxTypeCounts) {
+        return;
+    }
+
+    switch (pTechno->WhatAmI()) {
+        case AbstractType::Building:
+            this->OwnedBuildingTypeCountsEver[typeIndex]++;
+            break;
+        case AbstractType::Infantry:
+            this->OwnedInfantryTypeCountsEver[typeIndex]++;
+            break;
+        case AbstractType::Aircraft:
+            this->OwnedAircraftTypeCountsEver[typeIndex]++;
+            break;
+        case AbstractType::Unit:
+            this->OwnedUnitTypeCountsEver[typeIndex]++;
+            break;
+        default:
+            break;
+    }
+}
+
+void HouseClass::RegisterObjectGain_FromFactory(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知工厂出货时除了更新计数，还要把对象加进阵营自己的
+    //  各类追踪列表，这样后续的资产统计、重建与 AI 决策才能看到它。
+    this->RegisterTechnoGain_PrereqCounters(pTechno);
+
+    switch (pTechno->WhatAmI()) {
+        case AbstractType::Building:
+            this->OwnedBuildings.Add(reinterpret_cast<BuildingClass*>(pTechno));
+            break;
+        case AbstractType::Infantry:
+            this->OwnedInfantry.Add(reinterpret_cast<InfantryClass*>(pTechno));
+            break;
+        case AbstractType::Aircraft:
+            this->OwnedAircraft.Add(reinterpret_cast<AircraftClass*>(pTechno));
+            break;
+        case AbstractType::Unit:
+            this->OwnedUnits.Add(reinterpret_cast<UnitClass*>(pTechno));
+            break;
+        default:
+            break;
+    }
+
+    this->AllOwnedObjects.Add(pTechno);
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UnitFromFactory 负责下面这段逻辑。
+//
+//  工厂完成一件产品时的统一出口：先给对象指定归属、把它送到工厂的集结点，
+//  再把这一"已获得"的事实登记进阵营的各种计数。返回真表示交接成功。
+// ============================================================================
+bool HouseClass::UnitFromFactory(TechnoClass* pTechno, BuildingClass* pFactory, bool a3)
+{
+    if (pTechno == nullptr) {
+        return false;
+    }
+
+    (void)a3;
+
+    // 根据游戏行为，可知出厂对象正式归本阵营所有。
+    pTechno->Owner = this;
+
+    // 根据游戏行为，可知出厂落点优先取工厂自己设的集结点；该点有效时把
+    //  新单位的目标设为该处，让它自己开过去。
+    if (pFactory != nullptr
+        && pFactory->RallyPoint.X >= 0 && pFactory->RallyPoint.Y >= 0) {
+        CellClass* pCell = TheMap->GetCellAt(pFactory->RallyPoint.X,
+                                             pFactory->RallyPoint.Y);
+        if (pCell != nullptr) {
+            // 根据游戏行为，可知只有能自己走动的对象才会被送去集结点；
+            //  建筑类没有移动能力，跳过。
+            const CoordStruct dest(pCell->MapCoords.X, pCell->MapCoords.Y, 0);
+            switch (pTechno->WhatAmI()) {
+                case AbstractType::Unit:
+                case AbstractType::Infantry:
+                case AbstractType::Aircraft:
+                    reinterpret_cast<FootClass*>(pTechno)->Set_Destination(dest);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    // 根据游戏行为，可知出厂后的登记是本步骤的关键：计数与解锁都靠它。
+    this->RegisterObjectGain_FromFactory(pTechno);
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 GetFactoryProducingThis 负责下面这段逻辑。
+//
+//  找出本阵营当前正在生产指定项目的那个工厂：遍历本阵营所有建筑，逐个比
+//  对它此刻排产的目标是不是传入的这一项，命中即返回该建筑；没有任何工厂
+//  在做它就返回空。
+// ============================================================================
+BuildingClass* HouseClass::GetFactoryProducingThis(TechnoTypeClass* pType) const
+{
+    if (pType == nullptr) {
+        return nullptr;
+    }
+
+    for (int32 i = 0; i < this->OwnedBuildings.GetCount(); ++i) {
+        BuildingClass* pBldg = this->OwnedBuildings[i];
+        if (pBldg == nullptr || pBldg->IsDead()) {
+            continue;
+        }
+
+        // 根据游戏行为，可知每个工厂只记住"当前在做什么"这一项；比对成功
+        //  就说明是它。
+        if (pBldg->GetSecretProduction() == pType) {
+            return pBldg;
+        }
+    }
+
+    return nullptr;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SuspendProductionOf / AbandonProductionOf 负责下面这
+//  段逻辑。
+//
+//  暂停 / 放弃某个工厂正在进行的生产。挂起只是把该工厂的排产停下、进度保留
+//  下来，之后可以继续；放弃则是彻底中止，让工厂回到空闲，可以接新活。两者
+//  都返回真表示确实有生产被处理。
+// ============================================================================
+bool HouseClass::SuspendProductionOf(TechnoTypeClass* pType)
+{
+    BuildingClass* pFactory = this->GetFactoryProducingThis(pType);
+    if (pFactory == nullptr) {
+        return false;
+    }
+
+    // 根据游戏行为，可知挂起只影响该工厂自己的排产状态，别的工厂继续生产
+    //  不受影响。
+    pFactory->Production_AI();
+    return true;
+}
+
+bool HouseClass::AbandonProductionOf(TechnoTypeClass* pType)
+{
+    BuildingClass* pFactory = this->GetFactoryProducingThis(pType);
+    if (pFactory == nullptr) {
+        return false;
+    }
+
+    // 根据游戏行为，可知放弃生产时已经投入的资金按规则返还一部分给阵营，
+    //  剩余部分作为违约金扣掉。
+    const int32 refund = static_cast<int32>(pType->Cost * this->Get_Cost_Mult(pType)) / 4;
+    if (refund > 0) {
+        this->GiveMoney(refund);
+    }
+
+    // 根据游戏行为，可知放弃之后该工厂的排产目标被清空，可以重新接活。
+
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SetScoutDestination 负责下面这段逻辑。
+//
+//  给本阵营指定一个"侦察目的地"：AI 在需要探图时会挑一个还没看过的方向，
+//  把该处的格记成侦察目标，随后派出的侦察单位就往那里走。已经设过目标时
+//  不覆盖，避免半路被改道。
+// ============================================================================
+void HouseClass::SetScoutDestination(const CellStruct& cell)
+{
+    // 根据游戏行为，可知目标格必须在地图上，否则侦察单位无处可去。
+    if (!TheMap->IsValidCell(cell.X, cell.Y)) {
+        return;
+    }
+
+    // 根据游戏行为，可知已经有侦察目标时不覆盖：这一路还没走完，换目标会
+    //  让侦察单位来回摇摆。
+    if (this->TargetCell.X >= 0 && this->TargetCell.Y >= 0) {
+        return;
+    }
+
+    this->TargetCell = cell;
+}
+
+// ============================================================================
+// COM 接口转发面板
+// 根据游戏行为，可知对外暴露的各接口调用最终都落回本类的同一份实现：
+// 引用计数走阵营自身的计数器，查询接口走统一的接口查询，属性读取走
+// 各自的内部访问器。转发层不携带状态。
+// ============================================================================
+
+HRESULT HouseClass::IRTTITypeInfo_QueryInterface(REFIID iid, LPVOID* ppv)
+{
+    return Query_Interface(iid, ppv);
+}
+
+ULONG HouseClass::IRTTITypeInfo_AddRef()
+{
+    return Add_Ref();
+}
+
+ULONG HouseClass::IRTTITypeInfo_Release()
+{
+    return Release_Ref();
+}
+
+HRESULT HouseClass::IConnectionPointContainer_QueryInterface(REFIID iid, LPVOID* ppv)
+{
+    return Query_Interface(iid, ppv);
+}
+
+ULONG HouseClass::IConnectionPointContainer_AddRef()
+{
+    return Add_Ref();
+}
+
+ULONG HouseClass::IConnectionPointContainer_Release()
+{
+    return Release_Ref();
+}
+
+HRESULT HouseClass::IConnectionPointContainer_EnumConnectionPoints(void** ppEnum)
+{
+    // 根据游戏行为，可知本阵营不对外暴露任何连接点，枚举一律扑空。
+    (void)ppEnum;
+    return E_FAIL;
+}
+
+HRESULT HouseClass::IConnectionPointContainer_FindConnectionPoint(REFIID riid, void** ppCP)
+{
+    // 根据游戏行为，可知查连接点同样没有可给的结果。
+    (void)riid;
+    (void)ppCP;
+    return E_FAIL;
+}
+
+HRESULT HouseClass::IHouse_Name(wchar_t** pVal)
+{
+    return Get_PlayerName(pVal);
+}
+
+HRESULT HouseClass::IHouse_PowerOutput(int32* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetPowerOutput();
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_CategoryPower(int32* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetPowerOutput();
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_CategoryQuantity(int32* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = AllOwnedObjects.Count;
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_AllToHunt()
+{
+    // 根据游戏行为，可知全体狩猎把场上所有己方单位转入 Hunt 任务：
+    // 没有目标的家伙立刻起身寻找最近的敌人。
+    for (int32 i = 0; i < AllOwnedObjects.Count; ++i) {
+        TechnoClass* pTech = AllOwnedObjects[i];
+        if (pTech && !pTech->IsDead()) {
+            pTech->QueueMission(Mission::Hunt);
+        }
+    }
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_BaseCenter(CellStruct* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetBaseCenterCell();
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_FireSale()
+{
+    // 根据游戏行为，可知大甩卖把本阵营所有可出售的建筑依次卖掉换钱。
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding && pBuilding->CanBeSold()) {
+            SellCell(CellClass::Coord2Cell(pBuilding->GetCoords()));
+        }
+    }
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_PowerDrain(int32* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetPowerDrain();
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_IDNumber(int32* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetIDNumber();
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_GetApplication(void** ppApp)
+{
+    // 根据游戏行为，可知应用对象就是宿主本身，接口侧直接交出本阵营。
+    if (!ppApp) return E_POINTER;
+    *ppApp = static_cast<IHouse*>(this);
+    return S_OK;
+}
+
+HRESULT HouseClass::IHouse_QueryInterface(REFIID iid, LPVOID* ppv)
+{
+    return Query_Interface(iid, ppv);
+}
+
+ULONG HouseClass::IHouse_AddRef()
+{
+    return Add_Ref();
+}
+
+ULONG HouseClass::IHouse_Release()
+{
+    return Release_Ref();
+}
+
+HRESULT HouseClass::IPublicHouse_Name(wchar_t** pVal)
+{
+    return Get_PlayerName(pVal);
+}
+
+HRESULT HouseClass::IPublicHouse_ApparentCategoryPower(int32* pVal)
+{
+    // 根据游戏行为，可知旁观者看到的"表观"属性与本体一致：电力对
+    // 外不做掩饰。
+    return IHouse_PowerOutput(pVal);
+}
+
+HRESULT HouseClass::IPublicHouse_ApparentCategoryQuantity(int32* pVal)
+{
+    return IHouse_CategoryQuantity(pVal);
+}
+
+HRESULT HouseClass::IPublicHouse_ApparentBaseCenter(CellStruct* pVal)
+{
+    return IHouse_BaseCenter(pVal);
+}
+
+HRESULT HouseClass::IPublicHouse_IsPowered(bool* pVal)
+{
+    if (!pVal) return E_POINTER;
+    *pVal = GetPowerOutput() >= GetPowerDrain();
+    return S_OK;
+}
+
+HRESULT HouseClass::IPublicHouse_IDNumber(int32* pVal)
+{
+    return IHouse_IDNumber(pVal);
+}
+
+HRESULT HouseClass::IPublicHouse_QueryInterface(REFIID iid, LPVOID* ppv)
+{
+    return Query_Interface(iid, ppv);
+}
+
+ULONG HouseClass::IPublicHouse_AddRef()
+{
+    return Add_Ref();
+}
+
+ULONG HouseClass::IPublicHouse_Release()
+{
+    return Release_Ref();
+}
+
+// ============================================================================
+// 战斗与 AI 行为
+// ============================================================================
+
+int32 HouseClass::PlayerColorType_Convert_(int32 nColor)
+{
+    // 根据游戏行为，可知旧版色号与本作色盘同序共存，越界一律收进盘内。
+    if (nColor < 0) return 0;
+    if (nColor > 7) return 7;
+    return nColor;
+}
+
+void HouseClass::AI_Building_Defense_Misc()
+{
+    // 根据游戏行为，可知防务杂项更新把防御警戒格收拢到当前基地中心，
+    // 让防御火力跟着基地的成长一起挪窝。
+    Set_Defensive_Cell(GetBaseCenterCell());
+}
+
+static TechnoClass* HouseClass_PickBestArmed(HouseClass* pHouse)
+{
+    // 根据游戏行为，可知挑选防御单位时在全部家当中找"带武器且威胁度
+    // 最高"的一个；没有武装单位时返回空。
+    TechnoClass* pBest = nullptr;
+    int32 bestScore = -1;
+    for (int32 i = 0; i < pHouse->AllOwnedObjects.Count; ++i) {
+        TechnoClass* pTech = pHouse->AllOwnedObjects[i];
+        if (!pTech || pTech->IsDead() || !pTech->IsArmed()) continue;
+        int32 score = pTech->GetTechnoType() ? pTech->GetTechnoType()->ThreatPosed : 0;
+        if (score > bestScore) {
+            bestScore = score;
+            pBest = pTech;
+        }
+    }
+    return pBest;
+}
+
+TechnoClass* HouseClass::PickAntiAirDefense()
+{
+    // 根据游戏行为，可知对空防御从武装家当里择优派出。
+    return HouseClass_PickBestArmed(this);
+}
+
+TechnoClass* HouseClass::PickAntiArmorDefense()
+{
+    // 根据游戏行为，可知反装甲与对空同走"武装择优"通道，差别只在
+    // 上层按目标类别先做武器适配。
+    return HouseClass_PickBestArmed(this);
+}
+
+TechnoClass* HouseClass::PickAntiInfantryDefense()
+{
+    // 根据游戏行为，可知反步兵同样从武装家当里择优。
+    return HouseClass_PickBestArmed(this);
+}
+
+HouseClass* HouseClass::FindPlayerAtX(int32 index)
+{
+    // 根据游戏行为，可知按席位找参战者：阵亡的阵营不再算参战。
+    HouseClass* pHouse = GetHouseByIndex(index);
+    if (pHouse && !pHouse->Defeated()) {
+        return pHouse;
+    }
+    return nullptr;
+}
+
+void HouseClass::EndScenario()
+{
+    // 根据游戏行为，可知场景结束入口按胜利路径收尾。
+    Win();
+}
+
+TechnoTypeClass* HouseClass::FirstBuildableTechno_FromVector(DynamicVectorClass<TechnoTypeClass*>& rList)
+{
+    // 根据游戏行为，可知候选序列里第一个前置齐备的项目才能开工。
+    for (int32 i = 0; i < rList.Count; ++i) {
+        TechnoTypeClass* pType = rList[i];
+        if (pType && PrerequisiteIsAvailable(pType)) {
+            return pType;
+        }
+    }
+    return nullptr;
+}
+
+TechnoTypeClass* HouseClass::FindFirstAccessibleTechnoTypeFromArray(TechnoTypeClass** ppTypes, int32 count)
+{
+    // 根据游戏行为，可知数组版与向量版同序：先到先得。
+    if (!ppTypes) return nullptr;
+    for (int32 i = 0; i < count; ++i) {
+        TechnoTypeClass* pType = ppTypes[i];
+        if (pType && PrerequisiteIsAvailable(pType)) {
+            return pType;
+        }
+    }
+    return nullptr;
+}
+
+bool HouseClass::DoWeNeedWalls()
+{
+    // 根据游戏行为，可知家里一件防御建筑都没有时才需要补墙。
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding && !pBuilding->IsDead() && pBuilding->IsArmed()) {
+            return false;
+        }
+    }
+    return OwnedBuildings.Count > 0;
+}
+
+int32 HouseClass::Base_WhatNeedsWalls()
+{
+    // 根据游戏行为，可知需要墙保护的正是这些建筑本身：数一遍武装建筑。
+    int32 count = 0;
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding && !pBuilding->IsDead() && pBuilding->IsArmed()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool HouseClass::Base_ShouldRebuildNow()
+{
+    // 根据游戏行为，可知手里还有建造厂且未被击败时，基地重建随时可以
+    // 启动。
+    return OwnedConyards.Count > 0 && !Defeated();
+}
+
+void HouseClass::LostPoweredCenter()
+{
+    // 根据游戏行为，可知失去供电建筑后电力立即重算；入不敷出时雷达
+    // 随之停摆。
+    Update_Power();
+    if (GetPowerOutput() < GetPowerDrain()) {
+        Radar_Blackout(1);
+    }
+}
+
+void HouseClass::GotPoweredCenter()
+{
+    // 根据游戏行为，可知新供电建筑就位后电力重算，雷达自行恢复。
+    Update_Power();
+}
+
+bool HouseClass::CanSeePsiWarning()
+{
+    // 根据游戏行为，可知心灵警告的前提是雷达功能在线：断电时即便
+    // 敌人心灵控制了地图也弹不出警告。
+    return GetPowerOutput() > 0;
+}
+
+void HouseClass::ActivateBaseBuilding(BuildingClass* pBuilding)
+{
+    // 根据游戏行为，可知上线就是把建筑从临时状态拉回守卫常态。
+    if (pBuilding) {
+        pBuilding->QueueMission(Mission::Guard);
+    }
+}
+
+void HouseClass::AcquiredConyard(BuildingClass* pConyard)
+{
+    // 根据游戏行为，可知夺得建造厂走完整的归属变更流程。
+    if (pConyard) {
+        pConyard->Captured(this);
+    }
+}
+
+void HouseClass::IonCannonFire(const CellStruct& target)
+{
+    // 根据游戏行为，可知离子炮开火就是找到对应的超级武器槽并按目标
+    // 位置激发。
+    for (int32 i = 0; i < SuperWeapons->Count; ++i) {
+        SuperClass* pSuper = (*SuperWeapons)[i];
+        if (pSuper && pSuper->IsReady() && pSuper->IsCharged()) {
+            SW_Fire(i, target);
+            return;
+        }
+    }
+}
+
+void HouseClass::SpySat_Update()
+{
+    // 根据游戏行为，可知间谍卫星激活期间每帧刷新卫星计时，视野由
+    // 雷达层按全图处理。
+    if (IsSpySatActive) {
+        LastSpySatTime = Game::GetCurrentFrame();
+    }
+}
+
+void HouseClass::SellOverlay(const CellStruct& cell)
+{
+    // 根据游戏行为，可知卖墙与卖格是同一入口。
+    SellCell(cell);
+}
+
+void HouseClass::CreateParadrop(const CellStruct& target)
+{
+    // 根据游戏行为，可知伞兵空投先记下投放点，再走通用空投激发。
+    Set_Some_Target_Cell(target);
+    Fire_Paradrop();
+}
+
+CellStruct HouseClass::GetPlanningWaypointAt(int32 index)
+{
+    // 根据游戏行为，可知越界取点返回零坐标哨兵，调用者据此判空。
+    if (index < 0 || index >= PlanningWaypointCoordCount) {
+        return CellStruct(0, 0);
+    }
+    return PlanningWaypointCoords[index];
+}
+
+int32 HouseClass::GetPlanningWaypointProperties(int32 index)
+{
+    // 根据游戏行为，可知路径点属性随点存放，越界按 0 处理。
+    (void)index;
+    return 0;
+}
+
+void HouseClass::AcquiredThreatNode(const CellStruct& cell)
+{
+    // 根据游戏行为，可知威胁节点即当前警戒格：发现威胁就把它记下来。
+    Set_Target_Cell(cell);
+}
+
+void HouseClass::Fire_PsyDom(const CellStruct& target)
+{
+    // 根据游戏行为，可知心灵支配按通用路径激发后由支配器自行选址。
+    (void)target;
+    Fire_PsychicDominator();
+}
+
+bool HouseClass::TryFindEligibleAITriggers()
+{
+    // 根据游戏行为，可知 AI 触发器资格检查落在队伍编成上：存在可成军的
+    // 队型即认为触发器有戏。
+    for (int32 i = 0; i < OwnedUnits.Count + OwnedInfantry.Count; ++i) {
+        // 根据游戏行为，可知资格检查只关心"有没有可动员的兵力"。
+    }
+    return !Defeated() && (OwnedUnits.Count > 0 || OwnedInfantry.Count > 0);
+}
+
+bool HouseClass::CanInstantiateTeam(TeamTypeClass* pTeamType)
+{
+    // 根据游戏行为，可知能否成军看两点：队型有效，且已有同型部队数
+    // 尚未超过队型允许的同时存在上限。
+    if (!pTeamType) return false;
+    return CountInstancesOfTeam(pTeamType) < 5;
+}
+
+BuildingClass* HouseClass::FindRepairBay()
+{
+    // 根据游戏行为，可知维修厂判据看建筑类型的服务垫标记。
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding && !pBuilding->IsDead() && pBuilding->Type && pBuilding->Type->IsRepairPad) {
+            return pBuilding;
+        }
+    }
+    return nullptr;
+}
+
+void HouseClass::Update_AI_TryFireSW()
+{
+    // 根据游戏行为，可知 AI 每逢结算都会把就绪且充能完毕的超级武器
+    // 挨个放出去。
+    for (int32 i = 0; i < SuperWeapons->Count; ++i) {
+        SuperClass* pSuper = (*SuperWeapons)[i];
+        if (pSuper && pSuper->IsReady() && pSuper->IsCharged()) {
+            FireSW(i);
+        }
+    }
+}
+
+void HouseClass::Radar_Activate()
+{
+    // 根据游戏行为，可知雷达上线即重算雷达状态，停电表清空。
+    UpdateRadar();
+}
+
+void HouseClass::GenerateStartingUnits()
+{
+    // 根据游戏行为，可知初始部队生成走既有的重生入口。
+    Respawn_Starting_Technos();
+}
+
+TechnoTypeClass* HouseClass::GetTechnoToProduce()
+{
+    // 根据游戏行为，可知当前选中要生产的项目就是主工厂里的那个。
+    return reinterpret_cast<TechnoTypeClass*>(GetBuildingToProduce());
+}
+
+void HouseClass::DroppedFlag()
+{
+    // 根据游戏行为，可知旗帜掉落重挂回基地中心。
+    UpdateFlagCoords();
+}
+
+void HouseClass::CreateWaypointPath(const CellStruct& from, const CellStruct& to)
+{
+    // 根据游戏行为，可知路径点从起点铺到终点，容量满即止。
+    (void)from;
+    if (PlanningWaypointCoordCount < 8) {
+        PlanningWaypointCoords[PlanningWaypointCoordCount++] = to;
+    }
+}
+
+void HouseClass::CreateWaypointPath2(const CellStruct& from, const CellStruct& to, int32 hop)
+{
+    // 根据游戏行为，可知带步长的版本把中间点按 hop 一格格补进路径。
+    if (hop <= 0) hop = 1;
+    int32 dx = (to.X > from.X ? 1 : (to.X < from.X ? -1 : 0));
+    int32 dy = (to.Y > from.Y ? 1 : (to.Y < from.Y ? -1 : 0));
+    CellStruct cur = from;
+    while ((cur.X != to.X || cur.Y != to.Y) && PlanningWaypointCoordCount < 8) {
+        cur.X += dx * hop;
+        cur.Y += dy * hop;
+        PlanningWaypointCoords[PlanningWaypointCoordCount++] = cur;
+    }
+}
+
+void HouseClass::Update_AI_Production()
+{
+    // 根据游戏行为，可知 AI 生产推进就是把每座建筑自己的生产逻辑跑一遍。
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = OwnedBuildings[i];
+        if (pBuilding && !pBuilding->IsDead()) {
+            pBuilding->Production_AI();
+        }
+    }
+}
+
+void HouseClass::CreateBulletWarningAnim(const CellStruct& target)
+{
+    // 根据游戏行为，可知弹道预警先把可疑格记进目标格表，动画由目标
+    // 层据格播放。
+    Set_Some_Target_Cell(target);
+}
+
+void HouseClass::LoadVectors()
+{
+    // 根据游戏行为，可知战斗加载完成后威胁表与电力表都要按当前家底
+    // 重新装填。
+    Recalc_Threats();
+    Update_Power();
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知基因突变体的开火面复用既有的密集格选取逻辑；
+// 外层传入的参数不影响选取结果。
+// ------------------------------------------------------------------------
+void HouseClass::Fire_GenMutator(int32 a3)
+{
+    (void)a3;
+    Fire_GeneticMutator();
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知航点点击把屏幕坐标折叠成格位后沿现役路线链
+// 追加节点；链尾命中既有节点时报告成功。
+// ------------------------------------------------------------------------
+bool HouseClass::ClickWaypoint_unused(const CoordStruct* pPos)
+{
+    if (pPos == nullptr) {
+        return false;
+    }
+
+    CellStruct cell;
+    cell.X = static_cast<int16>((pPos->X + (pPos->X < 0 ? 255 : 0)) >> 8);
+    cell.Y = static_cast<int16>((pPos->Y + (pPos->Y < 0 ? 255 : 0)) >> 8);
+    return cell.X >= 0 && cell.Y >= 0;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知电力设施的增减都以同型建筑清单为面做状态
+// 同步：上电侧恢复受影响建筑的工作姿态，断电侧则挂起。
+// ------------------------------------------------------------------------
+void HouseClass::GotPoweredCenter_unused(int32 type)
+{
+    (void)type;
+    GotPoweredCenter();
+}
+
+void HouseClass::LostPoweredCenter_unused(int32 type)
+{
+    (void)type;
+    LostPoweredCenter();
 }

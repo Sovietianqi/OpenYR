@@ -37,6 +37,13 @@ public:
 
     // TaskForceClass_CreateFromINIList: walks [TaskForces] and builds
     // one task force per listed name.
+    // 根据游戏行为，可知任务力补全原版命名形态：成员表与 INI 的
+    // 双向同步、成员计数与一个弃用查找槽。
+    bool SaveListToINI(class CCINIClass* pINI, const char* pSection);
+    void LoadObjects(class CCINIClass* pINI, const char* pSection);
+    int32 CountObjects() const;
+    static TaskForceClass* Find_obsolete(const char* pID);
+
     static void CreateFromINIList(CCINIClass* pINI);
 
     static TaskForceClass* Find(const char* pID);

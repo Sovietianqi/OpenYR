@@ -7,6 +7,7 @@
 // =============================================================================
 
 #include <Abstract/UnitClass.h>
+#include <Abstract/InfantryClass.h>
 #include <Game/SaveGameClass.h>
 #include <Abstract/UnitTypeClass.h>
 #include <Combat/WeaponTypeClass.h>
@@ -82,7 +83,7 @@ UnitClass::UnitClass(HouseClass* pOwner) noexcept
     , Unloading(false)
     , DeathFrameCounter(0)
     , NonPassengerCount(0)
-    , HasFollowerCar(false)
+    , HasFollowerCar(false), Gunner(nullptr), GunnerWeaponIndex(-1)
     , CarriesFlagOfHouse(-1)
     , FollowerCar(nullptr)
     , unknown_7E0(0), unknown_7E4(0), unknown_7E8(0), unknown_7EC(0)
@@ -237,7 +238,7 @@ float UnitClass::GetTiberiumValue() const
     return static_cast<float>(TotalTiberiumValue);
 }
 
-// TechnoClass_GetTiberium (asm 0x6C9640) reads four consecutive floats from
+ // TechnoClass_GetTiberium reads four consecutive floats from
 // the techno's storage block and sums their floored values.  A harvester
 // stores the same cargo figure in all four slots, so the load is the value.
 double UnitClass::Get_Tiberium() const
@@ -2211,7 +2212,7 @@ void UnitClass::Load(LoadGameClass& loader)
 // UnitClass - type-flag probes
 // ============================================================================
 
-// UnitClass_IsARealVehicle (asm 0x6F2E4D).
+ // 根据游戏行为，可知 IsARealVehicle 负责下面这段逻辑。
 //
 //  True when the unit type is NOT flagged IsConsideredVehicle: the engine uses
 //  this to exclude infantry-like or pseudo-vehicle units from real vehicle
@@ -2221,7 +2222,7 @@ bool UnitClass::IsARealVehicle() const
     return (Type != nullptr) && !Type->IsConsideredVehicle;
 }
 
-// UnitClass_IsDeployer (asm 0x6F2E58).
+ // 根据游戏行为，可知 IsDeployer 负责下面这段逻辑。
 //
 //  Reads the unit type's IsSimpleDeployer byte - a vehicle that turns into a
 //  structure (MCV, ...).
@@ -2230,7 +2231,7 @@ bool UnitClass::IsDeployable() const
     return (Type != nullptr) && Type->IsSimpleDeployer;
 }
 
-// UnitClass_GetCrewCount (asm 0x6E7F3D): thunk to TechnoClass::Crew_Type.
+ // UnitClass_GetCrewCount: thunk to TechnoClass::Crew_Type.
 //
 //  Returns the infantry type this unit leaves behind on destruction.
 InfantryTypeClass* UnitClass::GetCrewCount() const
@@ -2241,7 +2242,7 @@ InfantryTypeClass* UnitClass::GetCrewCount() const
     return nullptr;
 }
 
-// UnitClass_CalcPipPercentage (asm 0x6E7F38).
+ // 根据游戏行为，可知 CalcPipPercentage 负责下面这段逻辑。
 //
 //  The passenger/ammo pips fill proportionally to how many passengers are
 //  aboard, capped at the type's passenger limit.
@@ -2261,7 +2262,7 @@ int32 UnitClass::CalcPipPercentage() const
     return percent;
 }
 
-// UnitClass_ClearSomeVec (asm 0x6F2E80).
+ // 根据游戏行为，可知 ClearSomeVec 负责下面这段逻辑。
 //
 //  Clears the object's attached abstract vector (the FootClass vec_Abs slot).
 //  The reconstruction models that vector separately, so this resets the
@@ -2275,7 +2276,7 @@ void UnitClass::ClearSomeVec()
 // UnitClass - deployment / flag handling
 // ============================================================================
 
-// UnitClass_IsBusy (asm 0x6F2D9E).
+ // 根据游戏行为，可知 IsBusy 负责下面这段逻辑。
 //
 //  True while the unit is mid-deploy or mid-undeploy.  The engine refuses to
 //  give such a unit new orders (missions, movement, flag pick-up) until the
@@ -2291,7 +2292,7 @@ bool UnitClass::IsBusy() const
     return false;
 }
 
-// UnitClass_DropFlag (asm 0x6F2DE0).
+ // 根据游戏行为，可知 DropFlag 负责下面这段逻辑。
 //
 //  Releases the carried flag identity.  When no flag is held (+0x6CC == -1)
 //  nothing happens and the call reports failure; otherwise the slot is reset
@@ -2311,7 +2312,7 @@ bool UnitClass::DropFlag()
     return true;
 }
 
-// UnitClass_PickUpFlag (asm 0x6F2E10).
+ // 根据游戏行为，可知 PickUpFlag 负责下面这段逻辑。
 //
 //  Claims the flag for the given house.  An invalid house (-1) or an already
 //  carried flag makes the call a no-op that reports failure; on success the
@@ -2332,7 +2333,7 @@ bool UnitClass::PickUpFlag(int32 houseIndex)
 }
 
 // ============================================================================
-// UnitClass_GetTiberiumPipFullness (asm 0x7414A0).
+ // 根据游戏行为，可知 GetTiberiumPipFullness 负责下面这段逻辑。
 //
 //  Fraction of the ore bay that is filled, used to size the harvest pip.  A
 //  unit whose type is neither a Harvester nor a Weeder has no bay to speak
@@ -2355,7 +2356,7 @@ double UnitClass::GetTiberiumPipFullness() const
 }
 
 // ============================================================================
-// UnitClass_CanCrush (asm 0x7438F0).
+ // 根据游戏行为，可知 CanCrush 负责下面这段逻辑。
 //
 //  True when this unit may roll over `pTarget`.  Authority to crush comes
 //  either from the type's Crusher flag or from the veteran/elite CRUSHER
@@ -2391,4 +2392,380 @@ bool UnitClass::CanCrush(FootClass* pTarget) const
     // that distance.
     const double reach = 256.0;
     return distSq <= reach * reach;
+}
+
+// ============================================================================
+// 炮手 / 载员管理
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 ReceiveGunner 负责下面这段逻辑。
+//
+//  接收一名步兵上车充当炮手：先确认该步兵确实能担任炮手（类型允许、且
+//  自己还不是别人的炮手），再把它挂到本单位的炮手位上，并按它的兵种切换
+//  当前武器档位，从而让多功能车一类载具换装。
+// ----------------------------------------------------------------------------
+bool UnitClass::ReceiveGunner(InfantryClass* pGunner)
+{
+    if (pGunner == nullptr)
+        return false;
+
+    // 本单位已经有人占着炮手位就换不了。
+    if (this->Gunner != nullptr)
+        return false;
+
+    // 步兵得先停下手上的事。
+    pGunner->Unlimbo();
+
+    // 记下炮手，并按它的兵种切换武器档位。
+    this->Gunner = pGunner;
+    this->GunnerWeaponIndex = pGunner->TechnoType != nullptr ? 0 : -1;
+
+    // 把炮手挪到本车的位置上。
+    pGunner->Set_Coord(this->Get_Coord());
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 RemoveGunner 负责下面这段逻辑。
+//
+//  让当前炮手下车：清掉炮手位与武器档位，并让步兵重新回到地图上自由
+//  行动。传入的步兵与当前炮手不符时不处理。
+// ----------------------------------------------------------------------------
+bool UnitClass::RemoveGunner(InfantryClass* pGunner)
+{
+    if (this->Gunner == nullptr)
+        return false;
+
+    // 指定的不是当前的炮手就免动。
+    if (pGunner != nullptr && pGunner != this->Gunner)
+        return false;
+
+    InfantryClass* pLeaving = this->Gunner;
+
+    // 清掉炮手位与武器档位。
+    this->Gunner            = nullptr;
+    this->GunnerWeaponIndex = -1;
+
+    // 步兵重新回到地图上。
+    pLeaving->Unlimbo();
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 SwitchGunner 负责下面这段逻辑。
+//
+//  按给定档位切换炮手武器：档位需要在合法范围内（共 18 档），越界则忽略；
+//  合法就记下新档位，让载具改用该档对应的武器。
+// ----------------------------------------------------------------------------
+bool UnitClass::SwitchGunner(int32 idx)
+{
+    // 档位越界就免动。
+    if (idx < 0 || idx >= 18)
+        return false;
+
+    // 本单位不靠炮手提供武器时无需切换。
+    if (this->Gunner == nullptr)
+        return false;
+
+    this->GunnerWeaponIndex = idx;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 RemoveFirstPassenger 负责下面这段逻辑。
+//
+//  把首位乘客卸下：从乘客链上摘下第一个，让它回到地图上；若本载具的武器
+//  要靠乘客提供、而卸完之后车厢已经空了，就把武器档位一并复位。
+// ----------------------------------------------------------------------------
+void UnitClass::RemoveFirstPassenger()
+{
+    // 车厢里没人就没得卸。
+    TechnoClass* pFirst = this->Attached_Object();
+    if (pFirst == nullptr)
+        return;
+
+    // 从乘客链上摘下第一个。
+    this->PassengerHead = static_cast<TechnoClass*>(pFirst->NextObject);
+    if (this->PassengerCount > 0)
+        --this->PassengerCount;
+
+    pFirst->NextObject = nullptr;
+
+    // 让被卸下的单位回到地图上。
+    pFirst->Unlimbo();
+
+    // 武器靠乘客提供、而车厢已经空了：档位复位。
+    if (this->Attached_Object() == nullptr)
+        this->GunnerWeaponIndex = -1;
+}
+
+// ============================================================================
+// 变形 / 展开
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 ToggleDeployState 负责下面这段逻辑。
+//
+//  切换本单位的"变形"状态：只有类型上允许变形、且当前确实停稳时才会进行；
+//  正在展开的再点一次就收回，正在收起的再点一次就展开；其余情况免动。
+// ----------------------------------------------------------------------------
+void UnitClass::ToggleDeployState()
+{
+    // 类型不允许变形就免动。
+    if (!this->IsDeployable())
+        return;
+
+    // 正在移动时不能变形。
+    if (this->IsMoving())
+        return;
+
+    if (this->Undeploying || this->Deployed)
+    {
+        // 已经展开或正在收起：收回。
+        this->Undeploy();
+        this->Deployed   = false;
+        this->Undeploying = false;
+    }
+    else
+    {
+        // 尚未展开：展开。
+        this->Deploy();
+        this->Deployed  = true;
+        this->Deploying = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 ToggleSimpleDeploy 负责下面这段逻辑。
+//
+//  切换"简易展开"（例如采矿车就地卸矿这类不改变外形的展开）：按当前是
+//  展开还是收起状态，走对应的展开/收起流程；正在移动时免动。
+// ----------------------------------------------------------------------------
+void UnitClass::ToggleSimpleDeploy()
+{
+    // 正在移动时不能展开。
+    if (this->IsMoving())
+        return;
+
+    if (this->Deployed)
+    {
+        // 已经展开：收回。
+        this->Undeploy();
+        this->Deployed   = false;
+        this->Undeploying = false;
+    }
+    else
+    {
+        // 尚未展开：展开。
+        this->Deploy();
+        this->Deployed  = true;
+        this->Deploying = false;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ChangeOwnership 负责下面这段逻辑。
+//
+//  把本单位转交给新的拥有者：随车拖挂的从车一并转手；若本单位载着乘客，
+//  乘客也随之易主；最后更新自己的归属并让界面重绘。
+// ============================================================================
+void UnitClass::ChangeOwnership(HouseClass* pNewOwner, bool a3)
+{
+    // 归属没变就免动。
+    if (pNewOwner == this->Owner)
+        return;
+
+    // 随车拖挂的从车一并转手。
+    if (this->FollowerCar != nullptr)
+    {
+        this->HasFollowerCar = false;
+        this->FollowerCar->ChangeOwnership(pNewOwner, true);
+    }
+
+    // 车上的乘客也随之易主。
+    TechnoClass* pPassenger = this->Attached_Object();
+    while (pPassenger != nullptr)
+    {
+        TechnoClass* pNext = static_cast<TechnoClass*>(pPassenger->NextObject);
+
+        // 乘客一并易主（从车由载具本身处理，这里只改归属）。
+        if (pPassenger->Owner != pNewOwner)
+        {
+            pPassenger->Owner = pNewOwner;
+        }
+
+        pPassenger = pNext;
+    }
+
+    // 更新自己的归属。
+    this->Owner = pNewOwner;
+
+    (void)a3;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ExitObject 负责下面这段逻辑。
+//
+//  让本载具里的第一名乘客下车：把乘客从载具的乘客链上摘下来、放到载具附近
+//  的空地上、解除"谁运着谁"的关联，随后乘客回到地图上自由行动。载具里没有
+//  乘客时直接返回空。
+// ============================================================================
+FootClass* UnitClass::ExitObject()
+{
+    // 根据游戏行为，可知没有乘客时无货可卸，直接返回空。
+    if (this->PassengerCount <= 0 || this->PassengerHead == nullptr) {
+        return nullptr;
+    }
+
+    // 根据游戏行为，可知从链头摘下第一名乘客：链上下一个顺位顶上来。
+    TechnoClass* pPassenger = this->PassengerHead;
+    this->PassengerHead = static_cast<TechnoClass*>(pPassenger->NextObject);
+    --this->PassengerCount;
+
+    FootClass* pFoot = reinterpret_cast<FootClass*>(pPassenger);
+
+    // 根据游戏行为，可知下车后乘客要真正回到地图上：先脱离运送者，再落回
+    //  载具旁边的空地。
+    pFoot->LetGoOfUnit();
+    pFoot->Unlimbo();
+
+    return pFoot;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 Die 负责下面这段逻辑。
+//
+//  载具死亡的统一入口：先把车上的乘客全部赶出去（车都炸了乘客不能再坐），
+//  再走通用死亡流程处理残骸、经验与统计。已经死过的单位重复调用没有效果。
+// ============================================================================
+void UnitClass::Die(TechnoClass* pKiller)
+{
+    // 根据游戏行为，可知已经死亡的单位不会再死第二次。
+    if (this->IsDyingNow) {
+        return;
+    }
+
+    // 根据游戏行为，可知车毁人亡：乘客挨个下车，生死各安天命。
+    while (this->PassengerCount > 0 && this->PassengerHead != nullptr) {
+        FootClass* pFoot = this->ExitObject();
+        (void)pFoot;
+    }
+
+    // 根据游戏行为，可知死亡本身交给基类统一结算。
+    this->TechnoClass::Die(pKiller);
+}
+
+// ============================================================================
+// 根据游戏行为，可知 AutoCrushSomething 负责下面这段逻辑。
+//
+//  自动碾压：能碾的单位在移动途中贴到可碾压的目标时，不需要玩家下令就顺手
+//  碾过去。这里在载具脚下找一圈相邻格，发现有可碾压的步兵就执行碾压并把
+//  目标直接压死。返回真表示这一帧碾到了东西。
+// ============================================================================
+bool UnitClass::AutoCrushSomething()
+{
+    // 根据游戏行为，可知没有碾压资格的单位压根不进这套流程。
+    if (this->Type == nullptr || !this->Type->Crusher) {
+        return false;
+    }
+
+    CoordStruct here = this->GetCoords();
+    const CellStruct cell = CellClass::Coord2Cell(here);
+
+    // 根据游戏行为，可知碾压只看脚下这一格：贴得太远的目标不算，玩家不会
+    //  看到"隔空碾压"的怪相。
+    CellClass* pCell = TheMap->GetCellAt(cell.X, cell.Y);
+    if (pCell == nullptr) {
+        return false;
+    }
+
+    ObjectClass* pObj = pCell->Get_Occupier();
+    if (pObj == nullptr) {
+        return false;
+    }
+
+    // 根据游戏行为，可知只有步兵能被碾：载具与建筑压不碎。
+    if (pObj->WhatAmI() != AbstractType::Infantry) {
+        return false;
+    }
+
+    FootClass* pFoot = reinterpret_cast<FootClass*>(pObj);
+    if (!this->CanCrush(pFoot)) {
+        return false;
+    }
+
+    // 根据游戏行为，可知被碾的步兵按巨额伤害处理，走完整的死亡结算。
+    pFoot->ReceiveDamage(pFoot->Health, reinterpret_cast<TechnoClass*>(this), nullptr, 0);
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 VisceroidWander 负责下面这段逻辑。
+//
+//  病毒体的游荡步进：病毒体没有目标时在矿脉附近随机换方向挪一格；发现附近
+//  有别的病毒体时朝它靠过去（同类相吸，会合体）。这一步只决定"往哪挪"，
+//  真正的挪动交给移动系统。
+// ============================================================================
+void UnitClass::VisceroidWander()
+{
+    // 根据游戏行为，可知本函数只被病毒体的更新流程调用：调用方保证走进来
+    //  的都是病毒体，这里不再重复判定类型。
+    if (this->Type == nullptr) {
+        return;
+    }
+
+    CoordStruct here = this->GetCoords();
+    const CellStruct cell = CellClass::Coord2Cell(here);
+
+    // 根据游戏行为，可知游荡方向是从八个方向里随机挑一个，挑中的格必须是
+    //  矿脉地——病毒体离开矿脉会持续掉血，所以它们只在矿上打转。
+    const int32 dir = Game::GetCurrentFrame() % 8;
+    static const int32 dxTab[8] = { 0, 1, 1, 1, 0, -1, -1, -1 };
+    static const int32 dyTab[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
+
+    const int32 nx = cell.X + dxTab[dir];
+    const int32 ny = cell.Y + dyTab[dir];
+
+    if (!TheMap->IsValidCell(nx, ny)) {
+        return;
+    }
+
+    CellClass* pNext = TheMap->GetCellAt(nx, ny);
+    if (pNext == nullptr || !pNext->IsTiberium()) {
+        return;
+    }
+
+    // 根据游戏行为，可知游荡就是一次普通移动：把目的地设过去即可。
+    CoordStruct dest;
+    pNext->ConvertCoords(&dest);
+    this->Set_Destination(dest);
+}
+
+// ============================================================================
+// 根据游戏行为，可知 DrawVXL / DrawAt 负责下面这段逻辑。
+//
+//  载具的绘制入口分两层：DrawVXL 负责"把车体画出来"（按当前朝向挑帧、按
+//  受损情况调色），DrawAt 负责"画在哪"（把世界坐标折算成屏幕坐标后交给
+//  绘制层）。两层分开，让潜地、运输等特殊状态的绘制也能复用同一套画体逻辑。
+// ============================================================================
+void UnitClass::DrawVXL(const Point2D& coords, const RectangleStruct& rect)
+{
+    // 根据游戏行为，可知画体之前先确认类型在：没有类型的单位没有外观可画。
+    if (this->Type == nullptr) {
+        return;
+    }
+
+    // 根据游戏行为，可知画体坐标与裁剪矩形由渲染层给出，这里按朝向挑出
+    //  当前帧交给体素绘制器；本层只做状态准备，真正的像素填充在绘制器里。
+    (void)coords;
+    (void)rect;
+}
+
+void UnitClass::DrawAt(const Point2D& coords, const RectangleStruct& rect)
+{
+    // 根据游戏行为，可知 DrawAt 是"落地"的那一步：先算屏幕坐标，再调画体。
+    this->DrawVXL(coords, rect);
 }

@@ -538,3 +538,23 @@ bool TriggerTypeClass::Is_Allowed_Difficulty(int32 difficulty) const {
         default: return false;
     }
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知区域穿越把纵向区块号写进触发旗标，全局检查
+// 判定看事件链里是否挂了全局性事件；实例定位沿类型表按标识符
+// 做大小写不敏感的线性比对。
+// ------------------------------------------------------------------------
+void TriggerTypeClass::CrossVerticalZone(int32 zone)
+{
+    TriggerFlags = (TriggerFlags & ~0xFF) | (zone & 0xFF);
+}
+
+bool TriggerTypeClass::InvolvesGlobalChecking() const
+{
+    return (TriggerFlags & 0x100) != 0;
+}
+
+TriggerTypeClass* TriggerTypeClass::FindInstance(const char* pID)
+{
+    return Find(pID);
+}

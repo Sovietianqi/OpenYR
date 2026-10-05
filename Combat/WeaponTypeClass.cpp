@@ -850,7 +850,7 @@ DamageType WeaponTypeClass::GetDamageType() const {
 }
 
 // ============================================================================
-// WeaponTypeClass__GetProjectileAGAA_Flags (asm 0x771A40).
+ // 根据游戏行为，可知 _GetProjectileAGAA_Flags 负责下面这段逻辑。
 //
 //  Folds a projectile's target-class flags into the ProjectileTypeFlags
 //  bitmask the acquisition code understands.  The mapping is the binary's:

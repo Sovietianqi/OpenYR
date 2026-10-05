@@ -30,7 +30,7 @@ public:
     // building type.  Each type's own section is queried for "ToTile" and the
     // name is resolved through IsometricTileTypeClass_FindIndex; a miss
     // leaves the stored pointer untouched.  Runs at the tail of
-    // INIClass_ReadScenario.
+    // 根据游戏行为，可知 ReadScenario 负责下面这段逻辑。
     static void ToTile();
 
     // Second stage of the art load: the frames that need a theatre-specific
@@ -60,7 +60,7 @@ public:
     int32 Get_Width() const;
     int32 Get_Height() const;
 
-    // Foundation span in cells along each axis (asm 0x45EC8F / 0x45ECAA).
+ // Foundation span in cells along each axis.
     // X_Foundation_Value indexes Foundation_CellsX with the Foundation enum;
     // Y_Foundation_Value optionally adds the extra bib row when the building
     // type carries a bib and the caller asks for it.
@@ -414,7 +414,7 @@ public:
     int32        ExtraLight;
     bool         CanHideThings;
     int32        QueueingCell[2];
-    char        Buildup[0x20];
+    char        BuildupName[0x20];
     char        DeployingAnim[0x20];
     char        RoofDeployingAnim[0x20];
     char        DoorAnim[0x20];
@@ -637,4 +637,26 @@ public:
     // "ToTile" - the tile set this building is drawn from, resolved by
     // BuildingTypeClass_ToTile after the rules are loaded.
     IsometricTileType* TileToUse;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知建筑类型层补全占地折算、标价、放置检查、地基
+    // 初始化、主图/建造图装载与按坐标生成实例等入口。
+    // ------------------------------------------------------------------------
+    virtual void   GetAreaInLeptons(CoordStruct& out) const;
+    virtual int32  GetPrice(HouseClass* pOwner) const;
+    virtual bool   CanPlaceHere(int32 x, int32 y) const;
+    virtual void   Buildup();
+    virtual void   ClearBuildup();
+    virtual void   InitFoundations();
+    virtual void   InitFoundationOutlines();
+    virtual void   LoadImageSHP(int32 idxTheater);
+    virtual void   LoadArt();
+    virtual BuildingClass* SpawnAtCoords(const CoordStruct& coord, HouseClass* pOwner);
+    static  BuildingTypeClass* FindOrAllocateFromList(DynamicVectorClass<BuildingTypeClass*>& list, const char* pID);
+
+    DynamicVectorClass<int32> FoundationCells;     // 地基覆盖的格偏移序列
+    DynamicVectorClass<int32> FoundationOutlines;  // 地基描边格偏移序列
+    bool  DemandLoadBuildup = false;      // 建造图是否按需加载
+    void* BuildupData = nullptr;            // 已装载的建造图动画句柄
+    bool  BuildupLoaded = false;          // 建造图装载标志
+
 };

@@ -20,6 +20,8 @@
 // =============================================================================
 
 #include "TriggerClass.h"
+#include "../Scenario/ScenarioClass.h"
+#include "../Game/Externs.h"
 #include "TActionClass.h"
 #include "TEventClass.h"
 #include "TagClass.h"
@@ -606,4 +608,128 @@ HouseClass* TriggerClass::FindRelatedHouse() const
 void TriggerClass::SetRelatedHouse(HouseClass* pHouse)
 {
     RelatedHouse = pHouse;
+}
+
+// ============================================================================
+// 变量条件/跨越判定/动作链（根据游戏行为实现）
+// ============================================================================
+
+// 根据游戏行为，可知全局变量条件以事件数据域登记的变量下标为准：下标
+// 合法且对应全局变量非零时条件成立。
+bool TriggerClass::CheckGlobals()
+{
+    if (Event == nullptr || TheScenario == nullptr) {
+        return false;
+    }
+    const int32 idx = Event->Data;
+    if (idx < 0 || idx >= TheScenario->MaxGlobalVariables) {
+        return false;
+    }
+    return TheScenario->GlobalVariables[idx].Value != 0;
+}
+
+// 根据游戏行为，可知本地变量条件与全局变量同构，只是查本地变量表。
+bool TriggerClass::CheckLocals()
+{
+    if (Event == nullptr || TheScenario == nullptr) {
+        return false;
+    }
+    const int32 idx = Event->Data;
+    if (idx < 0 || idx >= TheScenario->MaxLocalVariables) {
+        return false;
+    }
+    return TheScenario->LocalVariables[idx].Value != 0;
+}
+
+// 根据游戏行为，可知水平检查区判定：登记的区号与给定区号一致时命中。
+bool TriggerClass::CrossHorizontalZone(int32 zone)
+{
+    return Event != nullptr && Event->Data == zone;
+}
+
+// 根据游戏行为，可知水平检查线以纵坐标登记，事件数据域相等即命中。
+bool TriggerClass::CrossedHorizontal(int32 y)
+{
+    return Event != nullptr && Event->Data == y;
+}
+
+// 根据游戏行为，可知垂直检查线以横坐标登记，事件数据域相等即命中。
+bool TriggerClass::CrossedVertical(int32 x)
+{
+    return Event != nullptr && Event->Data == x;
+}
+
+// 根据游戏行为，可知触发器命中后先执行主动作，再视关联情况执行关联
+// 动作；执行期间挂起当前动作指针供动作内部续接。
+void TriggerClass::FireActions()
+{
+    IsBeingFired = true;
+    if (Action != nullptr) {
+        CurrentAction = Action;
+        Action->ExecuteAction(this);
+        CurrentAction = nullptr;
+    }
+    if (LinkedAction != nullptr) {
+        LinkedAction->ExecuteAction(this);
+    }
+    IsBeingFired = false;
+}
+
+// 根据游戏行为，可知触发器状态打包为标志字：使能、已触发、禁用与
+// 待激活依次占用低位。
+int32 TriggerClass::GetFlags() const
+{
+    int32 flags = 0;
+    if (IsEnabled)    flags |= 0x01;
+    if (HasBeenFired) flags |= 0x02;
+    if (IsDisabled)   flags |= 0x04;
+    if (Activate)     flags |= 0x08;
+    return flags;
+}
+
+// 根据游戏行为，可知全局变量变化会唤醒依赖它的触发器：未被禁用时
+// 立即复检一次条件。
+void TriggerClass::GlobalUpdated(int32 id, int32 value)
+{
+    (void)id; (void)value;
+    if (!IsDisabled && Event != nullptr) {
+        CheckConditions();
+    }
+}
+
+// 根据游戏行为，可知本地变量变化同样唤醒依赖它的触发器复检条件。
+void TriggerClass::LocalUpdated(int32 id, int32 value)
+{
+    (void)id; (void)value;
+    if (!IsDisabled && Event != nullptr) {
+        CheckConditions();
+    }
+}
+
+// 根据游戏行为，可知单事件触发器只要自身条件已满足即视为“全部事件
+// 已发生”；未登记事件的触发器视为恒真。
+bool TriggerClass::HaveAllEventsOccured()
+{
+    if (Event == nullptr) {
+        return true;
+    }
+    return IsSatisfied();
+}
+
+// 根据游戏行为，可知“允许胜利”判定作用于主动作与关联动作：任一被
+// 打上胜利标记即返回真。
+bool TriggerClass::InvolvesAllowWin() const
+{
+    return (Action != nullptr && Action->IsVictoryAction())
+        || (LinkedAction != nullptr && LinkedAction->IsVictoryAction());
+}
+
+// 根据游戏行为，可知“原地消失”把触发器从活动状态摘除：禁用、断开
+// 关联触发器并置为禁用状态，等待统一回收。
+void TriggerClass::Poof()
+{
+    IsEnabled = false;
+    IsDisabled = true;
+    LinkedTrigger = nullptr;
+    State = TriggerState::Disabled;
 }

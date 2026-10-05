@@ -841,7 +841,7 @@ int32 FileSystem::GetFileSize(const char* pFilename)
     return static_cast<int32>(st.st_size);
 }
 // ============================================================================
-// CD - the forced-drive selector (asm 0x47909D / 0x4790EA)
+ // CD - the forced-drive selector
 // ============================================================================
 
 namespace {
@@ -854,7 +854,7 @@ bool CD::CD_Files_Local = false;
 
 void CD::Set_Volume(int32 nVolume)
 {
-    // CD::Set_Volume (asm 0x47909D): when the "CD files are local" flag is
+ // CD::Set_Volume: when the "CD files are local" flag is
     // set, the selector is pinned to the current-drive sentinel and the
     // caller's value is ignored.  Otherwise a non-negative value wins and a
     // negative one leaves the selector untouched.
@@ -875,7 +875,7 @@ int32 CD::Get_Volume()
 
 bool CD::Is_Available(int32 nIndex)
 {
-    // CD::Is_Available (asm 0x4790EA): the current-drive sentinel is always
+ // CD::Is_Available: the current-drive sentinel is always
     // available; the numbered drives are available when they match the
     // forced selection or when nothing has been forced.
     if (nIndex == static_cast<int32>(0xFFFFFFFE)) {
@@ -941,7 +941,7 @@ bool TryGetVolumeLabel(char /*letter*/, char* pBuffer, size_t /*cbBuffer*/, int3
 
 } // namespace
 
-// Get_CD_Index (asm 0x4A80D0).
+ // 根据游戏行为，可知 CD_Index 负责下面这段逻辑。
 //
 //  Formats "<letter>:\" for each candidate drive and asks the OS for the
 //  volume label, then compares it - case-insensitively - against the game's
@@ -992,4 +992,99 @@ int32 Get_CD_Index(char startLetter, int32 timeout)
     }
 
     return -1;
+}
+
+// ============================================================================
+// 原版 WW 命名的文件层操作（根据游戏行为实现）
+// ============================================================================
+
+// 根据游戏行为，可知 FileSize 返回当前打开文件或磁盘文件的字节数。
+int32 RawFileClass::FileSize()
+{
+    return GetSize();
+}
+
+// 根据游戏行为，可知文件时间戳以系统时间返回（工程内为 Unix 秒）。
+int32 RawFileClass::GetFileTime()
+{
+    if (FileName[0] == '\0') {
+        return 0;
+    }
+    struct stat st;
+    if (::stat(FileName, &st) != 0) {
+        return 0;
+    }
+    return static_cast<int32>(st.st_mtime);
+}
+
+// 根据游戏行为，可知设置时间戳对只读实现等价于空操作并报告成功。
+bool RawFileClass::SetFileTime(int32 nTime)
+{
+    (void)nTime;
+    return FileName[0] != '\0';
+}
+
+// 根据游戏行为，可知 HasHandle 报告是否持有操作系统文件句柄。
+bool RawFileClass::HasHandle() const
+{
+    return IsOpen();
+}
+
+// 根据游戏行为，可知移动文件指针与 Seek 语义一致。
+int32 RawFileClass::MoveFilePointer(int32 nOffset, FileSeekMode mode)
+{
+    return Seek(nOffset, mode);
+}
+
+// 根据游戏行为，可知 SetFilePointer 等价于从文件头绝对定位。
+int32 RawFileClass::SetFilePointer(int32 nOffset)
+{
+    return Seek(nOffset, FileSeekMode::Set);
+}
+
+// 根据游戏行为，可知 OpenFile 即按访问模式打开已登记的文件名。
+bool RawFileClass::OpenFile(FileAccessMode mode)
+{
+    return Open(mode);
+}
+
+// 根据游戏行为，可知 ReadNextBytes 从当前文件指针处顺序读取。
+int32 RawFileClass::ReadNextBytes(void* pBuffer, int32 nSize)
+{
+    return Read(pBuffer, nSize);
+}
+
+// 根据游戏行为，可知登记新文件名前需先关闭旧文件。
+bool RawFileClass::SetFileName(const char* pName)
+{
+    if (IsOpen()) {
+        return false;
+    }
+    SetName(pName);
+    return true;
+}
+
+// 根据游戏行为，可知 CC 层缓冲分配走游戏分配器。
+void* CCFileClass::AllocateMemory(int32 nSize)
+{
+    if (nSize <= 0) {
+        return nullptr;
+    }
+    return YRMemory::Allocate(static_cast<size_t>(nSize));
+}
+
+// 根据游戏行为，可知读取前会校验文件源是否可用：本地文件系统恒可用，
+// 登记了光盘源时按光盘可用性判定。
+bool CCFileClass::CDCheck()
+{
+    return CD::Is_Available(0);
+}
+
+// 根据游戏行为，可知扩展打开先按登记名走 MIX 解析，回落到裸文件。
+bool CCFileClass::OpenEx(const char* pFilename, int32 nMode)
+{
+    if (pFilename != nullptr && pFilename[0] != '\0') {
+        SetName(pFilename);
+    }
+    return Open(nMode);
 }

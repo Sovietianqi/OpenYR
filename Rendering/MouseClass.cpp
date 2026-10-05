@@ -799,3 +799,182 @@ TabClass::~TabClass()
     if (Instance == this)
         Instance = nullptr;
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知指针样式表是 86 条固定条目的静态数据：每条
+// 含主帧、帧数、动画间隔、小地图备用帧与热区锚点；小地图变体以
+// -1 哨兵标注"无备用帧"。
+// ------------------------------------------------------------------------
+namespace {
+
+struct MousePointerStruct {
+    int32 StartFrame;
+    int32 Count;
+    int32 AnimInterval;
+    int32 MiniFrame;
+    int32 MiniCount;
+    int32 HotX;
+    int32 HotY;
+};
+
+constexpr int32 HOTSPOT_LEFT = 0;
+constexpr int32 HOTSPOT_CENTER = 1;
+constexpr int32 HOTSPOT_RIGHT = 2;
+constexpr int32 HOTSPOT_TOP = 0;
+constexpr int32 HOTSPOT_MIDDLE = 1;
+constexpr int32 HOTSPOT_BOTTOM = 2;
+
+MousePointerStruct arr_MousePointers[86] = {
+    {0, 1, 0, 1, 1, 0, 0},
+    {2, 1, 0, -1, -1, 1, 0},
+    {3, 1, 0, -1, -1, 2, 0},
+    {4, 1, 0, -1, -1, 2, 1},
+    {5, 1, 0, -1, -1, 2, 2},
+    {6, 1, 0, -1, -1, 1, 2},
+    {7, 1, 0, -1, -1, 0, 2},
+    {8, 1, 0, -1, -1, 0, 1},
+    {9, 1, 0, -1, -1, 0, 0},
+    {10, 1, 0, -1, -1, 1, 0},
+    {11, 1, 0, -1, -1, 2, 0},
+    {12, 1, 0, -1, -1, 2, 1},
+    {13, 1, 0, -1, -1, 2, 2},
+    {14, 1, 0, -1, -1, 1, 2},
+    {15, 1, 0, -1, -1, 0, 2},
+    {16, 1, 0, -1, -1, 0, 1},
+    {17, 1, 0, -1, -1, 0, 0},
+    {18, 13, 4, -1, -1, 1, 1},
+    {31, 10, 4, 42, 10, 1, 1},
+    {41, 1, 0, 52, 1, 1, 1},
+    {53, 5, 4, 63, 5, 1, 1},
+    {58, 5, 4, 63, 5, 1, 1},
+    {68, 5, 4, 73, 5, 1, 1},
+    {78, 10, 4, -1, 10, 1, 1},
+    {88, 1, 0, -1, 1, 1, 1},
+    {89, 10, 4, 100, 10, 1, 1},
+    {99, 1, 0, 63, 1, 1, 1},
+    {110, 9, 4, -1, -1, 1, 1},
+    {119, 1, 0, -1, -1, 1, 1},
+    {120, 9, 4, -1, -1, 1, 1},
+    {129, 10, 4, -1, -1, 1, 1},
+    {139, 10, 4, -1, -1, 1, 1},
+    {149, 1, 0, -1, -1, 1, 1},
+    {150, 20, 4, -1, -1, 1, 1},
+    {170, 20, 4, -1, -1, 1, 1},
+    {190, 1, 0, -1, -1, 1, 1},
+    {191, 7, 0, -1, -1, 1, 1},
+    {199, 5, 0, -1, -1, 1, 1},
+    {204, 5, 0, -1, -1, 1, 1},
+    {209, 5, 0, -1, -1, 1, 1},
+    {214, 5, 0, -1, -1, 1, 1},
+    {219, 5, 0, -1, -1, 1, 1},
+    {224, 5, 0, -1, -1, 1, 1},
+    {229, 5, 0, -1, -1, 1, 1},
+    {234, 5, 0, -1, -1, 1, 1},
+    {239, 10, 0, -1, -1, 1, 1},
+    {249, 10, 0, -1, -1, 1, 1},
+    {259, 10, 0, 516, -1, 1, 1},
+    {269, 10, 0, -1, -1, 1, 1},
+    {356, 1, 0, -1, -1, 1, 1},
+    {279, 20, 4, 514, 1, 1, 1},
+    {299, 10, 0, -1, -1, 1, 1},
+    {309, 10, 4, -1, -1, 1, 1},
+    {319, 10, 4, 513, 1, 1, 1},
+    {329, 10, 0, -1, -1, 1, 1},
+    {339, 6, 0, -1, -1, 1, 1},
+    {345, 1, 0, -1, -1, 1, 1},
+    {346, 5, 0, -1, -1, 1, 1},
+    {357, 12, 0, -1, -1, 1, 1},
+    {369, 15, 0, -1, -1, 1, 1},
+    {384, 1, 0, -1, -1, 1, 1},
+    {385, 1, 0, -1, -1, 1, 1},
+    {386, 1, 0, -1, -1, 1, 1},
+    {387, 1, 0, -1, -1, 1, 1},
+    {388, 1, 0, -1, -1, 1, 1},
+    {389, 1, 0, -1, -1, 1, 1},
+    {390, 1, 0, -1, -1, 1, 1},
+    {391, 1, 0, -1, -1, 1, 1},
+    {392, 1, 0, -1, -1, 1, 1},
+    {393, 1, 0, -1, -1, 1, 1},
+    {394, 10, 4, -1, -1, 1, 1},
+    {404, 9, 4, 63, 5, 1, 1},
+    {413, 9, 4, -1, -1, 1, 1},
+    {422, 9, 4, -1, -1, 1, 1},
+    {431, 1, 0, -1, -1, 1, 1},
+    {432, 1, 0, -1, -1, 1, 1},
+    {433, 1, 0, -1, -1, 1, 1},
+    {434, 1, 0, -1, -1, 1, 1},
+    {435, 15, 4, -1, -1, 1, 1},
+    {450, 10, 4, -1, 1, 1, 1},
+    {460, 10, 4, -1, -1, 1, 1},
+    {470, 10, 4, -1, -1, 1, 1},
+    {480, 8, 4, -1, -1, 1, 1},
+    {488, 8, 4, 516, -1, 1, 1},
+    {496, 8, 4, 515, 1, 1, 1},
+    {504, 8, 4, 512, 1, 1, 1},
+};
+
+bool bool_MousePointerSet = false;
+int32 int_MousePointer_AnimStartTime = 0;
+int32 int_MousePointer_AnimInterval = 0;
+int32 int_MousePointer_CurrentNumber = -1;
+bool int_MousePointer_IsMinimap = false;
+
+} // namespace
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知指针切换先做幂等早退：已置位且样式号与小地图
+// 旗均未变化时直接报告失败；真正切换时记录动画起点与间隔并按
+// 小地图旗挑选主帧或备用帧。
+// ------------------------------------------------------------------------
+bool MouseClass::SetPointer(int idxPointer, bool minimap)
+{
+    if (idxPointer < 0 || idxPointer >= 86) {
+        return false;
+    }
+
+    const MousePointerStruct& entry = arr_MousePointers[idxPointer];
+    bool useMini = minimap;
+    if (entry.MiniFrame == -1) {
+        useMini = false;
+    }
+
+    if (bool_MousePointerSet && int_MousePointer_CurrentNumber == idxPointer
+        && int_MousePointer_IsMinimap == useMini) {
+        return false;
+    }
+
+    bool_MousePointerSet = true;
+    int_MousePointer_AnimStartTime = 0;
+    int_MousePointer_AnimInterval = entry.AnimInterval;
+    int_MousePointer_CurrentNumber = idxPointer;
+    int_MousePointer_IsMinimap = useMini;
+    return true;
+}
+
+int32 MouseClass::GetMPStartFrame(int idx)
+{
+    if (idx < 0 || idx >= 86) {
+        return -1;
+    }
+    return arr_MousePointers[idx].StartFrame;
+}
+
+int32 MouseClass::GetStartFrameOrMinimap(int idx, bool minimap)
+{
+    if (idx < 0 || idx >= 86) {
+        return -1;
+    }
+    const MousePointerStruct& entry = arr_MousePointers[idx];
+    if (minimap && entry.MiniFrame != -1) {
+        return entry.MiniFrame;
+    }
+    return entry.StartFrame;
+}
+
+int32 MouseClass::GetMPFrameCount(int idx)
+{
+    if (idx < 0 || idx >= 86) {
+        return 0;
+    }
+    return arr_MousePointers[idx].Count;
+}

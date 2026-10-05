@@ -13,7 +13,7 @@ static constexpr int32 PKT_MAX_CDS = 8;
 // PKTNodeClass
 //
 //   One entry of the game-type list shipped inside a multiplayer scenario
-//   (.PKT).  PKTNode_CTOR (asm 0x69A460) builds the node from a scenario
+ //   (.PKT).  PKTNode_CTOR builds the node from a scenario
 //   section of the game's own INI, then reads the [Digest] block embedded in
 //   the scenario file itself.
 //
@@ -55,7 +55,7 @@ public:
 // ============================================================================
 // PKTNodePool
 //
-//   The container Game_ParsePKTs (asm 0x69991E) fills.  The original grabs
+ //   The container Game_ParsePKTs fills.  The original grabs
 //   the pool off the session object at +0x690, resets the INIClass and walks
 //   three sources in this order:
 //

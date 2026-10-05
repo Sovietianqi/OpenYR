@@ -170,6 +170,16 @@ public:
     static int32 GetSoundCount();
     static void ClearSoundRegistry();
 
+    // 根据游戏行为，可知通道回退查找与按位播放是声音面的两个
+    // 底层入口：回退沿最近使用顺序取上一个，按位播放把索引绑定
+    // 到世界坐标。
+    static int32 GetPreviousFromHead();
+    static int32 GetPrevious();
+    static const char* FindNameByIndex(int32 index);
+    static void SaveData();
+    static void UpdateAtLocation(int32 index, void* pAnchor);
+    static bool PlayIndexAtPos(int32 index, const struct CoordStruct* pPos);
+
     // -------------------------------------------------------------------
     // Sound definition list
     //

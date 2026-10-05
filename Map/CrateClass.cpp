@@ -39,7 +39,7 @@ CrateClass::CrateClass()
 }
 
 // ============================================================================
-// CrateClass::Remove_It - asm 0x4A174D
+ // CrateClass::Remove_It -
 //
 //   If the tracked cell is not the default, remove the overlay occupying it and
 //   reset the cell.  When a spawn was pending (SpawnFrame != -1) the remaining
@@ -72,7 +72,7 @@ bool CrateClass::Remove_It()
 }
 
 // ============================================================================
-// CrateClass::Create_Crate - asm 0x4A17DD
+ // CrateClass::Create_Crate -
 //
 //   First consume any still-valid pending spawn (folding the elapsed frames
 //   into SpawnTimeLeft), then place the crate at coords.  A successful
@@ -135,7 +135,7 @@ bool CrateClass::Create_Crate(const CellStruct& coords)
 }
 
 // ============================================================================
-// CrateClass::Put_Crate - asm 0x4A191F
+ // CrateClass::Put_Crate -
 //
 //   Reject the placement when the cell is outside the radar (a gameplay-time
 //   check, so ScenarioInit is cleared for the duration) or already carries an
@@ -191,7 +191,7 @@ bool CrateClass::Put_Crate(const CellStruct& coords)
 }
 
 // ============================================================================
-// CrateClass::Get_Crate - asm 0x4A1A9D
+ // CrateClass::Get_Crate -
 //
 //   Validate that the cell's overlay is one of the three crate images, then
 //   remove it: mark the cell area dirty and clear the cell's overlay index and

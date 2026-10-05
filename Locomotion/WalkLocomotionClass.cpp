@@ -653,3 +653,73 @@ void WalkLocomotionClass::Force_New_Slope(int32 ramp)
         }
     }
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知搭车（IPiggyback）槽位：COM 三槽转发到本体；搭车
+// 状态由一个 ILocomotion* 槽承载——开始搭车登记、结束搭车交出并清槽、
+// 是否搭车看槽位占用、能否结束要确认本体已经停下。
+// ------------------------------------------------------------------------
+HRESULT WalkLocomotionClass::IPiggyback_QueryInterface(REFIID iid, void** ppvObject)
+{
+    return QueryInterface(iid, ppvObject);
+}
+
+ULONG WalkLocomotionClass::IPiggyback_AddRef()
+{
+    return AddRef();
+}
+
+ULONG WalkLocomotionClass::IPiggyback_Release()
+{
+    return Release();
+}
+
+bool WalkLocomotionClass::IPiggyback_IsPiggybacking() const
+{
+    return Piggyback != nullptr;
+}
+
+HRESULT WalkLocomotionClass::IPiggyback_BeginPiggyback(ILocomotion* pLoco)
+{
+    // 根据游戏行为，可知空指针与重复登记都以指针错误拒绝。
+    if (!pLoco)
+        return static_cast<HRESULT>(0x80004003); // E_POINTER
+    if (Piggyback && Piggyback != pLoco)
+        return static_cast<HRESULT>(0x80004003);
+    Piggyback = pLoco;
+    return S_OK;
+}
+
+HRESULT WalkLocomotionClass::IPiggyback_EndPiggyback(ILocomotion** ppOut)
+{
+    // 根据游戏行为，可知出参为空以指针错误拒绝；槽位为空时无物可交。
+    if (!ppOut)
+        return static_cast<HRESULT>(0x80004003); // E_POINTER
+    if (!Piggyback)
+        return E_FAIL;
+    *ppOut = Piggyback;
+    Piggyback = nullptr;
+    return S_OK;
+}
+
+bool WalkLocomotionClass::IPiggyback_IsOKToEnd()
+{
+    // 根据游戏行为，可知结束搭车前要确认：本体已经停下、搭车对象仍在、
+    // 下落状态已清。
+    if (IsMoving)
+        return false;
+    if (!Piggyback)
+        return false;
+    if (IsFalling)
+        return false;
+    return true;
+}
+
+HRESULT WalkLocomotionClass::IPiggyback_PiggybackCLSID(GUID* pGUID)
+{
+    // 根据游戏行为，可知取搭车对象的类别标识：出参或槽位为空都以指针
+    // 错误拒绝；否则向搭车对象索要 CLSID。
+    if (!pGUID || !Piggyback)
+        return static_cast<HRESULT>(0x80004003); // E_POINTER
+    LocomotionClass* pLoco = static_cast<LocomotionClass*>(Piggyback);
+    return pLoco->GetClassID(pGUID);
+}

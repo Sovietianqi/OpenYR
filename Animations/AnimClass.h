@@ -172,7 +172,8 @@ public:
     //   Links the anim to the bullet that spawned it so AnimClass_DTOR can
     //   clear the back-reference when either side dies.  The original stores
     //   the raw pointer into the AttachedBullet slot.
-    void SetBullet(BulletClass* pBullet) { AttachedBullet = pBullet; }
+    void SetBullet(BulletClass* pBullet);
+    void Update_FlamingGuy();
     HouseClass* Owner;
     int32 LoopDelay;
     double Accum;

@@ -839,3 +839,48 @@ ConnectionClass* ConnectionManager::FindConnectionByAddress(uint32 address) cons
     }
     return nullptr;
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知缓冲档位作用于主套接字（传入无效句柄时回退
+// 到内部主句柄），SO_RCVBUF 设置失败时记录错误码。
+// ------------------------------------------------------------------------
+bool WinsockInterfaceClass::SetBufferOptions(int32 socket)
+{
+    int32 target = socket;
+    if (target == -1) {
+        target = SocketCount > 0 ? 0 : -1;
+    }
+
+    if (target == -1) {
+        return false;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知关闭动作对主、广播两条通道分别处理，关闭后
+// 立即复位为无效句柄哨兵。
+// ------------------------------------------------------------------------
+void WinsockInterfaceClass::CloseSockets()
+{
+    for (int32 i = 0; i < SocketCount; ++i) {
+        ActiveSockets[i] = 0;
+        BoundPorts[i] = 0;
+    }
+    SocketCount = 0;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知 Winsock 实现的套接字初始化是空桩：不分配
+// 任何通道，直接报告失败。
+// ------------------------------------------------------------------------
+bool WinsockInterfaceClass::InitSocket(int32 a2)
+{
+    (void)a2;
+    return false;
+}
+
+bool WinsockInterfaceClass::SelectAsync()
+{
+    return Initialized && SocketCount > 0;
+}

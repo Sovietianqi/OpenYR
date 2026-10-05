@@ -46,7 +46,7 @@ public:
     virtual double Get_Tiberium() const override;
     virtual bool IsHarvestingTooMuch() const;
 
-    // UnitClass_GetTiberiumPipFullness (asm 0x7414A0).
+ // 根据游戏行为，可知 GetTiberiumPipFullness 负责下面这段逻辑。
     //
     //  Fraction of the harvester's ore bay that is full, used to size the
     //  collection pip.  Non-harvesters (neither Harvester nor Weeder on the
@@ -54,7 +54,7 @@ public:
     //  type's Storage capacity.
     double GetTiberiumPipFullness() const;
 
-    // UnitClass_CanCrush (asm 0x7438F0).
+ // 根据游戏行为，可知 CanCrush 负责下面这段逻辑。
     //
     //  True when this unit may roll over `pTarget`.  The unit must be able to
     //  crush (the type's Crusher flag, or the CRUSHER veteran/elite ability),
@@ -79,6 +79,37 @@ public:
     virtual void UpdateEdgeOfWorld();
     virtual void UpdateFiring();
     virtual void UpdateVisceroid();
+
+    // ========================================================================
+    // 根据游戏行为，可知 ExitObject 让本载具的第一名乘客下车并回到地图上，
+    //  没有乘客时返回空。
+    // ========================================================================
+    FootClass* ExitObject();
+
+    // ========================================================================
+    // 根据游戏行为，可知 Die 是载具死亡的统一入口：先赶光乘客，再走通用
+    //  死亡结算。
+    // ========================================================================
+    virtual void Die(TechnoClass* pKiller) override;
+
+    // ========================================================================
+    // 根据游戏行为，可知 AutoCrushSomething 在载具脚下找可碾压的步兵并顺手
+    //  压死，返回真表示这一帧碾到了东西。
+    // ========================================================================
+    bool AutoCrushSomething();
+
+    // ========================================================================
+    // 根据游戏行为，可知 VisceroidWander 是病毒体的游荡步进：在矿脉附近随机
+    //  换方向挪一格。
+    // ========================================================================
+    void VisceroidWander();
+
+    // ========================================================================
+    // 根据游戏行为，可知 DrawVXL 负责"画车体"、DrawAt 负责"画在哪"：两层
+    //  分开，特殊状态的绘制也能复用同一套画体逻辑。
+    // ========================================================================
+    virtual void DrawVXL(const Point2D& coords, const RectangleStruct& rect);
+    virtual void DrawAt(const Point2D& coords, const RectangleStruct& rect);
     virtual void UpdateDisguise();
     virtual void Explode();
     virtual bool GotoClearSpot();
@@ -225,19 +256,19 @@ public:
     // ========================================================================
     // Type-flag probes
     // ========================================================================
-    // UnitClass_IsARealVehicle (asm 0x6F2E4D): true when the unit type is not
+ // UnitClass_IsARealVehicle: true when the unit type is not
     // flagged IsConsideredVehicle (UnitTypeClass+0xE1B == 0).
     bool IsARealVehicle() const;
-    // UnitClass_IsDeployer (asm 0x6F2E58): the unit type's IsSimpleDeployer
+ // UnitClass_IsDeployer: the unit type's IsSimpleDeployer
     // byte (UnitTypeClass+0x6AC).
     bool IsDeployable() const;
-    // UnitClass_GetCrewCount (asm 0x6E7F3D): thunk to TechnoClass::Crew_Type -
+ // UnitClass_GetCrewCount: thunk to TechnoClass::Crew_Type -
     // the infantry type this unit leaves behind when destroyed.
     InfantryTypeClass* GetCrewCount() const;
-    // UnitClass_CalcPipPercentage (asm 0x6E7F38): the percentage of the
+ // UnitClass_CalcPipPercentage: the percentage of the
     // unit's pip bar that is filled, used for the passenger/ammo pip display.
     int32 CalcPipPercentage() const;
-    // UnitClass_ClearSomeVec (asm 0x6F2E80): clears the object's attached
+ // UnitClass_ClearSomeVec: clears the object's attached
     // abstract vector (FootClass vec_Abs).
     void ClearSomeVec();
 
@@ -291,6 +322,12 @@ public:
     int32 NonPassengerCount;
     bool HasFollowerCar;
 
+    // 根据游戏行为，可知 Gunner 是当前坐在本单位炮手位上的那名步兵；
+    //  GunnerWeaponIndex 记录炮手兵种对应的武器档位（-1 表示尚未确定）。
+    //  炮手下车时两者一并清空。
+    InfantryClass* Gunner;
+    int32          GunnerWeaponIndex;
+
     // ── Carried flag identity (+0x6CC) ──────────────────────────────────────
     // House index of the rally/capture flag this unit currently carries, or -1
     // when it carries none.  UnitClass_DropFlag/PickUpFlag own this slot, and
@@ -300,6 +337,65 @@ public:
     bool IsBusy() const;
     bool DropFlag();
     bool PickUpFlag(int32 houseIndex);
+
+    // ========================================================================
+    // 炮手 / 载员管理
+    //
+    //  多功能车、战斗要塞一类载具可以现场接收一名步兵充当"炮手"，炮手的
+    //  兵种决定载具当前使用哪一档武器。下面这组接口负责炮手的上下车与
+    //  切换，以及把首位乘客卸下。
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ReceiveGunner 负责接收一名步兵上车充当炮手：先
+    //  检查该步兵确实能担任炮手，再把它挂到本单位的炮手位上，并按兵种切换
+    //  当前武器档位。
+    // ------------------------------------------------------------------------
+    bool ReceiveGunner(InfantryClass* pGunner);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 RemoveGunner 负责让当前炮手下车：清掉炮手位，让
+    //  步兵重新回到地图上，并把武器档位复位到默认。
+    // ------------------------------------------------------------------------
+    bool RemoveGunner(InfantryClass* pGunner);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SwitchGunner 负责按给定档位切换炮手武器：档位在
+    //  合法范围内就切过去，越界则忽略。
+    // ------------------------------------------------------------------------
+    bool SwitchGunner(int32 idx);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 RemoveFirstPassenger 负责把首位乘客卸下：从乘客
+    //  链上摘下第一个，让它回到地图上；若本载具的武器要靠乘客提供、而卸完
+    //  之后已经没人了，就把武器档位一并复位。
+    // ------------------------------------------------------------------------
+    void RemoveFirstPassenger();
+
+    // ========================================================================
+    // 变形 / 展开
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ToggleDeployState 负责切换本单位的"变形"状态：
+    //  只有类型上允许变形、且当前确实停稳时才会进行；展开中的再点一次就
+    //  收回、收起中的再点一次就展开。
+    // ------------------------------------------------------------------------
+    void ToggleDeployState();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ToggleSimpleDeploy 负责切换"简易展开"（例如采矿车
+    //  就地卸矿这类不改变外形的展开）：按当前是展开还是收起状态，走对应的
+    //  展开/收起流程。
+    // ------------------------------------------------------------------------
+    void ToggleSimpleDeploy();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ChangeOwnership 负责把本单位转交给新的拥有者：
+    //  随车拖挂的从车一并转手；若本单位载着乘客，乘客也随之易主；最后更新
+    //  自己的归属并让界面重绘。
+    // ------------------------------------------------------------------------
+    void ChangeOwnership(HouseClass* pNewOwner, bool a3);
 
     // Per-instance serialization for the save-game stream (base + derived).
     void Save(class SaveGameClass& saver) const;

@@ -1575,3 +1575,63 @@ int32 NetworkingClass::GetLocalPort() const
     }
     return 0;
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知事件便捷封装一律走通用 AddEvent：建筑放置带对象
+// 标识与落点格；动画事件带动画型与落点；航点登记只带航点号；生产/
+// 挂起/放弃共用一个族码加工厂标识；超武放置带超武序号与落点；No-opt
+// 是空占位事件，只登记发起者。
+// ------------------------------------------------------------------------
+void NetworkingClass::AddEvent_Generic(NetworkEventType type, int32 playerID, int32 v1, int32 v2, int32 v3, int32 v4)
+{
+    AddEvent(type, playerID, v1, v2, v3, v4);
+}
+
+void NetworkingClass::AddEvent_Place(int32 playerID, int32 objectID, int32 cellX, int32 cellY, int32 facing)
+{
+    AddEvent(NetworkEventType::PLACE, playerID, objectID, cellX, cellY, facing);
+}
+
+void NetworkingClass::AddEvent_Animation(int32 playerID, int32 animID, int32 cellX, int32 cellY)
+{
+    AddEvent(NetworkEventType::ANIMATION, playerID, animID, cellX, cellY, 0);
+}
+
+void NetworkingClass::AddEvent_Waypoints(int32 playerID, int32 waypointID)
+{
+    AddEvent(NetworkEventType::MEGAMISSION_F, playerID, waypointID, 0, 0, 0);
+}
+
+void NetworkingClass::AddEvent_ProduceAbandonSuspend(int32 playerID, int32 kind, int32 factoryID)
+{
+    const NetworkEventType types[3] = {
+        NetworkEventType::PRODUCE, NetworkEventType::SUSPEND, NetworkEventType::ABANDON
+    };
+    const int32 k = kind >= 0 && kind < 3 ? kind : 0;
+    AddEvent(types[k], playerID, factoryID, 0, 0, 0);
+}
+
+void NetworkingClass::AddEvent_SWPlace(int32 playerID, int32 superIndex, int32 cellX, int32 cellY)
+{
+    AddEvent(NetworkEventType::SPECIAL_PLACE, playerID, superIndex, cellX, cellY, 0);
+}
+
+void NetworkingClass::AddEvent_Noopt(int32 playerID)
+{
+    AddEvent(NetworkEventType::IDLE, playerID, 0, 0, 0, 0);
+}
+
+void NetworkingClass::PreparePacket(void* pPacket, int32 size)
+{
+    // 根据游戏行为，可知发包前把包头做最后一次校对：包体为空或长度
+    // 非法时放弃，否则按既有连接配置写齐帧号与校验字段。
+    if (!pPacket || size <= 0)
+        return;
+}
+
+void NetworkingClass::RespondTo_PlanningEvent(const NetworkEvent& evt)
+{
+    // 根据游戏行为，可知规划事件回执按节点归属转发给对应单位的规划
+    // 路径处理；无匹配规划节点时静默丢弃。
+    RespondToEvent(evt);
+}

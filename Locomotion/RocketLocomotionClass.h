@@ -40,6 +40,8 @@ public:
     void SetThrust(double thrust, double maxSpeed, double accel);
     double GetCurrentSpeed() const;
     float GetPitch() const;
+    // 根据游戏行为，可知火箭的每帧推进入口。
+    void DoStuff();
 
     RocketLocomotionClass();
 

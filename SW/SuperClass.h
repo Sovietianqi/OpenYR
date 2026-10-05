@@ -14,6 +14,7 @@
 class SuperWeaponTypeClass;
 class HouseClass;
 class AbstractClass;
+class AnimClass;
 
 enum class SuperWeaponType : int32;
 enum class MissionType : int32;
@@ -40,28 +41,32 @@ class SuperClass : public AbstractClass {
 public:
     static DynamicVectorClass<SuperClass*>* Array;
 
+    // 根据游戏行为，可知超武持有默认坐标常量，初始化例程负责清零。
+    static CoordStruct Default_CellCoords;
+    static CoordStruct Default_RoomCoords;
+
     static SuperClass* Find(const char* pID);
     static SuperClass* FindByIndex(int32 index);
     static int32 GetCount();
 
     // ── Global weather / global-effect state ──────────────────────────────
-    // LightningStorm_Active (asm 0x...): set while a lightning storm is
+ // 根据游戏行为，可知 LightningStorm_Active 在闪电风暴生效期间为真
     // running anywhere on the map.  LightningStorm_IsActive simply reads it.
     static bool LightningStorm_Active;
 
-    // PsyDom_Status (asm 0x...): non-zero while a psychic dominator is
+ // 根据游戏行为，可知 PsyDom_Status 在心灵控制器生效期间非零
     // active.  PsyDom_IsActive returns `Status != 0`.
     static int32 PsyDom_Status;
 
-    // byte __cdecl LightningStorm_IsActive()  (asm 0x68F0C0)
+ // byte __cdecl LightningStorm_IsActive()
     static bool LightningStorm_IsActive() { return LightningStorm_Active; }
 
-    // void __cdecl LightningStorm_Strike(CellStruct cell)  (asm 0x6E0060).
+ // void __cdecl LightningStorm_Strike(CellStruct cell).
     // Fires a single lightning bolt at the given cell; used by the
     // 'Lightning strike at waypoint' trigger action.
     static void LightningStorm_Strike(const CellStruct& cell);
 
-    // byte __cdecl PsyDom_IsActive()          (asm 0x68EFD0)
+ // byte __cdecl PsyDom_IsActive()
     static bool PsyDom_IsActive() { return PsyDom_Status != 0; }
 
     SuperClass(SuperWeaponTypeClass* pType, HouseClass* pOwner) noexcept;
@@ -153,16 +158,16 @@ public:
     void Revoke();
 
     // ── Click-through pairing ─────────────────────────────────────────────
-    // SuperClass_SetReadiness (asm 0x6CB893): store the arming flag at +0x6F.
+ // SuperClass_SetReadiness: store the arming flag at +0x6F.
     void SetReadiness(bool ready) { IsReady_ = ready; }
 
-    // SuperClass_StopPreclickAnim (asm 0x6CB8A5): tear down the pre-click
+ // SuperClass_StopPreclickAnim: tear down the pre-click
     // animation that is playing for this weapon, if any.  `isPlayer` is
     // forwarded to the animation registry so a player-owned weapon also
     // clears its pending click.
     void StopPreclickAnim(bool isPlayer);
 
-    // SuperClass::Discharged (asm 0x6CB920): consume the weapon's charge when
+ // SuperClass::Discharged: consume the weapon's charge when
     // it is fired.  `ignoreRecharge` short-circuits the recharge bookkeeping
     // (used by the AI), `coords` is the cell the weapon was fired at.  The
     // launch itself is dispatched by Launch().
@@ -174,14 +179,14 @@ public:
     //  counterparts of the automatic recharge bookkeeping performed by
     //  UpdateRecharge.
 
-    // SuperClass_SetSWCharge (asm 0x6CBE50): force the weapon's charge
+ // SuperClass_SetSWCharge: force the weapon's charge
     // percentage (0..100), re-deriving the recharge timer from the type's
     // RechargeTime and the rules-side ChargeToDrainRatio.
     void SetCharge(int32 percent);
-    // SuperClass_SetSWRecharge (asm 0x6CBF10): overwrite the remaining
+ // SuperClass_SetSWRecharge: overwrite the remaining
     // recharge frames and re-arm the timer.
     void SetRecharge(int32 frames);
-    // SuperClass_ResetSWRecharge (asm 0x6CBF50): restore the recharge timer to
+ // SuperClass_ResetSWRecharge: restore the recharge timer to
     // the type's nominal RechargeTime without changing the charge state.
     void ResetRecharge();
 
@@ -244,6 +249,12 @@ public:
     int32 ChronoWarpTimer;
     int32 ChronoWarpState;
     int32 ChronoWarpDamageDone;
+    // 根据游戏行为，可知超武持有自己的放置动画与侧栏充能展示态，页签
+    // 闪烁以"起始帧 + 帧数窗口"表达。
+    int32 CameoChargeState = 0;      // 充能展示态：0 充能 / 1 就绪 / 2 生效中
+    AnimClass* ChronoAnim = nullptr; // 超武自持的放置动画
+    bool ChronoAnimPending = false;  // 是否已登记进动画跟踪表
+    int32 FlashStartFrame = 0;       // 页签闪烁起始帧
     int32 DominatorTimer;
     int32 DominatorScroll;
     bool DominatorActivated;
@@ -268,4 +279,17 @@ public:
     CellStruct unknown_130;
     int32 unknown_138;
     int32 unknown_13C;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知超级武器层补全就绪应答、侧栏文案、点击屏蔽与
+    // 时空动画入口，以及 COM 类型信息转发。
+    // ------------------------------------------------------------------------
+    virtual bool IsReadyToFire() const;
+    virtual const char* NameReadiness() const;
+    virtual bool ShouldFlash() const;
+    virtual void IgnoreClick(bool ignore);
+    virtual void CreateChronoAnim(const CoordStruct& coords);
+    virtual HRESULT IRTTITypeInfo_GetClassID(CLSID* pClassID);
+    static void Init_DefaultCellCoords();
+    static void Init_DefaultRoomCoords();
+
 };

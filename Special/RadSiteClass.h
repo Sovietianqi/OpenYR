@@ -43,6 +43,10 @@ public:
     void SetPosition(const CoordStruct& pos);
 
     int32 GetRadLevel() const;
+    void Radiate();
+    int32 GetCurrentLevel() const;
+    void IncreaseLevel();
+    void DecreaseLevel();
     int32 GetRadRadius() const;
     int32 GetDuration() const;
     int32 GetGlowIntensity() const;

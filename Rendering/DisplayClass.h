@@ -70,6 +70,17 @@ public:
         const CoordStruct& coords, const CellStruct& cell,
         ObjectClass* pObject, Action action, DWORD dwUnk2);
     virtual void RightMouseButtonUp(DWORD dwUnk);
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知显示层补全原版命名形态：守卫/攻击移动两种
+    // 光标码、选择集可攻判定与攻击动作换算、右键按下与重绘恢复。
+    // ------------------------------------------------------------------------
+    virtual MouseCursorType Cursor_Guard() const;
+    virtual MouseCursorType Cursor_AttackMove() const;
+    virtual bool CanAllSelectedAttack() const;
+    virtual Action ConvertAttack(Action action);
+    virtual void RightMouseDown(const Point2D& point);
+    virtual void Refresh();
+    virtual void Restore();
 
     // Non-virtual methods
     void Init();
@@ -87,6 +98,13 @@ public:
     void Read_INI();
     void Help_Text(const wchar_t* text);
     void Mouse_Left_Release();
+    // 根据游戏行为，可知鼠标消息以左右键与按压状态分档进入
+    // 处理面；裸名入口与 Mouse_ 前缀入口一一对应。
+    void Left_Press();
+    void Left_Release();
+    void Left_Held();
+    void Left_Up();
+    void Right_Press();
 
     // Action decision
     Action DecideAction(const CellStruct& cell, ObjectClass* pObject, DWORD dwUnk);

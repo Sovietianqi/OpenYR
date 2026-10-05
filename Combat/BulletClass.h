@@ -52,6 +52,8 @@ public:
     void Draw(Point2D* pCoord, RectangleStruct* pRect);
     int32 GetAnimRate() const;
     void Initialize(BulletTypeClass* pType);
+    void InitScalable();
+    bool IsHoming_obsolete() const;
 
 private:
     void CheckForCollision();

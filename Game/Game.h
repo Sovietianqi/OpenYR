@@ -255,6 +255,43 @@ public:
     static bool IsFrameMultipleOf(int divisor);
     static bool IsEvenFrame();
 
+    // ── Scenario & multiplayer flow ────────────────────────────────────
+    // 根据游戏行为，可知下面一组是网络对局与场景流程入口：网络包解析、
+    // 席位管理、玩家进出、结盟处理、资源装载与卸载。
+    static int32     ParsePKTs(void* pPktBuffer);
+    static void      CreateDummySlots();
+    static bool      IsRandomMap();
+    static void      PlayerLeftMP(int32 houseIndex);
+    static void      SaveTaunts();
+    static void      ProcessRandomPlayers();
+    static void      SetWantedSide(int32 sideIndex);
+    static int32     GetWantedSide();
+    static void      LoadPCXFiles();
+    static void      EnableJabber(bool bEnable);
+    static bool      IsJabberEnabled();
+    static void      ReloadNeutralMIX();
+    static bool      MakeScreenshot();
+    static void      SaveNetworkConfig();
+    static void      UnloadGUIPalettes();
+    static void      UnloadStartingGenericSpots();
+    static void      UnloadSideAndGUISHPs2();
+    static void      ReleaseNeutralMIX();
+    static void      MakeAlliances();
+    static int32     GetGameTypePrefs();
+    static void      SelectStartingPoint(int32 houseIndex, int32 spotIndex);
+    static void      LoadUI_LoadFiles();
+    static void      UnloadDiploOptPowerSHP();
+    static void      UnloadDiploOptSHP();
+    static void      UnloadGUISHPs();
+    static void      PlayerLeft(int32 houseIndex);
+    static bool      Load_ARTMD_INI();
+    static void      LoadUI();
+    static void      UnloadSideAndGUISHPs();
+    static void      EmptyMaps_InitStrings_PhoneBook();
+    static void      AllyHouses(int32 houseA, int32 houseB);
+    static void      UnloadStartingSpotsAndWinsock();
+    static void      ProcessCampaignOptions();
+
     // ── Speed helpers ───────────────────────────────────────────────────
     static unsigned int GetFrameDelay();
     static unsigned int GetTargetFrameTime();

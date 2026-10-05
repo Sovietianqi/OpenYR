@@ -16,6 +16,7 @@ template <class T> class DynamicVectorClass;
 
 class ObjectClass;
 class HouseClass;
+class BulletTypeClass;
 class BuildingClass;
 class OverlayClass;
 class SmudgeClass;
@@ -167,7 +168,7 @@ public:
     bool Tile_IsClearToSandLat() const;
     bool Tile_IsATunnel() const;
 
-    // CellClass::Is_Clear_To_Move (asm 0x4834DA) - the movement-legal cell
+ // CellClass::Is_Clear_To_Move - the movement-legal cell
     // test used by the map's "find a nearby spot" and unit-placement paths.
     //
     //   SpeedType      - the mover's speed class (SpeedType::Foot ..).
@@ -180,6 +181,20 @@ public:
     //   boo            - treat the mover as a bridge-layer.
     bool Is_Clear_To_Move(int32 SpeedType, bool a3, bool a4, int32 a5,
                           MovementZone zone, int32 a7, bool boo) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 FlagPlaced 负责让某一方把旗帜插到这格上：若本格
+    // 还没有旗帜，且这一格对插旗方来说是"可通行且未被占据"的，就置上旗帜
+    // 标记位，并把旗帜归属记为该方；否则什么都不做。返回是否插旗成功。
+    // ------------------------------------------------------------------------
+    bool FlagPlaced(int32 idxHouse);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ShouldDrawObjectsCloaked 负责判断"这一格上的隐形
+    // 单位是否应该对观众方显形"：如果这一格正被观众方的隐身发生器覆盖，
+    // 且观众方就是发生器拥有者，或者该方的探测计数大于零，则应当显形。
+    // ------------------------------------------------------------------------
+    bool ShouldDrawObjectsCloaked(int32 idxHouse) const;
 
     // Radiation
     //
@@ -218,12 +233,12 @@ public:
     // ========================================================================
     CellClass* AdjacentCell(DirType dir) const;
 
-    // CellClass_ScatterContent (asm 0x4866A0).  Moves whatever object is
+ // CellClass_ScatterContent.  Moves whatever object is
     // sitting on this cell and its immediate neighbours out of the way, the
     // way a freshly placed structure shoves parked units off its bib.
     void Scatter_Content(int32 a2, int32 a3, bool bIgnoreInfantry);
 
-    // CellClass_AdjustThreat (asm 0x485220).  Adds `threat` to the cell's
+ // CellClass_AdjustThreat.  Adds `threat` to the cell's
     // accumulated threat for `pFromHouse` (null means "the neutral bucket").
     // FootClass_AddThreatIntoCell / _RemoveThreatFromCell drive it.
     void Adjust_Threat(HouseClass* pFromHouse, int32 threat);
@@ -234,6 +249,31 @@ public:
     bool Cell_Seems_Ok() const;
     bool Goodie_Check() const;
     int32 GetContainedTiberiumValue() const;
+
+    // ========================================================================
+    // 根据游戏行为，可知 BlowUpBridge 炸断本格上的桥：桥体标记翻成已炸断、
+    //  地形变成断口、通知重绘并抛出"桥被炸断"事件。
+    // ========================================================================
+    bool BlowUpBridge();
+
+    // ========================================================================
+    // 根据游戏行为，可知格子的颜色分量按"红绿蓝"打包存放在格上：光照与
+    //  电磁表现改写它，读侧拆包、写侧重新打包。
+    // ========================================================================
+    void GetColourComponents(uint8* pR, uint8* pG, uint8* pB) const;
+    void SetColourComponents(uint8 r, uint8 g, uint8 b);
+
+    // ========================================================================
+    // 根据游戏行为，可知 Clear_Icon_4814F0 清掉本格的地块图标：叠加物一并
+    //  清掉，但地面类型与占用情况保持不变。
+    // ========================================================================
+    void Clear_Icon_4814F0();
+
+    // ========================================================================
+    // 根据游戏行为，可知 LAT 给出本格的地表平均类型（贴图分组编号），寻路
+    //  与放置判定拿它判断相邻格是否同组。
+    // ========================================================================
+    int32 LAT() const;
     bool IsShrouded() const;
     bool IsFogged() const;
     bool IsRevealed() const;
@@ -315,7 +355,7 @@ public:
     // Terrain object management
     TerrainClass* Get_Terrain() const;
 
-    // CellClass_StopAmbientSound (asm 0x5F6CB0).  Recursively silences the
+ // CellClass_StopAmbientSound.  Recursively silences the
     // ambient sound of whatever sits on this cell - the building first, and
     // failing that the terrain object.
     void Silence_Attached_Ambient();
@@ -330,7 +370,31 @@ public:
     int32 Get_Ground_Height() const;
     int32 Get_Z_Height() const;
 
-    // CellClass_GetCoords_unknown2 (asm 0x486890).
+    // ========================================================================
+    // 投射物落点判定
+    //
+    //  根据游戏行为，可知 CanTarget 判断一枚飞来的投射物能不能在这个格子上
+    //  生效，返回真正生效的那一格。判定分两类：
+    //    * 会被悬崖挡住的投射物：比较落点与入射格的高度层号，落差过大时拒绝。
+    //    * 会被墙/障碍挡住的投射物：比较层号、阻挡方归属，同阵营的墙不挡自己。
+    //  另外还要考虑"两格宽"的投射物在台阶处的连通性；全部通过则返回落点格，
+    //  否则返回空。
+    // ========================================================================
+    static CellClass* CanTarget(
+        CellClass* pSourceCell, int32 x, int32 y, int32 z,
+        BulletTypeClass* pProjType, HouseClass* pHouseOwner);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 Get_Containing_Rect 负责返回"这一格叠加物在屏幕上
+    // 占据的矩形"。叠加物缺省(-1)时返回空矩形；否则按叠加物类型记录里的
+    // 尺寸字段与当前叠加物帧换算出一个以格右上角为基准的矩形。泰矿/矿脉
+    // 等分块叠加物会按其帧序切成若干小格，因此矩形可能只覆盖格子的一部分。
+    // 本项目暂只还原"叠加物缺省返回空矩形、以及常规叠加物按其尺寸+帧序
+    // 换算"的主干，矿脉分块的细分贴图索引留待渲染管线建模后补齐。
+    // ------------------------------------------------------------------------
+    RectangleStruct Get_Containing_Rect() const;
+
+ // 根据游戏行为，可知 GetCoords_unknown2 负责下面这段逻辑。
     //
     //  Coordinate getter used by the vtable slot at +0xA4.  It forwards the
     //  cell's own GetCoords and, when the cell flag word (+0x140) has bit
@@ -340,7 +404,7 @@ public:
     //  level height.
     CoordStruct* GetCoordsUnknown2(CoordStruct* pCoords) const;
 
-    // CellClass_IsVeins (asm 0x485450).
+ // 根据游戏行为，可知 IsVeins 负责下面这段逻辑。
     //
     //  True while the cell can grow vein overlay: the overlay frame byte
     //  (+0x11C) must be at most 4, the land byte (+0x117) must not be one of
@@ -348,6 +412,24 @@ public:
     //  +0x44 must either be absent (-1) or a vein-type overlay.  The binary
     //  reads the "is vein" byte out of the OverlayTypeClass record at +0x2AE.
     bool IsVeins() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ActivateVeins 负责给踩在矿脉上的单位"放血"：
+    //  它对格子自身的条件(叠加物必须是矿脉、生长阶段达标、叠加物帧未满、
+    //  且格子上还没有激活标记)做一次筛选，然后顺着该格的对象链遍历；
+    //  凡是在地面上、且其类型没有"免疫矿脉"、也没有 VEIN_PROOF 能力的单位，
+    //  都会在格心生成一个矿脉攻击动画；只要本格处理过，就给格子打上
+    //  "已激活"标记，避免重复触发。
+    // ------------------------------------------------------------------------
+    void ActivateVeins();
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SetupVeins 负责把一格矿脉重新铺设成完整形态：
+    //  先确认本格确实是矿脉宿主，再取其包围矩形与一格尺寸做裁剪，然后按
+    //  包围范围从后往前逐格重铺；最后再跑一遍激活，让站在矿脉上的单位
+    //  重新吃到矿脉伤害。
+    // ------------------------------------------------------------------------
+    void SetupVeins();
 
     // Occupier management
     int32 Get_Occupier_Count() const;
@@ -373,6 +455,28 @@ public:
     ObjectClass* GetAircraft(bool alt = false) const;
     ObjectClass* GetInfantry(bool alt = false) const;
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 GetAircraftOrTerrain 负责为需要"落点"的对象找一个
+    //  可用目标：先把格子上非空的飞机挑出来（非地面层里的飞机），没有的话
+    //  再按"是否允许地形"回退到格子上可被占用的地形物；两者都没有就返回空。
+    // ------------------------------------------------------------------------
+    ObjectClass* GetAircraftOrTerrain(int32 a2, bool a3);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 RemoveContent 负责把某个对象从本格的对象链上摘除：
+    //  按 alt 标志选择要操作的链（地面链/空中链），命中链首时直接换链首，
+    //  否则沿链找到前驱并跳过目标；随后按目标类型做一些收尾（例如步兵离开
+    //  时通知其所在位置更新）。目标不属于本格或为空则什么都不做。
+    // ------------------------------------------------------------------------
+    void RemoveContent(ObjectClass* pObj, bool alt);
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 SetWallOwner 负责在格子上出现"墙类叠加物"时，找出
+    //  附近最近的一座、由本格可见的墙归属建筑，把它记为墙的拥有者；找不到
+    //  合适的建筑则清空归属。
+    // ------------------------------------------------------------------------
+    void SetWallOwner();
+
     // ========================================================================
     // Terrain / tiberium helpers
     // ========================================================================
@@ -384,6 +488,45 @@ public:
 
     // Radar color
     int32 Cell_Color() const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 Cell_Color_2 负责给出"地板/地面"这一层在雷达图上
+    //  的配色：地图上凡是画着地表的格子，雷达上统一用一套偏灰的深色调表示，
+    //  这样即便地表具体类型各异，雷达看起来也是一致的。给定一个缓冲，函数
+    //  把颜色写进去并返回。
+    //  没有地表的格子返回假，不写任何颜色。
+    // ------------------------------------------------------------------------
+    bool Cell_Color_2(uint8* pColorOut, int32 a3) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 ConvertCoords 负责把"格子坐标"换算成该格中心点的
+    //  世界坐标：格号左移 8 位得到格子左上角，再加半格（128）即得中心；
+    //  Z 取该格的地面高度。返回填好的坐标指针。
+    // ------------------------------------------------------------------------
+    CoordStruct* ConvertCoords(CoordStruct* pOut) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 GetFloorHeight 负责给出指定世界坐标处的地面高度，
+    //  结果带有小数部分以便坡道平滑：先把坐标换算成格号，取该格的地面高度，
+    //  再按格内的像素偏移做一次线性插值，使斜面上移动的单位高度连续变化。
+    // ------------------------------------------------------------------------
+    int32 GetFloorHeight(const CoordStruct& coords) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 GetFogged 负责判断本格在某个拥有者的视野里是否仍
+    //  被战争迷雾遮住：逐个检查该拥有者仍然"记得"的格位快照，只要有一处
+    //  与本格相符就认为已探明；一处都对不上则说明还是黑的。
+    //  战场未处于迷雾规则下时，一律报告未被遮住。
+    // ------------------------------------------------------------------------
+    bool GetFogged(HouseClass* pHouse) const;
+
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 PickInfantrySublocation 负责在一格之内给新生成的
+    //  步兵挑一个落脚点：把整格再细分成若干小位置，逐个试探哪些还空着、且
+    //  允许步兵站立，从中选一个可用的返回；全都被占满就报告失败。
+    // ------------------------------------------------------------------------
+    bool PickInfantrySublocation(CoordStruct* pOut, const CoordStruct& coords,
+                                 uint8 a4, uint8 a5, uint8 a6) const;
 
     // Buildability
     bool Can_Build_On() const;
@@ -405,7 +548,7 @@ public:
     void Set_Shrouded(bool shrouded);
     void Unshroud();
 
-    // CellClass_Setup (asm 0x4CC180).  Re-derives this cell's shroud state
+ // CellClass_Setup.  Re-derives this cell's shroud state
     // from the map's current view rectangle: the cell is checked against the
     // visible rect and either re-shrouded (`flag` < 0) or marked fogged.
     // Called for every cell when the player's view is resized.
@@ -434,28 +577,28 @@ public:
     // ========================================================================
     // Tunnel / coordinate / identity helpers
     // ========================================================================
-    // CellClass_GetTunnel (asm 0x484F2B): resolves TubeIndex against the
+ // CellClass_GetTunnel: resolves TubeIndex against the
     // tunnel table and returns the tunnel cell, or null when the index is
     // negative or out of range.
     CellClass* Get_Tunnel() const;
-    // CellClass_SetMapCoords (asm 0x47D3B8): copies the four-byte packed
+ // CellClass_SetMapCoords: copies the four-byte packed
     // X/Y pair into the cell's +0x24 coordinate slot.
     void Set_Map_Coords(const CellStruct& coords);
-    // CellClass_GetAbstractID (asm 0x482Axx): the fixed AbstractType ordinal
+ // CellClass_GetAbstractID (xx): the fixed AbstractType ordinal
     // every cell reports (AbstractType::Cell).
     int32 Get_AbstractID() const;
 
     // ========================================================================
     // Flag / shroud flag helpers
     // ========================================================================
-    // CellClass_FlagPickedUp (asm 0x4834xx): clears the "flag placed" bit
+ // CellClass_FlagPickedUp (xx): clears the "flag placed" bit
     // (0x10) of the cell's +0x140 flag word and resets the attached object
     // index at +0x50 to -1.  Returns true when the bit had been set.
     bool Flag_Picked_Up();
-    // CellClass_Smth0 (asm 0x487635): decrements the gap counter at +0x130,
+ // CellClass_Smth0: decrements the gap counter at +0x130,
     // wrapping a count of exactly 1 back down through zero.
     void Smth0();
-    // CellClass_Smth2 (asm 0x4876xx): sets bits 0x18 of the shroud flag word
+ // CellClass_Smth2 (xx): sets bits 0x18 of the shroud flag word
     // and, when the gap counter is still positive, tags 0x20 onto +0x140.
     void Smth2();
 
@@ -498,6 +641,11 @@ public:
     int32           CellColor;
     int32           Altitude;
     int32           Slope;
+
+    // 根据游戏行为，可知 Level 表示格子地形的高低"层号"，与高度值不同：层号
+    // 是整数台阶，用来比较两个格子是不是处于同一高度层（比如判断悬崖、坡道，
+    // 或者投射物能否从一侧越过)。高度是连续的绘图用值，层号则用于玩法判定。
+    uint8           Level;
     int32           TiberiumValue;
     double          RadLevel;           // +0xF0
     void*           RadSite;            // +0xF8

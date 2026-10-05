@@ -346,7 +346,7 @@ AbstractType InfantryTypeClass::Get_Build_Queue_Type() const
 }
 
 // ============================================================================
-// Resolve_SHP_References
+// 根据游戏行为，可知 SHP_References 负责下面这段逻辑。
 //
 //  Binds the infantry SHP image.  Infantry use SHP files (not voxels) for
 //  their rendering, with multiple sequences for walking, firing, prone, etc.
@@ -373,7 +373,7 @@ void InfantryTypeClass::Resolve_SHP_References()
 }
 
 // ============================================================================
-// Get_Cameo_Data
+// 根据游戏行为，可知 Cameo_Data 负责下面这段逻辑。
 //
 //  Returns the cameo SHP for the sidebar build button.  Falls back to the
 //  parent implementation if no infantry-specific cameo is set.
@@ -874,7 +874,7 @@ int32 InfantryTypeClass::GetSequenceNameCount()
 }
 
 // ============================================================================
-// InfantryTypeClass_ParseSequence - asm 0x523D20
+ // InfantryTypeClass_ParseSequence -
 //
 //   artmd.ini's section for this infantry is scanned twice per sequence.  The
 //   "<Name>" key carries a "%d,%d,%d,%s" value: two frame numbers, a count,

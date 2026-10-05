@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 #include "../Map/MapClass.h"
+#include "../Map/CellClass.h"
 
 // ============================================================================
 // JumpjetLocomotionClass - Jumpjet infantry movement.
@@ -571,4 +572,11 @@ bool JumpjetLocomotionClass::Is_Really_Moving_Now() const
 int32 JumpjetLocomotionClass::GetAltitude() const
 {
     return Altitude;
+}
+bool JumpjetLocomotionClass::LocationClear(const CoordStruct& coord)
+{
+    // 根据游戏行为，可知跳跃喷气移位在挪位前要确认目标点上空没有其他
+    // 载具占用：以目标格的占用旗标为依据。
+    CellClass* pCell = TheMap->GetCellAt(coord.X >> 8, coord.Y >> 8);
+    return pCell && !pCell->IsOccupied();
 }

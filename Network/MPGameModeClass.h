@@ -59,7 +59,8 @@ public:
     // Tournament / alliance policy flags, read from the mode's INI section.
     bool    WonlineTournamentAllowed;
     bool    WonlineClanTournamentAllowed;
-    bool    AlliesAllowed;
+    bool    AlliesAllowedFlag;
+    bool    AIAllowedFlag;
     bool    MustAlly;
 
     void ReadFromINI(CCINIClass* pINI, const char* pSection);
@@ -77,6 +78,58 @@ public:
 
     void SetTeam(int32 playerID, int32 team);
     int32 GetTeam(int32 playerID) const;
+
+    //========================================================================
+    // 根据游戏行为，可知下面一组是模式层的应答桩与选人界面入口：常量
+    // 应答桩给选项判定一个稳定的默认答案，选人填充与出生点映射负责
+    // 开局界面的数据准备。
+    //========================================================================
+    virtual int32 ret1();
+    virtual int32 ret1_1();
+    virtual int32 ret1_3();
+    virtual int32 ret1_6();
+    virtual int32 ret1_7();
+    virtual int32 ret1_8();
+    virtual int32 ret0();
+    virtual int32 ret0_0();
+    virtual int32 ret0_1();
+    virtual int32 ret0_4();
+    virtual int32 retm1();
+    virtual int32 retm2();
+    virtual int32 Selected(int32 slot) const;
+    virtual void  FillTeamSelector();
+    virtual void  FillTeamSelectorForSlot(int32 slot);
+    virtual void  SpawnBaseUnit(int32 houseIndex);
+    virtual bool  ShouldTeam(int32 slot) const;
+    virtual void  AllyTeams(int32 teamA, int32 teamB);
+    virtual void  StartingPositionsToHouseBases();
+    virtual bool  MustAlly02() const;
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知模式层还有一组“配置应答/开局流程”槽位：AI 与结盟
+    // 的允许性应答、出生点分配、队伍编制、初始单位生成、选人界面刷新，
+    // 以及若干以原版槽位名保留的 funcXX 供对照（purecall 系为纯虚占位，
+    // 由编译器生成，这里不复现）。
+    // ------------------------------------------------------------------------
+    virtual bool    AIAllowed();
+    virtual int32   AlliesAllowed();
+    virtual void    AssignStartingPoints();
+    virtual void    CreateMPTeams();
+    virtual void    CreateStartingUnits();
+    virtual void    DrawTeamSelector();
+    virtual void    SmthStartingHouses2(int32 idxHouse, DynamicVectorClass<CoordStruct>* pCoords, bool positionsTaken);
+    virtual bool    func10();
+    virtual bool    func40();
+    virtual int32   func54(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6, int32 a7);
+    virtual int32   func58(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6, int32 a7, int32 a8, int32 a9);
+    virtual void    func6C();
+    virtual int32   func70(int32 a1, int32 a2, int32 a3);
+    virtual bool    func7C();
+    virtual bool    funcB4(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6);
+    virtual int32   ret0_2();
+    virtual int32   ret1_0();
+    virtual int32   ret1_2();
+    virtual int32   ret1_4();
+    virtual int32   ret1_5();
 
     void UpdateScores();
     int32 GetPlayerScore(int32 playerID) const;

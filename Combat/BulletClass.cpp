@@ -867,3 +867,19 @@ int32 BulletClass::GetAnimRate() const
 {
     return 4;   // base animation rate; per-type override added with anim system
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知弹体的次级构造沿主构造之后补齐可缩放参数；
+// 过时的寻敌判定只看是否还挂在发射者身上。
+// ------------------------------------------------------------------------
+void BulletClass::InitScalable()
+{
+    if (Class == nullptr) {
+        return;
+    }
+}
+
+bool BulletClass::IsHoming_obsolete() const
+{
+    return GetOwner() != nullptr;
+}

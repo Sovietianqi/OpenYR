@@ -54,6 +54,18 @@ public:
     void SetColor(const ColorStruct& col) { Color = col; }
     void SetAlpha(uint8 alpha) { Alpha = alpha; }
     void SetSize(float size) { Size_ = size; }
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知粒子补全各 BehavesLike 分支的推进入口与取帧。
+    // ------------------------------------------------------------------------
+    void Update_Fire();
+    void Update_Gas();
+    void Update_Smoke();
+    void Update_Railgun();
+    void Update_Spark();
+    void Update_2();
+    void Update2_Gas();
+    void Update2_Smoke();
+    int32 GetImageFrame();
 
     // Particle sub-type factory methods
     static ParticleClass* CreateSparkParticle(const CoordStruct& pos, const CoordStruct& vel);

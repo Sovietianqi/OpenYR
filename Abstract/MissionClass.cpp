@@ -111,7 +111,7 @@ void MissionControlClass::LoadAllFromINI(CCINIClass* pINI)
 // MissionClass
 // ============================================================================
 
-// MissionClass_CTOR (asm 0x5B3680).
+ // 根据游戏行为，可知 CTOR 负责下面这段逻辑。
 //
 //  ObjectClass_CTOR, then every mission slot is set to -1 (no mission) and
 //  the two counters / the timer are zeroed; MissionTimer.TimeStart is left 0
@@ -468,7 +468,7 @@ void MissionClass::SuspendMission(Mission mission)
 // Mission-layer queries
 // ============================================================================
 
-// MissionClass_FindNameByIdx (asm 0x5B3730).
+ // 根据游戏行为，可知 FindNameByIdx 负责下面这段逻辑。
 //
 //  Returns the INI section name of the *current* mission.  A mission of -1
 //  (no mission assigned) resolves to the literal "<none>" instead of a table
@@ -481,7 +481,7 @@ const char* MissionClass::FindNameByIdx() const
     return MissionControlClass::FindName(CurrentMission);
 }
 
-// MissionClass_IsRecruitable (asm 0x5B36D0).
+ // 根据游戏行为，可知 IsRecruitable 负责下面这段逻辑。
 //
 //  The AI team recruiter asks the object whether its current mission permits
 //  being pulled into a team.  An unassigned mission (-1) always answers yes;
@@ -500,7 +500,7 @@ bool MissionClass::IsRecruitable() const
     return MissionControlClass::Array.Items[idx].Recruitable;
 }
 
-// MissionClass_ResetMission (asm 0x5B36C0).
+ // 根据游戏行为，可知 ResetMission 负责下面这段逻辑。
 //
 //  Promotes a queued mission into the live slot.  With nothing queued (-1)
 //  the call is a no-op that reports failure; otherwise the queued value moves
@@ -518,7 +518,7 @@ bool MissionClass::ResetMission()
     return true;
 }
 
-// MissionClass_LoadMissionControlFromINI (asm 0x5B3760).
+ // 根据游戏行为，可知 LoadMissionControlFromINI 负责下面这段逻辑。
 //
 //  RulesData_LoadTypeData reaches this to fill the whole [MissionControl]
 //  block of the rules INI into the MissionControlClass table.  Each table
@@ -528,3 +528,18 @@ void MissionClass::LoadMissionControlFromINI(CCINIClass* pINI)
 {
     MissionControlClass::LoadAllFromINI(pINI);
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_ 系列是 Mission_ 系列状态处理器的原版命名转发
+// 形态，行为一一对应。
+// ------------------------------------------------------------------------
+int32 MissionClass::Mi_Sleep()        { return Mission_Sleep(); }
+int32 MissionClass::Mi_Harmless()     { return Mission_Harmless(); }
+int32 MissionClass::Mi_Ambush()       { return Mission_Ambush(); }
+int32 MissionClass::Mi_Harvest()      { return Mission_Harvest(); }
+int32 MissionClass::Mi_Return()       { return Mission_Return(); }
+int32 MissionClass::Mi_Stop()         { return Mission_Stop(); }
+int32 MissionClass::Mi_Wait()         { return Mission_Wait(); }
+int32 MissionClass::Mi_Open()         { return Mission_Open(); }
+int32 MissionClass::Mi_Construction() { return Mission_Construction(); }
+int32 MissionClass::Mi_Selling()      { return Mission_Selling(); }

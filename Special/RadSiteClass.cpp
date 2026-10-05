@@ -459,3 +459,37 @@ void RadSiteManagerClass::RenderAllGlowEffects(BlitterClass* blitter, DSurface* 
         }
     }
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知辐射发作把当前帧写入时间戳槽位并沿领域格
+// 清单逐格施加伤害；这里转调既有的伤害施加面。
+// ------------------------------------------------------------------------
+void RadSiteClass::Radiate()
+{
+    ApplyRadiationDamage();
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知当前等级是起始等级与累计剂量之间的比例折算，
+// 起始等级非正时直接报零。
+// ------------------------------------------------------------------------
+int32 RadSiteClass::GetCurrentLevel() const
+{
+    if (RadLevel <= 0) {
+        return 0;
+    }
+    return (MaxRadLevel * RadLevel) / (RadLevel > 0 ? RadLevel : 1);
+}
+
+void RadSiteClass::IncreaseLevel()
+{
+    if (RadLevel < MaxRadLevel) {
+        ++RadLevel;
+    }
+}
+
+void RadSiteClass::DecreaseLevel()
+{
+    if (RadLevel > 0) {
+        --RadLevel;
+    }
+}

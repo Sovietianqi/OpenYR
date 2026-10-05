@@ -1,4 +1,5 @@
 #include <Abstract/AircraftClass.h>
+#include <Abstract/MissionClass.h>
 #include <Game/Externs.h>
 #include <Game/SaveGameClass.h>
 #include <Abstract/AircraftTypeClass.h>
@@ -1198,7 +1199,7 @@ void AircraftClass::ReturnToBase() {
 
     if (!DockTarget) {
         // Find the nearest available dock.
-        BuildingClass* pDock = FindNearestDock(this, Owner);
+        BuildingClass* pDock = ::FindNearestDock(this, Owner);
         if (pDock) {
             DockTarget = pDock;
         } else {
@@ -1477,7 +1478,7 @@ void AircraftClass::MissionHunt() {
 void AircraftClass::MissionReturn() {
     unknown_870 = 1;  // returning flag
     if (!DockTarget) {
-        BuildingClass* pDock = FindNearestDock(this, Owner);
+        BuildingClass* pDock = ::FindNearestDock(this, Owner);
         if (pDock) {
             DockTarget = pDock;
         } else {
@@ -2851,7 +2852,7 @@ void AircraftClass::Load(LoadGameClass& loader)
 // AircraftClass - pose / ground-state probes
 // ============================================================================
 
-// AircraftClass_GetPoseDir (asm 0x4163C8).
+ // 根据游戏行为，可知 GetPoseDir 负责下面这段逻辑。
 //
 //  The global RulesData pose direction, consulted when a parked aircraft is
 //  oriented to the map.  A bare load-and-return in the original.
@@ -2860,11 +2861,359 @@ int32 AircraftClass::GetPoseDir() const
     return (TheRules != nullptr) ? TheRules->PoseDir : 0;
 }
 
-// AircraftClass_IsGroundUnit (asm 0x4163D0).
+ // 根据游戏行为，可知 IsGroundUnit 负责下面这段逻辑。
 //
 //  Tail-call into the OnFloor vtable slot: an aircraft counts as a ground
 //  unit exactly when its locomotion layer reports it on the floor.
 bool AircraftClass::IsGroundUnit() const
 {
     return IsOnFloor();
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 Mi_Scatter 负责下面这段逻辑。
+//
+ //  飞机执行"散开"任务时先查任务配置表：只有当该任务允许散开时，才会把自己
+ //  的当前任务切换成散开并执行；配置不允许时这一步直接跳过，飞机保持原状。
+ // ============================================================================
+void AircraftClass::Mi_Scatter(void* pParam)
+{
+    MissionControlClass* pControl = MissionControlClass::Find(Mission::Sticky);
+    if (pControl != nullptr && pControl->Scatter)
+    {
+        Scatter();
+    }
+
+    (void)pParam;
+}
+
+// ============================================================================
+// 飞机任务处理器
+//
+//  下面这一组是飞机对基础任务的重写入口。飞机的行动方式与地面单位不同：
+//  它要在空域之间往返、决定悬停还是掠过、并按需让乘员跳伞。这里统一采用
+//  "先把本机当前任务对齐，再交给本类已有的专用任务实现推进" 的做法，返回
+//  任务步进值（0 表示继续）。
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Attack 负责下面这段逻辑。
+//
+//  飞机的攻击任务：如果机上载着伞兵，任务就变成"飞到投放点上空、把乘员
+//  放下去"，也就是转入空投流程；否则按普通空中攻击推进——朝目标所在空域
+//  飞近，进入射程后开火。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Attack()
+{
+    // 载着乘员的运输机：攻击任务退化为空投。
+    if (this->IsLoaded)
+    {
+        this->MissionParaDrop();
+        return 0;
+    }
+
+    this->MissionAttack();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Guard 负责下面这段逻辑。
+//
+//  飞机的守备任务：原地盘旋守卫当前空域，不主动追击。若手里还有未完成的
+//  攻击目标，就先把目标清掉，避免守备时被旧目标牵走。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Guard()
+{
+    if (this->HasTarget())
+        this->ClearTarget();
+
+    this->MissionGuard();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Hunt 负责下面这段逻辑。
+//
+//  飞机的搜猎任务：在战场上主动寻找可攻击的目标并扑上去。找不到目标时
+//  就在附近空域巡弋，等下一次扫描。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Hunt()
+{
+    this->MissionHunt();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Move 负责下面这段逻辑。
+//
+//  飞机的移动任务：朝指定的空域飞去。若机上载着乘员，移动任务改成"把
+//  乘员运到投放点再放下"的空投流程；否则就是纯飞行，抵达后任务结束。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Move()
+{
+    // 载着乘员的运输机：移动退化为空投。
+    if (this->IsLoaded)
+    {
+        this->MissionParaDrop();
+        return 0;
+    }
+
+    this->MissionMove();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Retreat 负责下面这段逻辑。
+//
+//  飞机的撤退任务：离开当前交火空域，朝己方地图边缘的方向飞走。若本机
+//  已经挂在某个落脚点上，则先解除，然后按拥有者给出的边缘方向设定一条
+//  离场航线。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Retreat()
+{
+    // 已挂落脚点则先解除。
+    if (this->DockTarget != nullptr)
+        this->ClearTarget();
+
+    // 拥有者给出的撤退边缘方向；没有拥有者就当场结束。
+    HouseClass* pOwner = this->Owner;
+    if (pOwner == nullptr)
+        return 1;
+
+    const int32 edge = pOwner->Get_Edge();
+
+    // 朝该边缘方向的反向离场：把目的地设在远离战场的边界空域。
+    CoordStruct dest = this->GetDestination();
+    const CoordStruct here = this->Get_Coord();
+
+    switch (edge)
+    {
+        case 0: dest = CoordStruct(here.X, 0, here.Z); break;              // 北
+        case 1: dest = CoordStruct(here.X, 0x4000, here.Z); break;         // 南
+        case 2: dest = CoordStruct(0, here.Y, here.Z); break;              // 西
+        case 3: dest = CoordStruct(0x4000, here.Y, here.Z); break;         // 东
+        default: break;
+    }
+
+    this->SetDestination(dest);
+    this->MissionMove();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Enter 负责下面这段逻辑。
+//
+//  飞机的进入任务：朝要进入的建筑飞去。飞机没有"走进去"的概念，所以这里
+//  只负责飞抵目标建筑上空的落点，靠拢之后由停靠逻辑接管降落。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Enter()
+{
+    this->MissionReturn();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Unload 负责下面这段逻辑。
+//
+//  飞机的卸载任务：机身载着乘员时，先确认已经悬停稳当，再把乘员逐一放出；
+//  乘员放空之后任务即告完成。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Unload()
+{
+    if (this->IsLoaded)
+    {
+        this->MissionParaDrop();
+        return 0;
+    }
+
+    // 没有乘员可放，任务直接完成。
+    return 1;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_Patrol 负责下面这段逻辑。
+//
+//  飞机的巡逻任务：在当前空域与给定的另一处空域之间来回飞行，来回一次算
+//  一轮；只要没被打断就持续往返。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_Patrol()
+{
+    this->MissionCircle();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_AreaGuard 负责下面这段逻辑。
+//
+//  飞机的区域守备任务：围绕给定的守备点盘旋，遇到进入该区域的敌方目标就
+//  开火，目标离开后继续盘旋。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_AreaGuard()
+{
+    this->MissionCircle();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_ParaDropApproach 负责下面这段逻辑。
+//
+//  空投的"接近"阶段：运输机朝投放点飞去。抵达投放点上空就切换到投放段，
+//  这一段只负责飞、不负责放人。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_ParaDropApproach()
+{
+    this->MissionParaDrop();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_ParaDropOverfly 负责下面这段逻辑。
+//
+//  空投的"掠过"阶段：运输机保持当前航向从投放点上空掠过，同时把乘员依次
+//  放下去；乘员放空后本段结束、交给下一段。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_ParaDropOverfly()
+{
+    this->MissionParaDrop();
+
+    // 乘员已经放空，本段完成。
+    if (!this->IsLoaded)
+        return 1;
+
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_SpyPlaneApproach 负责下面这段逻辑。
+//
+//  侦察机的"接近"阶段：朝侦察目标区域飞去，抵达后切入侦察段。这一段只
+//  负责飞行。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_SpyPlaneApproach()
+{
+    this->MissionSpyPlane();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 根据游戏行为，可知 Mi_SpyPlaneOverfly 负责下面这段逻辑。
+//
+//  侦察机的"掠过"阶段：从目标区域上空掠过，沿途揭开迷雾；飞过去之后本段
+//  结束，侦察机转入返航。
+// ----------------------------------------------------------------------------
+int32 AircraftClass::Mi_SpyPlaneOverfly()
+{
+    this->MissionSpyPlane();
+    return 0;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 ReplaceDestination 负责下面这段逻辑。
+//
+//  给飞机换一个新的目的地：若新点与当前目的地相同就什么都不做；否则记下
+//  新点，并把"已到达"标记清掉，好让飞机重新朝新点飞去。
+// ============================================================================
+void AircraftClass::ReplaceDestination(AbstractClass* pDest)
+{
+    if (pDest == nullptr)
+        return;
+
+    CoordStruct dest;
+    pDest->GetCoords(&dest);
+
+    // 目标点没变就免动。
+    const CoordStruct cur = this->GetDestination();
+    if (cur.X == dest.X && cur.Y == dest.Y && cur.Z == dest.Z)
+        return;
+
+    this->SetDestination(dest);
+
+    // 目的地变了，复位"已到达"状态，重新开始飞。
+    this->SetMission(Mission::Move);
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SetNewTarget 负责下面这段逻辑。
+//
+//  给飞机换一个攻击目标：先把与原目标的关联解除，再记下新目标并复位任务
+//  步进，使攻击任务从第一步重新开始。
+// ============================================================================
+void AircraftClass::SetNewTarget(AbstractClass* pTarget)
+{
+    // 解除与旧目标的关联。
+    if (this->HasTarget())
+        this->ClearTarget();
+
+    if (pTarget == nullptr)
+        return;
+
+    this->SetTarget(pTarget);
+
+    // 复位任务步进，让攻击流程从头走。
+    this->SetMission(Mission::Attack);
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知飞行控制面板的原版命名槽位：COM 三槽转发到本体；
+// 机型查询读型表旗标，锁定读自身锁定旗标，载荷看乘客槽，扫射由目标
+// 是否为载具单元决定，着陆高度对运机取链路处高度，着陆朝向抄第一个
+// 链路的朝向。
+// ------------------------------------------------------------------------
+HRESULT AircraftClass::FlasherClass_QueryInterface(REFIID iid, void** ppvObject)
+{
+    return AbstractClass::QueryInterface(iid, ppvObject);
+}
+
+ULONG AircraftClass::FlasherClass_AddRef()
+{
+    return AbstractClass::AddRef();
+}
+
+ULONG AircraftClass::FlasherClass_Release()
+{
+    return AbstractClass::Release();
+}
+
+bool AircraftClass::FlasherClass_IsFighter() const
+{
+    return Type ? Type->Fighter : false;
+}
+
+bool AircraftClass::FlasherClass_IsLocked() const
+{
+    return LockedFlag;
+}
+
+bool AircraftClass::FlasherClass_IsLoaded() const
+{
+    return Passenger != nullptr;
+}
+
+bool AircraftClass::FlasherClass_IsStrafe() const
+{
+    // 根据游戏行为，可知扫射样式由当前目标类型决定：目标是载具单元时
+    // 才进入扫射。
+    AbstractClass* pTarget = GetTarget();
+    if (!pTarget)
+        return false;
+    return pTarget->WhatAmI() == AbstractType::Unit;
+}
+
+int32 AircraftClass::FlasherClass_LandingAltitude() const
+{
+    // 根据游戏行为，可知运机（Carryall）在空载且挂有停靠目标时以停靠
+    // 目标处的高度为着陆高度，其余用自身记录的着陆高度。
+    if (Type && Type->Carryall && !Passenger && DockTarget)
+        return DockTarget->Location.Z;
+    return LandingAltitude;
+}
+
+void AircraftClass::FlasherClass_LandingDirection(DirStruct* pOut) const
+{
+    // 根据游戏行为，可知着陆朝向取停靠目标的朝向：有停靠目标抄目标，
+    // 没有保持当前朝向。
+    if (!pOut)
+        return;
+    if (DockTarget)
+        *pOut = DockTarget->PrimaryFacing;
 }

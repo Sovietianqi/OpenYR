@@ -59,6 +59,15 @@ public:
 
     AITriggerTypeClass(const char* pID) noexcept;
 
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 AI 触发类型补全原版命名形态：两个超武充能
+    // 百分比判定、参战方资金比较与启停写入。
+    // ------------------------------------------------------------------------
+    bool CompareHouseMoney(HouseClass* pHouse);
+    bool IronCurtainPercentReady(HouseClass* pHouse);
+    bool ChronospherePercentReady(HouseClass* pHouse);
+    void WriteToTriggerEnable(bool enable);
+
 protected:
     explicit AITriggerTypeClass(noinit_t) noexcept : AbstractTypeClass(noinit) {}
 

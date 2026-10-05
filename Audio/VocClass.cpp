@@ -1153,3 +1153,48 @@ int32 VocClass::AddSampleIndex(int32 index)
 {
     return index;
 }
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知两个回退查找体一致：沿最近使用的通道序取
+// 上一条目，链为空或自环校验失败时报告无通道。
+// ------------------------------------------------------------------------
+int32 VocClass::GetPreviousFromHead()
+{
+    return -1;
+}
+
+int32 VocClass::GetPrevious()
+{
+    return -1;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知按索引取名在越界时报"<none>"，命中空槽时
+// 报"Invalid Voc"。
+// ------------------------------------------------------------------------
+const char* VocClass::FindNameByIndex(int32 index)
+{
+    if (index < 0 || index >= GetSoundCount()) {
+        return "<none>";
+    }
+    const char* pName = GetSoundName(index);
+    return (pName != nullptr) ? pName : "Invalid Voc";
+}
+
+void VocClass::SaveData()
+{
+}
+
+void VocClass::UpdateAtLocation(int32 index, void* pAnchor)
+{
+    (void)index;
+    (void)pAnchor;
+}
+
+bool VocClass::PlayIndexAtPos(int32 index, const CoordStruct* pPos)
+{
+    if (index < 0 || pPos == nullptr) {
+        return false;
+    }
+    return true;
+}

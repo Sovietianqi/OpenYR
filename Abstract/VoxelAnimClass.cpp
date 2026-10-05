@@ -242,7 +242,7 @@ int32 VoxelAnimClass::Get_CRC() const
 }
 
 // ============================================================================
-// Get_Bounce_Physics
+// 根据游戏行为，可知 Bounce_Physics 负责下面这段逻辑。
 //
 //  Returns whether this voxel anim bounces when it hits the ground.  This is
 //  determined by the type's WillBounce flag.
@@ -399,7 +399,7 @@ void VoxelAnimClass::Update()
 }
 
 // ============================================================================
-// Draw_It
+// 根据游戏行为，可知 It 负责下面这段逻辑。
 //
 //  Renders the voxel anim at the given screen origin.  The full binary draws
 //  the tumbling voxel model with rotation and lighting; the standalone build

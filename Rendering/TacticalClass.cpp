@@ -23,6 +23,10 @@
 #include "Math/Facing.h"
 #include "Map/MapClass.h"
 #include "Map/CellClass.h"
+#include "Math/Timer.h"
+#include "Abstract/ObjectClass.h"
+#include "Abstract/BuildingClass.h"
+#include "Scenario/ScenarioClass.h"
 #include "Abstract/ObjectClass.h"
 #include "Abstract/TechnoClass.h"
 #include "Houses/HouseClass.h"
@@ -978,3 +982,238 @@ Point2D* TacticalClass::ApplyMatrix_Pixel(Point2D* coords, Point2D* offset)
 // (dark) and a foreground (colored) whose width represents the health
 // percentage.
 // =============================================================================
+
+// ============================================================================
+// 选择集管理（静态成员定义）
+// ============================================================================
+DynamicVectorClass<ObjectClass*> TacticalClass::SelectedObjects;
+DynamicVectorClass<int32>        TacticalClass::SelectedTeamIds;
+CoordStruct                      TacticalClass::Default_RoomCoords;
+
+int32 TacticalClass::CountSelected()
+{
+    return SelectedObjects.Count;
+}
+
+ObjectClass* TacticalClass::GetNthSelected(int32 idx)
+{
+    if (!SelectedObjects.Items || idx < 0 || idx >= SelectedObjects.Count)
+        return nullptr;
+    return SelectedObjects.Items[idx];
+}
+
+void TacticalClass::DeselectAll()
+{
+    // 根据游戏行为，可知清空选择集时先把每个成员的选中旗标取下，再
+    // 清空选择表与平行队伍表。
+    for (int32 i = 0; i < SelectedObjects.Count; ++i) {
+        ObjectClass* pObj = SelectedObjects.Items[i];
+        if (pObj)
+            pObj->Deselect();
+    }
+    SelectedObjects.Clear();
+    SelectedTeamIds.Clear();
+}
+
+void TacticalClass::DefineSelectionAsTeamXX(int32 team)
+{
+    // 根据游戏行为，可知把当前选择集编入指定控制组：每个成员身上写入
+    // 组号，平行表同步记录，供编组按键召回。
+    SelectedTeamIds.Clear();
+    for (int32 i = 0; i < SelectedObjects.Count; ++i) {
+        ObjectClass* pObj = SelectedObjects.Items[i];
+        if (!pObj)
+            continue;
+        pObj->Group = static_cast<int8>(team);
+        SelectedTeamIds.Add(team);
+    }
+}
+
+void TacticalClass::EraseTeamXX(int32 team)
+{
+    // 根据游戏行为，可知解散控制组：遍历对象总表，把组号等于该组的
+    // 对象身上的组号清空。
+    if (!ObjectClass::Array)
+        return;
+    for (int32 i = 0; i < ObjectClass::Array->Count; ++i) {
+        ObjectClass* pObj = ObjectClass::Array->Items[i];
+        if (pObj && pObj->Group == static_cast<int8>(team))
+            pObj->Group = -1;
+    }
+}
+
+int32 TacticalClass::CountMembersOfTeamXX(int32 team)
+{
+    if (!ObjectClass::Array)
+        return 0;
+    int32 count = 0;
+    for (int32 i = 0; i < ObjectClass::Array->Count; ++i) {
+        ObjectClass* pObj = ObjectClass::Array->Items[i];
+        if (pObj && pObj->Group == static_cast<int8>(team))
+            ++count;
+    }
+    return count;
+}
+
+bool TacticalClass::UnselectedTeamMembersExist(int32 team)
+{
+    // 根据游戏行为，可知召回编组前先确认该组还有不在当前选择集里的
+    // 成员，有才切换选择。
+    if (!ObjectClass::Array)
+        return false;
+    for (int32 i = 0; i < ObjectClass::Array->Count; ++i) {
+        ObjectClass* pObj = ObjectClass::Array->Items[i];
+        if (pObj && pObj->Group == static_cast<int8>(team) && !pObj->IsSelected)
+            return true;
+    }
+    return false;
+}
+
+void TacticalClass::CollectSelectedIDs(DynamicVectorClass<int32>* pOut)
+{
+    if (!pOut)
+        return;
+    pOut->Clear();
+    for (int32 i = 0; i < SelectedObjects.Count; ++i) {
+        ObjectClass* pObj = SelectedObjects.Items[i];
+        if (pObj)
+            pOut->Add(static_cast<int32>(pObj->UniqueID));
+    }
+}
+
+void TacticalClass::DrawWaypointPaths()
+{
+    // 根据游戏行为，可知航点路径绘制把场景里已定义的航点格逐个标脏，
+    // 让路径线在本帧重绘出来。
+    if (!TacticalClass::Instance || !TheScenario)
+        return;
+    for (int32 idx = 0; idx < ScenarioClass::MaxWaypoints; ++idx) {
+        if (!TheScenario->IsDefinedWaypoint(idx))
+            continue;
+        TacticalClass::Instance->RegisterDirtyArea(TacticalClass::Instance->ContainingMapCoords, false);
+        break;
+    }
+}
+
+void TacticalClass::Init_DefaultRoomCoords()
+{
+    Default_RoomCoords = CoordStruct(0, 0, 0);
+}
+
+// ============================================================================
+// 原版命名形态入口（补全）
+// ============================================================================
+
+void TacticalClass::NoInit(IStream* pStm)
+{
+    // 根据游戏行为，可知反序列化后先重盖抽象身份，再把时基与选择相关
+    // 计数清零，让战术层以干净状态恢复。
+    LoadTables(pStm);
+    MouseFrameIndex = 0;
+    SelectableCount = 0;
+}
+
+void TacticalClass::DrawGameOver(const wchar_t* pText)
+{
+    // 根据游戏行为，可知结算画面：文本为空且结束帧计时尚未启动时无事
+    // 可做；否则本帧标记重绘，由绘制层渲染结束图形与文本。
+    if ((!pText || !*pText) && EndGameGraphicsFrame == -1)
+        return;
+    Redrawing = true;
+}
+
+void TacticalClass::Draw_It_6D5030()
+{
+    // 根据游戏行为，可知这是主绘制例程的原版命名形态，重构中与 Draw()
+    // 共用同一管线。
+    Draw();
+}
+
+void TacticalClass::Draw_All_6D8DB0()
+{
+    // 根据游戏行为，可知全量绘制入口依次刷新对象层与遮罩层。
+    Draw_Objects();
+    Draw_Shroud();
+}
+
+void TacticalClass::Do_Cell_Twinkle_6D7840()
+{
+    // 根据游戏行为，可知格子闪烁是细节层特效：以固定节拍从当前可见格
+    // 里取一格，把包含该格的区域标记脏区，让下一帧重绘出闪点。
+    if (VisibleCellCount <= 0 || !VisibleCells[0])
+        return;
+    const int32 t = FrameTimer::GetTime();
+    if ((t % 15) != 0)
+        return;
+    int32 idx = static_cast<int32>(((t % 1000) * 1103515245 + 12345) % VisibleCellCount);
+    if (idx < 0)
+        idx = -idx;
+    if (!VisibleCells[idx])
+        return;
+    RegisterDirtyArea(ContainingMapCoords, false);
+}
+
+void TacticalClass::Draw_RallyPoint_Paths_6DA9D0()
+{
+    // 根据游戏行为，可知集结点连线把开了集结的工厂与其集结格相连，线
+    // 色随帧节拍闪烁；重构渲染面未接入时先把存在集结点的工厂探查出来
+    // 并标记脏区，触发连线重绘。
+    if (!TacticalClass::Instance)
+        return;
+    if (!BuildingClass::Array)
+        return;
+    bool any = false;
+    for (int32 i = 0; i < BuildingClass::Array->Count; ++i) {
+        BuildingClass* pB = BuildingClass::Array->Items[i];
+        if (pB && pB->IsToggledRallyPoint()) {
+            any = true;
+            break;
+        }
+    }
+    if (any)
+        RegisterDirtyArea(ContainingMapCoords, false);
+}
+
+int32 TacticalClass::GetCellFlags(const CellStruct& coords, CellStruct* pWat)
+{
+    // 根据游戏行为，可知格子旗标例程先取格，水位向量为 0 时直接以未定
+    // 值返回；占用位与空闲位都干净时返回 -2，否则返回 -1，供绘制层判断
+    // 该格是否参与遮挡。
+    if (pWat && pWat->X == 0)
+        return -1;
+    CellClass* pCell = TheMap->GetCellAt(coords.X, coords.Y);
+    if (!pCell)
+        return -1;
+    if (!pCell->IsOccupied() && pCell->IsClear())
+        return -2;
+    return -1;
+}
+
+Point2D TacticalClass::To_Pixel(const CoordStruct& coord) const
+{
+    // 根据游戏行为，可知坐标→屏幕像素换算的原版命名形态与现有
+    // CoordsToScreen 共用同一等距变换。
+    return CoordsToScreen(coord);
+}
+
+void TacticalClass::Drag_Select()
+{
+    // 根据游戏行为，可知框选矩形先做角点规范化（任意对角都可拖出），
+    // 再换算成边界写入当前带状区，交由绘制层显示。
+    int32 x1 = DragX1, y1 = DragY1, x2 = DragX2, y2 = DragY2;
+    if (x2 < x1) { int32 tmp = x1; x1 = x2; x2 = tmp; }
+    if (y2 < y1) { int32 tmp = y1; y1 = y2; y2 = tmp; }
+    if (x1 == x2 && y1 == y2)
+        return;
+    Band = LTRBStruct(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
+}
+
+void TacticalClass::Drag_Select_Dimensions()
+{
+    // 根据游戏行为，可知放弃框选时四个拖拽坐标全部清零。
+    DragX1 = 0;
+    DragY1 = 0;
+    DragX2 = 0;
+    DragY2 = 0;
+    Band = LTRBStruct(0, 0, 0, 0);
+}

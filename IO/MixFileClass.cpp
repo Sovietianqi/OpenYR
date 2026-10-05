@@ -115,7 +115,7 @@ MixFileClass::~MixFileClass() noexcept
 }
 
 //========================================================================
-// MixFileClass_CTOR (asm 0x5B3C31) - two-argument form
+ // MixFileClass_CTOR - two-argument form
 //
 //   Identical to the single-argument constructor except that pKey is handed
 //   to the index straw when the archive's header requests encryption.  The
@@ -978,3 +978,56 @@ namespace MixCrypto
         }
     }
 } // namespace MixCrypto
+// ============================================================================
+// MIX 注册表链与装卸（根据游戏行为实现）
+// ============================================================================
+
+// 根据游戏行为，可知挂载时把 MIX 同时登记进链表与数组两类注册结构。
+void MixFileClass::Init_List()
+{
+    GetMixList().AddTail(this);
+    GetMixArray().Add(this);
+}
+
+// 根据游戏行为，可知卸载时从两类注册结构里摘除自身。
+void MixFileClass::UnInit_List()
+{
+    GetMixList().Remove(this);
+    for (int32 i = 0; i < GetMixArray().Count; ++i) {
+        if (GetMixArray()[i] == this) {
+            GetMixArray().Remove(i);
+            break;
+        }
+    }
+}
+
+// 根据游戏行为，可知链修正会重走一遍注册表：缺席者补登记，重复者去重。
+bool MixFileClass::CorrectChain()
+{
+    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
+    for (int32 i = 0; i < arr.Count; ++i) {
+        if (arr[i] == nullptr) {
+            arr.Remove(i);
+            --i;
+        }
+    }
+    return true;
+}
+
+// 根据游戏行为，可知按名字查找 MIX 即在数组注册表里做不区分大小写
+// 的逐一比对。
+MixFileClass* MixFileClass::FindFileByName(const char* pName)
+{
+    if (pName == nullptr) {
+        return nullptr;
+    }
+    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
+    for (int32 i = 0; i < arr.Count; ++i) {
+        MixFileClass* pMix = arr[i];
+        if (pMix != nullptr && pMix->FileName != nullptr
+            && !_strcmpi(pMix->FileName, pName)) {
+            return pMix;
+        }
+    }
+    return nullptr;
+}

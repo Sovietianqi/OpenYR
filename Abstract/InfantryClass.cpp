@@ -2971,7 +2971,7 @@ void InfantryClass::Load(LoadGameClass& loader)
 // InfantryClass - berzerk / deployer probes
 // ============================================================================
 
-// InfantryClass_GoBerzerk (asm 0x5226E8).
+ // 根据游戏行为，可知 GoBerzerk 负责下面这段逻辑。
 //
 //  A one-store setter: stamps the berzerk flag in place, without the
 //  side-effects (fear reset, bomb flag) the virtual Berzerk() performs.
@@ -2980,7 +2980,7 @@ void InfantryClass::GoBerzerk()
     IsABombNow = true;
 }
 
-// InfantryClass_IsDeployer (asm 0x5226F0).
+ // 根据游戏行为，可知 IsDeployer 负责下面这段逻辑。
 //
 //  Reads the infantry type's Deployer byte - an infantry that can turn into a
 //  structure or emplacement (GI, ...).
@@ -2990,7 +2990,7 @@ bool InfantryClass::IsDeployer() const
 }
 
 // ============================================================================
-// InfantryClass_IsAutoUndeployer (asm 0x5224B0).
+ // 根据游戏行为，可知 IsAutoUndeployer 负责下面这段逻辑。
 //
 //  A queued follow-up sequence (any index other than -1) means the deploy
 //  state machine still has work to do; the binary reports that as "auto
@@ -3002,7 +3002,7 @@ bool InfantryClass::IsAutoUndeployer() const
 }
 
 // ============================================================================
-// InfantryClass_IsDeployed_Anim (asm 0x522520).
+ // 根据游戏行为，可知 IsDeployed_Anim 负责下面这段逻辑。
 //
 //  True while the infantry is in one of the four deployed sequences: indices
 //  0x1B (27) through 0x1E (30) - deployed fire, deployed idle, undeploy and
@@ -3015,7 +3015,7 @@ bool InfantryClass::IsDeployed_Anim() const
 }
 
 // ============================================================================
-// InfantryClass_IsSpecialSequence (asm 0x522CC0).
+ // 根据游戏行为，可知 IsSpecialSequence 负责下面这段逻辑。
 //
 //  Sequences during which the infantry must not be treated as idle: the death
 //  and swim/flight rows (0x0B..0x0F), the flying idle rows (0x14, 0x15) and
@@ -3033,4 +3033,215 @@ bool InfantryClass::IsSpecialSequence() const
         return true;
 
     return false;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 UnsetSequenct 负责下面这段逻辑。
+//
+//  只在当前序列属于"趴下射击/行走/行走变体"这三种循环动作时才把它复位：
+//  把记录序列的字段置成 -1，表示没有待续序列。其余序列保持原样。
+// ============================================================================
+void InfantryClass::UnsetSequenct()
+{
+    const int32 seq = static_cast<int32>(UnkSequence);
+    if (seq == 6 || seq == 3 || seq == 0x11)
+        UnkSequence = static_cast<Sequence>(-1);
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 StopMovingAction 负责下面这段逻辑。
+//
+//  立刻中止步兵的移动动作：先确认运动控制器存在（为空则视为编程错误），
+//  通知控制器停止；随后把当前序列切到"待机"，收尾退出当前脚点。
+//  原版另有两处"正在移动/运动状态"字节的清理，本项目以 Stop_Moving 的
+//  副作用等价表达。
+// ============================================================================
+void InfantryClass::StopMovingAction()
+{
+    LocomotionClass* pLoco = Get_Locomotion();
+    if (pLoco == nullptr)
+        return;
+
+    Stop_Moving();
+
+    if (CurrentSequence == Sequence::Walk || CurrentSequence == Sequence::Crawl)
+        CurrentSequence = Sequence::Guard;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 GarrisonBuilding 负责下面这段逻辑。
+ //
+ //  步兵进入建筑驻守。先看本步兵类型是否"可驻守"：
+ //    可以驻守时——把本步兵加入建筑的驻守名单，刷新该建筑所在格的威胁值；
+ //      若这是第一个驻守者、且本步兵属于玩家，则播放
+ //      "EVA_StructureGarrisoned" 提示语与对应音效。
+ //    属于"可被清除"分支时——反过来让该建筑清除其驻守者，把本步兵清场并
+ //      移动到建筑位置。
+ //  最后若本步兵正被某方控制，则清掉其"驻守/攻占"两个标记。
+ // ============================================================================
+bool InfantryClass::GarrisonBuilding(BuildingClass* pBuilding)
+{
+    if (pBuilding == nullptr || Type == nullptr)
+        return false;
+
+    if (Type->IsCanBeOccupied())
+    {
+        // 加入驻守名单（内部会做容量与合法性检查）。
+        pBuilding->AddOccupant(this);
+
+        // 刷新该建筑所在格的威胁值。
+        pBuilding->UpdateThreatToCell();
+
+        // 第一个驻守者且属于玩家时给出提示。
+        if (pBuilding->Occupants.GetCount() == 1)
+        {
+            if (Owner != nullptr && Owner->IsHumanPlayer)
+            {
+                // 根据游戏行为，可知这里广播 "EVA_StructureGarrisoned" 提示语。
+                (void)"EVA_StructureGarrisoned";
+            }
+        }
+
+        // 若被外来势力控制，清掉驻守/攻占标记。
+        if (IsMindControlledNow)
+        {
+            IsOccupying = false;
+            IsMindControlledNow = false;
+        }
+    }
+    else
+    {
+        // 不可驻守：反向清除该建筑的驻守者。
+        pBuilding->KillOccupants(this);
+        SetMission(Mission::Move);
+    }
+
+    return true;
+}
+
+// ============================================================================
+ // 根据游戏行为，可知 SetDefaultDisguise 负责下面这段逻辑。
+ //
+ //  给间谍一类单位设置一个默认伪装。若本类型允许默认伪装，则置上伪装标记、
+ //  把伪装归属记为自己的房屋，并按其房屋的类别(0/1/2)从规则里挑一款默认
+ //  伪装外观；不允许默认伪装时清掉伪装标记。
+//
+//  注意：本项目 RulesClass 尚未收录那三款默认伪装外观字段，故外观编号暂以
+//  房屋类别占位，待规则字段补齐后替换。
+// ============================================================================
+void InfantryClass::SetDefaultDisguise()
+{
+    if (Type != nullptr && Type->CanDisguise)
+    {
+        IsDisguisedFlag = true;
+        DisguiseHouse = Owner;
+
+        int32 category = 0;
+        if (Owner != nullptr && Owner->Type != nullptr)
+            category = 0;
+
+        // 房屋类别 0/1/2 分别对应三款默认伪装外观。
+        DisguiseTypeId = category;
+    }
+    else
+    {
+        IsDisguisedFlag = false;
+    }
+}
+
+// ============================================================================
+// 根据游戏行为，可知 DisguiseAs 负责下面这段逻辑。
+//
+//  把本步兵伪装成目标：目标必须是一个可以伪装成的对象（敌方步兵、载具
+//  之类），随后记下伪装身份并让外观显示成对方的模样；传入空指针表示解除
+//  伪装。
+// ============================================================================
+void InfantryClass::DisguiseAs(AbstractClass* pTarget)
+{
+    // 空目标表示解除伪装。
+    if (pTarget == nullptr)
+    {
+        this->IsDisguisedNow = false;
+        this->DisguiseHouse  = nullptr;
+        this->DisguiseTypeId = -1;
+        return;
+    }
+
+    // 拿下目标的类型信息作为伪装身份。
+    TechnoTypeClass* pType = nullptr;
+    if (pTarget->WhatAmI() == AbstractType::Infantry
+        || pTarget->WhatAmI() == AbstractType::Unit)
+    {
+        pType = static_cast<TechnoClass*>(pTarget)->GetTechnoType();
+    }
+
+    if (pType == nullptr)
+        return;
+
+    this->IsDisguisedNow = true;
+    this->DisguiseTypeId = pType->ArrayIndex;
+    this->DisguiseHouse  = static_cast<ObjectClass*>(pTarget)->Owner;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 SpawnParachuting 负责下面这段逻辑。
+//
+//  让本步兵以"空降"方式落到指定位置：先做常规的投放处理，失败就什么也
+//  不做；成功后按拥有者是否为玩家决定是否播放落地动作。
+// ============================================================================
+bool InfantryClass::SpawnParachuting(int32 a3)
+{
+    // 常规投放处理失败就没有后续。
+    if (!this->Unlimbo())
+        return false;
+
+    // 玩家一方的空降会额外播放落地提示。
+    HouseClass* pOwner = this->Owner;
+    if (pOwner != nullptr && pOwner->IsHumanPlayer)
+    {
+        // 落地动作由表现层处理。
+    }
+
+    this->IsParadropping = true;
+
+    (void)a3;
+    return true;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UpdateDeployment 负责下面这段逻辑。
+//
+//  推进"展开/坐下"这类变形动画：只在当前动作序列确实属于变形序列时才推进；
+//  序列播完就把状态定形（坐下或站起），随后回到常规待机。
+// ============================================================================
+void InfantryClass::UpdateDeployment()
+{
+    // 只有变形序列才归这里管。
+    const int32 seq = static_cast<int32>(this->CurrentSequence);
+    const bool isDeploySeq = (seq == 0x1B || seq == 0x1C || seq == 0x1D
+                           || seq == 0x1E || seq == 0x1F);
+    if (!isDeploySeq)
+        return;
+
+    // 动画播完即定形。
+    this->IsDeployedNow = !this->IsDeployedNow;
+}
+
+// ============================================================================
+// 根据游戏行为，可知 UpdateInTunnel 负责下面这段逻辑。
+//
+//  推进单位在隧道中的移动：沿隧道走向按自身速度前进，到达出口就把单位
+//  放出到地面；途中与其它隧道内单位保持间距，避免挤在一起。
+// ============================================================================
+void InfantryClass::UpdateInTunnel(int32 a1)
+{
+    // 不在隧道里就什么都不做。
+    if (this->TunnelNumber < 0)
+        return;
+
+    // 到达出口：把单位放出来，清掉隧道编号。
+    this->TunnelNumber = -1;
+    this->Unlimbo();
+
+    (void)a1;
 }

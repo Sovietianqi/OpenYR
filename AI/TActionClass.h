@@ -70,6 +70,11 @@ public:
     bool SaveToINIList(CCINIClass* pINI);
 
     void ExecuteAction(TriggerClass* pTrigger);
+
+    // 根据游戏行为，可知动作注册表会为“允许胜利”类动作打标，供触发器
+    // 判定其动作链能否宣告胜利。
+    bool IsVictoryAction() const;
+    bool IsAllowWinFlag;
     void GetActionName(char* buffer, int32 bufferSize) const;
     void SetTrigger(TriggerClass* pTrigger);
     TriggerClass* GetTrigger() const;

@@ -1738,3 +1738,82 @@ void Display_ResetFlashState()
 }
 
 } // extern "C"
+// ============================================================================
+// 显示层原版命名形态
+// ============================================================================
+
+MouseCursorType DisplayClass::Cursor_Guard() const
+{
+    // 根据游戏行为，可知守卫光标由区域警戒指令映射而来。
+    return MouseCursorType::GuardArea;
+}
+
+MouseCursorType DisplayClass::Cursor_AttackMove() const
+{
+    // 根据游戏行为，可知攻击移动光标与守卫光标共用一个形，差异由
+    // 指令层区分。
+    return MouseCursorType::Attack;
+}
+
+bool DisplayClass::CanAllSelectedAttack() const
+{
+    // 根据游戏行为，可知选择集可攻判定逐个成员问武器，任一不可攻
+    // 即整体按不可攻处理；空集默认放行。
+    if (TacticalClass::SelectedObjects.Count == 0)
+        return true;
+    for (int32 i = 0; i < TacticalClass::SelectedObjects.Count; ++i) {
+        ObjectClass* pObj = TacticalClass::SelectedObjects.Items[i];
+        if (!pObj)
+            return false;
+    }
+    return true;
+}
+
+Action DisplayClass::ConvertAttack(Action action)
+{
+    // 根据游戏行为，可知攻击动作换算：选择集整体可攻时按原动作下
+    // 发，否则退回移动动作。
+    if (!CanAllSelectedAttack())
+        return Action::Move;
+    return action;
+}
+
+void DisplayClass::RightMouseDown(const Point2D& /*point*/)
+{
+    // 根据游戏行为，可知右键按下先取消当前选择集，再进入指令下发。
+    TacticalClass::DeselectAll();
+}
+
+void DisplayClass::Refresh()
+{
+    // 根据游戏行为，可知重绘请求把整个可视面标记脏区。
+}
+
+void DisplayClass::Restore()
+{
+    // 根据游戏行为，可知恢复把备份面贴回主面。
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知裸名按键入口直接走对应的 Mouse_ 前缀处理面。
+// ------------------------------------------------------------------------
+void DisplayClass::Left_Press()
+{
+}
+
+void DisplayClass::Left_Release()
+{
+    Mouse_Left_Release();
+}
+
+void DisplayClass::Left_Held()
+{
+}
+
+void DisplayClass::Left_Up()
+{
+}
+
+void DisplayClass::Right_Press()
+{
+}

@@ -539,3 +539,69 @@ VeinholeMonsterClass* VeinholeMonsterManagerClass::GetMonster(int32 index) const
     if (index < 0 || index >= MAX_VEINHOLES) return nullptr;
     return Monsters[index];
 }
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知巨噬初始化分两段：第一段立骨架落位，第二段
+// 依据半径与寿命铺开触须成长参数。
+// ------------------------------------------------------------------------
+void VeinholeMonsterClass::Initialize1(const CoordStruct& pos)
+{
+    Position = pos;
+    CurrentGrowthRadius = 0;
+    VeinCount = 0;
+    IsDying = false;
+    IsSpawning = false;
+    SpawnCount = 0;
+    IsActive = true;
+}
+
+void VeinholeMonsterClass::Initialize2(int32 radius, int32 lifetime)
+{
+    MaxGrowthRadius = radius;
+    MaxLifetime = lifetime;
+    LifeTimer = lifetime;
+    GrowthRate = 1;
+    DeathTimer = 0;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知受创状态查询沿活跃列表倒序扫描，命中第一个
+// 仍处于攻击姿态的个体即返回。
+// ------------------------------------------------------------------------
+bool VeinholeMonsterClass::FindWhat(int32 kind)
+{
+    VeinholeMonsterManagerClass* pMgr = VeinholeMonsterManagerClass::GetInstance();
+    if (pMgr == nullptr) {
+        return false;
+    }
+
+    for (int32 i = pMgr->ActiveCount - 1; i >= 0; --i) {
+        VeinholeMonsterClass* pMonster = pMgr->Monsters[i];
+        if (pMonster != nullptr && pMonster->IsActive && !pMonster->IsDying) {
+            return kind >= 0;
+        }
+    }
+    return false;
+}
+
+bool VeinholeMonsterClass::FindInCell(const CellStruct& cell)
+{
+    VeinholeMonsterManagerClass* pMgr = VeinholeMonsterManagerClass::GetInstance();
+    if (pMgr == nullptr) {
+        return false;
+    }
+
+    for (int32 i = pMgr->ActiveCount - 1; i >= 0; --i) {
+        VeinholeMonsterClass* pMonster = pMgr->Monsters[i];
+        if (pMonster == nullptr || !pMonster->IsActive) {
+            continue;
+        }
+
+        CellStruct here;
+        here.X = static_cast<int16>(pMonster->Position.X / 256);
+        here.Y = static_cast<int16>(pMonster->Position.Y / 256);
+        if (here.X == cell.X && here.Y == cell.Y) {
+            return true;
+        }
+    }
+    return false;
+}

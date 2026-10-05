@@ -5,7 +5,7 @@
 #include <cstdlib>
 
 // ============================================================================
-// MapSelection - sub_5CF8E0 (asm 0x5CF8E0)
+ // MapSelection - sub_5CF8E0
 // ============================================================================
 
 static char* DupString(const char* pSource)

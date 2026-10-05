@@ -112,7 +112,7 @@ public:
 
     explicit MixFileClass(const char* pFileName);
 
-    // MixFileClass_CTOR (asm 0x5B3C31) - the two-argument form.  pKey is the
+ // MixFileClass_CTOR - the two-argument form.  pKey is the
     // archive's encryption key, handed to PKStraw_SetKey when the header's
     // flag bit marks the index as encrypted.  A missing or empty key leaves
     // the archive unmounted from the encrypted path, exactly as passing a
@@ -231,6 +231,19 @@ public:
     static uint32 CRCTable[256];
     static bool CRCTableInitialized;
 
+public:
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 MIX 注册表按名字检索文件，命中返回登记项。
+    // ------------------------------------------------------------------------
+    static MixFileClass* FindFileByName(const char* pName);
+
 private:
     DISABLE_COPY_AND_MOVE(MixFileClass)
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知 MIX 注册表还提供链修正与列表装卸。
+    // ------------------------------------------------------------------------
+    void Init_List();
+    void UnInit_List();
+    bool CorrectChain();
+
 };

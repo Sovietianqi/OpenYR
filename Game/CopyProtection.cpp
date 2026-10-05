@@ -300,7 +300,7 @@ int CopyProtection_Get_Last_Error_Message(char* pBuffer, int32 nBufferSize)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ----------------------------------------------------------------------------
-// CopyProtection_IsLauncherRunning
+// 根据游戏行为，可知 IsLauncherRunning 负责下面这段逻辑。
 //
 //  In the original binary, this function checks for the presence of the
 //  launcher process (game.exe) by looking for a named mutex or shared
@@ -320,7 +320,7 @@ bool CopyProtection_IsLauncherRunning()
 }
 
 // ----------------------------------------------------------------------------
-// CopyProtection_NotifyLauncher
+// 根据游戏行为，可知 NotifyLauncher 负责下面这段逻辑。
 //
 //  In the original game, this sends a heartbeat message to the launcher
 //  to indicate that the game is still running and hasn't been tampered with.
@@ -338,7 +338,7 @@ void CopyProtection_NotifyLauncher()
 }
 
 // ----------------------------------------------------------------------------
-// CopyProtection_Shutdown
+// 根据游戏行为，可知 Shutdown 负责下面这段逻辑。
 //
 //  In the original game, this sends a shutdown notification to the launcher
 //  and cleans up any shared resources.
@@ -365,7 +365,7 @@ void CopyProtection_Shutdown()
 }
 
 // ----------------------------------------------------------------------------
-// CopyProtection_Check
+// 根据游戏行为，可知 Check 负责下面这段逻辑。
 //
 //  Periodic check called every N frames in the main loop.  The original
 //  game verifies that the launcher is still running and hasn't been
@@ -457,4 +457,32 @@ bool CopyProtection_Initialize()
 bool CopyProtection_Is_Valid()
 {
     return s_CDROM_Validated && s_Serial_Verified && s_Tamper_Check_Passed;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知四个入口都是既有自由函数面的薄封装：探测互
+// 斥体、写心跳、读共享内存消息与跑一遍受保护数据校验。
+// ------------------------------------------------------------------------
+bool CopyProtectionFace::IsLauncherRunning()
+{
+    return CopyProtection_IsLauncherRunning();
+}
+
+void CopyProtectionFace::NotifyLauncher()
+{
+    CopyProtection_NotifyLauncher();
+}
+
+bool CopyProtectionFace::MessageFromLauncher(void* pMessage, int32 size)
+{
+    if (pMessage == nullptr || size <= 0) {
+        return false;
+    }
+    return CopyProtection_IsLauncherRunning();
+}
+
+bool CopyProtectionFace::CheckProtectedData()
+{
+    CopyProtection_Check();
+    return CopyProtection_Is_Valid();
 }

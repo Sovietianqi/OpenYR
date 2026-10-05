@@ -8,7 +8,7 @@
 #include <cstdlib>
 
 // ============================================================================
-// PKTNodeClass - PKTNode_CTOR (asm 0x69A460)
+ // PKTNodeClass - PKTNode_CTOR
 // ============================================================================
 
 PKTNodeClass::PKTNodeClass()
@@ -154,7 +154,7 @@ bool PKTNodeClass::Construct(CCINIClass* pINI, const char* pSection)
 }
 
 // ============================================================================
-// PKTPool - Game_ParsePKTs (asm 0x69991E)
+ // PKTPool - Game_ParsePKTs
 // ============================================================================
 
 namespace PKTPool

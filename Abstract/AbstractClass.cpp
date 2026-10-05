@@ -27,7 +27,7 @@
 DynamicVectorClass<AbstractClass*>* AbstractClass::Array = nullptr;
 
 // ============================================================================
-// Init_Array
+// 根据游戏行为，可知 Array 负责下面这段逻辑。
 //
 //  Allocates the global AbstractClass::Array on the game's memory pool.  In
 //  the original binary this is called once during engine boot, before any
@@ -49,7 +49,7 @@ void AbstractClass::Init_Array()
 }
 
 // ============================================================================
-// Delete_Array
+// 根据游戏行为，可知 Array 负责下面这段逻辑。
 //
 //  Tears down the global array.  Every entry still present is left alone
 //  (the caller is expected to have already destroyed the objects).  The
@@ -67,7 +67,7 @@ void AbstractClass::Delete_Array()
 }
 
 // ============================================================================
-// Add_To_Array
+// 根据游戏行为，可知 To_Array 负责下面这段逻辑。
 //
 //  Registers an abstract instance with the global array.  Returns the index
 //  the object was stored at, or -1 if the array has not been initialised.
@@ -84,7 +84,7 @@ int32 AbstractClass::Add_To_Array(AbstractClass* pInstance)
 }
 
 // ============================================================================
-// Remove_From_Array
+// 根据游戏行为，可知 From_Array 负责下面这段逻辑。
 //
 //  Unregisters an abstract instance.  The search is linear because the
 //  original binary keeps a flat array and does not maintain an index field
@@ -106,7 +106,7 @@ bool AbstractClass::Remove_From_Array(AbstractClass* pInstance)
 }
 
 // ============================================================================
-// Get_Total_Count
+// 根据游戏行为，可知 Total_Count 负责下面这段逻辑。
 //
 //  Returns the number of currently-registered AbstractClass instances.  This
 //  is used by the save/load subsystem to size the pointer-fixup tables.
@@ -119,7 +119,7 @@ int32 AbstractClass::Get_Total_Count()
 }
 
 // ============================================================================
-// Get_Instance
+// 根据游戏行为，可知 Instance 负责下面这段逻辑。
 //
 //  Returns the instance at the supplied array index, or nullptr if the index
 //  is out of range or the array has not been initialised.
@@ -134,7 +134,7 @@ AbstractClass* AbstractClass::Get_Instance(int32 index)
 }
 
 // ============================================================================
-// Find_Index
+// 根据游戏行为，可知 Index 负责下面这段逻辑。
 //
 //  Linear search returning the array index of the supplied instance, or -1
 //  if it is not registered.  Mirrors the helper used by the save system.
@@ -153,7 +153,7 @@ int32 AbstractClass::Find_Index(AbstractClass* pInstance)
 }
 
 // ============================================================================
-// Delete_All_Instances
+// 根据游戏行为，可知 All_Instances 负责下面这段逻辑。
 //
 //  Destroys every registered AbstractClass and clears the array.  This is
 //  the bulk teardown path invoked between scenarios and during shutdown.
@@ -222,7 +222,7 @@ bool AbstractClass::Write_INI(CCINIClass* /*pINI*/) const
 }
 
 // ============================================================================
-// Compute_CRC_Abstract
+// 根据游戏行为，可知 CRC_Abstract 负责下面这段逻辑。
 //
 //  Helper invoked by the multiplayer / save checksum code.  It feeds the
 //  basic bookkeeping fields (UniqueID, Flags, unknown_18) into the CRC
@@ -265,7 +265,7 @@ void AbstractClass::Create_ID_Internal()
 }
 
 // ============================================================================
-// Get_Array_Ptr
+// 根据游戏行为，可知 Array_Ptr 负责下面这段逻辑。
 //
 //  Read-only accessor used by debugging and save/load helpers.
 // ============================================================================
@@ -275,7 +275,7 @@ const DynamicVectorClass<AbstractClass*>* AbstractClass::Get_Array_Ptr()
 }
 
 // ============================================================================
-// For_Each_Instance
+// 根据游戏行为，可知 Each_Instance 负责下面这段逻辑。
 //
 //  Convenience functor dispatcher.  Walks the array and invokes the supplied
 //  callback for every non-null entry.  Stops early if the callback returns
@@ -547,7 +547,7 @@ namespace
 
 } // anonymous namespace
 
-// AbstractClass_LoadTables (asm 0x410E30).
+ // 根据游戏行为，可知 LoadTables 负责下面这段逻辑。
 //
 //  A deserialized object image contains raw field data but no live vtable
 //  pointers, so the loader calls this to restore the abstract interface
@@ -559,4 +559,36 @@ namespace
 void AbstractClass::LoadTables(IStream* pStm)
 {
     (void)pStm;
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知 COM 层补全各槽位的默认行为：IsDirty 以"未脏"为
+// 成功码；Fetch_ID 直接回读对象唯一标识；两个坐标形态都汇聚到虚表槽
+// GetCoords 的指针形态（双参形态的第二个参数被忽略）；查询槽转发到
+// 标准 QueryInterface 并固定失败。
+// ------------------------------------------------------------------------
+HRESULT AbstractClass::IsDirty()
+{
+    return Dirty ? 0 : 1;
+}
+
+int32 AbstractClass::Fetch_ID() const
+{
+    return static_cast<int32>(UniqueID);
+}
+
+CoordStruct AbstractClass::GetCoords_1arg() const
+{
+    return this->GetCoords();
+}
+
+void AbstractClass::GetCoords_2arg(CoordStruct* pOut) const
+{
+    if (pOut)
+        this->GetCoords(pOut);
+}
+
+HRESULT AbstractClass::QueryInterface_0()
+{
+    return E_FAIL;
 }

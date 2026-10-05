@@ -44,6 +44,19 @@ public:
     void PlayWarpInAnimation();
     void CheckChronoVortex();
     void SpawnChronoVortex();
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知传送移位面板补全 ILocomotion 槽位的原版命名形态。
+    // ------------------------------------------------------------------------
+    bool ILocomotion_718080() const;
+    void ILocomotion_7180A0(CoordStruct* pOut) const;
+    void ILocomotion_718100(const CoordStruct& to);
+    void ILocomotion_718230();
+    void ILocomotion_7192C0(DirStruct dir);
+    int32 ILocomotion_719E20() const;
+    void ILocomotion_71A090(CoordStruct* pCoord);
+    HRESULT ILocomotion_71A160(REFIID iid, void** ppvObject);
+    ULONG ILocomotion_71A170();
+    ULONG ILocomotion_71A180();
 
     TeleportLocomotionClass();
 

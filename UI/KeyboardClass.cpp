@@ -42,7 +42,7 @@ void KeyboardClass::Clear()
 }
 
 // ============================================================================
-// KeyboardClass_LoadFromINI - asm 0x533E05
+ // KeyboardClass_LoadFromINI -
 //
 //   "KEYBOARDMD.INI" is opened through a stack CCFileClass.  The binding
 //   table is discarded and rebuilt; the [Hotkey] section is then walked key

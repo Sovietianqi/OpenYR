@@ -447,3 +447,72 @@ bool RadioClass::IsLinked(TechnoClass* pLink) const
 //   [1] - Commands sent to a specific recipient
 //   [2] - Commands sent with additional data payload
 // =============================================================================
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知链路表查询以原版命名形态成对出现：空表判定、非空
+// 判定、成员判定（含对象形态）、按下标取项（含出参形态）与按项取下标。
+// ------------------------------------------------------------------------
+bool RadioClass::IsArrayEmpty() const
+{
+    return RadioLinks.Count == 0;
+}
+
+bool RadioClass::ArrayHasAtLeastOneItem() const
+{
+    return RadioLinks.Count > 0;
+}
+
+bool RadioClass::ContainsEntry(TechnoClass* pTech) const
+{
+    return ContainsLink(pTech);
+}
+
+bool RadioClass::IsObjectInArray(TechnoClass* pTech) const
+{
+    return FindLinkIndex(pTech) != -1;
+}
+
+TechnoClass* RadioClass::GetNthEntry(int32 idx) const
+{
+    if (idx < 0 || idx >= RadioLinks.Count)
+        return nullptr;
+    return RadioLinks.Items[idx];
+}
+
+bool RadioClass::GetNthEntry2(int32 idx, TechnoClass** pOut) const
+{
+    if (!pOut)
+        return false;
+    *pOut = GetNthEntry(idx);
+    return *pOut != nullptr;
+}
+
+int32 RadioClass::GetIdxOfEntry2(TechnoClass* pTech) const
+{
+    return FindLinkIndex(pTech);
+}
+
+// ------------------------------------------------------------------------
+// 根据游戏行为，可知链路指令与停靠的原版命名形态是现有指令面的别名：
+// SendToFirst 对首链路下发，SendToEach 向所有链路广播，SendSmth 携带
+// 数据载荷下发，LinkWith 建立双向链路。
+// ------------------------------------------------------------------------
+RadioCommand RadioClass::SendToFirst(RadioCommand command)
+{
+    return SendToFirstLink(command);
+}
+
+void RadioClass::SendToEach(RadioCommand command)
+{
+    SendToEachLink(command);
+}
+
+RadioCommand RadioClass::SendSmth(RadioCommand command, AbstractClass*& pInOut, TechnoClass* pRecipient)
+{
+    return SendCommandWithData(command, pInOut, pRecipient);
+}
+
+bool RadioClass::LinkWith(TechnoClass* pLink)
+{
+    return LinkTo(pLink);
+}

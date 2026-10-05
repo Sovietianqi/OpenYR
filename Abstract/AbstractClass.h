@@ -54,13 +54,13 @@ public:
 
     virtual HRESULT GetClassID(CLSID* pClassID) override = 0;
 
-    virtual HRESULT IsDirty() override { return 0; }
+    virtual HRESULT IsDirty() override;
     virtual HRESULT Load(IStream* pStm) override = 0;
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override = 0;
     virtual HRESULT GetSizeMax(uint64* pcbSize) override { return 0; }
 
     virtual AbstractType What_Am_I() const override { return AbstractType::Abstract; }
-    virtual int32 Fetch_ID() const override { return static_cast<int32>(UniqueID); }
+    virtual int32 Fetch_ID() const override;
     virtual void Create_ID() override {}
 
     virtual bool INoticeSink_Unknown(DWORD dwUnknown) override { return false; }
@@ -160,7 +160,7 @@ public:
     // ========================================================================
     void Create_ID_Internal();
     // ========================================================================
-    // LoadTables (asm 0x410E30)
+ // LoadTables
     //
     //  AbstractClass_LoadTables re-stamps the four abstract interface vtable
     //  pointers that a deserialized image has lost: AbstractClass at +0,
@@ -170,4 +170,11 @@ public:
     //  Derived layers chain this and then re-stamp their own identity on top.
     // ========================================================================
     virtual void LoadTables(IStream* pStm);
+    // ------------------------------------------------------------------------
+    // 根据游戏行为，可知抽象层补全坐标读取的两个原版形态与 COM 查询族。
+    // ------------------------------------------------------------------------
+    virtual CoordStruct GetCoords_1arg() const;
+    virtual void GetCoords_2arg(CoordStruct* pOut) const;
+    virtual HRESULT QueryInterface_0();
+
 };
