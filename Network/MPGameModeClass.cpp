@@ -6,9 +6,11 @@
 #include "../Houses/HouseClass.h"
 #include "../Map/MapClass.h"
 #include "../INI/INIClass.h"
+#include "../Abstract/UnitClass.h"
 
 #include <cstring>
 #include <cstdlib>
+#include <new>
 
 // ============================================================
 // MPGameModeClass
@@ -878,31 +880,152 @@ int32 MPGameModeClass::retm2()  { return -2; }
 
 int32 MPGameModeClass::Selected(int32 slot) const
 {
-    // 根据游戏行为，可知选中查询按席位给答案：席位有效即视为可选。
+    // asm: vt_MPGameModeClass.FillTeamSelector   (asm:?)
     return (slot >= 0 && slot < MAX_MP_PLAYERS) ? 1 : 0;
 }
 
 void MPGameModeClass::FillTeamSelector()
 {
-    // 根据游戏行为，可知选人列表按当前登记的模式集重建，越界席位
+    // asm: vt_MPGameModeClass.FillTeamSelectorForSlot   (asm:?)
     // 不进列表。
 }
 
 void MPGameModeClass::FillTeamSelectorForSlot(int32 slot)
 {
-    // 根据游戏行为，可知按席位重建只刷新该席位的可选行。
+    // asm: vt_MPGameModeClass.SpawnBaseUnit   (asm:?)
     (void)slot;
 }
 
+// ----------------------------------------------------------------------------
+// asm: MPUnholy_CreateBaseUnit
+//
+//   UnholyAlliance 模式的开局基地单位生成。原版把这段挂在 UnholyAlliance
+//   的 vftable 上，槽位与本类的 SpawnBaseUnit 对应；原版签名是
+//   __stdcall(int Owner, int _20) 两栈参、ecx 不参与，第二个栈参全程未被
+//   读取（见 asm 全文），所以这里只需 houseIndex 一个参数。
+//
+//   for (i = Rules.BaseUnit.Count - 1 ; i >= 0 ; --i):
+//     type = Rules.BaseUnit[i]
+//     if (!type)                                { failed = 1 ; continue }
+//     unit = UnitClass_CTOR(new UnitClass, type, Owner)
+//     if (!unit)                                { failed = 1 ; continue }
+//     home = Owner->GetHomeCell()
+//     home.X += 3 ; home.Y += 3
+//     if (i == 0):                              首轮先试 lepton 直接落位
+//       coords = { (home.X<<8)+0x80, (home.Y<<8)+0x80, 0 }
+//       if (unit->[vt+0xD8](unit, &coords, 0))  continue
+//     if (Scan_Place_Object(unit, Owner->GetHomeCell(), 3))  continue
+//     unit->[vt+0x20](unit, 1)                  扫描不到 → 就地销毁
+//     failed = 1
+//   返回 !failed
+//
+//   【留白（铁律①）】
+//   vt+0xD8 与 vt+0x20 两个虚槽在项目里没有等价声明：前者是原版
+//   TechnoClass 的"按给定 lepton 坐标直接落到地图"重载，后者是
+//   "就地销毁"重载；本项目的 Unlimbo()/析构语义并不逐槽对应，
+//   强行挪用会让链接期选错槽位，所以此处不写死槽位号，只保留控制流与
+//   调用点，等这两槽在真实类里补出来后再接上。
+//   Scan_Place_Object（__fastcall(TechnoClass*, wXY*, int)，原版 0x688F00
+//   一带）是本项目尚未移植的地图扫描放置设施，同样只保留调用点。
+//
+//   原版返回值在本项目里没有调用方使用（见 CreateStartingUnits）。
+// ----------------------------------------------------------------------------
 void MPGameModeClass::SpawnBaseUnit(int32 houseIndex)
 {
-    // 根据游戏行为，可知基地车落位由出生点流程触发，模式层只做登记。
-    (void)houseIndex;
+    if (RulesClass::Instance == nullptr) {
+        return;
+    }
+
+    // 在项目里，houseIndex 是全局房屋表 Houses[] 的下标。
+    if (houseIndex < 0 || houseIndex >= MAX_HOUSES) {
+        return;
+    }
+    HouseClass* pOwner = Houses[houseIndex];
+    if (pOwner == nullptr) {
+        return;
+    }
+
+    DynamicVectorClass<UnitTypeClass*>& baseUnits = RulesClass::Instance->BaseUnit;
+
+    for (int32 i = baseUnits.Count - 1; i >= 0; --i) {
+        UnitTypeClass* pType = baseUnits[i];
+        if (pType == nullptr) {
+            continue;
+        }
+
+        // asm: push size UnitClass / call new / push Owner / push type /
+        //      mov ecx, eax / call UnitClass_CTOR
+        //      —— 类型由构造函数第二参数写入，不经由外部赋值。
+        UnitClass* pUnit = new (std::nothrow) UnitClass(pOwner);
+        if (pUnit == nullptr) {
+            continue;
+        }
+        pUnit->Type = pType;
+
+        // asm: HouseClass_GetHomeCell(Owner, &out) / add cx,3 / add ax,3
+        CellStruct home = pOwner->GetHomeCell();
+        home.X = static_cast<int16>(home.X + 3);
+        home.Y = static_cast<int16>(home.Y + 3);
+
+        if (i == 0) {
+            // 首轮用格心的 lepton 坐标直接落位，成功就不再走扫描。
+            const CoordStruct coords(
+                (static_cast<int32>(home.X) << 8) + 0x80,
+                (static_cast<int32>(home.Y) << 8) + 0x80,
+                0);
+            if (this->Place_Base_Unit_At_Lepton(*pUnit, coords)) {
+                continue;
+            }
+        }
+
+        // asm: HouseClass_GetHomeCell(Owner, &a2) / Scan_Place_Object(unit, eax, 3)
+        if (this->Scan_Place_Object(*pUnit, pOwner->GetHomeCell(), 3)) {
+            continue;
+        }
+
+        // asm: push 1 / call [eax+20h]  (就地销毁)
+        delete pUnit;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 留白（铁律①）：SpawnBaseUnit 依赖的两个原版设施尚未移植。
+//
+//   Place_Base_Unit_At_Lepton  —— 原版 UnitClass 虚表 +0xD8 槽。asm 调用点：
+//       mov eax, [esi] / push edi(0) / push &coords / mov ecx, esi /
+//       call dword ptr [eax+0D8h] / test al, al
+//     即"按给定 lepton 坐标落位"，返回是否成功。
+//
+//   Scan_Place_Object —— 原版 __fastcall(TechnoClass* this, wXY* where,
+//     int mode)，入口 0x688F00 一带（符号 Scan_Place_Object，被
+//     MPSiege_SpawnBaseUnit / MPUnholy_CreateBaseUnit 等共同引用）。
+//
+// 这两个设施一旦在真实类里补出，把实现接过来即可，调用点无需改动。
+// 为保证控制流可见，这里给出保守实现：落位一律失败、扫描一律失败，
+// 于是 SpawnBaseUnit 会走到"删除单位"那一支 —— 与原版"没有可放置位置
+// 就撤掉单位"的行为一致，且不会把单位留在半初始化状态。
+// ----------------------------------------------------------------------------
+bool MPGameModeClass::Place_Base_Unit_At_Lepton(UnitClass& unit,
+                                               const CoordStruct& coords)
+{
+    (void)unit;
+    (void)coords;
+    return false;
+}
+
+bool MPGameModeClass::Scan_Place_Object(UnitClass& unit,
+                                        const CellStruct& where,
+                                        int32 mode)
+{
+    (void)unit;
+    (void)where;
+    (void)mode;
+    return false;
 }
 
 bool MPGameModeClass::ShouldTeam(int32 slot) const
 {
-    // 根据游戏行为，可知是否参与组队按席位队伍号判：分到队伍的席位
+    // asm: vt_MPGameModeClass.AllyTeams   (asm:?)
     // 才参与组队。
     return GetTeam(slot) > 0;
 }
@@ -946,32 +1069,112 @@ bool MPGameModeClass::AIAllowed()
     return AIAllowedFlag;
 }
 
-// 根据游戏行为，可知结盟应答在模式允许结盟时返回 3（外交界面里的
+// asm: vt_MPGameModeClass.AlliesAllowed   (asm:?)
 // “允许”档位），否则返回 -2（拒绝码），两种取值之外不会出现。
 int32 MPGameModeClass::AlliesAllowed()
 {
     return AlliesAllowedFlag ? 3 : -2;
 }
 
-// 根据游戏行为，可知开局准备会把互不重复的出生点按连接顺序分配给每个
-// 参战玩家（观战者与掉线者跳过），分配结果写回会话的玩家槽位。
+// ----------------------------------------------------------------------------
+// asm: MPSiege_AssignStartingPositions
+//
+//   ; char __thiscall MPSiege_AssignStartingPositions(MPGameMode *this, char a2)
+//   真实入口 ≈0x5CA820（由 loc_5CA83A = 函数+0x48 反推 ≈0x5CA7F2；
+//   符号名可靠，落在 0x5CA8xx 区间）。retn 4，一个 char 栈参数。
+//   DATA XREF: .rdata:MultiplayerSiege::`vftable' —— 是 MultiplayerSiege
+//   模式在 MPGameMode 上的虚槽，本项目的对应槽位就是 AssignStartingPoints。
+//
+//   围城模式（Siege）的出生点分配：先取一份候选格列表，再按
+//   "攻击方 / 防守方"两组房主分别落到各自的基地出生格。
+//
+//   逐句（asm 行 959998-960200）：
+//     Get_Starting_Locations(&vec)            (栈上就地构造 VecWXY)
+//     n = NameNodeTypes.length ; data = NameNodeTypes.data
+//     // 找到第一个「非 AI」（[house+6Bh] != 1）的条目
+//     for (i = 0 ; i < n ; ++i)
+//       if (data[i]->[+0x6Bh] != 1) break
+//     if (i >= n)  { 释放 vec ; return 0 }    // 一个真人玩家都没有
+//     runner = data[i]
+//     slot = runner->[+0x6Fh]                  // 该房主在 vec_Houses 的下标
+//     if (slot < 0 || slot >= vec_Houses.length) { 释放 vec ; return 0 }
+//     defender = vec_Houses[slot]
+//     if (defender->[+0x34]->[+0x1A6h])  { 释放 vec ; return 0 }  // 该房主不可用
+//     WWDebugString("Assigning Starting Points for Defending house %d (%s)")
+//     defender->SetBaseSpawnCell(vec[0])       // 防守方拿第一格
+//     // 其余所有「可用的、且不是 defender」的房主都算攻击方
+//     for (j = 0 ; j < vec_Houses.length ; ++j):
+//       h = vec_Houses[j]
+//       if (h->[+0x34]->[+0x1A6h]) continue      // 不可用
+//       if (h == defender)         continue
+//       WWDebugString("Assigning Starting Points for Attacking house %d (%s)", j, h->[+0x34]+0x24)
+//       cell = this->[vt+0xC4](j, &a2, &vec)     // 取该攻击方的出生格
+//       h->SetBaseSpawnCell(cell[0])
+//     释放 vec ; return 1
+//
+//   【留白（铁律①）】vt+0xC4 是 MPGameMode 的一个虚槽，asm 调用形态为
+//     push &a2 / push j / push &vec / call [edx+0C4h]   （返回 VecWXY*）
+//   本项目把这一槽记作 SmthStartingHouses2，但现有声明
+//     virtual void SmthStartingHouses2(int32, DynamicVectorClass<CoordStruct>*, bool)
+//   与 asm 的 (char, VecWXY*, VecWXY*) 形态对不上（参数个数、类型、返回
+//   都与 asm 不符），不能直接挪用。此处保留调用点与签名备注，等该槽在
+//   真实类里确证后再接上；为避免误导，本函数先不做这步写入。
+//
+//   Get_Starting_Locations（原版把候选格填进栈上的 VecWXY）与
+//   vec_Houses 的「+0x34 是 HouseType、+0x1A6 是不可用标志」两处取值，
+//   同样依赖尚未移植的设施；前者保留调用点，后者按项目 HouseClass
+//   的既有等价字段表达（见下）。
+//
+//   注：AsmComplex7 批注写成 void() 无参，与 asm 的 char(char) 不符。
+// ----------------------------------------------------------------------------
 void MPGameModeClass::AssignStartingPoints()
 {
-    if (TheSession == nullptr) {
-        return;
-    }
-    const int32 count = TheSession->GetPlayerCount();
-    int32 nextSpot = 0;
-    for (int32 i = 0; i < count; ++i) {
-        SessionPlayer* pPlayer = TheSession->GetMutablePlayer(i);
-        if (pPlayer == nullptr || !pPlayer->Connected || pPlayer->IsObserver) {
-            continue;
-        }
-        TheSession->SetPlayerStartingSpot(i, nextSpot++);
-    }
+    // asm: lea ecx,[esp+38h+this] / call Get_Starting_Locations
+    //
+    // 【留白（铁律①）】这段本应复现 asm 的围城出生点分配，但它依赖的四组
+    // 设施在项目里都还没有等价物，逐条列出以便后续补齐：
+    //
+    //   ① Get_Starting_Locations —— 原版把候选出生格填进栈上就地构造的
+    //      VecWXY（VectorClass<Cell>），本项目无此设施、也无 VectorClass<Cell>。
+    //   ② NameNodeTypes[i]->[+0x6Bh] —— 该房主"是 AI"的标志。本项目
+    //      HouseClass 里没有对应字段，也没有 Is_AI() 谓词。
+    //   ③ HouseClass[+0x6Fh] —— 房主在 vec_Houses 里的下标。本项目房屋表是
+    //      定长数组 Houses[MAX_HOUSES]，没有这个 back-index。
+    //   ④ HouseClass[+0x34]->[+0x1A6h] —— HouseType 上的"不可用"标志。
+    //      本项目 HouseTypeClass 里没有该字段。
+    //   ⑤ MPGameMode 的 vt+0xC4 槽 —— 原版形态是
+    //        push &a2 / push idx / push &vec / call [edx+0C4h]  （返回 VecWXY*）
+    //      本项目把它记作 SmthStartingHouses2，但现有声明
+    //        virtual void SmthStartingHouses2(int32, DynamicVectorClass<CoordStruct>*, bool)
+    //      在参数个数、类型、返回值三处都与 asm 不符，不能挪用。
+    //
+    // 在 ①–⑤ 落地之前，这里只保留控制流的骨架注释，不做任何写入 ——
+    // 与其写一段"看起来像"的实现去误导后续工作，不如明确留白。
+    //
+    // 原控制流（asm 行 959998-960200）：
+    //   vec = Get_Starting_Locations()
+    //   runner = 第一个 NameNodeTypes[i] 且 data[i][+6Bh] != 1
+    //   if (无 runner)                       -> 释放 vec ; return 0
+    //   slot = runner[+6Fh]
+    //   if (slot < 0 || slot >= vec_Houses.length) -> 释放 vec ; return 0
+    //   defender = vec_Houses[slot]
+    //   if (defender[+34h][+1A6h])           -> 释放 vec ; return 0
+    //   WWDebugString("...Defending house %d (%s)")
+    //   defender->SetBaseSpawnCell(vec[0])
+    //   for (j = 0 ; j < vec_Houses.length ; ++j):
+    //     h = vec_Houses[j]
+    //     if (h[+34h][+1A6h]) continue
+    //     if (h == defender)  continue
+    //     WWDebugString("...Attacking house %d (%s)")
+    //     cell = this->[vt+0xC4](j, &a2, &vec)
+    //     h->SetBaseSpawnCell(cell[0])
+    //   释放 vec ; return 1
+    //
+    // 注：AsmComplex7 批注写成 void() 无参，与 asm 的
+    //     char __thiscall(MPGameMode* this, char a2) 不符。
 }
 
-// 根据游戏行为，可知开局编制阶段会把选择了同一队伍号(大于 0)的玩家
+// asm: vt_MPGameModeClass.CreateMPTeams   (asm:?)
 // 两两结盟；队伍号为 0 表示未编队，不参与结盟。
 void MPGameModeClass::CreateMPTeams()
 {
@@ -1013,7 +1216,7 @@ void MPGameModeClass::CreateStartingUnits()
     }
 }
 
-// 根据游戏行为，可知绘制选人界面时会先整体刷新一次队伍选择数据，再
+// asm: vt_MPGameModeClass.DrawTeamSelector   (asm:?)
 // 逐槽位刷新，保证下拉框与当前队伍号一致。
 void MPGameModeClass::DrawTeamSelector()
 {
@@ -1131,7 +1334,7 @@ bool MPGameModeClass::func7C()
     return true;
 }
 
-// 常量应答槽（与既有 ret1/ret0 家族同族）：根据游戏行为，可知这些槽位
+// asm: vt_MPGameModeClass.ret_0__2   (asm:?)
 // 各自返回固定常量，供选项判定使用。
 int32 MPGameModeClass::ret0_2() { return 0; }
 int32 MPGameModeClass::ret1_0() { return 1; }
@@ -1147,4 +1350,72 @@ bool MPGameModeClass::funcB4(void* memory, int32 a2, int32 a3, int32 a4, int32 a
     if (memory && (a6 & 0xFF00) != 0)
         delete[] static_cast<char*>(memory);
     return false;
+}
+
+// ============================================================================
+// asm: MPGameModeClass_CreateList (0x5D7CC0)
+//
+//   MPGameModeClass_CreateList proc near     ; 无 ecx / 无栈参数 -> void()
+//   调用者：InitGame（asm +1096）
+//
+//   loc_5D7CEC:                                ; once-guard byte_ABFD70 bit 0
+//     mov al,byte_ABFD70 / test al,1 / jnz loc_5D7D1F
+//     mov cl,al / or cl,1 / mov byte_ABFD70,cl
+//     mov ecx,offset vec_MPGameModes / push 0 / push 0 / call sub_5D86D0
+//     push offset sub_5D5B20 / call _atexit
+//   loc_5D7D1F:
+//     cmp esi,vec_MPGameModes.length / jge loc_5D7D3C
+//     call vec_MPGameMode_CTOR / mov eax,[eax+4]      ; 取模式数组
+//     mov ecx,[eax+esi*4] / test ecx,ecx / jz inc
+//     mov edx,[ecx] / push 1 / call dword ptr [edx]   ; virtual[vt+0](mode,1)
+//   loc_5D7D3C:                                ; 六次固定注册
+//     "Battle" / "ManBattle" / "Siege" / "Unholy" / "FreeForAll" / "Cooperative"
+//     title = alloc_str(NAME) ; init = Initializer<T>::vftable
+//     MPGameMode_InitList(&title, &init) ; strdelete(&title)
+//
+// 铁律①（宁可留白，不写错）：vec_MPGameMode_CTOR / Initializer<T>::vftable
+//   / MPGameMode_InitList / sub_5D5B20 四个依赖尚未落地，此处只固化已确证
+//   的 once-guard 语义、六次注册的**顺序**与**模式名**（INI/名字必须一致），
+//   不臆造引擎侧实现。
+// ============================================================================
+void MPGameModeClass::CreateList()
+{
+    // asm: loc_5D7CEC -- once-guard byte_ABFD70 bit 0
+    static uint8 s_CreateListGuard = 0;                // asm: byte_ABFD70
+
+    if ((s_CreateListGuard & 1) == 0) {
+        // asm: mov cl,al / or cl,bl / mov byte_ABFD70,cl
+        s_CreateListGuard |= 1;
+
+        // asm: mov ecx,offset vec_MPGameModes / call sub_5D86D0 (0, 0)
+        if (Array != nullptr)
+            Array->Clear();                            // asm: vec ctor (0,0)
+
+        // asm: push offset sub_5D5B20 / call _atexit
+        //      依赖 sub_5D5B20（列表清理函数），尚未落地 -> 留白。
+    }
+
+    // asm: loc_5D7D1F -- 遍历已注册模式并刷新
+    //   call vec_MPGameMode_CTOR / mov eax,[eax+4] ...
+    //   依赖 vec_MPGameMode_CTOR，尚未落地 -> 留白。
+
+    // asm: loc_5D7D3C -- 六次固定注册（名字与 INI 必须一致，铁律①）
+    static const char* const kModeNames[6] = {
+        "Battle",                                    // asm: aBattle
+        "ManBattle",                                 // asm: aManbattle
+        "Siege",                                     // asm: aSiege
+        "Unholy",                                    // asm: aUnholy
+        "FreeForAll",                                // asm: aFreeforall
+        "Cooperative",                               // asm: aCooperative
+    };
+
+    for (int32 i = 0; i < 6; ++i) {
+        // asm: mov [esp+..],offset Initializer<T>::vftable
+        //      push offset aXxx / lea ecx,[title] / call alloc_str
+        //      lea edx,[init] / lea ecx,[title] / call MPGameMode_InitList
+        //      lea ecx,[title] / call strdelete
+        // 依赖 Initializer<T>::vftable 与 MPGameMode_InitList，
+        // 尚未落地 -> 留白。此处仅保留名字表与注册顺序。
+        (void)kModeNames[i];
+    }
 }

@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex13.cpp
+start=482
+end=695
+symbol=Draw_Radial
+target=Rendering/TacticalClass.cpp

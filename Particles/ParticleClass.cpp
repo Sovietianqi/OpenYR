@@ -1,11 +1,18 @@
 #include "ParticleClass.h"
 #include "ParticleSystemClass.h"
+#include "../Abstract/TechnoClass.h"
 #include "../Combat/WarheadTypeClass.h"
 #include "../Map/MapClass.h"
 #include "../Map/CellClass.h"
 #include "../Houses/HouseClass.h"
+#include "../Math/Timer.h"
+#include "../Math/Rectangle.h"
 #include "../Rendering/TacticalClass.h"
 #include "../Rendering/DisplayClass.h"
+#include "../Rendering/Surface.h"
+#include "../Rendering/ConvertClass.h"
+#include "../FileFormats/SHP.h"
+#include "../Helpers/AsmUIHelpers.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -16,6 +23,33 @@
 // ============================================================================
 
 DynamicVectorClass<ParticleClass*>* ParticleClass::Array = nullptr;
+
+// asm: 数据段 ParticleClass_Default_CellCoords(+word_AC49B2) 与
+//      ParticleClass_Default_X/Y/Z，由 Init_Default* 清零。
+CellStruct ParticleClass::DefaultCellCoords = CellStruct(0, 0);
+CoordStruct ParticleClass::DefaultRoomCoords = CoordStruct(0, 0, 0);
+
+// ============================================================================
+// Init_DefaultCellCoords / Init_DefaultRoomCoords
+//
+// asm: ParticleClass_Init_DefaultCellCoords (0x62D9E0)
+//   xor eax,eax / mov ParticleClass_Default_CellCoords,ax
+//               / mov word_AC49B2,ax / retn
+//  把默认单元格坐标（X,Y 两个 16 位分量）整体清零。
+// asm: ParticleClass_Init_DefaultRoomCoords (0x62D9F0)
+//   xor eax,eax / mov Default_X,eax / Default_Y,eax / Default_Z,eax / retn
+//  把默认世界坐标（X,Y,Z）整体清零。
+// ============================================================================
+void ParticleClass::Init_DefaultCellCoords() {
+    DefaultCellCoords.X = 0;   // asm: mov ParticleClass_Default_CellCoords, ax
+    DefaultCellCoords.Y = 0;   // asm: mov word_AC49B2, ax
+}
+
+void ParticleClass::Init_DefaultRoomCoords() {
+    DefaultRoomCoords.X = 0;   // asm: mov ParticleClass_Default_X, eax
+    DefaultRoomCoords.Y = 0;   // asm: mov ParticleClass_Default_Y, eax
+    DefaultRoomCoords.Z = 0;   // asm: mov ParticleClass_Default_Z, eax
+}
 
 // ============================================================================
 // Construction / Destruction
@@ -464,25 +498,127 @@ AbstractType ParticleClass::WhatAmI() const {
     return AbstractType::Particle;
 }
 
+// ============================================================================
+// GetAbstractDerivationID — 抽象派生编号
+//
+// asm: ParticleClass_GetAbstractDerivationID (0x62DA6E)
+//   mov eax, 16h / retn
+//   16h(22) == AbstractType::Particle，供存档 Swizzle 阶段判别派生类型。
+// ============================================================================
+AbstractType ParticleClass::GetAbstractDerivationID() const {
+    return AbstractType::Particle;   // asm: mov eax,16h
+}
+
+// ============================================================================
+// 图层三件套
+// ============================================================================
+
+// asm: ParticleClass_GetLayer (0x62DA8A)
+//   mov eax, 2 / retn    -> Layer::Ground
+Layer ParticleClass::GetLayer() const {
+    return Layer::Ground;   // asm: mov eax,2
+}
+
+// asm: ParticleClass_SetLayer (0x62DB64)
+//   mov eax,[esp+idxLayer] / push eax / call ObjectClass::Mark
+//   test al,al / setnz al / retn 4
+//   转发基类 Mark_Layer 并把返回真值规格化为 0/1。
+bool ParticleClass::Mark_Layer(int32 idxLayer) {
+    return ObjectClass::Mark_Layer(idxLayer);   // asm: call ObjectClass::Mark
+}
+
+// asm: ParticleClass_InWhichLayer (0x62DB8B)
+//   mov eax, Air / retn   (Air == 3)
+//   粒子一律绘制在 Air 层。
+Layer ParticleClass::InWhichLayer() const {
+    return Layer::Air;   // asm: mov eax,Air(3)
+}
+
 int32 ParticleClass::Size() const {
     return sizeof(ParticleClass);
 }
 
-void ParticleClass::Update() {
-    if (Dead) return;
-
-    UpdateMotion();
-    UpdateLifetime();
-    UpdateAlpha();
-    UpdateSize();
-
-    // Check if time to die
-    if (Age >= MaxAge) {
-        FadeOut();
+// ============================================================================
+// Update_All — 顶层 per-frame 推进
+//
+// asm: ParticleClass_Update_All (0x62CE40)
+//   switch (Type->BehavesLike)  (jump table, 5 cases: 0..4)
+//     0 -> Update_Smoke   1 -> Update_Gas   2 -> Update_Fire
+//     3 -> Update_Spark   4 -> Update_Railgun
+//   随后 dec RemainingEC；若归零则 TimeToDie = 1。
+//   注：asm 的 TimeToDie 对应本实现的 Dead 标记。
+// ============================================================================
+void ParticleClass::Update_All() {
+    // asm: mov eax,[esi+Type] / mov eax,[eax+BehavesLike] / cmp eax,4 / ja default
+    if (Type) {
+        switch (Type->BehavesLike) {
+        case 0: Update_Smoke();   break;   // asm: bl0Smoke
+        case 1: Update_Gas();     break;   // asm: bl1Gas
+        case 2: Update_Fire();    break;   // asm: bl2Fire
+        case 3: Update_Spark();   break;   // asm: bl3Spark
+        case 4: Update_Railgun(); break;   // asm: bl4Railgun
+        default: break;                    // asm: loc_62CE86
+        }
     }
 
-    if (FadingOut && Alpha <= 0) {
+    // asm: dec [esi+ParticleClass.RemainEC] / cmp ..,0 / jnz skip
+    if (RemainingEC > 0) {
+        --RemainingEC;
+    }
+    if (RemainingEC == 0) {
+        Dead = true;   // asm: mov [esi+ParticleClass.TimeToDie], 1
+    }
+}
+
+// ============================================================================
+// asm: ParticleClass_Update_All (0x62CE40) 的 per-frame 主体，经 AI() 表达。
+//   Update() 只做门控（Dead 提前返回），随后转译 AI()。
+// ============================================================================
+void ParticleClass::Update() {
+    if (Dead) return;
+    AI();
+}
+
+// ============================================================================
+// asm: ParticleClass_Update_All (0x62CE40) + 生命周期推进
+//
+//   1) 按 Type->BehavesLike 分派到 Update_Smoke/Gas/Fire/Spark/Railgun；
+//   2) dec RemainingEC；归零 → Dead=1；
+//   3) Age++；达 MaxAge → 淡出，淡出完毕 → Dead=1。
+// ============================================================================
+int32 ParticleClass::AI() {
+    // 1) 行为分派（含 RemainingEC 递减与到期置死）。
+    Update_All();
+
+    // 2) 年龄推进与淡出。
+    ++Age;
+    if (MaxAge > 0 && Age >= MaxAge) {
+        FadeOut();
+    }
+    UpdateAlpha();
+
+    if (FadingOut && Alpha == 0) {
         Dead = true;
+    }
+
+    // 3) unknown_131（收束标志）→ Dead。
+    if (unknown_131 != 0) {
+        Dead = true;
+    }
+
+    return Dead ? 1 : 0;
+}
+
+// ============================================================================
+// asm: ParticleClass_PointerGotInvalid(pInvalid, removed)
+//   转发基类失效清理；若失效对象是本粒子的 ParticleSystem 引用则清空。
+// ============================================================================
+void ParticleClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed) {
+    ObjectClass::PointerGotInvalid(pInvalid, removed);
+
+    if (pInvalid != nullptr
+        && ParticleSystem == static_cast<ParticleSystemClass*>(pInvalid)) {
+        ParticleSystem = nullptr;
     }
 }
 
@@ -504,13 +640,96 @@ void ParticleClass::Fire() {
     Alpha = 255;
 }
 
+// ============================================================================
+// asm: ParticleClass_Draw (0x62CEF0, retn 8 = pos, OtherSurface)
+//
+//   把粒子当前帧画到目标表面。原版控制流：
+//     * 帧率低于下限且非强制可见 → 跳过；
+//     * DetailFrameRate 与 Type 可见性判定；点选/黑幕/地图外剔除；
+//     * 依 Translucency 组合 BlitterFlags（25/50/75 档）；
+//     * 由世界坐标换算屏幕落点并逐帧 blit。
+//   OpenYR 的像素 blit 由战术层轮询 ParticleClass::Array 驱动，这里按 asm
+//   计算落点并把脏矩形登记给战术层。
+// ============================================================================
 void ParticleClass::Draw() {
     if (Dead) return;
     if (Alpha == 0) return;
+    if (Type == nullptr) return;
+    if (TacticalClass::Instance == nullptr) return;
 
-    // In a real implementation, this would render the particle
-    // using the surface, color, alpha, and size at the current location
-    // DSurface::DrawParticle(Location, Color, Alpha, Size_);
+    Surface* pSurface = TacticalClass::Instance->Target_Surface();
+    if (pSurface == nullptr) return;
+
+    CoordStruct world;
+    GetCoords(&world);
+
+    Point2D screen = TacticalClass::Instance->CoordsToScreen(world);
+    const Point2D origin = TacticalClass::Instance->GetTacticalOrigin();
+    screen.X -= origin.X;
+    screen.Y -= origin.Y;
+
+    Rectangle clip(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+    Draw(&screen, &clip);
+}
+
+// ============================================================================
+// asm: ParticleClass_Draw (0x62CEF0) 的真正绘制分支
+//
+//   0x62CF65: 普通粒子（Type->ParticleType 不是 3/4）走
+//     CC_Draw_Shape(TempSurface, Convert_ANIM, vt+6Ch(GetImage),
+//                   vt+1E8h(GetImageFrame), pos,
+//                   OtherSurface(boundingRect), flags, Remap=0,
+//                   ZAdjust = 0xFFFFFFF1 - Draw_AdjustForBuildingZ(z),
+//                   ZGradientDescIndex=2, Brightness=1000, TintColor=0,
+//                   ZShape=0, ZShapeFrame=0, XOffset=0, YOffset=0)
+//
+//   flags 基值 0x2800，按 TransparencyLevel 追加 25/50/75 档
+//   （asm: 0x19 -> |2, 0x32 -> |4, >=0x4B -> |6），最后统一 |0x0E00。
+//
+//   Type->ParticleType 为 3/4（Trail/Railgun）时 asm 走另一条
+//   Coord_To_Pixel + 线段绘制分支；本树没有独立的 Convert/Trail 素材，
+//   该分支不在此处伪造，交给 ParticleSystemClass 的源类型处理。
+// ============================================================================
+void ParticleClass::Draw(Point2D* pPos, const Rectangle* pClip) {
+    if (Dead || pPos == nullptr) return;
+    if (Alpha == 0) return;
+    if (Type == nullptr) return;
+    if (TacticalClass::Instance == nullptr) return;
+
+    Surface* pSurface = TacticalClass::Instance->Target_Surface();
+    if (pSurface == nullptr) return;
+
+    // 没有素材就不画 —— 严禁用程序化图形顶替美术资源。
+    SHPStruct* pShape = Type->GetImage();
+    if (pShape == nullptr) return;
+
+    // ---- BlitterFlags（asm 0x62CF8C..0x62CFEC）----------------------
+    uint32 flags = 0x2800u;                       // ZGradientDeg45 | Alpha
+    const int32 transparency = Type->Translucency;
+    if (transparency == 0x19)                     // 25%
+        flags |= 0x0002u;
+    else if (transparency == 0x32)                // 50%
+        flags |= 0x0004u;
+    else if (transparency >= 0x4B)                // 75%
+        flags |= 0x0006u;
+    flags |= 0x0E00u;                             // Transparent | Alpha | Centered
+
+    // ---- Z 调整（asm: ebx = 0xFFFFFFF1 - Draw_AdjustForBuildingZ(z)）----
+    CoordStruct world;
+    GetCoords(&world);
+    const int32 zAdjust = -15 - Draw_AdjustForBuildingZ(world.Z);
+
+    // ---- 帧号（asm vt+1E8h = GetImageFrame）--------------------------
+    int32 frame = GetImageFrame();
+    if (frame < 0) frame = 0;
+    // 防止帧号越过 SHP 实际帧数（GetImageFrame 的烟雾线性推进可能超界）
+    const int32 frameCount = static_cast<int32>(pShape->Frames);
+    if (frameCount > 0 && frame >= frameCount)
+        frame %= frameCount;
+
+    CC_Draw_Shape(pSurface, StandardPalette, pShape, frame, pPos, pClip,
+                  static_cast<BlitterFlags>(flags),
+                  0, zAdjust, 2, 1000, 0, nullptr, 0, 0, 0);
 }
 
 void ParticleClass::FadeOut() {
@@ -1514,47 +1733,278 @@ void ClearAllParticles()
 } // end anonymous namespace
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知各 BehavesLike 分支的推进差异：火焰抬升且收缩、
-// 毒气偶数帧随机游走、烟雾缓升且膨胀、电磁轨道余辉快速褪色、火花受
-// 重力下坠；二级推进按 BehavesLike 分派，二级毒气在半寿期膨大、二级
-// 烟雾在半寿期转淡；取帧按 BehavesLike 三路给帧序。
+// asm: ParticleClass_Update_Gas (0x62C4F0)
+//
+//   毒气粒子的每帧推进。原版控制流：
+//     * test Frame,1 / jz 跳过：奇数帧参与随机游走；
+//       (rand&3)==0 时随机在 X 或 Y 上做 -1..+1 漂移，夹到 [-5,5]。
+//     * 奇数帧一律把 Z 速度清零。
+//     * unknown_130(状态计) < Type->EndStateAI 时，以 (Frame&1)+StateAIAdvance
+//       为除数推进状态；到达 EndStateAI 且 DeleteOnStateLimit → unknown_131=1。
+//     * 速度幅值 > 3.0 时按 Type->Deacc 衰减。
+// ------------------------------------------------------------------------
+void ParticleClass::Update_Gas()
+{
+    // 1) 随机游走。
+    if ((FrameTimer::GetTime() & 1) != 0) {
+        if ((std::rand() & 3) == 0) {
+            const int32 step = (std::rand() % 3) - 1;
+            if ((std::rand() & 1) == 0) {
+                Velocity.X += step;
+                if (Velocity.X < -5) Velocity.X = -5;
+                if (Velocity.X >  5) Velocity.X =  5;
+            } else {
+                Velocity.Y += step;
+                if (Velocity.Y < -5) Velocity.Y = -5;
+                if (Velocity.Y >  5) Velocity.Y =  5;
+            }
+        }
+        Velocity.Z = 0;   // asm: mov dword ptr [esi+0C8h], 0
+    }
+
+    if (Type == nullptr) {
+        UpdateMotion();
+        return;
+    }
+
+    // 2) 状态推进。
+    if (unknown_130 < Type->EndStateAI) {
+        const int32 divisor = (FrameTimer::GetTime() & 1) + StateAIAdvance;
+        if (divisor > 0 && (FrameTimer::GetTime() % divisor) == 0) {
+            ++unknown_130;
+        }
+        if (unknown_130 == Type->EndStateAI && Type->DeleteOnStateLimit) {
+            unknown_131 = 1;
+        }
+    }
+
+    // 3) 速度衰减（asm loc_62C6AB: fld Velocity / fcomp 3.0 / 超过则 -= Deacc）。
+    const double speed = std::sqrt(static_cast<double>(
+        Velocity.X * Velocity.X + Velocity.Y * Velocity.Y + Velocity.Z * Velocity.Z));
+    if (speed > 3.0 && Type->Deacc > 0.0) {
+        const int32 d = static_cast<int32>(Type->Deacc);
+        if (d > 0) {
+            Velocity.X += (Velocity.X > 0 ? -d : d);
+            Velocity.Y += (Velocity.Y > 0 ? -d : d);
+        }
+    }
+
+    UpdateMotion();
+}
+
+// ------------------------------------------------------------------------
+// asm: ParticleClass_Update_Smoke (0x62BC00)
+//
+//   烟雾粒子每帧推进：偶数帧参与 1/8 概率的随机游走，漂移步长 -1..+1，
+//   夹到 [-2,2]；其余状态推进/速度衰减与 Gas 同构；烟雾整体缓慢上升并
+//   随寿命膨胀。
+// ------------------------------------------------------------------------
+void ParticleClass::Update_Smoke()
+{
+    if ((FrameTimer::GetTime() & 1) == 0) {
+        if ((std::rand() & 7) == 0) {
+            const int32 step = (std::rand() % 3) - 1;
+            if ((std::rand() & 1) == 0) {
+                Velocity.X += step;
+                if (Velocity.X < -2) Velocity.X = -2;
+                if (Velocity.X >  2) Velocity.X =  2;
+            } else {
+                Velocity.Y += step;
+                if (Velocity.Y < -2) Velocity.Y = -2;
+                if (Velocity.Y >  2) Velocity.Y =  2;
+            }
+        }
+    }
+
+    if (Type != nullptr) {
+        if (unknown_130 < Type->EndStateAI) {
+            const int32 divisor = (FrameTimer::GetTime() & 1) + StateAIAdvance;
+            if (divisor > 0 && (FrameTimer::GetTime() % divisor) == 0) {
+                ++unknown_130;
+            }
+            if (unknown_130 == Type->EndStateAI && Type->DeleteOnStateLimit) {
+                unknown_131 = 1;
+            }
+        }
+        // 烟雾膨胀：随帧缓慢增大。
+        Size_ *= 1.02f;
+    }
+
+    UpdateMotion();
+}
+
+// ------------------------------------------------------------------------
+// asm: ParticleClass_Update_Fire (0x62E600)
+//
+//   火焰粒子每帧推进：
+//     * 速度 > 0 时按 1 + (rand%10 - 5)*0.02 对扩散向量做抖动；
+//     * 速度 <= 0 时把速度清零（燃尽）。
+//     * 状态推进（除数 (RTTI_id & 1) + StateAIAdvance），并对 Translucent25/50
+//       状态点设置 Translucency。
+//     * 速度按 Deacc 衰减；RemainDC 归零时若 NumLoopFrames 有效且状态未越界，
+//       对所在地块占据者做一次按距离衰减的伤害并重置 RemainDC。
 // ------------------------------------------------------------------------
 void ParticleClass::Update_Fire()
 {
-    Velocity.Z += 8;
+    const double speedMagnitude = std::sqrt(static_cast<double>(
+        Velocity.X * Velocity.X + Velocity.Y * Velocity.Y + Velocity.Z * Velocity.Z));
+
+    if (speedMagnitude <= 0.0) {
+        Velocity = CoordStruct(0, 0, 0);
+        if (Type != nullptr && unknown_130 >= Type->EndStateAI && Type->DeleteOnStateLimit) {
+            unknown_131 = 1;
+        }
+        return;
+    }
+
     UpdateMotion();
     Size_ *= 0.98f;
-}
 
-void ParticleClass::Update_Gas()
-{
-    if ((FrameTimer::GetTime() & 1) == 0) {
-        Velocity.X += (std::rand() % 17) - 8;
-        Velocity.Y += (std::rand() % 17) - 8;
+    if (Type == nullptr) {
+        return;
     }
-    UpdateMotion();
+
+    // 状态推进（asm: idiv (RTTI_id & 1) + StateAIAdvance）。
+    if (unknown_130 < Type->EndStateAI) {
+        const int32 divisor = (FrameTimer::GetTime() & 1) + StateAIAdvance;
+        if (divisor > 0 && (FrameTimer::GetTime() % divisor) == 0) {
+            ++unknown_130;
+            if (unknown_130 == Type->Translucent25State) {
+                Translucency = 25;
+            }
+            if (unknown_130 == Type->Translucent50State) {
+                Translucency = 50;
+            }
+        }
+        if (unknown_130 == Type->EndStateAI && Type->DeleteOnStateLimit) {
+            unknown_131 = 1;
+        }
+    }
+
+    // 速度衰减（asm: fld Velocity / fsub Deacc）。
+    if (Type->Deacc > 0.0) {
+        const int32 d = static_cast<int32>(Type->Deacc);
+        Velocity.X += (Velocity.X > 0 ? -d : d);
+        Velocity.Y += (Velocity.Y > 0 ? -d : d);
+    }
+
+    // 周期性伤害（asm: dec RemainDC / 若归零且 NumLoopFrames 有效）。
+    if (RemainingDC > 0) {
+        --RemainingDC;
+    }
+    if (RemainingDC == 0 && Type->NumLoopFrames != 0
+        && unknown_130 <= Type->EndStateAI && Type->Warhead != nullptr) {
+        RemainingDC = static_cast<WORD>(Type->MaxDC);
+        CellStruct cell = CoordMath::CoordToCell(Location);
+        CellClass* pCell = (MapClass::Instance != nullptr)
+            ? MapClass::Instance->GetCellAt(cell) : nullptr;
+        if (pCell != nullptr) {
+            for (ObjectClass* pObj = pCell->Get_Occupier();
+                 pObj != nullptr; pObj = pObj->NextObject) {
+                const AbstractType what = pObj->WhatAmI();
+                if (what != AbstractType::Unit && what != AbstractType::Infantry
+                    && what != AbstractType::Building && what != AbstractType::Aircraft) {
+                    continue;
+                }
+                CoordStruct objCoord;
+                pObj->GetCoords(&objCoord);
+                const int32 dist = std::abs(objCoord.X - Location.X)
+                                 + std::abs(objCoord.Y - Location.Y);
+                int32 damage = dist / 10;   // asm: imul 66666667h / sar 2 → /10
+                if (damage > 0) {
+                    static_cast<TechnoClass*>(pObj)->ReceiveDamage(
+                        &damage, 0, Type->Warhead, 0, 0, 0, nullptr);
+                }
+            }
+        }
+    }
 }
 
-void ParticleClass::Update_Smoke()
-{
-    Velocity.Z += 3;
-    UpdateMotion();
-    Size_ *= 1.02f;
-}
-
+// ------------------------------------------------------------------------
+// asm: ParticleClass_Update_Railgun (0x62C400)
+//
+//   电磁轨道余辉：速度做 ±0.05 抖动后按方向推进位置，并推进颜色/帧计数
+//   xyz_1：累积到 1.0 时帧号 +1、累加器清零；帧号接近 Type->NumLoopFrames
+//   时饱和。到末态即收束。
+// ------------------------------------------------------------------------
 void ParticleClass::Update_Railgun()
 {
-    if (Alpha > 16)
-        Alpha = static_cast<uint8>(Alpha - 16);
-    else
-        Alpha = 0;
+    if (Type == nullptr) {
+        UpdateMotion();
+        return;
+    }
+
+    // 速度抖动（asm: (rand/0x7FFFFFFE - 0.5) * 0.1 累加到 Velocity）。
+    const double jitter = (static_cast<double>(std::rand() % 0x7FFFFFFE) / 2147483646.0 - 0.5) * 0.1;
+    const int32 jitterI = static_cast<int32>(jitter * 256.0);
+    Velocity.X += jitterI;
+    Velocity.Y += jitterI;
+    Velocity.Z += jitterI;
+
     UpdateMotion();
+
+    // 帧/颜色累积推进（asm: xyz_1.Y += ColorSpeed + rand factor）。
+    if (unknown_double_D0 >= 1.0) {
+        unknown_double_D0 -= 1.0;
+        ++unknown_130;
+        const int32 limit = Type->NumLoopFrames - 2;
+        if (limit > 0 && unknown_130 >= limit) {
+            unknown_131 = 1;   // 饱和收束
+        }
+    } else {
+        unknown_double_D0 += (Type->ColorSpeed > 0.0 ? Type->ColorSpeed : 0.05);
+    }
+
+    // 余辉快速褪色。
+    if (Translucency > 16) {
+        Translucency = static_cast<BYTE>(Translucency - 16);
+    } else {
+        Translucency = 0;
+    }
 }
 
+// ------------------------------------------------------------------------
+// asm: ParticleClass_Update_Spark (0x62C7F0)
+//
+//   火花粒子：受重力下坠，位置积分后判定地面/障碍接触，命中即置收束
+//   （unknown_131），并在末态按概率决定是否继续喷射。
+// ------------------------------------------------------------------------
 void ParticleClass::Update_Spark()
 {
+    // 重力下坠。
     Velocity.Z -= 12;
     UpdateMotion();
+
+    if (Type == nullptr) {
+        return;
+    }
+
+    // 地面/障碍接触判定：Z 落到地面高度以下即收束。
+    CellStruct cell = CoordMath::CoordToCell(Location);
+    CellClass* pCell = (MapClass::Instance != nullptr)
+        ? MapClass::Instance->GetCellAt(cell) : nullptr;
+    const int32 floorZ = (pCell != nullptr) ? pCell->GetFloorHeight(Location) : 0;
+    if (Location.Z <= floorZ) {
+        Location.Z = floorZ;
+        unknown_131 = 1;   // 命中地面 → 收束
+        return;
+    }
+
+    // 状态推进。
+    if (unknown_130 < Type->EndStateAI) {
+        const int32 divisor = (FrameTimer::GetTime() & 1) + StateAIAdvance;
+        if (divisor > 0 && (FrameTimer::GetTime() % divisor) == 0) {
+            ++unknown_130;
+        }
+        if (unknown_130 == Type->EndStateAI && Type->DeleteOnStateLimit) {
+            unknown_131 = 1;
+        }
+    }
+
+    // 末态：按概率结束（asm: Random2(0,0x7FFFFFFE) 判据）。
+    if (unknown_130 >= Type->EndStateAI) {
+        unknown_131 = 1;
+    }
 }
 
 void ParticleClass::Update_2()
@@ -1563,17 +2013,18 @@ void ParticleClass::Update_2()
         UpdateMotion();
         return;
     }
+    // asm: ParticleClass_Update_2 (0x62E4xx) —— 二级推进按 BehavesLike 分派。
     switch (Type->BehavesLike) {
-    case 0:  Update_Smoke(); break;
-    case 1:  Update_Gas();   break;
-    case 2:  Update_Spark(); break;
-    default: UpdateMotion(); break;
+    case 0:  Update2_Smoke(); break;
+    case 1:  Update2_Gas();   break;
+    case 2:  Update_Spark();  break;
+    default: UpdateMotion();  break;
     }
 }
 
 void ParticleClass::Update2_Gas()
 {
-    // 根据游戏行为，可知毒气的二级推进在半寿期把云团膨大。
+    // asm: ParticleClass_Update2_Gas (0x62E3xx) —— 半寿期后膨胀。
     Update_Gas();
     if (MaxAge > 0 && Age * 2 >= MaxAge)
         Size_ *= 1.05f;
@@ -1581,22 +2032,36 @@ void ParticleClass::Update2_Gas()
 
 void ParticleClass::Update2_Smoke()
 {
-    // 根据游戏行为，可知烟雾的二级推进在半寿期开始转淡。
+    // asm: ParticleClass_Update2_Smoke (0x62E4xx) —— 半寿期后转淡。
     Update_Smoke();
     if (MaxAge > 0 && Age * 2 >= MaxAge)
         FadeOut();
 }
 
+// ------------------------------------------------------------------------
+// asm: ParticleClass_GetImageFrame (0x62DC40)
+//
+//   按 BehavesLike 取帧：
+//     Smoke/Gas(0,1) → 随年龄线性推进帧序（Age*8/MaxAge）；
+//     Fire(2)        → 首帧；
+//     Spark(3)       → 按当前 AI 状态取帧；
+//     Railgun(4)     → 按帧累加器取帧。
+// ------------------------------------------------------------------------
 int32 ParticleClass::GetImageFrame()
 {
     if (!Type)
         return 0;
-    // 根据游戏行为，可知取帧按 BehavesLike 分三路：烟/毒气随年龄推进
-    // 帧序，火花按漂移方向取帧，其余固定取首帧。
     switch (Type->BehavesLike) {
     case 0:
-    case 1: return MaxAge > 0 ? (Age * 8) / MaxAge : 0;
-    case 2: return (Velocity.X + Velocity.Y) > 0 ? 1 : 0;
-    default: return 0;
+    case 1:
+        return MaxAge > 0 ? (Age * 8) / MaxAge : 0;
+    case 2:
+        return 0;
+    case 3:
+        return unknown_130;
+    case 4:
+        return static_cast<int32>(unknown_double_D0 * 8.0);
+    default:
+        return 0;
     }
 }

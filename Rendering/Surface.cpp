@@ -4,8 +4,14 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <cmath>
 #include <algorithm>
+
+// asm: g_bDebugMode (Game/Globals.cpp, driven by OPENYR_DEBUG). Declared here
+// instead of pulling in Game/Externs.h, which would drag every game class into
+// this translation unit.
+extern bool g_bDebugMode;
 
 // ============================================================================
 // Font data helper
@@ -298,7 +304,99 @@ Point2D* Simple_Text_Print_Wide(
 }
 
 // ============================================================================
-// CC_Draw_Shape implementation
+// asm: Plain_Text_Print (0x4A6710)
+//
+//   if (schemeIdx == -1): 直接用调用者给的 rawColor
+//   else:                 取 ColorScheme.data[schemeIdx] 的 RGB，
+//                         按 5-6-5 打包成 16 位色
+//   然后调 DSurface_PrintText，把返回的两个 dword（绘制后的光标/包围盒）
+//   拷进 *pOut，返回 pOut。
+//
+//   降级点见头文件（font / a14 不参与；色阶表用 BaseColor 代替）。
+// ============================================================================
+Point2D* Plain_Text_Print(Point2D* pOut, Surface* pSurface, int32 x, int32 y,
+                          const char* pText, int32 rawColor, int32 font,
+                          int32 a14, int32 a1C, int32 schemeIdx)
+{
+    (void)font;
+    (void)a14;
+    (void)a1C;
+
+    if (pOut == nullptr)
+        return nullptr;
+
+    int32 color = rawColor;
+
+    if (schemeIdx != -1) {
+        // asm: mov ecx,ColorScheme.data / mov eax,[ecx+eax*4]
+        ColorScheme* pScheme = nullptr;
+        if (ColorScheme::Array != nullptr &&
+            schemeIdx >= 0 && schemeIdx < ColorScheme::Array->Count) {
+            pScheme = (*ColorScheme::Array)[schemeIdx];
+        }
+        if (pScheme != nullptr) {
+            // asm: lea ecx,[eax+308h] / call sub_517440 -> RGB 三字节
+            const uint8 r = pScheme->BaseColor.R;
+            const uint8 g = pScheme->BaseColor.G;
+            const uint8 b = pScheme->BaseColor.B;
+
+            // asm: 各通道先右移（col_*_SHR）再左移（col_*_SHL）打包
+            const int32 rr = (r >> 3) << 11;      // col_R_SHR_3 / col_R_SHL_11
+            const int32 gg = (g >> 2) << 5;       // col_G_SHR_2 / col_G_SHL_5
+            const int32 bb = (b >> 3) << 0;       // col_B_SHR_3 / col_B_SHL_0
+            color = (rr | gg | bb) & 0xFFFF;
+        }
+    }
+
+    if (pSurface == nullptr || pText == nullptr) {
+        pOut->X = x;
+        pOut->Y = y;
+        return pOut;
+    }
+
+    // 窄字符 -> 宽字符（DSurface_PrintText 收的是 char*，本项目文本层收 wchar_t）
+    wchar_t wide[512];
+    int32 n = 0;
+    for (; pText[n] != '\0' && n < 511; ++n)
+        wide[n] = static_cast<wchar_t>(static_cast<uint8>(pText[n]));
+    wide[n] = L'\0';
+
+    Rectangle bounds(0, 0, pSurface->Width, pSurface->Height);
+    Point2D location(x, y);
+    Fancy_Text_Print_Wide(*pOut, wide, pSurface, bounds, location,
+                          static_cast<DWORD>(color), 0, TextPrintType::Left);
+    return pOut;
+}
+
+// ============================================================================
+// CC_Draw_Shape  (asm 0x4AED80，retn 38h)
+//
+//   void __fastcall CC_Draw_Shape(
+//       BSurface *Surface, ConvertClass *Convert, SHPStruct *SHP, int frameIdx,
+//       dwXY *pos, dwLTRB *boundingRect, size_t flags,
+//       _DWORD a8, _DWORD a9, _DWORD a10, _DWORD a11, int TintColor,
+//       void *BUILDINGZ_SHA, _DWORD zFrame, int ZS_X, int ZS_Y)
+//
+//   逐段（asm 顺序）：
+//     ① SHP 是复合体（word[0] == 0xFFFF）→ 先求值，再取 [SHP+0Ch] 的真实体；
+//     ② 目标面 bounds ∩ boundingRect，空则退出；
+//     ③ Convert->field_17C = arg_14（z 梯度索引）；
+//     ④ 取帧头 (x,y,w,h) 与帧解码尺寸；
+//     ⑤ 建临时面（尺寸 = SHP 画布的 Width/Height）——本实现直接解码到缓存，
+//        语义相同；
+//     ⑥ flags & 0x200（Centered）→ pos -= (画布宽/2, 画布高/2)；
+//     ⑦ 有 ZShape 时再按 zShape 帧原点二次对齐；
+//     ⑧ pos += 帧原点 (x,y)；
+//     ⑨ 有 ZShape 时用 z 帧包围盒再做一次裁剪；
+//     ⑩ ValidFrameIndex 决定 RLE / 普通 blitter；
+//     ⑪ 逐行把 8bit 索引交给 blitter 合成到目标面。
+//
+//   与旧实现的差别：
+//     * 旧版自己写逐像素循环、选了 blitter 却 `(void)blitter` 丢掉，
+//       于是 Remap / 半透明 / Alpha / Darken / Z 全都不生效；
+//     * 旧版把“居中”用的画布宽高与帧宽高混在一起，且 flags 位值是猜的
+//       （Centered=1），实际会把每个精灵往左上挪半帧；
+//     * 旧版忽略复合 SHP（建筑/动画常用），遇到 0xFFFF 头直接当普通 SHP。
 // ============================================================================
 void CC_Draw_Shape(
     Surface* pSurface, ConvertClass* Palette, SHPStruct* SHP, int32 FrameIndex,
@@ -307,179 +405,350 @@ void CC_Draw_Shape(
     int32 Brightness, int32 TintColor,
     SHPStruct* ZShape, int32 ZShapeFrame, int32 XOffset, int32 YOffset)
 {
-    if (!pSurface || !SHP || !Position) return;
-
-    // Get frame data from SHP
-    BYTE* frameData = SHP->GetPixels(FrameIndex);
-    if (!frameData) return;
-
-    Rectangle frameBounds;
-    SHP->GetFrameBounds(frameBounds, FrameIndex);
-
-    int32 dstX = Position->X + XOffset;
-    int32 dstY = Position->Y + YOffset;
-
-    // Apply centering if needed
-    if ((static_cast<uint32>(Flags) & static_cast<uint32>(BlitterFlags::Centered)) != 0)
+    (void)Remap;
+    (void)Brightness;
+    if (pSurface == nullptr || SHP == nullptr || Position == nullptr)
+        return;
+    if (pSurface->Buffer == nullptr)
+        return;
+    // ---- ① 复合 SHP：头 word 为 0xFFFF 时取引用体 -------------------------
+    SHPStruct* shp = SHP;
+    if (shp->Type == 0xFFFF)
     {
-        dstX -= frameBounds.Width / 2;
-        dstY -= frameBounds.Height / 2;
-    }
-
-    Rectangle srcRect(0, 0, frameBounds.Width, frameBounds.Height);
-    Rectangle dstRect(dstX, dstY, frameBounds.Width, frameBounds.Height);
-
-    // Clip to bounds
-    Rectangle clipRect = dstRect;
-    if (Bounds)
-    {
-        clipRect = dstRect.Intersection(*Bounds);
-        if (clipRect.IsEmpty()) return;
-    }
-
-    // Clip to surface bounds
-    Rectangle surfRect(0, 0, pSurface->Width, pSurface->Height);
-    clipRect = clipRect.Intersection(surfRect);
-    if (clipRect.IsEmpty()) return;
-
-    int32 srcOffX = clipRect.X - dstRect.X;
-    int32 srcOffY = clipRect.Y - dstRect.Y;
-    int32 copyW = clipRect.Width;
-    int32 copyH = clipRect.Height;
-
-    int32 bytesPerPix = pSurface->GetBytesPerPixel();
-    int32 srcPitch = frameBounds.Width;
-    int32 dstPitch = pSurface->GetPitch();
-
-    BYTE* dstBuffer = static_cast<BYTE*>(pSurface->Buffer);
-
-    // Select appropriate blitter if Palette is available
-    Blitter* blitter = nullptr;
-    if (Palette)
-    {
-        blitter = Palette->SelectPlainBlitter(Flags);
-    }
-
-    bool isDarken = (static_cast<uint32>(Flags) & static_cast<uint32>(BlitterFlags::Darken)) != 0;
-    bool isTranslucent = (static_cast<uint32>(Flags) & static_cast<uint32>(BlitterFlags::Translucent)) != 0;
-
-    uint16* palette16 = nullptr;
-    if (Palette && Palette->PaletteData)
-    {
-        palette16 = reinterpret_cast<uint16*>(Palette->PaletteData);
-    }
-
-    for (int32 row = 0; row < copyH; ++row)
-    {
-        int32 srcY = srcOffY + row;
-        int32 dstY = clipRect.Y + row;
-        BYTE* srcLine = frameData + srcY * srcPitch + srcOffX;
-        BYTE* dstLine = dstBuffer + dstY * dstPitch + clipRect.X * bytesPerPix;
-
-        for (int32 col = 0; col < copyW; ++col)
+        SHPReference* pRef = shp->AsReference();
+        if (pRef != nullptr)
         {
-            BYTE srcIdx = srcLine[col];
-            if (srcIdx == 0) continue; // Color key 0 = transparent
+            if (!pRef->Loaded)
+                pRef->Load();
+            shp = pRef->Data;
+        }
+        if (shp == nullptr)
+            return;
+    }
 
-            if (bytesPerPix == 1)
-            {
-                // 8-bit surface: apply remap if available
-                if (Remap >= 0 && Remap < 256 && palette16)
-                {
-                    // Remap through palette lookup
-                    dstLine[col] = srcIdx;
-                }
-                else
-                {
-                    dstLine[col] = srcIdx;
-                }
-            }
-            else if (bytesPerPix == 2)
-            {
-                uint16* dst16 = reinterpret_cast<uint16*>(dstLine);
+    // ---- ② 目标面 ∩ 外部裁剪框 -------------------------------------------
+    Rectangle surfRect(0, 0, pSurface->Width, pSurface->Height);
+    Rectangle clipBounds = surfRect;
+    if (Bounds != nullptr)
+    {
+        clipBounds = clipBounds.Intersection(*Bounds);
+        if (clipBounds.IsEmpty())
+            return;
+    }
 
-                if (palette16)
-                {
-                    uint16 color = palette16[srcIdx];
+    // ---- ③ z 梯度索引写回转换器（原版 [Convert+17Ch]）---------------------
+    if (Palette != nullptr)
+        Palette->CurrentZRemap = static_cast<DWORD>(ZGradientDescIndex);
 
-                    // Apply brightness
-                    if (Brightness != 0 && Brightness != 1000)
-                    {
-                        int32 r = static_cast<int32>((color >> 11) & 0x1F) * Brightness / 1000;
-                        int32 g = static_cast<int32>((color >> 5) & 0x3F) * Brightness / 1000;
-                        int32 b = static_cast<int32>(color & 0x1F) * Brightness / 1000;
-                        if (r > 31) r = 31; if (r < 0) r = 0;
-                        if (g > 63) g = 63; if (g < 0) g = 0;
-                        if (b > 31) b = 31; if (b < 0) b = 0;
-                        color = static_cast<uint16>((r << 11) | (g << 5) | b);
-                    }
+    // ---- ④ 帧头 -----------------------------------------------------------
+    int32 frameW = 0;
+    int32 frameH = 0;
+    if (shp->GetFrameSize(FrameIndex, frameW, frameH) != 0)
+        return;
+    if (frameW <= 0 || frameH <= 0)
+        return;
 
-                    // Apply tint color
-                    if (TintColor != 0 && (static_cast<uint32>(Flags) & static_cast<uint32>(BlitterFlags::TintColor)))
-                    {
-                        uint16 tint = static_cast<uint16>(TintColor);
-                        int32 r = (((color >> 11) & 0x1F) + ((tint >> 11) & 0x1F)) / 2;
-                        int32 g = (((color >> 5) & 0x3F) + ((tint >> 5) & 0x3F)) / 2;
-                        int32 b = ((color & 0x1F) + (tint & 0x1F)) / 2;
-                        color = static_cast<uint16>((r << 11) | (g << 5) | b);
-                    }
+    const Rectangle frame = shp->GetFrameBounds(FrameIndex);
 
-                    // Apply translucency blending
-                    if (isTranslucent && palette16)
-                    {
-                        uint16 dest = dst16[col];
-                        uint16 mask = 0x7BEF; // RGB 565 mask
+    // ---- ⑤⑥ 锚点：Centered 用**画布**宽高，不是帧宽高 --------------------
+    int32 px = Position->X + XOffset;
+    int32 py = Position->Y + YOffset;
 
-                        uint32 transMask = static_cast<uint32>(Flags) & static_cast<uint32>(BlitterFlags::Translucent);
-                        if (transMask == static_cast<uint32>(BlitterFlags::Translucent25))
-                        {
-                            // 25% src + 75% dst
-                            dst16[col] = static_cast<uint16>((mask & (dest >> 2)) + 3 * (mask & (color >> 2)));
-                        }
-                        else if (transMask == static_cast<uint32>(BlitterFlags::Translucent50))
-                        {
-                            // 50% src + 50% dst
-                            dst16[col] = static_cast<uint16>((mask & (dest >> 1)) + (mask & (color >> 1)));
-                        }
-                        else if (transMask == static_cast<uint32>(BlitterFlags::Translucent75))
-                        {
-                            // 75% src + 25% dst
-                            dst16[col] = static_cast<uint16>(3 * (mask & (dest >> 2)) + (mask & (color >> 2)));
-                        }
-                    }
-                    else if (isDarken)
-                    {
-                        uint16 dest = dst16[col];
-                        uint16 mask = 0x7BEF;
-                        dst16[col] = static_cast<uint16>(((dest & mask) * (color & mask)) >> 8) & mask;
-                    }
-                    else
-                    {
-                        dst16[col] = color;
-                    }
-                }
-                else
-                {
-                    // No palette: use raw index as color
-                    dst16[col] = static_cast<uint16>(srcIdx);
-                }
-            }
-            else if (bytesPerPix == 4)
-            {
-                uint32* dst32 = reinterpret_cast<uint32*>(dstLine);
-                if (palette16)
-                {
-                    uint16 color16 = palette16[srcIdx];
-                    int32 r = ((color16 >> 11) & 0x1F) << 3;
-                    int32 g = ((color16 >> 5) & 0x3F) << 2;
-                    int32 b = (color16 & 0x1F) << 3;
-                    dst32[col] = static_cast<uint32>((r << 16) | (g << 8) | b);
-                }
-                else
-                {
-                    dst32[col] = static_cast<uint32>(srcIdx);
-                }
-            }
+    const int32 canvasW = (shp->Width  > 0) ? static_cast<int32>(shp->Width)  : frameW;
+    const int32 canvasH = (shp->Height > 0) ? static_cast<int32>(shp->Height) : frameH;
+
+    const uint32 f = static_cast<uint32>(Flags);
+    const bool centered = (f & static_cast<uint32>(BlitterFlags::Centered)) != 0;
+
+    if (centered)
+    {
+        px -= canvasW / 2;
+        py -= canvasH / 2;
+    }
+
+    // ---- ⑦ ZShape 二次对齐（建筑 Z 形状）---------------------------------
+    if (ZShape != nullptr)
+    {
+        const Rectangle zf = ZShape->GetFrameBounds(ZShapeFrame);
+        px -= canvasW / 2 - zf.X;
+        py -= canvasH / 2 - zf.Y;
+    }
+
+    // ---- ⑧ 加帧原点 -------------------------------------------------------
+    px += frame.X;
+    py += frame.Y;
+
+    Rectangle dstRect(px, py, frameW, frameH);
+    Rectangle drawRect = dstRect.Intersection(clipBounds);
+    if (drawRect.IsEmpty())
+        return;
+
+    // ---- ⑨ 有 ZShape 时再按 z 帧包围盒裁一次 ------------------------------
+    if (ZShape != nullptr)
+    {
+        Rectangle zRect(px, py, frameW, frameH);
+        drawRect = drawRect.Intersection(zRect);
+        if (drawRect.IsEmpty())
+            return;
+    }
+
+    // ---- ⑩ blitter --------------------------------------------------------
+    if (Palette == nullptr || Palette->PaletteData == nullptr)
+        return;
+
+    Blitter* pBlitter = Palette->SelectPlainBlitter(Flags);
+    if (pBlitter == nullptr)
+        return;
+
+    // ---- ⑪ 逐行合成 -------------------------------------------------------
+    uint8* pixels = shp->Get_Decoded_Pixels(FrameIndex);
+    if (pixels == nullptr)
+        return;
+
+    const int32 srcOffX = drawRect.X - dstRect.X;
+    const int32 srcOffY = drawRect.Y - dstRect.Y;
+    const int32 copyW   = drawRect.Width;
+
+    const int32 bytesPerPix = pSurface->GetBytesPerPixel();
+    if (bytesPerPix != 2)
+        return;                              // 本工程的战术面恒为 16bpp
+
+    const int32 dstPitch = pSurface->GetPitch();
+    BYTE* dstBase = static_cast<BYTE*>(pSurface->Buffer);
+
+    // 染色：原版把 TintColor 交给 blitter 的 Blit_Copy_Tinted。
+    //   Flags 没带 TintColor 时忽略（避免把 0x1000 这类标记当颜色用）。
+    const bool useTint = (TintColor != 0) &&
+                         ((f & static_cast<uint32>(BlitterFlags::TintColor)) != 0);
+
+    // ---- ⑫ z 值 / 逐行 zbuf ---------------------------------------------
+    //
+    // asm: BSurface_DrawSHPFrame 在进入逐行 blit 之前先算好 z（loc_437C39），
+    //   每行再把 zbuf 指针往后挪一行的宽度：
+    //     mov  ax, [zobj+24h] / add ax,[zobj+4]     ; 8000h + 视口top
+    //     sub  ax, rect.Y / sub ax,帧高 / sub ax,帧Y ; - 精灵底边屏幕 Y
+    //     inc  eax / and eax,0FFFFh / add eax,[a8]   ; +1 + ZAdjust
+    //   本树把这套换算收在 Surface::Compute_Z，这里只取"底边"和 ZAdjust。
+    //   z 值按目标面的 z 视图（ZLeft/ZTop/ZWidth/ZHeight）寻址，越界的行
+    //   传 nullptr —— 越界即"不做深度测试"，与 asm 里 zbuf 为空时的行为一致。
+    uint16 zValue = 0;
+    const bool hasZ = (pSurface->Get_Z_Buffer() != nullptr);
+    if (hasZ)
+        zValue = pSurface->Compute_Z(dstRect.Y + frameH, ZAdjust);
+
+    for (int32 row = 0; row < drawRect.Height; ++row)
+    {
+        const int32 srcY = srcOffY + row;
+        if (srcY < 0 || srcY >= frameH)
+            continue;
+
+        BYTE* srcLine = pixels + static_cast<size_t>(srcY) * static_cast<size_t>(frameW)
+                        + srcOffX;
+        BYTE* dstLine = dstBase + static_cast<size_t>(drawRect.Y + row) * static_cast<size_t>(dstPitch)
+                        + static_cast<size_t>(drawRect.X) * 2u;
+
+        uint16* zLine = hasZ ? pSurface->Get_Z_Line(drawRect.X, drawRect.Y + row) : nullptr;
+        // 行首越界（视口右/下边切掉一半）时该行整行不测，避免越界写。
+        if (zLine != nullptr && static_cast<int32>(drawRect.X - pSurface->ZLeft) + copyW > pSurface->Get_Z_Width())
+            zLine = nullptr;
+
+        if (useTint)
+        {
+            pBlitter->Blit_Copy_Tinted(dstLine, srcLine, copyW,
+                                       static_cast<int32>(zValue), zLine, nullptr, 0, 0,
+                                       static_cast<uint16>(TintColor));
+        }
+        else
+        {
+            pBlitter->Blit_Copy(dstLine, srcLine, copyW,
+                                static_cast<int32>(zValue), zLine, nullptr, 0, 0);
         }
     }
+
+    if (g_bDebugMode)
+    {
+        std::fprintf(stderr,
+                     "[SHP] frame=%d canvas=%dx%d frame=(%d,%d %dx%d) dst=(%d,%d) "
+                     "clip=(%d,%d %dx%d) flags=%08X\n",
+                     FrameIndex, canvasW, canvasH,
+                     frame.X, frame.Y, frameW, frameH,
+                     dstRect.X, dstRect.Y,
+                     drawRect.X, drawRect.Y, drawRect.Width, drawRect.Height,
+                     static_cast<unsigned>(f));
+    }
+}
+
+// ============================================================================
+// 全局离屏表面（asm .data: DSurface_Alternate / _Hidden / _Composite /
+// _Tile / _Sidebar）—— 初始为空，由 DisplayClass::RecreateSurfaces 在
+// SetVideoMode 尾部整批销毁重建。
+//
+// 原版在 .data 里只留五个 DSurfaceClass* 指针槽；Hidden 这张面在装载 /
+// 进度 / 记分画面上承担"先画再翻"的中转角色（取面者只用到 Surface 层接口，
+// 但槽本身的类型是 DSurface*，与建面时写入的一致）。
+// ============================================================================
+DSurface* DSurface_Alternate = nullptr;
+DSurface* DSurface_Hidden    = nullptr;
+DSurface* DSurface_Composite = nullptr;
+DSurface* DSurface_Tile      = nullptr;
+DSurface* DSurface_Sidebar   = nullptr;
+
+// asm: ChronoScreenEffectSurf —— 超时空特效的离屏面，读档时被清空。
+DSurface* ChronoScreenEffectSurf = nullptr;
+
+// asm: dword_887644 —— 战术视口的深度缓冲。由
+// TacticalClass::Set_View_Dimensions（对应原版 DisplayClass::Set_View_Dimensions）
+// 销毁重建；空指针 = 本树当前没有 z 缓冲，提笔器按"不做深度测试"处理。
+ZBufferClass* ZBuffer_Global = nullptr;
+
+// ============================================================================
+// ZBufferClass —— 见 Surface.h 顶部的反汇编对照
+//
+//   asm 里的构造（sub_7BC970）等效于：
+//     new BSurface(宽, 高, 2bpp)  -> 缓冲；
+//     末尾清零到 0xFFFF（push 0FFFFh / call [vt+14h] = FillRect）；
+//     +1Ch = 基址 + 宽*高*2；  +20h = 宽*高*2；  +24h = 0x8000。
+//   布局上 +28h/+2Ch 存的是宽/高（同一份数据在 +08h/+0Ch 也存了一份），
+//   这里用 Width/Height 一个字段表达 —— 语义不变，省掉二份冗余。
+// ============================================================================
+ZBufferClass::ZBufferClass(const Rectangle& view)
+    : Left(view.X)
+    , Top(view.Y)
+    , Width(view.Width)
+    , Height(view.Height)
+    , Offset(0)
+    , Buffer(nullptr)
+    , Base(nullptr)
+    , End(nullptr)
+    , Wrap(0)
+    , ZBase(0x8000)
+    , Target(nullptr)
+{
+    if (Width <= 0 || Height <= 0)
+        return;
+
+    // asm: push 20h / call new —— 一个 0x20 字节的 BSurface
+    Buffer = new BSurface();
+    if (Buffer == nullptr)
+        return;
+
+    // asm: AllocateMemory(0, 宽*高*2)，面宽 = 视口宽，2bpp => 行距 = 宽*2。
+    //   BSurface::Allocate 自己会先 memset 0，紧接着的 Clear() 再全部改成
+    //   0xFFFF，两步都与 asm 的 new + FillRect(0xFFFF) 一致。
+    Buffer->Allocate(Width, Height);
+    Base = reinterpret_cast<uint16*>(Buffer->Buffer);
+    if (Base == nullptr)
+        return;
+
+    Wrap = static_cast<uint32>(Width) * static_cast<uint32>(Height) * sizeof(uint16);
+    End  = reinterpret_cast<uint16*>(reinterpret_cast<BYTE*>(Base) + Wrap);
+
+    Clear();
+}
+
+ZBufferClass::~ZBufferClass()
+{
+    // 退挂：目标面还指着这块内存的话必须置空，否则下一帧会读到已释放的缓冲。
+    if (Target != nullptr && Target->Get_Z_Buffer() == Base)
+    {
+        Target->Set_Z_Buffer(nullptr);
+        Target->ZPitch  = 0;
+        Target->ZWidth  = 0;
+        Target->ZHeight = 0;
+    }
+    Target = nullptr;
+
+    // asm: sub_7BCAE0 -> 缓冲面的析构（vt[0](1)）再 delete；这里 new/delete 配对。
+    delete Buffer;
+    Buffer = nullptr;
+    Base   = nullptr;
+    End    = nullptr;
+    Wrap   = 0;
+
+    if (ZBuffer_Global == this)
+        ZBuffer_Global = nullptr;
+}
+
+void ZBufferClass::Clear()
+{
+    if (Base == nullptr || Width <= 0 || Height <= 0)
+        return;
+
+    // asm: sub_7BCFB0 用 `or eax, 0FFFFFFFFh / rep stosd` —— 一次写 4 字节，
+    //   行尾奇数字再补一个 word 0FFFFh；等价于整片填 0xFFFF。
+    memset(Base, 0xFF, static_cast<size_t>(Wrap));
+}
+
+void ZBufferClass::Clear_Rect(int32 x, int32 y, int32 w, int32 h)
+{
+    if (Base == nullptr || w <= 0 || h <= 0)
+        return;
+
+    int32 x0 = x;
+    int32 y0 = y;
+    int32 x1 = x + w;
+    int32 y1 = y + h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > Width)  x1 = Width;
+    if (y1 > Height) y1 = Height;
+    if (x0 >= x1 || y0 >= y1)
+        return;
+
+    const size_t rowWords = static_cast<size_t>(Width);
+    for (int32 row = y0; row < y1; ++row)
+    {
+        uint16* line = Base + static_cast<size_t>(row) * rowWords + x0;
+        const int32 count = x1 - x0;
+        // asm 同样是"整 dword 铺 0xFFFFFFFF，奇尾补 word"
+        int32 i = 0;
+        for (; i + 1 < count; i += 2)
+            *reinterpret_cast<uint32*>(line + i) = 0xFFFFFFFFu;
+        if (i < count)
+            line[i] = 0xFFFF;
+    }
+}
+
+uint16* ZBufferClass::Lock(int32 x, int32 y)
+{
+    // asm: sub_7BD130(this, x, y)：
+    //   p = Buffer->Lock(x, y) ; Buffer->Unlock() ;
+    //   eax = [this+10h] + p ; if (eax >= [this+1Ch]) eax -= [this+20h] ; return eax
+    if (Buffer == nullptr || Base == nullptr)
+        return nullptr;
+
+    uint16* p = reinterpret_cast<uint16*>(Buffer->Lock(x, y));
+    Buffer->Unlock();
+    if (p == nullptr)
+        return nullptr;
+
+    if (Offset != 0)
+        p = reinterpret_cast<uint16*>(reinterpret_cast<BYTE*>(p) + Offset);
+    if (p >= End)
+        p = reinterpret_cast<uint16*>(reinterpret_cast<BYTE*>(p) - Wrap);
+    return p;
+}
+
+void ZBufferClass::Unlock()
+{
+    if (Buffer != nullptr)
+        Buffer->Unlock();
+}
+
+void ZBufferClass::Bind(Surface* pTarget)
+{
+    if (pTarget == nullptr)
+        return;
+
+    // 没有缓冲时挂空 —— 提笔器按"不做深度测试"处理，与 asm 在
+    //   `test ecx, ecx / jz` 分支里跳过后端的行为一致。
+    pTarget->Set_Z_Buffer(Base);
+    pTarget->ZPitch  = (Base != nullptr) ? Width  : 0;
+    pTarget->ZWidth  = (Base != nullptr) ? Width  : 0;
+    pTarget->ZHeight = (Base != nullptr) ? Height : 0;
+    pTarget->ZLeft   = Left;
+    pTarget->ZTop    = Top;
+    pTarget->ZBase   = ZBase;
+
+    Target = pTarget;
 }

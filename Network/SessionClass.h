@@ -130,6 +130,15 @@ public:
     void ResetSession();
     void SetupFromLobby();
 
+    // ------------------------------------------------------------------------
+    // asm: SessionClass_Progess_5EF930 (0x5EF930, thiscall, retn 4)
+    //   多人载入进度泵。随机地图先把目标位置折半，推进进度条，然后按会话
+    //   类型分派：类型 3/4 走 IPX 广播"保证进度"包，类型 1/2 走连接对话框；
+    //   每次循环睡 20ms，直到 0xF0 的预算耗尽或服务计数降到 5 以下。
+    //   进来的闸门：Debug_Map 置位直接返回；[this+284Ch]==1 也直接返回。
+    // ------------------------------------------------------------------------
+    void Progress(int32 pos);
+
     // ── Preferences (RA2MD.INI) ─────────────────────────────────────────
     //
     //  SessionClass::Read_MultiPlayer_Settings (asm 0x698074) restores the
@@ -164,6 +173,11 @@ public:
     void SetPlayerLatency(int32 playerID, int32 latency);
 
     int32 SessionID;
+    // asm +0x0000 —— 会话类型（1..4）：Progress 的 4 分支 switch 就开着它，
+    //   (类型-1) 为 2/3 走 IPX 广播，0/1 走连接对话框。
+    int32 SessionType;
+    // asm +0x284C —— 等于 1 时 Progress 直接返回（会话正忙，不推进进度）
+    int32 Field_284C;
     GameSessionState GameState;
     int32 PlayerCount;
     int32 MaxPlayerCount;
@@ -180,6 +194,12 @@ public:
     bool Crates;
     bool BridgesDestroyable;
     bool FogOfWar;
+    // asm: gBases —— "允许建造基地"复选框（ModemHost_ReadDialog 0x66Ah 写入）
+    bool Bases = false;
+    // asm: gHarvesterTruce —— "采矿车停战"复选框（0x596h 写入）
+    bool HarvesterTruce = false;
+    // asm: gMultiEngineer —— "多个工程师"复选框（0x551h 写入）
+    bool MultiEngineer = false;
     int32 CountdownTimer;
     bool CountdownStarted;
     int32 LobbyReadyCount;
@@ -189,6 +209,8 @@ public:
     int32 ReconnectTimeout;
     int32 GameDuration;
     int32 AIPlayers;
+    // asm: gAIDifficulty —— AI 难度（ModemHost_ReadDialog 0x553h 写入）
+    int32 AIDifficulty = 0;
     int32 ScenarioIndex;
     bool TournamentMode;
     bool BattleMode;

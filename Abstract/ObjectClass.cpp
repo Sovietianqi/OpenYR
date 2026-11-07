@@ -12,6 +12,8 @@
 #include <Rendering/TacticalClass.h>
 #include <Math/CoordStruct.h>
 #include <Map/CellClass.h>
+#include <Audio/VocClass.h>
+#include <Rules/RulesClass.h>
 
 #include <cmath>
 
@@ -53,6 +55,159 @@ namespace
 // Static member definitions
 // ============================================================================
 DynamicVectorClass<ObjectClass*>* ObjectClass::Array = nullptr;
+DynamicVectorClass<ObjectClass*>* ObjectClass::VisibleObjects = nullptr;
+
+// ============================================================================
+// VisibleObjects_DeleteDead (0x725C50)
+//
+//   Sweeps the global vec_VisibleObjects and retires every entry that reports
+//   itself dead.  The original body reads:
+//
+//     push ecx / push esi / xor esi,esi / test len,len / jle done
+//   loc:                                       ; loc_725C81
+//     mov eax,[vec_VisibleObjects.data]
+//     mov ecx,[eax+esi*4]                      ; ecx = pObj
+//     mov [esp+8+var_4], ecx                   ; stash pObj
+//     mov edx,[ecx]
+//     call [edx+44h]                           ; vt+0x44 == IsDead()
+//     test al,al / jz loc_725D7F               ; alive -> ++esi
+//   FindIndex loop:                            ; loc_725C9A
+//     mov edx,[vec_VisibleObjects.vt]
+//     lea eax,[esp+8+var_4]                    ; &pObj
+//     push eax / mov ecx,offset vec / call [edx+10h]   ; vt+0x10 == FindIndex
+//     cmp eax,-1 / jz loc_725CE1
+//     cmp eax,len / jge loc_725CE1
+//     dec len / store len / jge loc_725C9A     ; loop while idx < new len
+//     ; tail shift                                    loc_725CC7
+//     mov ecx,[vec.data] / inc eax
+//     mov edx,[ecx+eax*4] / mov [ecx+eax*4-4],edx
+//     mov ecx,len / cmp eax,ecx / jl loc_725CC7
+//     jmp loc_725C9A
+//   Survivor cleanup:                          ; loc_725CE1
+//     mov eax,[esp+0Ch+var_8] / push eax
+//     mov ecx,[eax] / call [ecx+8]             ; vt+0x08 == Release()
+//     test eax,eax / jz loc_725D80             ; refcount 0 -> skip cleanup
+//     4x (push / ___RTtypeid / type_info::operator==)
+//       vs BuildingClass / UnitClass / InfantryClass / AircraftClass
+//     loc_725D63: mov byte [eax+90h],1         ; InLimbo = true
+//     loc_725D6E: mov ecx,pObj / test ecx,ecx / jz loc_725D80
+//                 mov edx,[ecx] / push 1 / call [edx+20h]   ; vt+0x20 == Mark_Layer(1)
+//   loc_725D80: cmp esi,len / jl loc_725C81
+//
+//   Two details worth spelling out, because getting either wrong changes the
+//   control flow:
+//
+//   * IDA emits three separate stack locals (var_C / var_8 / var_4) but they
+//     are one and the same dword: the prologue pushes ecx and esi, and the
+//     mid-function ___RTtypeid calls re-adjust esp, so every `[esp+N+var_X]`
+//     resolves to the single saved `&pObj` slot.  There is exactly one local.
+//
+//   * vt+0x08 is Release(), not a boolean gate.  `mov ecx,[eax]` loads the
+//     vtable (eax still holds pObj, which was pushed as the this-pointer), and
+//     the branch tests the refcount Release() returns.  A dead object that is
+//     still referenced is left untouched beyond dropping it from the list.
+//
+//   The outer index is deliberately NOT advanced after a purge: the tail
+//   shift leaves the next element at the same slot, which is exactly why the
+//   asm falls straight back into the loc_725D80 length comparison.
+// ============================================================================
+void ObjectClass::DeleteDead()
+{
+    if (VisibleObjects == nullptr)
+        return;
+
+    int32 i = 0;
+    while (i < VisibleObjects->Count) {                 // asm: loc_725D80 cond
+        ObjectClass* pObj = VisibleObjects->Items[i];   // asm: mov ecx,[eax+esi*4]
+
+        // asm: mov edx,[ecx] / call [edx+44h] / test al,al / jz loc_725D7F
+        if (pObj == nullptr || !pObj->IsDead()) {
+            ++i;                                        // asm: loc_725D7F inc esi
+            continue;
+        }
+
+        // asm: loc_725C9A -- FindIndex/Remove until the pointer is gone.
+        // The original re-runs FindIndex after every shift so duplicated
+        // pointers are all dropped; Remove() shifts the tail up one, which is
+        // what loc_725CC7 hand-rolls.
+        for (;;) {
+            int32 idx = -1;
+            for (int32 k = 0; k < VisibleObjects->Count; ++k) {
+                if (VisibleObjects->Items[k] == pObj) { idx = k; break; }
+            }
+            if (idx == -1 || idx >= VisibleObjects->Count)  // asm: cmp/jz/jge
+                break;
+            VisibleObjects->Remove(idx);                    // asm: dec length + shift
+        }
+
+        // asm: loc_725CE1 -- vt+0x08 == Release().  The branch is on the new
+        // refcount, so an object that is still referenced skips the cleanup.
+        if (pObj->Release() == 0) {
+            // asm: 4x ___RTtypeid + type_info::operator== against
+            //      BuildingClass / UnitClass / InfantryClass / AircraftClass.
+            // The project identifies the concrete classes through WhatAmI().
+            const AbstractType what = pObj->WhatAmI();
+            if (what == AbstractType::Building || what == AbstractType::Unit ||
+                what == AbstractType::Infantry || what == AbstractType::Aircraft) {
+                // asm: loc_725D63 -- mov byte [eax+90h],1  (InLimbo)
+                pObj->IsInLimbo = true;
+            }
+            // asm: loc_725D6E -- push 1 / call [edx+20h] (vt+0x20 == Mark_Layer)
+            pObj->Mark_Layer(1);
+        }
+
+        // index deliberately not advanced (see header note)
+    }
+}
+
+// ============================================================================
+// VisibleObjects_DeleteDead (proc@1644735)
+//
+//  Main_Loop@756905 每帧调用的原名入口。asm 里它和
+//  ObjectClass::DeleteDead 是同一段代码的两个符号（IDA 按调用点命名），
+//  这里保留原名以对齐调用链，实现完全共用。
+// ============================================================================
+void ObjectClass::VisibleObjects_DeleteDead()
+{
+    DeleteDead();
+}
+
+// ============================================================================
+// vec_Logics 登记 / 注销
+//
+//  asm: ObjectClass::Unlimbo L1049805-1049806
+//         push 0 / push esi / mov ecx,offset vec_Logics / call sub_55BAA0
+//       ObjectClass_DTOR  L1047348 `mov ecx,offset vec_Logics; call sub_55BAE0`
+//       ObjectClass_Remove0 L1049520 同上
+//
+//  表只存裸指针、不增删引用计数，与原版一致。
+// ============================================================================
+void ObjectClass::Register_Logic()
+{
+    LogicClass_Register(this);
+}
+
+void ObjectClass::Unregister_Logic()
+{
+    LogicClass_Unregister(this);
+}
+
+bool ObjectClass::Is_Logic_Registered() const
+{
+    return LogicClass_IsRegistered(this);
+}
+
+// ============================================================================
+// ~ObjectClass
+//
+//  asm: ObjectClass_DTOR (proc@1047138)，L1047348 从 vec_Logics 摘除。
+//  原版以 `[esi+98h]`（Alive）为门；这里按指针无条件查找摘除——表里没有
+//  该指针时循环自然不动作，既不会误删也不会留下悬空项。
+// ============================================================================
+ObjectClass::~ObjectClass()
+{
+    Unregister_Logic();
+}
 
 // ============================================================================
 // Init_Array / Delete_Array
@@ -64,26 +219,49 @@ DynamicVectorClass<ObjectClass*>* ObjectClass::Array = nullptr;
 // ============================================================================
 void ObjectClass::Init_Array()
 {
-    if (Array != nullptr)
-        return;
-
-    Array = static_cast<DynamicVectorClass<ObjectClass*>*>(
-        YRMemory::Allocate(sizeof(DynamicVectorClass<ObjectClass*>)));
-
-    if (Array != nullptr)
+    if (Array == nullptr)
     {
-        new (Array) DynamicVectorClass<ObjectClass*>();
+        Array = static_cast<DynamicVectorClass<ObjectClass*>*>(
+            YRMemory::Allocate(sizeof(DynamicVectorClass<ObjectClass*>)));
+
+        if (Array != nullptr)
+        {
+            new (Array) DynamicVectorClass<ObjectClass*>();
+        }
+    }
+
+    // asm: vec_VisibleObjects —— VisibleObjects_DeleteDead 每帧清扫的对象表。
+    //   原版在全局表初始化块（L69914-69920 一帶）与 vec_Logics 一同建立。
+    if (VisibleObjects == nullptr)
+    {
+        VisibleObjects = static_cast<DynamicVectorClass<ObjectClass*>*>(
+            YRMemory::Allocate(sizeof(DynamicVectorClass<ObjectClass*>)));
+
+        if (VisibleObjects != nullptr)
+        {
+            new (VisibleObjects) DynamicVectorClass<ObjectClass*>();
+        }
     }
 }
 
 void ObjectClass::Delete_Array()
 {
-    if (Array == nullptr)
+    if (Array == nullptr && VisibleObjects == nullptr)
         return;
 
-    Array->~DynamicVectorClass<ObjectClass*>();
-    YRMemory::Deallocate(Array);
-    Array = nullptr;
+    if (Array != nullptr)
+    {
+        Array->~DynamicVectorClass<ObjectClass*>();
+        YRMemory::Deallocate(Array);
+        Array = nullptr;
+    }
+
+    if (VisibleObjects != nullptr)
+    {
+        VisibleObjects->~DynamicVectorClass<ObjectClass*>();
+        YRMemory::Deallocate(VisibleObjects);
+        VisibleObjects = nullptr;
+    }
 }
 
 // ============================================================================
@@ -159,17 +337,39 @@ int32 ObjectClass::Find_Index(ObjectClass* pInstance)
 // ============================================================================
 bool ObjectClass::Limbo()
 {
+    // asm: 0x5F4D50 ObjectClass::Limbo (inlined at the Unlimbo/Remove0 sites)
+    //   Guard: an object that is already off the map cannot be limboed again.
     if (IsInLimbo)
         return false;
 
-    // Detach from the map.  In the full game this would call into
-    // MapClass to clear the cell-occupation bits and remove the object
-    // from the per-layer render lists.  The standalone build only needs
-    // to flip the flag and clear the selection state.
+    // asm: 被摘下前先取消选中——被摘出地图的对象不应继续留在选择圈里。
     if (IsSelected)
         Deselect();
 
+    // asm: 同时清掉战术层注册标记，layer 里不再为它保留槽位。
+    Marked = false;
+
+    // asm: 从可见对象表里移除（vec_VisibleObjects）。战术绘制每帧遍历该表，
+    //   留下一个已离场的指针会让遍历读到悬空状态。
+    if (VisibleObjects != nullptr)
+    {
+        for (int32 i = 0; i < VisibleObjects->Count; ++i)
+        {
+            if (VisibleObjects->Items[i] == this)
+            {
+                VisibleObjects->Remove(i);
+                break;
+            }
+        }
+    }
+
+    // asm: 置"已离场"标记（[esi+81h]=1）。
     IsInLimbo = true;
+
+    // asm: ObjectClass::Limbo 在摘下对象时同步从 vec_Logics 摘除——这与
+    //   Unlimbo 末尾无条件 Add 互为逆操作（否则反复 limbo/unlimbo 会让同一
+    //   对象在表里堆积多份，每帧被驱动多次）。
+    Unregister_Logic();
     return true;
 }
 
@@ -180,14 +380,108 @@ bool ObjectClass::Limbo()
 // ============================================================================
 bool ObjectClass::Unlimbo()
 {
+    // asm: 0x5F4EF0 ObjectClass::Unlimbo(this, xyz, a3)   retn 8
+    //   1. 目标坐标是"默认哨兵"（Default_X/Y/Z）-> 返回假；
+    //   2. 战场未开打（GameActive == 0）-> 返回假；
+    //   3. 对象当前并不在 limbo（[esi+81h] == 0）-> 返回假；
+    //   4. 已经带战术层注册标记（[esi+74h] != 0）-> 返回假。
+    //   全部通过后才清 limbo 位、经虚拟 SetPosition 落位，最后 Mark(1) 放回
+    //   地面层；Mark 失败则把 limbo 位重新置回并返回假。
     if (!IsInLimbo)
         return false;
 
-    IsInLimbo = false;
+    if (Marked)
+        return false;
 
-    // Re-attach to the map at the current Location.  The full engine would
-    // re-mark cell occupation bits and re-add to the render lists here.
+    // asm: 先清"已离场"与"敞篷搭载"两位，再落位。
+    IsInLimbo = false;
+    InOpenTopped = false;
+
+    // asm: call [edx+1B4h] -> SetPosition(coord)；本项目以 Set_Coord 承载。
+    Set_Coord(Location);
+
+    // asm: call [edx+124h](1) -> Mark(1)，把对象放回地面层。失败时复原。
+    if (!Mark_Layer(1))
+    {
+        IsInLimbo = true;
+        return false;
+    }
+
+    // asm: 尾部还会据类型上的 UseLineTrail 建一条 LineTrailClass 尾迹并挂到
+    //   +0xA8。本项目 TechnoType 未登记该字段，尾迹由渲染层负责，故略。
+
+    // asm: L1049805-1049806 —— 落位成功后把 this 登记进 vec_Logics。
+    //   原版在 Session 为 0/5 时直接 Add，其余会话下先做一次 FindIndex
+    //   （== 0xFFFFFFFE 即“已在表内”）再决定是否 Add；本项目由
+    //   LogicClass_Register 的查重承担同一语义。
+    Register_Logic();
+
+    // asm: the tail of Unlimbo submits the object to the tactical display
+    //   layer (DisplayClass::Submit).  Without it the object exists in the
+    //   world and in vec_Logics but never enters the draw list, so the
+    //   renderer reports visible=0 for a fully populated map.
+    if (DisplayClass::Instance != nullptr)
+        DisplayClass::Instance->Submit(this);
+
     return true;
+}
+
+// ============================================================================
+// Put
+//
+//  asm: ObjectClass 的 Put 虚槽（vt_TechnoClass.r.m.o.Put 的基实现）。
+//  语义：把对象落到给定的 lepton 坐标，再回到地图上。原版子类（单位 /
+//  步兵 / 飞行器）各自覆写，基类这里给出通用落位：先写坐标并置于 limbo，
+//  再走虚 Unlimbo 完成战术层注册。
+// ============================================================================
+bool ObjectClass::Put(const CoordStruct& coords, int32 a2)
+{
+    (void)a2;
+    Set_Coord(coords);
+    IsInLimbo = true;
+    return Unlimbo();
+}
+
+// ============================================================================
+// asm: ObjectClass_Update   (gamemd:1047494 .. 1047799)
+//
+//   对象层逐帧主体。逐段：
+//
+//     段 1（1047494）：已 limbo（[esi+81h]）→ 跳到收尾；
+//     段 2（1047500）：取类型（vt+0x88 GetType），若类型上登记了
+//                      AmbientSound（!= -1）→ 在对象坐标处循环播放环境音；
+//     段 3（1047530）：对象自带的"名字音"槽（+0x60）非 -1 → 一并播放；
+//     段 4（1047553）：Falling 标志为真时做高度收尾——据 GetZ（vt+0x1D0）
+//                      与对象 Z 重算绘制 YSort，刷新层，落地点清状态、
+//                      附着的动画槽清零、把对象重新 Submit 回显示层；
+//     段 5（1047594）：仍 limbo → DisplayClass::Remove(this) 从显示层摘除。
+//
+//   本项目把"高度/伞降/名字音"这几个 asm 直读的私有槽收敛为与
+//   现有字段等价的表达：环境音按 ObjectTypeClass::AmbientSound 播放；
+//   离场走 DisplayClass::Remove。其余依赖 TechnoClass 侧虚拟槽
+//   （GetHeight/SetHeight/GetZ/UpdatePosition）的分支，由 TechnoClass
+//   覆写本槽时承担（TechnoClass::Update 已链上各自实现）。
+// ============================================================================
+void ObjectClass::Update()
+{
+    // 段 1 + 段 2：非 limbo 对象按类型登记的环境音在自身坐标处循环。
+    if (!IsInLimbo)
+    {
+        const ObjectTypeClass* pType = GetType();
+        if (pType != nullptr && pType->AmbientSound != -1)
+        {
+            // Audio/VocClass 的 Sound_Effect 第三参已改为 VocSoundAnchor*；
+            //  ObjectClass 未实现该接口，故传 nullptr（与原版“无跟随声源”分支等价）。
+            VocClass::Sound_Effect(pType->AmbientSound, nullptr, nullptr);
+        }
+    }
+
+    // 段 5（loc_5F4146）：已离场的对象从显示层摘除，避免战术绘制继续引用。
+    if (IsInLimbo)
+    {
+        if (DisplayClass::Instance != nullptr)
+            DisplayClass::Instance->Remove(this);
+    }
 }
 
 // ============================================================================
@@ -236,29 +530,100 @@ bool ObjectClass::Is_Valid() const
 // ============================================================================
 // Select / Deselect
 //
-//  Toggle the IsSelected flag and notify the owning house so its
-//  "current selection" list stays in sync.  In the full binary this
-//  dispatches through HouseClass::Select / Deselect; here we just flip
-//  the local flag and update the global selection count.
+//  asm: ObjectClass::Select     (0x5F4530, export 2144)
+//       ObjectClass_Deselect    (0x5F44B0, export 2107)
+//
+//  Select: the original refuses a selection that is already in limbo, is
+//  already selected, or fails the CanBeSelectedNow slot (vt+0x138, base =
+//  ObjectClass_CanBeSelectedNow -> CanBeSelected -> the type's Selectable
+//  bit).  Past those guards it consults Debug_Map / the techno-armed test /
+//  ptr_BuildingTypeClass_ToPlace and inserts the object into the global
+//  v_CurrentObjects selection list (front insert for armed technos, back
+//  insert otherwise), then sets the selected byte and returns true.  The
+//  list bookkeeping belongs to v_CurrentObjects, which this reconstruction
+//  does not model yet; the observable per-object state is the selected flag.
+//
+//  Deselect: clears the selected byte, drops the object from that same list,
+//  and clears the map's follow-camera target when it pointed here.
 // ============================================================================
 bool ObjectClass::Select()
 {
-    if (IsSelected)
-        return true;
-    if (!Is_Selectable())
-        return false;
+    // asm: 0x5F4530 ObjectClass::Select
+    //   前置三道门：不在 limbo、尚未被选中、且通过 vt+0x138 的
+    //   "CanBeSelectedNow"。任一不过即拒绝。
     if (IsInLimbo)
-        return false;
+        return false;                                   // asm: [esi+81h] -> false
+    if (IsSelected)
+        return false;                                   // asm: [esi+83h] -> false
+    if (!Is_Selectable())
+        return false;                                   // asm: call [edx+138h]
 
-    IsSelected = true;
+    // asm: call Is_Techno -> edi。非 techno（地形/覆盖物/动画）跳过后续两道
+    //   techno 专属判定，直接进入列表插入。
+    const AbstractType kind = WhatAmI();
+    const bool isTechno = (kind == AbstractType::Building
+                        || kind == AbstractType::Unit
+                        || kind == AbstractType::Infantry
+                        || kind == AbstractType::Aircraft);
+
+    TechnoClass* pTechno = isTechno ? static_cast<TechnoClass*>(this) : nullptr;
+
+    if (pTechno != nullptr)
+    {
+        // asm: [edi+3D4h] 非零（"当前不可被玩家选中"）-> 拒绝；这是搬运/被
+        //   控制的临时态。
+        if (!pTechno->CanBeSelected())
+            return false;                               // asm: call [eax+1D4h]
+    }
+
+    // asm: v_CurrentObjects 里已有被选中对象、且表首对象的所属玩家与本对象
+    //   不同时，先 Unselect_All 清空上一批（选择往往在切换阵营时整体重来）。
+    if (TacticalClass::SelectedObjects.Count > 0)
+    {
+        ObjectClass* pFirst = TacticalClass::SelectedObjects.Items[0];
+        if (pFirst != nullptr && pFirst->Get_Owner() != Owner)
+        {
+            for (int32 i = 0; i < TacticalClass::SelectedObjects.Count; ++i)
+            {
+                ObjectClass* p = TacticalClass::SelectedObjects.Items[i];
+                if (p != nullptr && p->IsSelected)
+                    p->Deselect();
+            }
+            TacticalClass::SelectedObjects.Clear();
+        }
+    }
+
+    // asm: 武装的 techno 走"前插"分支把新单位插到选择集表头（memmove 后写
+    //   [0]），其余走"追加"分支写到表尾。本项目 SelectedObjects 只提供追加，
+    //   两类统一追加——选择集本身无序，语义等价。
+    TacticalClass::SelectedObjects.Add(this);
+
+    IsSelected = true;                                  // asm: mov byte [esi+83h],1
     return true;
 }
 
 void ObjectClass::Deselect()
 {
+    // asm: 0x5F44B0 ObjectClass_Deselect
     if (!IsSelected)
-        return;
-    IsSelected = false;
+        return;                                         // asm: test [esi+83h]
+
+    // asm: call [v_CurrentObjects.vt+10h](&this) -> FindIndex；命中则从表里
+    //   删除（尾部元素前移补位）。
+    for (int32 i = 0; i < TacticalClass::SelectedObjects.Count; ++i)
+    {
+        if (TacticalClass::SelectedObjects.Items[i] == this)
+        {
+            TacticalClass::SelectedObjects.Remove(i);
+            break;
+        }
+    }
+
+    IsSelected = false;                                 // asm: mov byte [esi+83h],0
+
+    // asm: MapClass_FollowingWhat() == this ? MapClass_FollowThis(nullptr)
+    if (TheMap != nullptr && TheMap->FollowingWhat() == this)
+        TheMap->FollowThis(nullptr);
 }
 
 // ============================================================================
@@ -270,18 +635,17 @@ bool ObjectClass::Is_Selected() const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Selectable 负责下面这段逻辑。
+// asm: ObjectClass_IsSelectable   (asm export 253, 0x5F0... retn)
 //
-//  Default implementation.  Buildings / infantry / units override this with
-//  type-specific rules (e.g. "is this building powered on?").
+//  The base slot is a hard `xor al, al / retn` - the neutral ObjectClass
+//  never reports itself selectable.  Buildings / infantry / units override
+//  this slot with their own eligibility rules (powered on, not in limbo, the
+//  type's Selectable flag, ...); the type-level `Selectable` bit is consulted
+//  by ObjectClass_CanBeSelected, a *different* slot.
 // ============================================================================
 bool ObjectClass::Is_Selectable() const
 {
-    if (IsInLimbo)
-        return false;
-    if (IsDead())
-        return false;
-    return true;
+    return false;                                       // asm: xor al,al / retn
 }
 
 // ============================================================================
@@ -449,8 +813,12 @@ int32 ObjectClass::DistanceFrom(ObjectClass* pTarget) const
         BuildingClass* pBld = static_cast<BuildingClass*>(pTarget);
         if (pBld->Type != nullptr)
         {
+            // asm (ObjectClass_DistanceFrom, 0x5F6460): the foundation span is
+            //   Y_Foundation_Value(0) + X_Foundation_Value(), negated, shifted
+            //   left by 6 (one cell == 0x40 leptons) and *added* to the floored
+            //   distance, then clamped at zero.
             const int32 span =
-                pBld->Type->Y_Foundation_Value(true) + pBld->Type->X_Foundation_Value();
+                pBld->Type->Y_Foundation_Value(false) + pBld->Type->X_Foundation_Value();
             dist -= span * 0x40;
             if (dist < 0)
                 dist = 0;
@@ -463,11 +831,15 @@ int32 ObjectClass::DistanceFrom(ObjectClass* pTarget) const
 // ============================================================================
 // DistanceFrom2
 //
- //
+//  asm: ObjectClass_DistanceFrom2 (0x5F6340 / export 4920).
 //
-//  Same as DistanceFrom but includes the Z component, giving a true 3D range.
-//  The extra two arguments are the value and unit that the original's callers
-//  pass through (height thresholds); they do not affect the arithmetic.
+//  Same shape as DistanceFrom but measures the true 3D span: the original
+//  forms dx/dy/dz from the two GetCoords results, sums their squares,
+//  floors the square root, and then applies the *identical* building
+//  foundation correction DistanceFrom uses - so a building target is
+//  measured from its nearest footprint edge, not its origin.  The trailing
+//  two arguments of this transcription are not read by the routine (the
+//  binary's `retn 4` pops only the target pointer).
 // ============================================================================
 int32 ObjectClass::DistanceFrom2(ObjectClass* pTarget, int32 a3, int32 a4) const
 {
@@ -475,30 +847,47 @@ int32 ObjectClass::DistanceFrom2(ObjectClass* pTarget, int32 a3, int32 a4) const
     (void)a4;
 
     if (pTarget == nullptr)
-        return 0;
+        return 0;                                       // asm: test edi,edi / jz
 
-    const CoordStruct mine = GetCoords();
-    const CoordStruct theirs = pTarget->GetCoords();
+    const CoordStruct mine = GetCoords();               // asm: call [edx+48h] (this)
+    const CoordStruct theirs = pTarget->GetCoords();    // asm: call [eax+48h] (target)
 
-    const int32 dx = mine.X - theirs.X;
-    const int32 dy = mine.Y - theirs.Y;
-    const int32 dz = mine.Z - theirs.Z;
+    const int32 dx = mine.X - theirs.X;                 // asm: var_24
+    const int32 dy = mine.Y - theirs.Y;                 // asm: var_20
+    const int32 dz = mine.Z - theirs.Z;                 // asm: var_1C
 
-    return FloorSqrt(dx * dx + dy * dy + dz * dz);
+    int32 dist = FloorSqrt(dx * dx + dy * dy + dz * dz);
+
+    // asm (0x5F63E0): identical foundation correction to DistanceFrom --
+    //   Y_Foundation_Value(0) + X_Foundation_Value(), negated, << 6, added.
+    if (pTarget->WhatAmI() == AbstractType::Building)
+    {
+        BuildingClass* pBld = static_cast<BuildingClass*>(pTarget);
+        if (pBld->Type != nullptr)
+        {
+            const int32 span =
+                pBld->Type->Y_Foundation_Value(false) + pBld->Type->X_Foundation_Value();
+            dist -= span * 0x40;
+            if (dist < 0)
+                dist = 0;
+        }
+    }
+
+    return dist;
 }
 
 // ============================================================================
 // GetCoords1
 //
- //
-//
-//  Out-of-line mirror of the virtual coordinate copy so that derived types
-//  which do not want the inlined form still get the vtable dispatch.
+//  asm: ObjectClass_GetCoords_1 (0x5F6C90, export 5534).  The routine does not
+//  read Location directly: it marshals a 12-byte temporary, invokes the
+//  object's *virtual* GetCoords slot (vt+0x48) and copies the result into the
+//  caller's buffer.  Kept out-of-line so types that would otherwise call the
+//  inlined virtual still get the dispatch.
 // ============================================================================
 CoordStruct* ObjectClass::GetCoords1(CoordStruct* pCrd) const
 {
-    *pCrd = Location;
-    return pCrd;
+    return GetCoords(pCrd);                             // asm: call [eax+48h]
 }
 
 // ============================================================================
@@ -1029,7 +1418,7 @@ void ObjectClass::AssignPlanningPath(int32 a2, int32 a3) const
 // ObjectClass - object-level probes and handlers
 // ============================================================================
 
- // 根据游戏行为，可知 AnimPointerGotInvalid 负责下面这段逻辑。
+ // asm: void __thiscall ObjectClass_AnimPointerGotInvalid(_ObjectClass *this, AnimClass *anim)   (asm:1053804)
 //
 //  When an attached animation is destroyed the engine walks every object and
 //  invalidates the slot that pointed at it.  Only the matching slot is cleared.
@@ -1069,7 +1458,7 @@ int32 ObjectClass::GetCurrentMission() const
     return -1;
 }
 
- // 根据游戏行为，可知 Special_Draw_It 负责下面这段逻辑。
+ // asm: ObjectClass_Special_Draw_It
 //
 //  A tail-call into the object's Draw vtable slot (+0x114) with the two
 //  arguments in reverse push order, so derived classes may override the
@@ -1079,7 +1468,7 @@ void ObjectClass::Special_Draw_It(int32 a2, int32 a3)
     Draw(a2, a3, 0);
 }
 
- // 根据游戏行为，可知 CompareYSortValues 负责下面这段逻辑。
+ // asm: char __thiscall ObjectClass_CompareYSortValues(_ObjectClass *this, _ObjectClass *a2)   (asm:1052135)
 //
 //  Reached from MapClass_AddObjectToALayer as its insertion-sort predicate.
 //  Both sort keys are taken through the virtual RealYSort slot (vtable
@@ -1092,7 +1481,7 @@ bool ObjectClass::CompareYSortValues(ObjectClass* pOther) const
     return RealYSort() > otherKey;
 }
 
- // 根据游戏行为，可知 LoadTables 负责下面这段逻辑。
+ // asm: ObjectClass_LoadTables
 //
 //  AbstractClass_LoadTables restores only the abstract interface vtables; the
 //  object layer has to re-stamp the concrete ObjectClass identity on top of
@@ -1117,19 +1506,23 @@ void ObjectClass::StopAmbientSound(int32 flag) { (void)flag; }
 //  byte had actually been set.
 bool ObjectClass::Mark_Layer(int32 idxLayer)
 {
-    // Already highlighted: nothing to change.
-    if (InOpenTopped)
+    // asm: 0x5F5880 ObjectClass::Mark
+    //   Guard 1：已离场（[esi+81h] 非零）的对象不属于任何战术层。
+    if (IsInLimbo)
         return false;
 
+    // idxLayer == 2：选中层。要求对象没有处于"敞篷搭载"（[+0x80]）且已经
+    //   注册过（[+0x74] 已置）。
     if (idxLayer == 2)
     {
-        if (Marked)
-            return false;
-
-        Marked = true;
+        if (InOpenTopped)
+            return false;                               // asm: [esi+80h] != 0 -> false
+        if (!Marked)
+            return false;                               // asm: [esi+74h] == 0 -> false
         return true;
     }
 
+    // idxLayer == 1 / 3：高亮层。已在层内则无需重复，否则置标记。
     if (idxLayer == 1 || idxLayer == 3)
     {
         if (Marked)
@@ -1139,6 +1532,7 @@ bool ObjectClass::Mark_Layer(int32 idxLayer)
         return true;
     }
 
+    // idxLayer == 0：撤下高亮，仅在原来确实置过时报告成功。
     if (idxLayer == 0)
     {
         if (!Marked)
@@ -1155,7 +1549,7 @@ bool ObjectClass::Mark_Layer(int32 idxLayer)
 // ObjectClass coordinate-forwarding getters
 // ============================================================================
 
- // 根据游戏行为，可知 GetPos 负责下面这段逻辑。
+ // asm: void __thiscall ObjectClass_GetPos(_ObjectClass *this, dwXYZ *pos)   (asm:102230)
 CoordStruct* ObjectClass::GetPos(CoordStruct* pPos) const
 {
     CoordStruct tmp;
@@ -1164,7 +1558,7 @@ CoordStruct* ObjectClass::GetPos(CoordStruct* pPos) const
     return pPos;
 }
 
- // 根据游戏行为，可知 GetCoords_2 负责下面这段逻辑。
+ // asm: ObjectClass_GetCoords_2
 CoordStruct* ObjectClass::GetCoords2(CoordStruct* pPos) const
 {
     CoordStruct tmp;
@@ -1173,7 +1567,7 @@ CoordStruct* ObjectClass::GetCoords2(CoordStruct* pPos) const
     return pPos;
 }
 
- // 根据游戏行为，可知 GetExitCoords 负责下面这段逻辑。
+ // asm: vt_ObjectClass.GetExitCoords   (asm:?)
 //
 //  The second argument is a direction code that the base implementation
 //  discards; only a derived class with an exit layout (refineries, repair
@@ -1188,61 +1582,77 @@ CoordStruct* ObjectClass::GetExitCoords(CoordStruct* pPos, int32 a3) const
     return pPos;
 }
 
- // 根据游戏行为，可知 ReturnRealYSort 负责下面这段逻辑。
+ // asm: ObjectClass_ReturnRealYSort   (asm export 5402, 0x5F6B... )
 //
-//  The binary invokes the object's GetCoords virtual twice, discards the
-//  return of the second call, and returns the sum of the two Y components.
-//  In this project the two calls collapse to the same accessor, so the sum
-//  is twice the object's own Y - which is exactly what the original computes
-//  for any object whose animation shares its position.
+//  The binary invokes the object's virtual GetCoords slot twice - the first
+//  result is kept in a local, the second is discarded after its X is read -
+//  and returns `first.Y + second.X`.  For any object whose two GetCoords
+//  results coincide (Location) this is Location.Y + Location.X:
+//
+//      lea ecx,[esp+ptr]  / call [eax+GetCoords]   ; edi = first
+//      lea eax,[esp+var_C]/ call [edx+GetCoords]   ; eax = second
+//      mov ecx,[edi+4]    ; first.Y
+//      mov edx,[eax]      ; second.X
+//      add ecx,edx
 int32 ObjectClass::ReturnRealYSort() const
 {
     CoordStruct a;
     CoordStruct b;
-    GetCoords(&a);
-    GetCoords(&b);
-    return a.Y + b.Y;
+    GetCoords(&a);                                      // asm: first GetCoords
+    GetCoords(&b);                                      // asm: second GetCoords
+    return a.Y + b.X;                                   // asm: [edi+4] + [eax]
 }
 
 // ============================================================================
- // 根据游戏行为，可知 ReceivedRadioCommand 负责下面这段逻辑。
+ // asm: signed int __thiscall ObjectClass_ReceivedRadioCommand(_TechnoClass *this, _TechnoClass *arg0, eRadioCommands cmd, int a4)   (asm:1050175)
 // ============================================================================
 int32 ObjectClass::ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4)
 {
     (void)arg0;
     (void)a4;
 
+    // asm: 1050183 jumptable —— 仅 0x0D / 0x22 两个命令在本层有处理，
+    //   其余一律返回 0（未处理，交上层）。
     if (cmd == 0x0D)
     {
-        // MarkGround: drop the object onto the ground layer.  The binary
-        // pushes the Ground layer constant into the Mark slot.
+        // asm: loc_5F5370 —— push Ground / call [vt+Mark] 把对象放回地面层，
+        //   然后返回 1 表示已处理。
         Mark_Layer(static_cast<int32>(Layer::Ground));
         return 1;
     }
 
     if (cmd == 0x22)
     {
-        // Confirm: refuse while the object is badly damaged.  Only technos
-        // carry a health pool (ObjectClass sits above them in the hierarchy),
-        // so the fraction test is applied after confirming the runtime kind
-        // through WhatAmI - the project builds without RTTI.  The binary
-        // compares the fraction against a rules-level threshold that the
-        // project does not yet store, so any shortfall from full health is
-        // treated as a refusal.
-        const AbstractType what = WhatAmI();
-        const bool isTechno = (what == AbstractType::Unit
-                            || what == AbstractType::Infantry
-                            || what == AbstractType::Building
-                            || what == AbstractType::Aircraft);
-
+        // asm: loc_5F5339 —— 取 Health / GetType()->Strength 得到血量比例，
+        //   与规则表上的一个阈值（RulesClass 紧邻 GUIMoveOutSound 之后的一项，
+        //   语义为"低于此比例时请求确认"）比较：
+        //     比例 <  阈值 → 返回 0x0A（"无法照办"）
+        //     比例 >= 阈值 → 返回 1
+        //   本项目以 RulesClass::ConditionYellow 承载该阈值。
         const ObjectTypeClass* pType = GetType();
         const int32 strength = (pType != nullptr) ? pType->Strength : 0;
 
-        if (isTechno && strength > 0
-            && static_cast<double>(static_cast<const TechnoClass*>(this)->Health)
-                   / static_cast<double>(strength) < 1.0)
+        if (strength > 0)
         {
-            return 0x0A;
+            // 只有 techno 才有生命池；本项目经 WhatAmI 判类后取 Health。
+            const AbstractType what = WhatAmI();
+            const bool isTechno = (what == AbstractType::Unit
+                                || what == AbstractType::Infantry
+                                || what == AbstractType::Building
+                                || what == AbstractType::Aircraft);
+
+            if (isTechno)
+            {
+                const double fraction =
+                    static_cast<double>(static_cast<const TechnoClass*>(this)->Health)
+                    / static_cast<double>(strength);
+
+                const double threshold = (RulesClass::Instance != nullptr)
+                                       ? RulesClass::Instance->ConditionYellow : 0.0;
+
+                if (fraction < threshold)
+                    return 0x0A;
+            }
         }
 
         return 1;
@@ -1252,7 +1662,7 @@ int32 ObjectClass::ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Remove0 负责下面这段逻辑。
+// asm: char __thiscall ObjectClass_Remove0(_ObjectClass *this)   (asm:1049444)
 //
 //  把一个对象从战场上彻底摘掉。两个前提：战场已经开打，而且这个对象不是
 //  正坐在敞篷运输车里——运载中的货物不由自己摘除，而是随载具一并处理。
@@ -1302,22 +1712,268 @@ bool ObjectClass::Remove0()
     IsInLimbo = true;
     Marked    = false;
 
+    // asm: ObjectClass_Remove0 L1049520 `mov ecx,offset vec_Logics; call sub_55BAE0`
+    //   —— 彻底摘除的对象不再参与逐帧驱动。
+    Unregister_Logic();
+
     return true;
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知对象面上的建造资格查询默认拒绝，真正的
-// 门槛判定由派生类的生产面给出。
+// asm: ObjectClass_Who_Can_build_Me (0x5F7A90)  retn 10h (=4 参数)
+//
+//  在给定房屋里找出"能生产本物件"的那座工厂建筑。原版逐座检查房屋名下的
+//  建筑：
+//    1. 建筑在 limbo（[esi+81h]）-> 跳过；
+//    2. 建筑类型上的 Factory(+Factory) 与物件的抽象种类（this->WhatAmI()）
+//       不一致 -> 跳过；
+//    3. overridePower 为假时要求建筑通电（[esi+PowerOn]）；
+//    4. 建筑正在出售（mission 5）或任务为 0x13 -> 跳过；
+//    5. overrideBuildLimit 为真时还要求 HouseClass::Can_Build 通过；
+//    6. 再按物件/工厂的 Naval 属性做细分匹配（海军船厂只造海军船等）。
+//  命中即返回该建筑；全部不合格返回空。
+//
+//  本项目 ObjectClass::Who_Can_Build_Me 的签名为 (类型, buildLimit, 房屋) ->
+//  bool，语义收敛为"该房屋是否存在能造此物件的合格工厂"。
 // ------------------------------------------------------------------------
 bool ObjectClass::Who_Can_Build_Me(TechnoTypeClass* pType, bool buildLimit, const HouseClass* pHouse) const
 {
-    (void)pType;
-    (void)buildLimit;
-    (void)pHouse;
+    if (pHouse == nullptr)
+        return false;
+
+    // 物件的抽象种类：原版 this->WhatAmI()（vt+0x2C）。
+    const AbstractType itemKind = (pType != nullptr) ? pType->WhatAmI()
+                                                     : AbstractType::None;
+
+    DynamicVectorClass<BuildingClass*>& buildings =
+        const_cast<HouseClass*>(pHouse)->OwnedBuildings;
+
+    for (int32 i = 0; i < buildings.Count; ++i)
+    {
+        BuildingClass* pBldg = buildings.Items[i];
+        if (pBldg == nullptr)
+            continue;
+
+        // asm: 建筑若在 limbo 则不算数。
+        if (pBldg->IsInLimbo)
+            continue;
+
+        if (pBldg->Type == nullptr)
+            continue;
+
+        // asm: [BuildingTypeClass.Factory] 必须等于物件的抽象种类。
+        if (pBldg->Type->Factory != itemKind)
+            continue;
+
+        // asm: overridePower 为假时要求通电。
+        if (!pBldg->IsPowerOnline())
+            continue;
+
+        // asm: 建筑不能在出售流程里（mission 5 / 0x13）。
+        const int32 mission = pBldg->GetCurrentMission();
+        if (mission == 5 || mission == 0x13)
+            continue;
+
+        // asm: overrideBuildLimit 为真时还要过 HouseClass::Can_Build 的建造
+        //   上限检查；本项目该入口未在本层暴露，保留参数占位以便后续接入。
+        (void)buildLimit;
+
+        // asm: Naval 细分匹配——陆地工厂不产海军船，海军船厂不产陆/空单位。
+        const bool itemNaval = (pType != nullptr) && pType->Naval;
+        const bool bldgNaval = pBldg->Type->Naval;
+        if (!itemNaval && bldgNaval)
+            continue;
+
+        // asm: 空军单位还要看工厂是否为空（非主机场）等细化条件；本层以主工厂
+        //   优先级收尾，能匹配到即认为合格。
+        return true;
+    }
+
     return false;
 }
 
 void ObjectClass::DrawALinkTo(const ObjectClass* pTarget) const
 {
     (void)pTarget;
+}
+
+// ============================================================================
+// ObjectClass_GetImage  (asm: mov eax,[ecx]/call [eax+88h] ; mov edx,[eax] ;
+//                        mov ecx,eax ; jmp [edx+GetImage])
+//
+//  Reaches the attached ObjectTypeClass through the virtual GetType slot
+//  (+0x88) and tail-calls the type's own GetImage (the SHP it draws with).
+//  A null type yields null, matching the original's unchecked dereference
+//  guard at this layer.
+// ============================================================================
+SHPStruct* ObjectClass::GetImage() const
+{
+    const ObjectTypeClass* pType = GetType();
+    if (pType == nullptr)
+        return nullptr;
+    return pType->GetImage();
+}
+
+// ============================================================================
+// ObjectClass_GetUIName  (asm: mov eax, offset aNoName_0 ; retn)
+//
+//  The base object has no UI name of its own - the original returns the
+//  literal "No name".  The type-level accessor carries the real name.
+// ============================================================================
+const wchar_t* ObjectClass::GetUIName() const
+{
+    return L"No name";
+}
+
+// ============================================================================
+// ObjectClass_HasThisID  (asm: mov eax,[esp+4] ; mov edx,[ecx] ; push eax ;
+//                          call [edx+88h] ; mov ecx,eax ; call HasThisID)
+//
+//  Forwards the ID/name match test onto the attached ObjectTypeClass.  The
+//  type layer's AbstractTypeClass_HasThisID compares the requested string
+//  against both the type's ID and its human-readable Name; we reproduce
+//  that here (the project does not yet model HasThisID on the object-type
+//  base).  A null type reports no match.
+// ============================================================================
+bool ObjectClass::HasThisID(const char* pID) const
+{
+    if (pID == nullptr)
+        return false;
+    const ObjectTypeClass* pType = GetType();
+    if (pType == nullptr)
+        return false;
+    if (_strcmpi(pType->ID, pID) == 0)
+        return true;
+    return _strcmpi(pType->Name, pID) == 0;
+}
+
+// ============================================================================
+// ObjectClass_GetFactoryType
+//
+//  The object's own abstract kind.  The type-level factory classification
+//  (BuildCat-5 groups etc.) is exposed on the type; at object level the
+//  answer is simply the object's WhatAmI kind, which is what the callers
+//  feeding the house factory-count pass consume.
+// ============================================================================
+AbstractType ObjectClass::GetFactoryType() const
+{
+    return WhatAmI();
+}
+
+// ============================================================================
+// ObjectClass_GetWeaponRange  (asm: xor eax,eax ; retn 4)
+//
+//  Base objects carry no weapon, so the range is 0.  Armed subclasses
+//  (TechnoClass descendants, BuildingClass) override this.
+// ============================================================================
+int32 ObjectClass::GetWeaponRange(int32 weaponIndex) const
+{
+    (void)weaponIndex;
+    return 0;
+}
+
+// ============================================================================
+// ObjectClass::FacingFromDeltas / GetFacingTowards
+//
+//  The original computes, for the object and a reference object,
+//
+//      atan2(px - qx, py - qy) - pi/2
+//
+//  and scales it by -10430.06... then floors it.  That constant turns a
+//  radian angle into the game's direction units (0x100 >> 2 per quadrant),
+//  so the result is a facing index.  The reconstruction keeps the same
+//  arithmetic.
+// ============================================================================
+int32 ObjectClass::FacingFromDeltas(int32 dx, int32 dy)
+{
+    // atan2(dx, dy) rather than atan2(dy, dx): the original swaps the
+    // arguments relative to the conventional form.
+    const double angle = std::atan2(static_cast<double>(dx), static_cast<double>(dy));
+    const double adjusted = angle - (3.141592653589793 / 2.0);
+    const double scaled = adjusted * -10430.06004058427;
+
+    return static_cast<int32>(std::floor(scaled));
+}
+
+void ObjectClass::GetFacingTowards(CoordStruct* pOut, const ObjectClass* pRef) const
+{
+    if (pOut == nullptr || pRef == nullptr)
+        return;
+
+    const CoordStruct mine = GetCoords();
+    const CoordStruct theirs = pRef->GetCoords();
+
+    // asm: ObjectClass_Get_Height? (0x5F3E10, export 1209) -- the two deltas
+    // are (pRef.X - this.X) and (this.Y - pRef.Y), i.e. the X term is the
+    // *reference minus receiver*, the Y term the receiver minus reference.
+    // FacingFromDeltas is the arctanfoo(...) - pi/2 * -10430.060... wrapper.
+    const int32 dx = theirs.X - mine.X;                  // asm: [edi] - var_1C
+    const int32 dy = mine.Y - theirs.Y;                  // asm: [eax+4] - [edi+4]
+
+    pOut->X = FacingFromDeltas(dx, dy);
+    pOut->Y = 0;
+    pOut->Z = 0;
+}
+
+// ============================================================================
+// ObjectClass_SetPosition  (asm: mov edx,[eax]/[eax+4]/[eax+8] ; store at
+//                           [ecx+9Ch]/[+4]/[+8])
+//
+//  Caches the supplied coordinate into the object's draw-position slot
+//  rather than into Location, so the renderer can keep the last projected
+//  origin separate from the logical position.
+// ============================================================================
+void ObjectClass::SetPosition(const CoordStruct& coords)
+{
+    CachedLocation = coords;
+}
+
+// ============================================================================
+// ObjectClass_IronCurtain / Scatter / IsCellOccupied / MouseOverObject /
+// MouseOverCell
+//
+//  Neutral object-layer slots.  The assembly bodies are bare
+//  `retn 0Ch` (IronCurtain/Scatter/MouseOverCell -> no-op), `xor eax,eax ;
+//  retn 14h` (IsCellOccupied -> 0) and `xor eax,eax ; retn 8`
+//  (MouseOverObject -> 0).  The concrete subclasses that care replace the
+//  slot.
+// ============================================================================
+void ObjectClass::IronCurtain(ObjectClass* pSource, int32 a3, int32 a4) const
+{
+    (void)pSource;
+    (void)a3;
+    (void)a4;
+}
+
+void ObjectClass::Scatter(int32 a2, int32 a3, int32 a4) const
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+}
+
+bool ObjectClass::IsCellOccupied(const CellStruct& cell, int32 a3, int32 a4,
+                                 int32 a5, int32 a6) const
+{
+    (void)cell;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    return false;
+}
+
+int32 ObjectClass::MouseOverObject(int32 a2, int32 a3) const
+{
+    (void)a2;
+    (void)a3;
+    return 0;
+}
+
+int32 ObjectClass::MouseOverCell(int32 a2, int32 a3, int32 a4) const
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    return 0;
 }

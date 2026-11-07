@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex14.cpp
+start=2703
+end=3199
+symbol=HouseClass_AI_Building_Defense_Misc
+target=Houses/HouseClass.cpp

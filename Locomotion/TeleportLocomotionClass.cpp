@@ -1,18 +1,45 @@
 #include "TeleportLocomotionClass.h"
 #include "../Map/MapClass.h"
+#include "../Map/CellClass.h"
 #include "../Animations/AnimClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Combat/WarheadTypeClass.h"
 #include "../Combat/DamageArea.h"
+#include "../Audio/VocClass.h"
+#include "../Abstract/FootClass.h"
 
 #include <cstdlib>
 #include <cmath>
 
 // ============================================================================
-// TeleportLocomotionClass - Chrono/teleport locomotion.
-// Teleport animation (fade in/out), chrono shift effect, destination
-// validation, terrain check, and chrono vortex chance on teleport.
+// TeleportLocomotionClass - 超时空/传送移位器。
+//
+// 权威来源：
+//   asm: TeleportLocomotionClass_CTOR                      (asm:22)
+//   asm: TeleportLocomotionClass_ILocomotion_718080        (asm:88)   Is_Moving
+//   asm: TeleportLocomotionClass_ILocomotion_7180A0        (asm:116)  Destination
+//   asm: TeleportLocomotionClass_ILocomotion_718100        (asm:183)  Move_To
+//   asm: TeleportLocomotionClass_ILocomotion_718230        (asm:309)  Stop_Moving
+//   asm: TeleportLocomotionClass_ILocomotion_7192C0        (asm:353)  Do_Turn
+//   asm: TeleportLocomotionClass_ILocomotion_Process       (asm:390)  逐帧状态机
+//   asm: TeleportLocomotionClass_ILocomotion_719E20        (asm:1468)
+//   asm: TeleportLocomotionClass_ILocomotion_71A090        (asm:1571)
+//
+// 相位表（asm Process 的 switch，[esi+0x34]）：
+//   0   起始/待命；由 IsBeingWarpedOut 或 Move_To 推入 1
+//   1   蓄能：置 IsBeingWarpedOut，起 0x3C 帧计时
+//   2   消失：WarpOut 动画 + ChronoOutSound，本体挪到目标点
+//   3   冷却：写入 ChronoLock（此处落到 WarpOutTimer）
+//   4   落位：把坐标写实到目标点
+//   5   出现：ChronoInSound + WarpIn 动画 + 占用位复活
+//   6   收尾等待
+//   7   复位：清 IsWarpingOut / 相位 / 移动旗标
 // ============================================================================
+
+namespace {
+// asm 里反复出现的 0x3C 帧蓄能/收尾时长。
+constexpr int32 kChargeFrames = 0x3C;
+} // namespace
 
 TeleportLocomotionClass::TeleportLocomotionClass()
     : LocomotionClass()
@@ -23,6 +50,7 @@ TeleportLocomotionClass::TeleportLocomotionClass()
     , TargetCell(0, 0, 0)
     , WarpPhase(0)
     , WarpDelay(30)
+    , TargetOnBridge(false)
 {
     Speed = 0;
 }
@@ -53,7 +81,9 @@ int32 TeleportLocomotionClass::Size()
 }
 
 // ============================================================================
-// Is_Moving - Teleport is "moving" during the teleportation sequence.
+// Is_Moving - 传送中即为在动。
+// asm: TeleportLocomotionClass_ILocomotion_718080   (asm:88)
+//   `[+0x30] == 1` —— IsTeleportingNow 为真时返回真。
 // ============================================================================
 
 bool TeleportLocomotionClass::Is_Moving()
@@ -62,40 +92,98 @@ bool TeleportLocomotionClass::Is_Moving()
 }
 
 // ============================================================================
-// Destination - Returns the teleport destination.
+// Destination - 传送中给目标点，否则给载体当前点。
+// asm: TeleportLocomotionClass_ILocomotion_7180A0   (asm:116)
 // ============================================================================
 
 CoordStruct TeleportLocomotionClass::Destination()
 {
-    return TargetCell;
+    if (Is_Moving()) {
+        return TargetCell;
+    }
+    return Owner ? Owner->CachedLocation : CoordStruct(0, 0, 0);
 }
 
 // ============================================================================
-// Move_To - Initiates teleport to the target coordinate.
+// Move_To - 发起一次传送。
+// asm: TeleportLocomotionClass_ILocomotion_718100   (asm:183)
+//   * 载体的四种"忙"状态任一命中 → 清 Owner 的传送相位槽并放弃；
+//   * 若载体类型具备超时空能力（+0x1F8 与类型 0xF），目标格先做
+//     ScatterContent（把占位内容强行赶开）；
+//   * 交给 sub_718B70 登记传送；
+//   * 若朝往点仍为零 → 通知载体中止任务；否则置 IsMoving 并把朝往点
+//     抄进目标点。
 // ============================================================================
 
 void TeleportLocomotionClass::Move_To(CoordStruct to)
 {
-    TeleportTo(to);
+    if (!Owner) {
+        return;
+    }
+
+    if (Owner->IsInLimbo || Owner->IsDead() || Owner->InOpenTopped) {
+        Owner->WarpInTimer = 0;
+        return;
+    }
+
+    CellStruct cell = CoordMath::CoordToCell(to);
+
+    // 目标格被占用：原版会对具备超时空能力的载具驱散占位内容；
+    // 重构模型里 Occupied 表示不可落点，能驱散时先清掉占用标记。
+    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+    if (pCell && pCell->IsOccupied()) {
+        MapClass::Instance->MarkCellOccupied(cell, false);
+    }
+
+    HeadTo = to;
+    Dest = to;
+    IsTeleportingNow = true;
+    HasArrived = false;
+    WarpPhase = 0;
+    TeleportTimer.Start(60);
+}
+
+void TeleportLocomotionClass::TeleportTo(CoordStruct coord)
+{
+    if (IsTeleportingNow) {
+        return;
+    }
+
+    if (!IsValidDestinationForCoord(coord)) {
+        CoordStruct nearest = GetClosestOkCell(coord);
+        if (nearest == CoordStruct(0, 0, 0)) {
+            return;
+        }
+        coord = nearest;
+    }
+
+    Move_To(coord);
+}
+
+void TeleportLocomotionClass::ChronoWarpTo(CoordStruct coord)
+{
+    TeleportTo(coord);
 }
 
 // ============================================================================
-// Stop_Moving - Cancels the teleport sequence.
+// Stop_Moving - 取消传送。
+// asm: TeleportLocomotionClass_ILocomotion_718230   (asm:309)
+//   目标点归零、IsTeleportingNow 与 HasArrived 清掉。
 // ============================================================================
 
 void TeleportLocomotionClass::Stop_Moving()
 {
-    if (IsTeleportingNow && WarpPhase == 0) {
-        IsTeleportingNow = false;
-        IsMoving = false;
-        HasArrived = false;
-        WarpPhase = 0;
-        TeleportTimer.Stop();
-    }
+    TargetCell = CoordStruct(0, 0, 0);
+    HeadTo = CoordStruct(0, 0, 0);
+    Dest = CoordStruct(0, 0, 0);
+    IsTeleportingNow = false;
+    HasArrived = false;
+    TeleportTimer.Stop();
 }
 
 // ============================================================================
-// Do_Turn - Teleport turning is instant at the destination.
+// Do_Turn - 传送移位把朝向交给载体的 FacingClass（Set_Desired 语义）。
+// asm: TeleportLocomotionClass_ILocomotion_7192C0   (asm:353)
 // ============================================================================
 
 void TeleportLocomotionClass::Do_Turn(DirStruct coord)
@@ -106,130 +194,321 @@ void TeleportLocomotionClass::Do_Turn(DirStruct coord)
 }
 
 // ============================================================================
-// Process - Main teleport animation loop with three phases:
-// Phase 0: Warp out (unit fades away)
-// Phase 1: Warp transition (unit is invisible)
-// Phase 2: Warp in (unit reappears at destination)
+// Process - 传送状态机主体。
+// asm: TeleportLocomotionClass_ILocomotion_Process   (asm:390)
 // ============================================================================
 
 bool TeleportLocomotionClass::Process()
 {
-    if (!IsTeleportingNow) {
+    if (!Owner) {
         return false;
     }
 
+    // (1)(2) 外部传送相位同步：被传送仪接管时当帧不推进。
+    if (HandleOuterWarp()) {
+        return false;
+    }
+
+    // (3) 被时间武器抹除（+0x27C）：武装并进入蓄能相位。
+    if (Owner->IsBeingWarpedOut()) {
+        if (WarpPhase == 0) {
+            BeginCharge();
+        } else {
+            ProcessPhase();
+        }
+        return false;
+    }
+
+    // (4) 已在相位推进中。
+    if (WarpPhase > 0) {
+        return ProcessPhase();
+    }
+
+    // (5) 起始段：必须有移动指令。
+    if (!Is_Moving()) {
+        return false;
+    }
+
+    const CoordStruct head = Head_To_Coord();
+
+    // 朝往点为零或与当前点重合 → 收脚。
+    if (head == CoordStruct(0, 0, 0) || head == Owner->CachedLocation) {
+        Mark_All_Occupation_Bits(MarkType::Down);
+        Stop_Moving();
+        return false;
+    }
+
+    BeginWarpOut();
+    return false;
+}
+
+// ============================================================================
+// HandleOuterWarp - 外部传送相位同步。
+// asm: TeleportLocomotionClass_ILocomotion_Process 开头 (asm:390 段)
+//   * 载体 IsWarpingOut（+0x74）为真且本机无相位、外部相位槽（+0x280）为空
+//     → 走影子矩阵分支，本机不推进；
+//   * 本机无相位但外部相位槽非空 → 把本机相位同步为外部相位槽并当帧不推进。
+// ============================================================================
+
+bool TeleportLocomotionClass::HandleOuterWarp()
+{
+    if (!Owner) {
+        return false;
+    }
+
+    if (Owner->IsWarpingOut() && WarpPhase == 0 && Owner->WarpInTimer == 0) {
+        return true;
+    }
+
+    if (WarpPhase == 0 && Owner->WarpInTimer != 0) {
+        WarpPhase = Owner->WarpInTimer;
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// BeginCharge - 蓄能相位入口（被抹除分支）。
+// asm: Process 的 loc_7197CC：置载体的抹除旗标、起 0x3C 帧计时、相位 +1。
+// ============================================================================
+
+void TeleportLocomotionClass::BeginCharge()
+{
+    if (!Owner) {
+        return;
+    }
+
+    Owner->IsBeingWarpedOutFlag = true;
+    TeleportTimer.Start(kChargeFrames);
+    ++WarpPhase;
+}
+
+// ============================================================================
+// TargetCellOnBridge - 相位点所在格是否桥面。
+// asm: Process 里对相位点格取 +0x140 的桥位（bit8）。
+// ============================================================================
+
+bool TeleportLocomotionClass::TargetCellOnBridge() const
+{
+    CellStruct cell = CoordMath::CoordToCell(TargetCell);
+    if (cell.X < 0 || cell.X >= 512 || cell.Y < 0 || cell.Y >= 512) {
+        return false;
+    }
+    return MapClass::Instance->IsBridgeCell(cell);
+}
+
+// ============================================================================
+// BeginWarpOut - 起始段：登记目标点、起 WarpOut 动画、置传送旗标。
+// asm: TeleportLocomotionClass_ILocomotion_Process 的 449..818 段
+//   （含目标点距离换算出的计时长度、ChronoOutSound、抛物线滞空用的
+//    WarpOut 动画，以及 IsWarpingOut 的置位）。
+// ============================================================================
+
+void TeleportLocomotionClass::BeginWarpOut()
+{
+    TargetCell = Head_To_Coord();
+    if (TargetCell == CoordStruct(0, 0, 0)) {
+        TargetCell = Dest;
+    }
+
+    // 计时长度按传送距离与 Rules->ChronoDistanceFactor 折算。
+    const int32 distance = CurrentCoord.DistanceFrom(TargetCell);
+    int32 frames = distance / 8;
+    if (frames < kChargeFrames) {
+        frames = kChargeFrames;
+    }
+    if (RulesClass::Instance->ChronoDistanceFactor > 0) {
+        frames = distance / RulesClass::Instance->ChronoDistanceFactor;
+        if (frames < kChargeFrames) {
+            frames = kChargeFrames;
+        }
+    }
+    TeleportTimer.Start(frames);
+
+    // 立刻播放消失动画和音效；本体随后在相位 2 挪位。
+    PlayWarpOutAnimation();
+    PlayChronoOutSound();
+
+    // 相位点若在桥面，记录桥位标记（asm 写回载体的 +0x8C）。
+    TargetOnBridge = TargetCellOnBridge();
+
+    Owner->IsWarpingOutFlag = true;
+    Owner->IsBeingWarpedOutFlag = false;
+    IsTeleportingNow = true;
+    HasArrived = false;
+
+    // 相位由 0 直接进入 2（1 是"武装/抹除"专用入口）。
+    WarpPhase = 2;
+}
+
+// ============================================================================
+// ProcessPhase - 相位 1..7 的分派。
+// asm: TeleportLocomotionClass_ILocomotion_Process 的 719803..719BE2 段。
+// ============================================================================
+
+bool TeleportLocomotionClass::ProcessPhase()
+{
     switch (WarpPhase) {
-        case 0:
-            return ProcessWarpOut();
         case 1:
-            return ProcessWarpTransition();
+            return ProcessWarpOut();
+
         case 2:
+            return ProcessWarpOut();
+
+        case 3:
+            return ProcessWarpTransition();
+
+        case 4:
             return ProcessWarpIn();
+
+        case 5:
+            return ProcessWarpIn();
+
+        case 6:
+            return ProcessWarpIn();
+
+        case 7:
+            return FinishWarp();
+
         default:
             return false;
     }
 }
 
 // ============================================================================
-// ProcessWarpOut - Phase 0: Unit fades out at origin.
+// ProcessWarpOut - 相位 1..2：蓄能结束后把本体挪到目标点并放消失动画。
+// asm: TeleportLocomotionClass_ILocomotion_Process 的 case 1/case 2。
 // ============================================================================
 
 bool TeleportLocomotionClass::ProcessWarpOut()
 {
     TeleportTimer.Update();
 
-    if (WarpOutAnim) {
-        PlayWarpOutAnimation();
-    }
-
-    if (Owner) {
-        float progress = 1.0f - static_cast<float>(TeleportTimer.GetTimeLeft())
-            / static_cast<float>(WarpDelay);
-        Owner->SetAlpha(static_cast<uint8>(255.0f * (1.0f - progress)));
-    }
-
-    if (TeleportTimer.Expired()) {
-        WarpPhase = 1;
-        Mark_All_Occupation_Bits(MarkType::Down);
-
-        CurrentCoord = TargetCell;
-        if (Owner) {
-            Owner->SetCoords(CurrentCoord);
-            Owner->SetAlpha(0);
+    if (WarpPhase == 1) {
+        if (!TeleportTimer.Expired()) {
+            return true;
         }
-
-        TeleportTimer.Start(WarpDelay);
+        ++WarpPhase;
+        return true;
     }
 
+    // 相位 2：消失。
+    PlayWarpOutAnimation();
+    PlayChronoOutSound();
+
+    Owner->IsWarpingOutFlag = true;
+    Owner->IsBeingWarpedOutFlag = false;
+
+    // 暗中把本体挪到目标点（原版在"隐形"期间完成位移）。
+    CurrentCoord = TargetCell;
+    Owner->SetCoords(TargetCell);
+
+    Mark_All_Occupation_Bits(MarkType::Down);
+
+    TeleportTimer.Start(kChargeFrames);
+    ++WarpPhase;
     return true;
 }
 
 // ============================================================================
-// ProcessWarpTransition - Phase 1: Unit is in transit (invisible).
+// ProcessWarpTransition - 相位 3..4：冷却写入 + 落位。
+// asm: case 3（写 ChronoLockRemaining = Rules[+0xBEC]）、case 4
+//   （载体设坐标到朝往点）。
 // ============================================================================
 
 bool TeleportLocomotionClass::ProcessWarpTransition()
 {
     TeleportTimer.Update();
 
-    CheckChronoVortex();
+    if (WarpPhase == 3) {
+        // 冷却：原版写 ChronoLockRemaining，这里落到载体的 WarpOutTimer。
+        int32 lock = RulesClass::Instance->ChronoDistanceFactor;
+        Owner->WarpOutTimer = (lock > 0) ? lock : kChargeFrames;
 
-    if (TeleportTimer.Expired()) {
-        WarpPhase = 2;
-
-        if (!IsValidDestination()) {
-            RevertTeleport();
-            return true;
+        if (TeleportTimer.Expired()) {
+            ++WarpPhase;
         }
-
-        TeleportTimer.Start(WarpDelay);
+        return true;
     }
 
+    // 相位 4：落位。
+    CurrentCoord = TargetCell;
+    Owner->SetCoords(TargetCell);
+    ++WarpPhase;
     return true;
 }
 
 // ============================================================================
-// ProcessWarpIn - Phase 2: Unit reappears at destination.
+// ProcessWarpIn - 相位 5..6：出现动画 + 音效 + 占用位复活。
+// asm: case 5（ChronoInSound / WarpIn 动画 / 占用位）与 case 6 收尾等待。
 // ============================================================================
 
 bool TeleportLocomotionClass::ProcessWarpIn()
 {
     TeleportTimer.Update();
 
-    if (WarpInAnim) {
+    if (WarpPhase == 5) {
+        CurrentCoord = TargetCell;
+        Owner->SetCoords(TargetCell);
+
+        PlayChronoInSound();
         PlayWarpInAnimation();
-    }
-
-    if (Owner) {
-        float progress = 1.0f - static_cast<float>(TeleportTimer.GetTimeLeft())
-            / static_cast<float>(WarpDelay);
-        Owner->SetAlpha(static_cast<uint8>(255.0f * progress));
-    }
-
-    if (TeleportTimer.Expired()) {
-        HasArrived = true;
-        IsTeleportingNow = false;
-        IsMoving = false;
-        WarpPhase = 0;
-
-        if (Owner) {
-            Owner->SetAlpha(255);
-            Owner->SetCoords(TargetCell);
-        }
-
         Mark_All_Occupation_Bits(MarkType::Up);
+
+        TeleportTimer.Start(kChargeFrames);
+        ++WarpPhase;
+        return true;
     }
 
+    // 相位 6：等动画收束。
+    if (TeleportTimer.Expired()) {
+        ++WarpPhase;
+    }
     return true;
 }
 
 // ============================================================================
-// IsValidDestination - Validates the teleport destination terrain.
+// FinishWarp - 相位 7：复位所有传送状态。
+// asm: case 7（清 IsWarpingOut、清相位槽、清 IsTeleportingNow、清相位）。
+// ============================================================================
+
+bool TeleportLocomotionClass::FinishWarp()
+{
+    Owner->IsWarpingOutFlag = false;
+    Owner->WarpInTimer = 0;
+
+    IsTeleportingNow = false;
+    HasArrived = true;
+    WarpPhase = 0;
+    TargetCell = CoordStruct(0, 0, 0);
+    HeadTo = CoordStruct(0, 0, 0);
+    Dest = CoordStruct(0, 0, 0);
+    return false;
+}
+
+bool TeleportLocomotionClass::IsTeleporting() const
+{
+    return IsTeleportingNow;
+}
+
+int32 TeleportLocomotionClass::GetWarpPhase() const
+{
+    return WarpPhase;
+}
+
+// ============================================================================
+// IsValidDestination - 目的地点是否可落（地形 + 占用）。
 // ============================================================================
 
 bool TeleportLocomotionClass::IsValidDestination() const
 {
-    CellStruct cell = CoordMath::CoordToCell(TargetCell);
+    return IsValidDestinationForCoord(TargetCell);
+}
+
+bool TeleportLocomotionClass::IsValidDestinationForCoord(CoordStruct coord) const
+{
+    CellStruct cell = CoordMath::CoordToCell(coord);
 
     if (cell.X < 0 || cell.X >= 512 || cell.Y < 0 || cell.Y >= 512) {
         return false;
@@ -240,35 +519,28 @@ bool TeleportLocomotionClass::IsValidDestination() const
         return false;
     }
 
-    if (MapClass::Instance->IsCellOccupied(cell)) {
-        return false;
-    }
-
     return true;
 }
 
 // ============================================================================
-// RevertTeleport - Reverts a failed teleport back to origin.
+// RevertTeleport - 传送失败回退到出发前位置。
 // ============================================================================
 
 void TeleportLocomotionClass::RevertTeleport()
 {
     IsTeleportingNow = false;
-    IsMoving = false;
     HasArrived = false;
     WarpPhase = 0;
+    TeleportTimer.Stop();
 
     if (Owner) {
-        Owner->SetAlpha(255);
-        CoordStruct originalPos = GetOriginalPosition();
-        CurrentCoord = originalPos;
-        Owner->SetCoords(originalPos);
+        Owner->IsWarpingOutFlag = false;
+        Owner->IsBeingWarpedOutFlag = false;
+        CurrentCoord = Owner->CachedLocation;
+        Owner->SetCoords(CurrentCoord);
+        Mark_All_Occupation_Bits(MarkType::Up);
     }
 }
-
-// ============================================================================
-// GetOriginalPosition - Returns the position before teleport.
-// ============================================================================
 
 CoordStruct TeleportLocomotionClass::GetOriginalPosition() const
 {
@@ -276,40 +548,87 @@ CoordStruct TeleportLocomotionClass::GetOriginalPosition() const
 }
 
 // ============================================================================
-// PlayWarpOutAnimation - Plays the chrono fade-out animation.
+// PlayWarpOutAnimation - 在当前位置放消失动画（Rules->WarpOut）。
+// asm: TeleportLocomotionClass_ILocomotion_Process 里的 AnimClass 构造
+//   （WarpOut / WarpAway 两种动画源）。
 // ============================================================================
 
 void TeleportLocomotionClass::PlayWarpOutAnimation()
 {
-    if (WarpOutAnim && Owner) {
-        AnimClass* anim = GameCreate<AnimClass>();
-        if (anim) {
-            anim->Type = WarpOutAnim;
-            anim->SetCoords(CurrentCoord);
-            anim->SetOwner(Owner->GetOwningHouse());
-        }
+    AnimTypeClass* pAnim = WarpOutAnim;
+    if (!pAnim) {
+        pAnim = RulesClass::Instance->WarpOut;
+    }
+    if (!pAnim) {
+        pAnim = RulesClass::Instance->WarpAway;
+    }
+    if (!pAnim || !Owner) {
+        return;
+    }
+
+    AnimClass* anim = GameCreate<AnimClass>();
+    if (anim) {
+        anim->Type = pAnim;
+        anim->SetCoords(Owner->CachedLocation);
     }
 }
 
 // ============================================================================
-// PlayWarpInAnimation - Plays the chrono fade-in animation.
+// PlayWarpInAnimation - 在目标点放出现动画。
 // ============================================================================
 
 void TeleportLocomotionClass::PlayWarpInAnimation()
 {
-    if (WarpInAnim && Owner) {
-        AnimClass* anim = GameCreate<AnimClass>();
-        if (anim) {
-            anim->Type = WarpInAnim;
-            anim->SetCoords(TargetCell);
-            anim->SetOwner(Owner->GetOwningHouse());
-        }
+    AnimTypeClass* pAnim = WarpInAnim;
+    if (!pAnim) {
+        pAnim = RulesClass::Instance->WarpAway;
+    }
+    if (!pAnim || !Owner) {
+        return;
+    }
+
+    AnimClass* anim = GameCreate<AnimClass>();
+    if (anim) {
+        anim->Type = pAnim;
+        anim->SetCoords(TargetCell);
     }
 }
 
 // ============================================================================
-// CheckChronoVortex - Random chance of creating a chrono vortex during
-// teleport, which can destroy the unit or nearby objects.
+// PlayChronoOutSound / PlayChronoInSound - 消失 / 出现音效。
+// asm: Process 中 Sound_Effect(ChronoOutSound) / Sound_Effect(ChronoInSound)，
+//   音效编号优先取类型字段，回落到 Rules。
+// ============================================================================
+
+void TeleportLocomotionClass::PlayChronoOutSound()
+{
+    if (!Owner) {
+        return;
+    }
+    int32 index = RulesClass::Instance->ChronoOutSound;
+    if (index < 0) {
+        return;
+    }
+    CoordStruct pos = Owner->CachedLocation;
+    VocClass::PlayIndexAtPos(index, &pos);
+}
+
+void TeleportLocomotionClass::PlayChronoInSound()
+{
+    if (!Owner) {
+        return;
+    }
+    int32 index = RulesClass::Instance->ChronoInSound;
+    if (index < 0) {
+        return;
+    }
+    CoordStruct pos = TargetCell;
+    VocClass::PlayIndexAtPos(index, &pos);
+}
+
+// ============================================================================
+// CheckChronoVortex / SpawnChronoVortex - 传送涡流（原版按 ChronoTrigger 规则
+//   概率生成，可摧毁单位与附近目标）。
 // ============================================================================
 
 void TeleportLocomotionClass::CheckChronoVortex()
@@ -328,10 +647,6 @@ void TeleportLocomotionClass::CheckChronoVortex()
         SpawnChronoVortex();
     }
 }
-
-// ============================================================================
-// SpawnChronoVortex - Creates a chrono vortex at the destination.
-// ============================================================================
 
 void TeleportLocomotionClass::SpawnChronoVortex()
 {
@@ -354,9 +669,7 @@ void TeleportLocomotionClass::SpawnChronoVortex()
 
     MapClass::Instance->ApplyDamageArea(damageArea);
 
-    if (Owner) {
-        Owner->TakeDamage(damage, nullptr, WarheadTypeClass::GetDefault());
-    }
+    Owner->TakeDamage(damage, nullptr, WarheadTypeClass::GetDefault());
 
     IsTeleportingNow = false;
     IsMoving = false;
@@ -365,23 +678,16 @@ void TeleportLocomotionClass::SpawnChronoVortex()
 }
 
 // ============================================================================
-// Mark_All_Occupation_Bits - Teleport occupation marking.
+// Mark_All_Occupation_Bits - 传送期间不占格；否则按脚印标记当前格。
+// asm: Process 里换格时的占用位切换。
 // ============================================================================
 
 void TeleportLocomotionClass::Mark_All_Occupation_Bits(MarkType mark)
 {
-    if (IsTeleportingNow) {
-        return;
-    }
-
     CellStruct cell = CoordMath::CoordToCell(CurrentCoord);
     bool occupy = (mark == MarkType::Up);
     MapClass::Instance->MarkCellOccupied(cell, occupy);
 }
-
-// ============================================================================
-// Limbo - Teleport limbo state.
-// ============================================================================
 
 void TeleportLocomotionClass::Limbo()
 {
@@ -393,100 +699,19 @@ void TeleportLocomotionClass::Limbo()
     Mark_All_Occupation_Bits(MarkType::Down);
 }
 
-// ============================================================================
-// TeleportTo - Initiates a teleport to a target coordinate.
-// ============================================================================
-
-void TeleportLocomotionClass::TeleportTo(CoordStruct coord)
-{
-    if (IsTeleportingNow) {
-        return;
-    }
-
-    if (!IsValidDestinationForCoord(coord)) {
-        CoordStruct nearest = GetClosestOkCell(coord);
-        if (nearest == CoordStruct(0, 0, 0)) {
-            return;
-        }
-        coord = nearest;
-    }
-
-    TargetCell = coord;
-    IsTeleportingNow = true;
-    IsMoving = true;
-    HasArrived = false;
-    WarpPhase = 0;
-    TeleportTimer.Start(WarpDelay);
-}
-
-// ============================================================================
-// IsValidDestinationForCoord - Validates a specific coordinate for teleport.
-// ============================================================================
-
-bool TeleportLocomotionClass::IsValidDestinationForCoord(CoordStruct coord) const
-{
-    CellStruct cell = CoordMath::CoordToCell(coord);
-
-    if (cell.X < 0 || cell.X >= 512 || cell.Y < 0 || cell.Y >= 512) {
-        return false;
-    }
-
-    LandType land = MapClass::Instance->GetLandType(cell);
-    if (land == LandType::Water || land == LandType::Wall) {
-        return false;
-    }
-
-    return true;
-}
-
-// ============================================================================
-// IsTeleporting - Returns true if a teleport is in progress.
-// ============================================================================
-
-bool TeleportLocomotionClass::IsTeleporting() const
-{
-    return IsTeleportingNow;
-}
-
-// ============================================================================
-// ChronoWarpTo - Chrono warp variant of teleport.
-// ============================================================================
-
-void TeleportLocomotionClass::ChronoWarpTo(CoordStruct coord)
-{
-    TeleportTo(coord);
-}
-
-// ============================================================================
-// GetWarpPhase - Returns the current warp phase.
-// ============================================================================
-
-int32 TeleportLocomotionClass::GetWarpPhase() const
-{
-    return WarpPhase;
-}
-
-// ============================================================================
-// Get_Status - Teleport movement status code.
-// ============================================================================
-
 int32 TeleportLocomotionClass::Get_Status() const
 {
     if (IsTeleportingNow) {
-        if (WarpPhase == 0) {
+        if (WarpPhase < 3) {
             return static_cast<int32>(Sequence::Deploy);
         }
-        if (WarpPhase == 2) {
+        if (WarpPhase >= 5) {
             return static_cast<int32>(Sequence::Undeploy);
         }
         return static_cast<int32>(Sequence::Ready);
     }
     return static_cast<int32>(Sequence::Ready);
 }
-
-// ============================================================================
-// Can_Fire - Cannot fire while teleporting.
-// ============================================================================
 
 FireError TeleportLocomotionClass::Can_Fire() const
 {
@@ -496,27 +721,25 @@ FireError TeleportLocomotionClass::Can_Fire() const
     return FireError::OK;
 }
 
-// ============================================================================
-// Is_Really_Moving_Now - Teleport is "moving" during warp.
-// ============================================================================
-
 bool TeleportLocomotionClass::Is_Really_Moving_Now() const
 {
     return IsTeleportingNow;
 }
+
 // 传送面板的默认登记点（复位槽位写回该值）。
 static CoordStruct TeleportLocomotionClass_Default_Pos(0, 0, 0);
 
 bool TeleportLocomotionClass::ILocomotion_718080() const
 {
-    // 根据游戏行为，可知该槽位判定传送状态机是否处于传送中。
+    // asm: TeleportLocomotionClass_ILocomotion_718080   (asm:88)
+    //   只认 `[+0x30] == 1`。
     return IsTeleportingNow;
 }
 
 void TeleportLocomotionClass::ILocomotion_7180A0(CoordStruct* pOut) const
 {
-    // 根据游戏行为，可知取坐标分两路：传送中给登记的目标点，否则给
-    // 载体的现行坐标。
+    // asm: TeleportLocomotionClass_ILocomotion_7180A0   (asm:116)
+    //   传送中给目标点，否则给载体现行坐标。
     if (!pOut)
         return;
     if (IsTeleportingNow)
@@ -524,61 +747,57 @@ void TeleportLocomotionClass::ILocomotion_7180A0(CoordStruct* pOut) const
     else if (LinkedTo)
         LinkedTo->GetCoords(pOut);
     else
-        *pOut = CoordStruct(0, 0, 0);
+        *pOut = TeleportLocomotionClass_Default_Pos;
 }
 
 void TeleportLocomotionClass::ILocomotion_718100(const CoordStruct& to)
 {
-    // 根据游戏行为，可知传送起步：先对载体做许可检查（滞留虚位、阵亡、
-    // 身处封闭载具任一命中即放弃）；目标格被占用时原版会先驱散占位内容，
-    // 重构的占用位模型以拒绝进入表达同一约束；随后登记目标点并归零
-    // 传送相位。
+    // asm: TeleportLocomotionClass_ILocomotion_718100   (asm:183)
+    //   载体忙/封闭则放弃；否则登记目标点并归零相位。
     if (!LinkedTo)
         return;
     if (LinkedTo->IsInLimbo || LinkedTo->IsDead() || LinkedTo->InOpenTopped)
         return;
-    CellClass* pCell = TheMap->GetCellAt(to.X >> 8, to.Y >> 8);
-    if (pCell && pCell->IsOccupied())
-        return;
+
     TargetCell = to;
+    HeadTo = to;
     IsTeleportingNow = true;
     WarpPhase = 0;
 }
 
 void TeleportLocomotionClass::ILocomotion_718230()
 {
-    // 根据游戏行为，可知复位把登记点归回默认值并清两个状态旗标。
+    // asm: TeleportLocomotionClass_ILocomotion_718230   (asm:309)
     TargetCell = TeleportLocomotionClass_Default_Pos;
+    HeadTo = TeleportLocomotionClass_Default_Pos;
     IsTeleportingNow = false;
     HasArrived = false;
 }
 
 void TeleportLocomotionClass::ILocomotion_7192C0(DirStruct dir)
 {
-    // 根据游戏行为，可知转向槽位把期望朝向写进载体的朝向机。
+    // asm: TeleportLocomotionClass_ILocomotion_7192C0   (asm:353)
     if (LinkedTo)
         LinkedTo->SetFacing(dir);
 }
 
 int32 TeleportLocomotionClass::ILocomotion_719E20() const
 {
-    // 根据游戏行为，可知该槽位固定返回 2（传送移动的组别值）。
+    // asm: TeleportLocomotionClass_ILocomotion_719E20   (asm:1468)
     return 2;
 }
 
 void TeleportLocomotionClass::ILocomotion_71A090(CoordStruct* pCoord)
 {
-    // 根据游戏行为，可知放置槽位只在未带坐标参数时动作：把当前登记点
-    // 回写给载体位置；带坐标参数时直接返回。
+    // asm: TeleportLocomotionClass_ILocomotion_71A090   (asm:1571)
     if (pCoord)
         return;
     if (LinkedTo)
-        LinkedTo->SetLocation(TargetCell);
+        LinkedTo->SetLocation(CurrentCoord);
 }
 
 HRESULT TeleportLocomotionClass::ILocomotion_71A160(REFIID iid, void** ppvObject)
 {
-    // 根据游戏行为，可知 COM 三槽是本体接口的转发形态。
     return QueryInterface(iid, ppvObject);
 }
 

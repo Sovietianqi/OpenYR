@@ -18,6 +18,17 @@ public:
     TClassFactory() noexcept;
     virtual ~TClassFactory();
 
+    // ------------------------------------------------------------------------
+    // asm: TClassFactory_SuperWeaponTypeClass_CTOR (0x5C0B40)
+    //   mov dword ptr [eax+4], 0     ; +4 槽清零
+    //   mov dword ptr [eax], vt      ; TClassFactory<SuperWeaponTypeClass>::vftable
+    //   mov eax, esi / retn
+    //
+    // 降级点：模板特化的 vtable 在 C++ 里由编译器给出，无法手写；本类唯一的
+    // +4 槽是 RefCount，故只保留"清零"这一步。
+    // ------------------------------------------------------------------------
+    void Construct_SuperWeaponTypeFactory() noexcept { RefCount = 0; }
+
     // IUnknown（工厂自身）
     HRESULT QueryInterface(REFIID iid, LPVOID* ppvObject);
     ULONG AddRef();

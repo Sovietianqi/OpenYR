@@ -5,6 +5,7 @@
 #include "../Core/Memory.h"
 
 class CCINIClass;
+class UnitClass;
 
 static constexpr int32 MAX_MP_PLAYERS = 8;
 static constexpr int32 MAX_MP_TEAMS = 4;
@@ -52,6 +53,27 @@ public:
     static MPGameModeClass* Find(int32 idx);
     static int32            FindIndex(int32 idx);
     static void             Register(MPGameModeClass* pMode);
+
+    // ── asm: MPGameModeClass_CreateList (0x5D7CC0) ──────────────────────
+    //
+    //   MPGameModeClass_CreateList proc near   ; 无 ecx/无参数 -> void()
+    //   调用者：InitGame（asm +1096）
+    //
+    //   once-guard byte_ABFD70:
+    //     !(guard & 1) -> guard |= 1 ; sub_5D86D0(&vec_MPGameModes, 0, 0) ;
+    //                     atexit(sub_5D5B20)
+    //   for (i = 0 ; i < vec_MPGameModes.length ; ++i):
+    //     hdr = vec_MPGameMode_CTOR() ; arr = [hdr+4]
+    //     if (arr[i]) virtual[vt+0](arr[i], 1)          ; mode refresh
+    //   六次固定注册，按序：
+    //     title = alloc_str(NAME) ; init = Initializer<T>::vftable
+    //     MPGameMode_InitList(&title, &init) ; strdelete(&title)
+    //     "Battle"/"ManBattle"/"Siege"/"Unholy"/"FreeForAll"/"Cooperative"
+    //
+    // 铁律①：vec_MPGameMode_CTOR / Initializer<T>::vftable /
+    //        MPGameMode_InitList / sub_5D5B20 均尚未落地，此处只固化
+    //        已确证的 once-guard、注册顺序与六个模式名，不臆造实现。
+    static void             CreateList();
 
     // GameMode identifier held at +0x28 in the original object layout.
     int32   Field_28;
@@ -134,6 +156,18 @@ public:
     void UpdateScores();
     int32 GetPlayerScore(int32 playerID) const;
     int32 GetTeamScore(int32 team) const;
+
+    // ------------------------------------------------------------------------
+    // SpawnBaseUnit 用到的两个原版设施（留白，见 .cpp 的说明）：
+    //   Place_Base_Unit_At_Lepton —— 原版 UnitClass 虚表 +0xD8 槽，
+    //     把单位按给定 lepton 坐标直接落到地图，成功返回 true。
+    //   Scan_Place_Object —— 原版 __fastcall(TechnoClass*, wXY*, int)，
+    //     从给定格出发扫描附近可放置的位置，成功返回非 0。
+    // 两者的真实实现尚未移植，这里只保留签名与调用点。
+    // ------------------------------------------------------------------------
+    bool Place_Base_Unit_At_Lepton(UnitClass& unit, const CoordStruct& coords);
+    bool Scan_Place_Object(UnitClass& unit, const CellStruct& where, int32 mode);
+
     void AddPlayerKill(int32 playerID);
     void AddPlayerLoss(int32 playerID);
     void AddPlayerEconomy(int32 playerID, int32 amount);

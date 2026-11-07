@@ -20,9 +20,12 @@ public:
     virtual void Move_To(CoordStruct to) override;
     virtual void Move_To(AbstractClass* target);
     virtual void Stop_Moving() override;
-    virtual bool Is_Moving_Now() override { return IsMoving && !IsFalling; }
+    // asm: WalkLocomotionClass_ILocomotion_IsMovingNow   (asm:106)
+    //   `Is_Moving() && Owner->SpeedPercentage > 0 && HeadTo != (0,0,0)`。
+    virtual bool Is_Moving_Now() override;
     virtual void Do_Turn(DirStruct coord) override;
     virtual Move Can_Enter_Cell(CellStruct cell) override;
+    // asm: WalkLocomotionClass_ILocomotion_IsReallyMovingNow   (asm:1418)
     virtual bool Is_Really_Moving_Now() const override;
     virtual void Mark_All_Occupation_Bits(MarkType mark) override;
     virtual void Limbo() override;
@@ -30,8 +33,28 @@ public:
     virtual int32 Get_Status() const override;
     virtual int32 Apparent_Speed() const override;
     virtual void Force_New_Slope(int32 ramp) override;
+    // asm: WalkLocomotionClass_ILocomotion_HeadToCoord   (asm:232)
+    virtual CoordStruct Head_To_Coord() override;
+    virtual CoordStruct Head_To_Coord() const;
+    // asm: WalkLocomotionClass_ILocomotion_Destination   (asm:168)
+    virtual CoordStruct Destination() override;
+    // asm: WalkLocomotionClass_ILocomotion_Lock   (asm:1446)
+    virtual void Lock() override;
+    // asm: WalkLocomotionClass_ILocomotion_ForceImmediateDestination   (asm:549)
+    virtual void Force_Immediate_Destination(CoordStruct coord) override;
+    // asm: WalkLocomotionClass_ILocomotion_IsMovingHere   (asm:1319)
+    virtual bool Is_Moving_Here(CoordStruct to) override;
+    // asm: WalkLocomotionClass_ILocomotion_StopMovementAction   (asm:1577)
+    virtual void Stop_Movement_Animation() override;
 
     void UpdatePosition();
+    // asm: sub_75AEC0 的坡道/楼梯高度插值段：逐帧把 Z 逼近目标格地面高度，
+    //   差值清零时置 JustLanded。返回本帧是否在坡道上。
+    bool InterpolateHeight(int32 targetZ);
+    // 朝往点是否已被走到（到达判定，距离 <= Rules->CloseEnough）。
+    bool IsAtDestination() const;
+    // 本帧生效速度：载体 GetCurrentSpeed 与老兵/SpeedPercentage 折合。
+    int32 GetCurrentSpeed() const;
     bool MoveOneStep();
     bool MoveToNextCell();
     bool CanMoveToCell(CellStruct cell);
@@ -76,4 +99,14 @@ public:
     bool IsCrawling;
     int32 MoveStepTimer;
     int32 StepSize;
+    // asm: WalkLocomotionClass +0x24 —— 朝往点（HeadTo）。本帧真正要推进到的
+    //   坐标，非零时覆盖 Owner 的缓存绘制点。
+    CoordStruct HeadTo;
+    // asm: WalkLocomotionClass +0x32 —— 本帧是否真的推进了（IsReallyMovingNow）。
+    bool IsReallyMovingNow;
+    // asm: WalkLocomotionClass +0x34/+0x35/+0x36 —— 三个逐帧布尔：
+    //   是否在坡道、是否刚落地、是否本帧被挤压。
+    bool OnRamp;
+    bool JustLanded;
+    bool WasCrushed;
 };

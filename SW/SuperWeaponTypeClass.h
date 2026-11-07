@@ -16,6 +16,9 @@ class HouseTypeClass;
 class AircraftTypeClass;
 class InfantryTypeClass;
 class SHPStruct;
+class CRCEngine;
+class IStream;
+class TechnoClass;
 
 // ============================================================================
 // SuperWeaponType
@@ -66,12 +69,45 @@ public:
     static SuperWeaponTypeClass* FindOrAllocate(const char* pID);
     static SuperWeaponTypeClass* FindByIndex(int32 index);
     static SuperWeaponTypeClass* FindByType(SuperWeaponType type);
+
+    // asm: index in [SWTypes]; returns the registry slot of pID, or -1.
+    // (SuperWeaponTypeClass_FindIndex)
+    static int32 FindIndex(const char* pID);
+
+    // asm: SuperWeaponType_FindFirstOfAction (0x6CEEB0)
+    // Walks the type registry and returns the first entry whose Action
+    // equals the requested value; null when nothing matches.
+    static SuperWeaponTypeClass* FindFirstOfAction(int32 action);
     static int32 GetCount();
 
     SuperWeaponTypeClass(const char* pID) noexcept;
     ~SuperWeaponTypeClass();
 
     bool LoadFromINI(CCINIClass* pINI);
+
+    // ------------------------------------------------------------------
+    // Persistence / registry (asm parity)
+    // ------------------------------------------------------------------
+    // asm: SuperWeaponTypeClass_GetClassID  (retn 8, out GUID*)
+    HRESULT GetClassID(CLSID* pClassID) const;
+    // asm: SuperWeaponTypeClass_Load  (base AbstractTypeClass_Load + swizzle)
+    HRESULT Load(IStream* pStm);
+    // asm: SuperWeaponTypeClass_Save  (base AbstractTypeClass_Save)
+    HRESULT Save(IStream* pStm, BOOL fClearDirty);
+    // asm: SuperWeaponTypeClass_GetAbstractDerivationID -> 0x20
+    int32 GetAbstractDerivationID() const;
+    // asm: SuperWeaponTypeClass_GetSize -> 0x100
+    int32 GetSize() const;
+    // asm: SuperWeaponTypeClass_GetCRC (walks base CRC then tagged fields)
+    int32 GetCRC() const;
+    // asm: SuperWeaponTypeClass_GetArrayIndex -> [this+0x98]
+    int32 GetArrayIndex() const;
+
+    // asm: SuperWeaponType_GetCursorOverObject  (retn 8)
+    // Returns the mouse cursor for hovering a target; ForceShield against an
+    // allied building yields the "cannot place" cursor (0x46), otherwise the
+    // type's Action value is used as the cursor id.
+    int32 GetCursorOverObject(int32 currentCursor, TechnoClass* pTarget) const;
 
     // Helper methods
     bool IsTargetable() const;
@@ -240,6 +276,9 @@ public:
     char SidebarImageName[0x18];
     SHPStruct* CameoShape;
     SHPStruct* SidebarImage;
+    // asm: registry slot index ([this+0x98]); assigned from the array length
+    // at construction, returned verbatim by GetArrayIndex.
+    int32 ArrayIndex;
     // ------------------------------------------------------------------
     // Rules / Art INI fields
     // ------------------------------------------------------------------

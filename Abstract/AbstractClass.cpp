@@ -180,7 +180,7 @@ void AbstractClass::Delete_All_Instances()
 }
 
 // ============================================================================
-// PointerExpired (default implementation)
+// PointerGotInvalid (default implementation)
 //
 //  Called by the pointer-fixup pass after a save game load.  The default
 //  behaviour is a no-op; derived classes override this to rebind their
@@ -547,7 +547,7 @@ namespace
 
 } // anonymous namespace
 
- // 根据游戏行为，可知 LoadTables 负责下面这段逻辑。
+ // asm: void __thiscall AbstractClass_LoadTables(AbstractClass *this)   (asm:78246)
 //
 //  A deserialized object image contains raw field data but no live vtable
 //  pointers, so the loader calls this to restore the abstract interface
@@ -562,7 +562,7 @@ void AbstractClass::LoadTables(IStream* pStm)
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知 COM 层补全各槽位的默认行为：IsDirty 以"未脏"为
+// asm: int __stdcall AbstractClass_IsDirty(int)   (asm:78748)
 // 成功码；Fetch_ID 直接回读对象唯一标识；两个坐标形态都汇聚到虚表槽
 // GetCoords 的指针形态（双参形态的第二个参数被忽略）；查询槽转发到
 // 标准 QueryInterface 并固定失败。

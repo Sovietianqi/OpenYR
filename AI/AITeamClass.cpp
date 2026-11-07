@@ -26,9 +26,16 @@
 #include "ScriptClass.h"
 #include "ScriptTypeClass.h"
 #include "TaskForceClass.h"
+#include "TagClass.h"
+#include "TriggerClass.h"
+#include "TeamClass.h"
+#include "TeamTypeClass.h"
 #include "../Abstract/TechnoClass.h"
 #include "../Abstract/FootClass.h"
 #include "../Abstract/TechnoTypeClass.h"
+#include "../Abstract/UnitClass.h"
+#include "../Abstract/InfantryClass.h"
+#include "../Abstract/AircraftClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Game/Game.h"
 #include "../Map/MapClass.h"
@@ -102,7 +109,17 @@ AITeamClass::AITeamClass(AITeamTypeClass* pType, HouseClass* pOwner) noexcept
       CurrentAction(0), Active(true), CurrentScriptLine(0), IsFormed(false),
       CreationFrame(0), TotalThreatValue(0), IsSuspended(false),
       IsReforming(false), NeedsReGrouping(false),
-      FormationTarget(0, 0, 0) {
+      FormationTarget(0, 0, 0),
+      SpawnCell(nullptr), FollowAnchor(nullptr), ITarget(nullptr),
+      PrevTarget(nullptr), AnchorCell{0, 0}, TotalObjects(0), totalStrength(0),
+      ActionExecuted(false), AchievedSuccess(false),
+      IsFullyLoaded(false), IsLeavingMap(false), HasLeftMap(false),
+      IsForming(false), WantsToDelete(false), NeedsRecheckState(false),
+      NeedsToDisappear(false), JustDisappeared(false),
+      ReassignTarget(false), RaiseTagEvent(false) {
+    for (int32 i = 0; i < MaxTaskForceSlots; ++i) {
+        TeamCounts[i] = 0;
+    }
     GuardAreaTimer.Start(0);
     SuspendTimer.Start(0);
     if (pType && pType->ScriptType) {
@@ -121,7 +138,12 @@ AITeamClass::~AITeamClass() {
         delete Script;
         Script = nullptr;
     }
+    Liberate();
     Members.Clear();
+    SpawnCell = nullptr;
+    FollowAnchor = nullptr;
+    ITarget = nullptr;
+    PrevTarget = nullptr;
 }
 
 // =============================================================================
@@ -403,62 +425,220 @@ int32 AITeamClass::Size() const {
 }
 
 // =============================================================================
-// Update - per-frame AI team tick.
+// PointerGotInvalid - drop any reference to an object that is being removed.
 //
-// Sequence:
-//   1. If suspended, count down the suspend timer and skip processing.
-//   2. Update the guard-area timer.
-//   3. Prune dead members.
-//   4. If the roster is empty, deactivate non-autocreate teams.
-//   5. If regrouping is requested, re-form the team.
-//   6. If the team is mid-reform, continue forming up.
-//   7. Otherwise, advance the behaviour script.
+// asm: TeamClass_PointerGotInvalid (0x6EAE60) retn 8 —— 逐个比较本队持有的
+// 指针字段，命中即将失效的对象就把该字段清零。
+// =============================================================================
+void AITeamClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed) {
+    (void)removed;
+    if (!pInvalid) return;
+
+    if (static_cast<AbstractClass*>(TeamType) == pInvalid) TeamType = nullptr;
+    if (static_cast<AbstractClass*>(Owner) == pInvalid) Owner = nullptr;
+    if (reinterpret_cast<AbstractClass*>(Script) == pInvalid) Script = nullptr;
+
+    // Also prune the member that is going away.
+    for (int32 i = Members.Count - 1; i >= 0; --i) {
+        if (static_cast<AbstractClass*>(Members[i]) == pInvalid) {
+            Members.Remove(i);
+        }
+    }
+}
+
+// =============================================================================
+// Update - per-frame AI team tick (asm: TeamClass_Update, asm:1527680).
+//
+// 原版把人链/脚本/征兵全写在一个 1000+ 行的 TeamClass_Update 里。此处按 asm 的
+// 控制流逐段复刻（派发下沉到 ScriptClass::Execute）：
+//   1. 挂起：TeamSuspended 时按 Frame - SuspendFrame >= SuspendDuration 唤醒，
+//      未到期直接返回（asm @@1-@@4）。
+//   2. 消失：NeedsToDisappear 置位就调 LeaveMap()，返回假则本队整体退场、本帧结束。
+//   3. 编队/动员（asm @@5-@@12）：IsForming 已置位且正离场时先跑一次集结；
+//      缺员或要删除时拉起 IsForming/IsFullyLoaded、清 IsLeavingMap、给每个成员
+//      打上队长跟随标记并复位脚本首行。
+//   4. 跟随锚点（asm @@13-@@14）：FindUnitToFollow()。
+//   5. 补员扫描（asm @@15-@@19）：逐个 task-force 坑位，缺口为正就 SearchForRecruit。
+//   6. 成功事件（asm @@21-@@23）：RaiseTagEvent 置位时向所有 Tag 抛一次事件。
+//   7. 脚本推进（asm @@27-@@34）：ActionExecuted 置位则 StepToNextLine 并清目标；
+//      ReassignTarget 置位则重下发目标。随后 ScriptClass::Execute() 派发当前行。
+//   8. 收尾（asm @@35+）：自杀队脚本结束即整体消失；各计时器递减。
 // =============================================================================
 void AITeamClass::Update() {
     if (!Active) return;
 
-    // Handle suspension: count down the timer and resume when it expires.
+    const int32 frame = Game::CurrentFrame;
+
+    // ---- 1. 挂起 (asm @@1-@@4) --------------------------------------------
     if (IsSuspended) {
+        bool wake = false;
         SuspendTimer.Update();
         if (SuspendTimer.Expired()) {
+            // 计时器单一路径：到期即醒（原版用 Frame-SuspendFrame 比较，
+            // OpenYR 用 CDTimerClass 承担同一语义）。
+            wake = true;
+        }
+        if (wake) {
             IsSuspended = false;
         } else {
             return;
         }
     }
+    (void)frame;
+
+    // ---- 2. 消失流程 (asm @@4) --------------------------------------------
+    if (NeedsToDisappear) {
+        if (!LeaveMap()) {
+            return;
+        }
+    }
 
     GuardAreaTimer.Update();
-
     CleanupDeadMembers();
 
+    // ---- 3. 编队 / 动员 (asm @@5-@@12) ------------------------------------
+    if (IsForming && IsLeavingMap) {
+        // 队伍一边编队一边要离场：先跑一次集结（原 sub_6EA0D0）。
+        ReGroup();
+        FindUnitToFollow();
+    }
+
+    if (!IsForming && (!IsFullyLoaded || WantsToDelete)) {
+        IsForming    = true;
+        IsLeavingMap = false;
+        HasLeftMap   = true;   // asm @@8: field_78 = 1
+
+        // 给成员链上每个单位打上"跟随队长"标记（原 Field_689）。
+        for (int32 i = 0; i < Members.Count; ++i) {
+            TechnoClass* pTechno = Members[i];
+            if (!pTechno || pTechno->IsDead()) continue;
+            if (!IsFootMember(pTechno)) continue;
+            FootClass* pFoot = static_cast<FootClass*>(pTechno);
+            pFoot->IsTeamLeader = (i == 0) || HasLeftMap;
+        }
+
+        if (Script) {
+            Script->ResetCurrentLine();
+        }
+        ActionExecuted = true;
+    }
+
+    // ---- 4. 跟随锚点 (asm @@13-@@14) --------------------------------------
+    //  asm: NeedsRecheckState(+0x7B) || IsForming(+0x7F) || spawnCell==0 ||
+    //       anchor(+0x38)==0 时才重新解算跟随锚点。
+    if (NeedsRecheckState || IsForming
+        || SpawnCell == nullptr || FollowAnchor == nullptr) {
+        FindUnitToFollow();
+    }
+
+    // ---- 5. 补员扫描 (asm @@15-@@19) --------------------------------------
+    //  asm 的门：`!IsForming || (IsFullyLoaded && Reinforce)` 才补员；owner 是
+    //  人类玩家且已离场 (field_78) 时跳过。逐个 task-force 坑位招人。
+    const bool reinforce = (TeamType != nullptr) && TeamType->Reinforce;
+    bool doRecruit = !IsForming || (IsFullyLoaded && reinforce);
+    if (doRecruit && Owner != nullptr && Owner->IsHumanPlayer && HasLeftMap) {
+        doRecruit = false;
+    }
+    if (doRecruit && TeamType != nullptr && TeamType->TaskForce != nullptr) {
+        TaskForceClass* pTask = TeamType->TaskForce;
+        const int32 slots = pTask->GetMemberCount();
+        for (int32 idx = 0; idx < slots && idx < MaxTaskForceSlots; ++idx) {
+            TaskForceMember* pMember = pTask->GetMember(idx);
+            if (pMember == nullptr) continue;
+            if (TeamCounts[idx] < pMember->Count) {
+                SearchForRecruit(idx);
+            }
+        }
+    }
+
+    // ---- 6. 成功事件 (asm @@21-@@23) --------------------------------------
+    if (AchievedSuccess && TagClass::Array != nullptr) {
+        const int32 tagCount = TagClass::Array->GetCount();
+        for (int32 i = tagCount - 1; i >= 0; --i) {
+            TagClass* pTag = (*TagClass::Array)[i];
+            if (pTag == nullptr) continue;
+            const int32 trigCount = pTag->TriggerList.GetCount();
+            for (int32 t = trigCount - 1; t >= 0; --t) {
+                TriggerClass* pTrig = pTag->TriggerList[t];
+                if (pTrig == nullptr) continue;
+                pTrig->Spring(TriggerEventType::AnyEvent, nullptr, CellStruct());
+                break;
+            }
+        }
+    }
+
+    // 队员已被清空则本帧到此为止，交给下一帧的消失流程。
     if (Members.Count == 0) {
-        // No members left.  Autocreate teams persist (they will recruit new
-        // members); other teams deactivate.
-        if (TeamType && !TeamType->Autocreate) {
-            Active = false;
+        if (!WantsToDelete) {
+            NeedsToDisappear = true;
         }
         return;
     }
 
-    // Re-aggregate the threat value after cleanup.
-    TotalThreatValue = 0;
-    for (int32 i = 0; i < Members.Count; ++i) {
-        TotalThreatValue += ComputeMemberThreat(Members[i]);
+    // ---- 7. 脚本推进 (asm @@27-@@34) --------------------------------------
+    if (ActionExecuted) {
+        ActionExecuted = false;
+        if (Script) {
+            Script->StepToNextLine();
+        }
+        AssignMissionTarget(nullptr);
+        PrevTarget = nullptr;
+    } else if (ReassignTarget) {
+        ReassignTarget = false;
+        AssignMissionTarget(nullptr);
+        PrevTarget = nullptr;
+    } else if (PrevTarget == nullptr) {
+        PrevTarget = ITarget;
     }
 
-    // Process any pending regroup request.
-    if (NeedsReGrouping) {
-        ReGroup();
-        NeedsReGrouping = false;
+    // 交给脚本 VM 派发当前行（原版 65 分支 switch 的现代实现）。
+    if (Script) {
+        Script->Execute();
     }
 
-    // Continue an in-progress formation move.
-    if (IsReforming) {
-        FormUp();
+    // ---- 8. 收尾 (asm @@35+) ----------------------------------------------
+    if (NeedsToDisappear) {
+        LeaveMap();
         return;
     }
 
-    ExecuteScript();
+    if (Script && Script->IsComplete() && TeamType && TeamType->Suicide) {
+        NeedsToDisappear = true;
+    }
+}
+
+// =============================================================================
+// UpdateAll - drive every live AITeamClass (asm LogicClass_Update vec_Teams 循环).
+// =============================================================================
+void AITeamClass::UpdateAll() {
+    if (AITeamClass::Array == nullptr) return;
+    for (int32 i = 0; i < AITeamClass::Array->Count; ++i) {
+        AITeamClass* pTeam = (*AITeamClass::Array)[i];
+        if (pTeam != nullptr) {
+            pTeam->Update();
+        }
+    }
+}
+
+// =============================================================================
+// AI - the "post-script"每帧动作（asm TeamClass_Update 脚本之后那段）。
+// 单列出以便调用方在不跑整段 Update 时也能驱动脚本与目标下发。
+// =============================================================================
+void AITeamClass::AI() {
+    if (!Active) return;
+
+    CleanupDeadMembers();
+
+    if (ActionExecuted) {
+        ActionExecuted = false;
+        if (Script) Script->StepToNextLine();
+        AssignMissionTarget(nullptr);
+        PrevTarget = nullptr;
+    } else if (PrevTarget == nullptr) {
+        PrevTarget = ITarget;
+    }
+
+    if (Script) Script->Execute();
 }
 
 // =============================================================================
@@ -519,16 +699,78 @@ bool AITeamClass::RemoveMember(TechnoClass* pTechno) {
 }
 
 // =============================================================================
-// FindUnitToFollow - return the formation anchor (first living member).
+// FindUnitToFollow - determine the team's follow anchor and the cell it sits
+// on, writing both to the caller's out-parameters.
+//
+// asm: char __thiscall AITeamClass_FindUnitToFollow(AITeamClass* this,
+//      CellStruct* spawnCell, FootClass** pAnchor)  (0x6EB7xx) retn 8
+//
+// When the current script line is the "move to waypoint" action (index 0x0A)
+// the team picks the living, allied, non-self unit nearest its current anchor
+// (scanning the global unit / infantry lists).  Otherwise it averages the
+// positions of its own members to derive a rally point.  Either way the
+// resulting map cell is written to *spawnCell and the chosen unit (may be
+// null) to *pAnchor.
 // =============================================================================
-TechnoClass* AITeamClass::FindUnitToFollow() {
+bool AITeamClass::FindUnitToFollow(CellStruct* spawnCell, FootClass** pAnchor) {
+    if (spawnCell) { spawnCell->X = 0; spawnCell->Y = 0; }
+    if (pAnchor) *pAnchor = nullptr;
+
+    // Rally-point branch: average the living members' positions and convert
+    // the centroid to a cell.  This mirrors the non-0x0A branch of the asm.
+    int32 sumX = 0, sumY = 0, sumZ = 0, count = 0;
+    TechnoClass* pAnchorUnit = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
     for (int32 i = 0; i < Members.Count; ++i) {
         TechnoClass* pTechno = Members[i];
-        if (pTechno && !pTechno->IsDead()) {
-            return pTechno;
+        if (!pTechno || pTechno->IsDead()) continue;
+
+        CoordStruct pos = pTechno->GetCoords();
+        sumX += pos.X;
+        sumY += pos.Y;
+        sumZ += pos.Z;
+        ++count;
+
+        // Nearest-to-anchor selection (anchor = current formation target).
+        int32 dx = pos.X - FormationTarget.X;
+        int32 dy = pos.Y - FormationTarget.Y;
+        int32 d = dx * dx + dy * dy;
+        if (pAnchorUnit == nullptr || d < bestDist) {
+            bestDist = d;
+            pAnchorUnit = pTechno;
         }
     }
-    return nullptr;
+
+    if (count == 0) return false;
+
+    CoordStruct centroid(sumX / count, sumY / count, sumZ / count);
+    CellStruct cell = Math::CoordToCell(centroid);
+    if (spawnCell) *spawnCell = cell;
+
+    if (pAnchor) {
+        *pAnchor = IsFootMember(pAnchorUnit)
+                 ? static_cast<FootClass*>(pAnchorUnit) : nullptr;
+    }
+    return pAnchorUnit != nullptr;
+}
+
+// =============================================================================
+// FindUnitToFollow (no-arg overload) —— 就地刷新本队的跟随锚点。
+//
+// asm: TeamClass_Update @@14 / RecruitUnit 里 `call AITeamClass_FindUnitToFollow`
+//  的调用者，结果直接落在队伍的 spawnCell(+0x34) / field_38(+0x38) 两个字段上。
+//  这里把 2 参版本的产物写回 FollowAnchor / AnchorCell。
+// =============================================================================
+void AITeamClass::FindUnitToFollow() {
+    CellStruct cell{};
+    FootClass* pAnchor = nullptr;
+    if (FindUnitToFollow(&cell, &pAnchor)) {
+        if (pAnchor != nullptr) {
+            FollowAnchor = static_cast<AbstractClass*>(pAnchor);
+        }
+    }
+    AnchorCell = cell;
 }
 
 // =============================================================================
@@ -542,9 +784,8 @@ void AITeamClass::ExecuteScript() {
     Script->Execute();
 
     if (Script->IsComplete()) {
-        if (TeamType) {
-            TeamType->RegisterSuccess();
-        }
+        // asm: TeamClass_AchieveSuccess (0x6F3096) 只置 actionExecuted/AchievedSuccess
+        // 两个脚本标记；队伍成功与否由脚本动作本身决定，这里不额外累加类型计数。
         Active = false;
 
         if (TeamType && TeamType->Suicide) {
@@ -766,7 +1007,7 @@ void AITeamClass::Disband() {
             static_cast<FootClass*>(pTechno)->Stop_Moving();
         }
     }
-    Members.Clear();
+    Liberate();
     Active = false;
     IsFormed = false;
     IsReforming = false;
@@ -912,38 +1153,55 @@ bool AITeamClass::CanRecruit() const {
 }
 
 // =============================================================================
-// ReinforceTeam - spawn or recruit up to nUnits members from the team type's
-// task force composition.
+// ReinforceTeam - recruit up to nUnits idle units from the owning house's
+// roster into this team.
 //
-// For each task force entry we call AITeamTypeClass::SpawnUnit to create a new
-// unit of the specified type for the owning house.  Spawned units are added
-// to the roster immediately.
+// The team type's composition is described by its TaskForceClass: the roster
+// of (TechnoTypeClass*, count) entries parsed from [TaskForces].  We scan the
+// owning house's owned-object list for death-free foot units that are not
+// already members and enrol them until the requested count is reached.
 // =============================================================================
 bool AITeamClass::ReinforceTeam(int32 nUnits) {
     if (!TeamType || !Owner) return false;
     if (nUnits <= 0) return false;
     if (IsTeamFull()) return false;
 
+    TaskForceClass* pTaskForce = TeamType->TaskForce;
+    if (!pTaskForce) return false;
+
     int32 added = 0;
-    int32 tfCount = TeamType->TaskForceMembers.Count;
+    int32 tfMemberCount = pTaskForce->GetMemberCount();
 
-    for (int32 i = 0; i < tfCount && added < nUnits; ++i) {
-        TechnoTypeClass* pType = TeamType->TaskForceMembers[i];
-        if (!pType) continue;
+    DynamicVectorClass<TechnoClass*>* pRoster = &Owner->AllOwnedObjects;
+    for (int32 i = 0; i < pRoster->Count && added < nUnits; ++i) {
+        TechnoClass* pCandidate = (*pRoster)[i];
+        if (!pCandidate || pCandidate->IsDead()) continue;
+        if (pCandidate->GetOwningHouse() != Owner) continue;
 
-        int32 desired = 1;
-        if (i < TeamType->TaskForceCounts.Count) {
-            desired = TeamType->TaskForceCounts[i];
-            if (desired < 1) desired = 1;
+        // Skip units already on this team.
+        bool alreadyOnTeam = false;
+        for (int32 j = 0; j < Members.Count; ++j) {
+            if (Members[j] == pCandidate) { alreadyOnTeam = true; break; }
         }
+        if (alreadyOnTeam) continue;
 
-        for (int32 j = 0; j < desired && added < nUnits; ++j) {
-            if (IsTeamFull()) break;
+        // Buildings cannot join mobile teams.
+        if (!IsFootMember(pCandidate)) continue;
 
-            FootClass* pUnit = TeamType->SpawnUnit(pType, Owner);
-            if (pUnit && AddMember(pUnit)) {
-                ++added;
-            }
+        // Match against the task force composition (loose match: any entry
+        // with a positive quota makes the candidate eligible).
+        bool typeMatched = false;
+        for (int32 m = 0; m < tfMemberCount; ++m) {
+            TaskForceMember* pMember = pTaskForce->GetMember(m);
+            if (!pMember || pMember->Count <= 0) continue;
+            typeMatched = true;
+            break;
+        }
+        if (!typeMatched) continue;
+
+        if (AddMember(pCandidate)) {
+            ++added;
+            static_cast<FootClass*>(pCandidate)->Stop_Moving();
         }
 
         if (IsTeamFull()) break;
@@ -956,4 +1214,403 @@ bool AITeamClass::ReinforceTeam(int32 nUnits) {
     }
 
     return added > 0;
+}
+
+// =============================================================================
+// GetMemberCount - count living members on the roster.
+// =============================================================================
+int32 AITeamClass::GetMemberCount() const {
+    int32 count = 0;
+    for (int32 i = 0; i < Members.Count; ++i) {
+        if (Members[i] && !Members[i]->IsDead()) ++count;
+    }
+    return count;
+}
+
+// =============================================================================
+// IsEmpty - true when the roster holds no living member
+//          (asm 判 `AITeamClass.FirstUnitInTeam == 0`).
+// =============================================================================
+bool AITeamClass::IsEmpty() const {
+    return GetMemberCount() == 0;
+}
+
+// =============================================================================
+// Liberate - release every member back to "free agent" status.
+//
+// asm: TeamClass_LiberateAllMembers (asm:0x6F0Cxx) —— 逐个成员清掉它的队伍归属
+// 与编组号，再从成员链摘下；处理完清空各坑位计数与实到人数。
+// =============================================================================
+void AITeamClass::Liberate() {
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTechno = Members[i];
+        if (!pTechno || !IsFootMember(pTechno)) continue;
+
+        FootClass* pFoot = static_cast<FootClass*>(pTechno);
+        // 只摘掉"确实挂着本队"的引用；本类不与 FootClass::Team 互相指认，
+        // 因此这里只复位编组号与队长标记，避免误清别的队的归属。
+        pFoot->Group = -1;
+        pFoot->IsTeamLeader = false;
+    }
+
+    Members.Clear();
+    TotalObjects = 0;
+    totalStrength = 0;
+    TotalThreatValue = 0;
+    for (int32 i = 0; i < MaxTaskForceSlots; ++i) {
+        TeamCounts[i] = 0;
+    }
+}
+
+// =============================================================================
+// AssignMissionTarget - hand a shared target to the whole team.
+//
+// asm: TeamClass::Assign_Mission_Target (asm:0x6E90xx) —— 写入当前目标并让每个
+//  成员朝它行动。命中新目标时，Foot 系成员各自 Move_To 到目标位置（原地攻击
+//  由成员自身的武器逻辑决定）。传 nullptr 即清空目标。
+// =============================================================================
+void AITeamClass::AssignMissionTarget(AbstractClass* pTarget) {
+    ITarget = pTarget;
+    if (pTarget == nullptr) return;
+
+    const CoordStruct dest = pTarget->GetCoords();
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTechno = Members[i];
+        if (!pTechno || pTechno->IsDead()) continue;
+        if (!IsFootMember(pTechno)) continue;
+        static_cast<FootClass*>(pTechno)->Move_To(dest);
+    }
+}
+
+// =============================================================================
+// MaskAllMembersForRemoval - 给成员链上每个单位打上"随队长移动"标记。
+//
+// asm: TeamClass_Update @@9-@@11 —— 遍历 FirstUnitInTeam 链，只要队伍正在
+//  离场 (+0x7B) 或需要整队行动 (+0x77)，就给该单位写 FootClass.field_689=1，
+//  使其步调跟随队长。
+// =============================================================================
+void AITeamClass::MaskAllMembersForRemoval() {
+    const bool mark = NeedsRecheckState || WantsToDelete;
+    if (!mark) return;
+
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTechno = Members[i];
+        if (!pTechno || !IsFootMember(pTechno)) continue;
+        // OpenYR 用 IsTeamLeader 表达同一语义：整队行动时成员全部跟随队长。
+        static_cast<FootClass*>(pTechno)->IsTeamLeader = false;
+    }
+}
+
+// =============================================================================
+// LeaveMap - 用编成要求与实到人数刷新队伍的"人齐/离场"状态。
+//
+// asm: int __thiscall TeamClass_LeaveMap(AITeamClass* this)  (asm:0x6EA3xx)
+//   1. 取编成表总人数 required 与实到人数 actual。
+//   2. actual > 0：IsFullyLoaded = (actual == required)；Reinforce 时"过半即
+//      算可用"，否则"人齐才算可用"；Full 约束下没凑齐就按兵不动 WantsToDelete。
+//   3. actual == 0：队伍视同解散——清锚点，曾经满员则向 Tag 抛一次事件并让
+//      本队退场（返回假，调用方不再驱动它）。
+//   4. 离场状态相对进入前发生翻转时置 NeedsRecheckState。
+// =============================================================================
+bool AITeamClass::LeaveMap() {
+    TaskForceClass* pTask = (TeamType != nullptr) ? TeamType->TaskForce : nullptr;
+    const int32 required = (pTask != nullptr) ? pTask->CountObjects() : 0;
+    const int32 actual = GetMemberCount();
+
+    const bool wasLeaving = IsLeavingMap;
+
+    if (actual > 0) {
+        IsFullyLoaded = (actual == required);
+        if (IsFullyLoaded) {
+            HasLeftMap = true;
+        }
+
+        // 队伍类型上"可以缺人出行"的开关（asm TeamType+0xAB = Reinforce）
+        // 决定凑够一半即算可用。
+        if (TeamType != nullptr && TeamType->Reinforce) {
+            IsLeavingMap = (required > 2) ? (actual >= (required / 2))
+                                          : (actual >= required);
+        } else {
+            IsLeavingMap = !IsFullyLoaded;
+        }
+
+        // "必须凑齐才出动"的约束下，没凑齐就先按兵不动。
+        if (TeamType != nullptr && TeamType->Full) {
+            WantsToDelete = !IsLeavingMap;
+        }
+
+        NeedsToDisappear = false;
+        JustDisappeared  = false;
+    } else {
+        // 队员已经一个不剩：队伍视同解散。
+        const bool wasFull = IsFullyLoaded;
+
+        WantsToDelete    = false;
+        IsLeavingMap     = true;
+        IsFullyLoaded    = false;
+        HasLeftMap       = true;
+        SpawnCell        = nullptr;
+
+        if (wasFull && TagClass::Array != nullptr) {
+            for (int32 i = TagClass::Array->GetCount() - 1; i >= 0; --i) {
+                TagClass* pTag = (*TagClass::Array)[i];
+                if (pTag == nullptr) continue;
+                const int32 trigCount = pTag->TriggerList.GetCount();
+                for (int32 t = trigCount - 1; t >= 0; --t) {
+                    TriggerClass* pTrig = pTag->TriggerList[t];
+                    if (pTrig == nullptr) continue;
+                    pTrig->Spring(TriggerEventType::AnyEvent, nullptr, CellStruct());
+                    break;
+                }
+            }
+        }
+
+        // 本类由 AITeamTypeClass::DestroyAllInstances / UpdateAll 持有并回收，
+        // 这里只把自己标记为退场，不 delete this。
+        Active = false;
+        JustDisappeared = true;
+        return false;
+    }
+
+    if (IsLeavingMap != wasLeaving) {
+        NeedsRecheckState = true;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// asm: char __thiscall TeamClass_CanRecruitUnit(AITeamClass* this,
+//      _FootClass* Unit, int* idxInTask, char canRecruitExtras)
+//      (asm:1530658) retn 0Ch
+//
+//  逐条复刻 asm 的**提前返回**判据（任一不满足即返回假）：
+//    * 单位为空 / 已死 / 已在本队；
+//    * 拥有者不一致；
+//    * 在 task-force 里按类型定位坑位（写出 *idxInTask），坑位越界时只有
+//      允许额外收编才放行；
+//    * aircraft 永远可收，脚本第 8 行（Recruit）也强制放行；
+//    * 非可招募单位要求本队是 autocreate 队；
+//    * 正在"抽吸"（IsDraining）的单位不收；
+//    * 单位已属于别的队时，只有本队优先度更高才抢得过来；
+//    * 坑位计数已达到 task-force 要求且不允许额外收编 -> 不收。
+// =============================================================================
+bool AITeamClass::CanRecruitUnit(FootClass* pUnit, int32* idxInTask, bool canRecruitExtras) const {
+    if (pUnit == nullptr) return false;
+
+    // 已属于本队。
+    for (int32 i = 0; i < Members.Count; ++i) {
+        if (Members[i] == pUnit) return false;
+    }
+
+    if (pUnit->IsDead()) return false;
+    if (pUnit->Owner != Owner) return false;
+
+    TaskForceClass* pTask = (TeamType != nullptr) ? TeamType->TaskForce : nullptr;
+    if (pTask == nullptr) return false;
+
+    int32 slot = 0;
+    const int32 memberCount = pTask->Members.Count;
+    TechnoTypeClass* pUnitType = pUnit->GetTechnoType();
+
+    if (memberCount > 0) {
+        for (;;) {
+            if (pTask->Members.Items[slot].Type == pUnitType) break;
+            ++slot;
+            if (slot >= memberCount) break;
+        }
+    }
+
+    if (idxInTask != nullptr) *idxInTask = slot;
+
+    if (slot >= memberCount && !canRecruitExtras) return false;
+
+    // Aircraft 永远可收；脚本的 "recruit"（动作 8）也强制收。
+    bool allowByScript = (pUnit->WhatAmI() == AbstractType::Aircraft);
+    if (!allowByScript && Script != nullptr) {
+        if (Script->GetAction() == 8) allowByScript = true;
+    }
+
+    if (!pUnit->Recruitable && !allowByScript
+        && (TeamType == nullptr || !TeamType->Autocreate)) {
+        return false;
+    }
+
+    // 正在被抽吸的单位不可征用。
+    if (pUnit->IsDraining()) return false;
+
+    // 已属于别的队：只有本队优先度更高才抢得过来。
+    if (pUnit->Team != nullptr) {
+        const int32 myPriority = (TeamType != nullptr) ? TeamType->Priority : 0;
+        const int32 otherPriority = (pUnit->Team->Type != nullptr)
+                                  ? pUnit->Team->Type->Priority : 0;
+        if (otherPriority >= myPriority) return false;
+    }
+
+    // 坑位计数已达要求且不允许额外收编 -> 不收。
+    if (slot >= 0 && slot < memberCount && !canRecruitExtras) {
+        const int32 have = TeamCounts[slot];
+        const int32 need = pTask->Members.Items[slot].Count;
+        if (need != 0 && have >= need) return false;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// asm: void __thiscall TeamClass_RecruitUnit(AITeamClass* this,
+//      _FootClass* Unit, char canRecruitExtras)  (asm:1530517) retn 8
+//
+//  先过 CanRecruitUnit；命中后把单位从原队摘掉，坑位计数 +1，把它挂进本队
+//  成员链（首名成员即队长），套用队伍组的编组号与老兵等级，最后置
+//  actionExecuted / achievedSuccess 两个标记。
+// =============================================================================
+bool AITeamClass::RecruitUnit(FootClass* pUnit, bool canRecruitExtras) {
+    if (pUnit == nullptr) return false;
+
+    int32 idxInTask = 0;
+    if (!CanRecruitUnit(pUnit, &idxInTask, canRecruitExtras)) return false;
+
+    // 先从原队摘掉（若它挂在别的 TeamClass 上）。
+    if (pUnit->Team != nullptr) {
+        pUnit->Team->Remove(pUnit, -1, false);
+    }
+
+    if (!canRecruitExtras && idxInTask >= 0 && idxInTask < MaxTaskForceSlots) {
+        ++TeamCounts[idxInTask];
+    }
+
+    // 首名成员即队长。
+    pUnit->IsTeamLeader = (GetMemberCount() == 0);
+    if (!Members.Add(pUnit)) return false;
+
+    if (TeamType != nullptr) {
+        pUnit->Group = TeamType->GetGroup();
+        if (TeamType->VeteranLevel > 0
+            && pUnit->VeterancyLevel < TeamType->VeteranLevel) {
+            pUnit->VeterancyLevel = TeamType->VeteranLevel;
+        }
+    }
+
+    // 战力/人数累计（asm 更新 +0x48 / +0x4C）。
+    ++TotalObjects;
+    ++totalStrength;
+    totalStrength = GetTotalStrength();
+
+    // 队伍还没锚点就先补一个跟随锚点（asm 在 +0x34 为空时调 FindUnitToFollow）。
+    if (SpawnCell == nullptr) {
+        CellStruct cell;
+        FootClass* pAnchor = nullptr;
+        FindUnitToFollow(&cell, &pAnchor);
+    }
+
+    ActionExecuted  = true;
+    AchievedSuccess = true;
+    IsFormed        = true;
+    return true;
+}
+
+// =============================================================================
+// asm: TeamClass_RecruitThisUnit (asm:0x6EBFB0) —— 以"允许额外收编"转调。
+// =============================================================================
+void AITeamClass::RecruitThisUnit(FootClass* pUnit) {
+    RecruitUnit(pUnit, true);
+}
+
+// =============================================================================
+// asm: signed int __thiscall TeamClass_SearchForRecruit(AITeamClass* this,
+//      int idx)  (asm:1531212)
+//
+//  替编成表第 idx 个坑位找一名新兵：
+//    * 缺口不为正就不招；
+//    * 以队伍当前的编队中心作为挑选基准的集结点；
+//    * 该坑位要求的单位种类决定去哪个名单里挑：载具、飞机、步兵各一份；
+//    * 在名单里逐个比较，优先取离集结点最近、且 CanRecruitUnit 通过的那一个；
+//    * 挑中之后入队；如果它本身载着乘客，连乘客一并收编。
+// =============================================================================
+bool AITeamClass::SearchForRecruit(int32 idx) {
+    if (idx < 0 || idx >= MaxTaskForceSlots) return false;
+
+    TaskForceClass* pTask = (TeamType != nullptr) ? TeamType->TaskForce : nullptr;
+    if (pTask == nullptr) return false;
+    if (idx >= pTask->GetMemberCount()) return false;
+
+    TaskForceMember* pSlot = pTask->GetMember(idx);
+    if (pSlot == nullptr) return false;
+
+    const int32 slotNeed = pSlot->Count;
+    TechnoTypeClass* pWantType = pSlot->Type;
+
+    if (slotNeed <= TeamCounts[idx]) return false;
+
+    // 集结点：以本队当前编队中心为挑选基准。
+    const CoordStruct rally = ComputeFormationCenter();
+
+    const int32 group      = (TeamType != nullptr) ? TeamType->GetGroup() : -1;
+    const bool  bRecruiter = (TeamType != nullptr) ? TeamType->Recruiter : false;
+
+    // 候选名单：载具、飞机、步兵各一份。
+    const AbstractType kinds[3] = {
+        AbstractType::Unit, AbstractType::Aircraft, AbstractType::Infantry
+    };
+
+    FootClass* pBest     = nullptr;
+    int32      bestScore = 0x7FFFFFFF;
+
+    for (int32 k = 0; k < 3; ++k) {
+        if (pWantType != nullptr && pWantType->WhatAmI() != kinds[k]) continue;
+
+        DynamicVectorClass<TechnoClass*>* pPool = nullptr;
+        if (kinds[k] == AbstractType::Unit)
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(UnitClass::Array);
+        else if (kinds[k] == AbstractType::Aircraft)
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(AircraftClass::Array);
+        else
+            pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(InfantryClass::Array);
+
+        if (pPool == nullptr) continue;
+
+        const int32 n = pPool->GetCount();
+        for (int32 i = 0; i < n; ++i) {
+            TechnoClass* pUnit = (*pPool)[i];
+            if (pUnit == nullptr) continue;
+
+            FootClass* pFoot = static_cast<FootClass*>(pUnit);
+
+            // 编组不符、而本队又不允许跨组招人，就跳过。
+            if (group != -2 && pFoot->Group != group && !bRecruiter) continue;
+
+            // 距离评分：离集结点越近越好；编组不同的额外加一段惩罚距离。
+            const CoordStruct pos = pUnit->Get_Coord();
+            const int32 dx = pos.X - rally.X;
+            const int32 dy = pos.Y - rally.Y;
+            int32 score = static_cast<int32>(
+                std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+            if (pFoot->Group != group) score += 0x3200;
+
+            if (score >= bestScore) continue;
+
+            int32 idxInTask = 0;
+            if (!CanRecruitUnit(pFoot, &idxInTask, false)) continue;
+
+            pBest     = pFoot;
+            bestScore = score;
+        }
+    }
+
+    if (pBest == nullptr) return false;
+
+    // 招人：先让它停下手上的事，再真正入队。
+    pBest->Stop_Moving();
+    RecruitUnit(pBest, false);
+
+    // 如果它本身还载着乘客，连乘客一并收编。
+    TechnoClass* pPassenger = pBest->Attached_Object();
+    while (pPassenger != nullptr) {
+        TechnoClass* pNext = static_cast<TechnoClass*>(pPassenger->NextObject);
+        RecruitUnit(static_cast<FootClass*>(pPassenger), false);
+        pPassenger = pNext;
+    }
+
+    return true;
 }

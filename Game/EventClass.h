@@ -23,6 +23,10 @@
 
 class CCINIClass;
 class IStream;
+class AbstractClass;
+class HouseClass;
+class TEventClass;
+class TriggerClass;
 
 // ----------------------------------------------------------------------------
 // GameEventType - the kinds of conditions that can trigger a game event.
@@ -183,6 +187,28 @@ public:
 
     // Manually trigger a Custom-type event by ID.
     bool Trigger_Event(int32 eventID);
+
+    // ----------------------------------------------------------------------
+    // asm: int __thiscall EventClass_HasOccured(EventClass *this,
+    //        int eventKind, HouseClass *pHouse, _ObjectClass *Object,
+    //        TimerStruct *ActivationFrame, char *isRepeating,
+    //        _ObjectClass *source)                      (0x71E964, retn 18h)
+    //
+    // 判定一条事件记录（原版 EventClass，OpenYR 侧为 TEventClass）在当前
+    // 世界状态下是否已经成立。事件种类取自 pEvent->EventKind（asm +0x2C），
+    // 参数取自 pEvent->Data（asm +0x34）。*isRepeating 在命中"可重复"
+    // 分支时被置真，调用方据此把该事件记入 EventsAlreadyFired。
+    //
+    //   eventKind  本次广播的事件类型，用于和事件自身的 Kind 比对
+    //   pHouse     触发器的关联方（可为空）
+    //   pObject    触发对象（可为空）
+    //   pTrigger   触发器实例，提供 TimeElapsed 的倒计时（asm ActivationFrame）
+    //   pSource    事件的源对象（asm 第 6 个参数，用于 SameHouse 判定）
+    // ----------------------------------------------------------------------
+    static bool HasOccurred(TEventClass* pEvent, int32 eventKind,
+                            HouseClass* pHouse, AbstractClass* pObject,
+                            TriggerClass* pTrigger, AbstractClass* pSource,
+                            bool* isRepeating);
 
     // Notify the event system that a unit entered a cell.  This evaluates
     // all UnitEnteredCell events against the given coordinates.

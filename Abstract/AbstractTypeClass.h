@@ -67,6 +67,16 @@ public:
     // ------------------------------------------------------------------
     const char* get_ID() const;
     const char* get_Name() const;
+
+    // asm: AbstractTypeClass_HasThisID (dup @0x410B...) --- __stdcall, ecx =
+    // this, one stack arg = the candidate ID.  It sign-extends __strcmpi's
+    // result into a boolean:
+    //     call __strcmpi(pArg, this+0x24)   ; +0x24 = ID
+    //     neg eax / sbb eax,eax / inc eax   ; 1 when equal, 0 otherwise
+    // Kept non-virtual so it does not perturb the vtable layout of the many
+    // derived type classes; TechnoTypeClass adds its own virtual overload.
+    bool HasThisID(const char* pID) const;
+
     int32 Get_Cost() const { return Cost; }
     int32 Get_TechLevel() const { return TechLevel; }
     int32 Get_ArrayIndex() const { return ArrayIndex; }

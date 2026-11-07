@@ -5,8 +5,11 @@
 #include <Core/Macros.h>
 #include <Core/Memory.h>
 #include <COM/IUnknown.h>
+#include <FileFormats/TMP.h>
+#include <Game/Externs.h>
 #include <IO/CRC.h>
 #include <INI/INIClass.h>
+#include <Rendering/TileArt.h>
 
 #include <cmath>
 #include <cstdio>
@@ -580,6 +583,13 @@ IsometricTileType::IsometricTileType() noexcept
     , TileXOffset(nullptr), TileYOffset(nullptr)
     , TileAttachesTo(nullptr), TileZAdjust(nullptr)
     , ArrayIndex(0)
+    , GlobalStartIndex(0)
+    , TileColorTable(nullptr)
+    , AttachesToType(nullptr)
+    , AnimTypeIndex(-1)
+    , TilesPerSetInstances(1)
+    , ImageData(nullptr)
+    , ImageLoadAttempted(false)
 {
     SetName[0] = '\0';
     FileName[0] = '\0';
@@ -592,10 +602,19 @@ IsometricTileType::~IsometricTileType() noexcept
     delete[] TileAttachesTo;
     delete[] TileZAdjust;
 
+    // asm: 析构里逐个 delete 调色表行再释放行表（~IsometricTileTypeClass）。
+    if (TileColorTable != nullptr) {
+        for (int32 i = 0; i < TilesInSet; ++i)
+            delete[] TileColorTable[i];
+        delete[] TileColorTable;
+    }
+
     TileXOffset = nullptr;
     TileYOffset = nullptr;
     TileAttachesTo = nullptr;
     TileZAdjust = nullptr;
+    TileColorTable = nullptr;
+    AttachesToType = nullptr;
 }
 
 int32 IsometricTileType::GetTileSetCount()
@@ -605,11 +624,62 @@ int32 IsometricTileType::GetTileSetCount()
 
 IsometricTileType* IsometricTileType::GetTileSet(int32 index)
 {
-    if (!TileTypeClass_Array || index < 0 || index >= TileTypeClass_Array->Count)
+    if (!TileTypeClass_Array || index < 0)
         return nullptr;
 
-    return (*TileTypeClass_Array)[index];
+    // 注意：index 是 [TileSet%04d] 的编号（CellClass::TileType 与
+    // IsometricTileType::ArrayIndex 都是它），不是 vector 下标。
+    // CreateFromINIList 会跳过 ToSnow/ToTemperate = 0 的条目，两者会分叉。
+    const int32 count = TileTypeClass_Array->Count;
+    for (int32 i = 0; i < count; ++i)
+    {
+        IsometricTileType* pSet = (*TileTypeClass_Array)[i];
+        if (pSet != nullptr && pSet->ArrayIndex == index)
+            return pSet;
+    }
+    return nullptr;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// 全局瓦片序号 → (瓦片集, 集内子序号)
+//
+//   地图 [IsoMapPack5] 每格存的是**全局序号**（跨全部瓦片集累加），而绘制
+//   需要的是「哪一套图的第几块」。原版的起点表是 dword_AA1140[setIndex]，
+//   由 CreateFromINIList 逐集累加 TilesInSet 填入（asm 0x546C30）。这里用
+//   每集自带的 GlobalStartIndex 做区间判定。
+//
+//   0xFFFF 是“无瓦片”哨兵：asm sub_544E30 的第一条就是
+//   `cmp ecx,0FFFFh / jnz ... / retn`，原样返回不参与任何换算。
+// ───────────────────────────────────────────────────────────────────────────
+bool IsometricTileType::Split_Global_Tile_Index(int32 globalIndex,
+                                               int32& outSetIndex,
+                                               int32& outSubIndex)
+{
+    outSetIndex = -1;
+    outSubIndex = -1;
+
+    if (TileTypeClass_Array == nullptr || globalIndex < 0 || globalIndex == 0xFFFF)
+        return false;
+
+    const int32 count = TileTypeClass_Array->Count;
+    for (int32 i = 0; i < count; ++i)
+    {
+        const IsometricTileType* pSet = (*TileTypeClass_Array)[i];
+        if (pSet == nullptr || pSet->TilesInSet <= 0)
+            continue;
+
+        const int32 start = pSet->GlobalStartIndex;
+        if (globalIndex < start || globalIndex >= start + pSet->TilesInSet)
+            continue;
+
+        outSetIndex = pSet->ArrayIndex;
+        outSubIndex = globalIndex - start;
+        return true;
+    }
+
+    return false;
+}
+
 
 // IsometricTileTypeClass_FindIndex - looks a tile set up by its SetName.
 // The original runs a case-insensitive compare over the registered sets and
@@ -633,6 +703,215 @@ int32 IsometricTileType::FindIndex(const char* pID)
     }
 
     return -1;
+}
+
+// ============================================================================
+// IsometricTileTypeClass_CreateSome (asm:714657)
+//
+//   bool __thiscall(this, WhereType where) —— 按本类型创建一块等距瓦片。
+//   asm 逐句：
+//     new 0xB0（sizeof IsometricTileClass）
+//     IsometricTileClass_CTOR(this, idx=[this+294h], where)
+//     return 分配并构造成功 ? true : false
+//
+//   OpenYR 对应：IsometricTile 承载瓦片实例（其构造参数为锚点格 X/Y），
+//   类型号取本类型的 ArrayIndex（asm [this+294h]），并把类型挂到瓦片上。
+// ============================================================================
+bool IsometricTileType::CreateSome(const CellStruct& where, int32 a3)
+{
+    // asm: push 0B0h / call new / test eax,eax / jz fail
+    IsometricTile* pTile = new IsometricTile(where.X, where.Y);
+    if (pTile == nullptr)
+        return false;                          // asm: xor al,al / retn 8
+
+    // asm: edx = [esi+294h]（类型索引）; IsometricTileClass_CTOR(idx, where)
+    pTile->SetTileSetIndex(ArrayIndex);
+    pTile->SetTileType(this);                  // asm: vec_IsometricTileTypes[idx]
+
+    // asm: a3 是 vtable 签名的一部分但本体未用（retn 8 的第 2 参）。
+    (void)a3;
+
+    // asm: test eax,eax / jz fail ; mov al,1
+    return true;
+}
+
+// =============================================================================
+// asm 原版命名形态
+// =============================================================================
+
+// asm: IsometricTileTypeClass_544E00(this, int a2) retn 4 (asm:427)
+//   edx = a2 % [this+2F0h]；从 this 起沿 [this+2BCh] 走 edx 步并返回。
+//   即：在 AttachesTo 链上按"每块实例数"取模后定位链节。
+IsometricTileType* IsometricTileType::GetTile(int32 index) const
+{
+    const int32 perSet = (TilesPerSetInstances > 0) ? TilesPerSetInstances : 1;
+
+    int32 rem = index;
+    if (index > perSet - 1)                    // asm: cmp eax, esi-1 ; jle skip
+        rem = index % perSet;                  // asm: idiv esi ; edx
+
+    const IsometricTileType* node = this;
+    while (rem > 0                   // asm: test edx,edx ; jz ret
+           && node->AttachesToType != nullptr)
+    {
+        node = node->AttachesToType;           // asm: mov eax,[eax+2BCh]
+        --rem;
+    }
+    return const_cast<IsometricTileType*>(node);
+}
+
+// asm: IsometricTileTypeClass_Get_Cell_Color?(this, a2, a3) retn 8 (asm:940)
+//   if (![this+0A4h] && [this+2F4h]) sub_547020(this)  ; 惰性准备
+//   return [ [this+2A8h][a2] + a3*4 ]                  ; 第 a2 行第 a3 列
+uint32 IsometricTileType::GetCellColor(int32 a2, int32 a3) const
+{
+    if (TileColorTable == nullptr)
+        return 0;
+    if (a2 < 0 || a2 >= TilesInSet)
+        return 0;
+    if (TileColorTable[a2] == nullptr)
+        return 0;
+
+    return TileColorTable[a2][a3];             // asm: [eax+edx*4]
+}
+
+// asm: IsometricTileTypeClass_GetCRC(this, buf) retn 4 (asm:595)
+//   AbstractTypeClass_GetCRC(buf) 之后逐个 CRC_DWORD/CRC_bool 本类字段。
+int32 IsometricTileType::GetCRC(CRCEngine& crc) const
+{
+    // asm: 基数先喂 AbstractTypeClass 部分（SetName/FileName 等）。
+    crc.AddData(SetName, sizeof(SetName));
+    crc.AddData(FileName, sizeof(FileName));
+
+    // asm: 之后按 [294h..2F0h] 顺序逐字段。
+    crc.AddData(&ArrayIndex, sizeof(ArrayIndex));
+    crc.AddData(&TilesInSet, sizeof(TilesInSet));
+    crc.AddData(&LastTilesInSet, sizeof(LastTilesInSet));
+    crc.AddData(&MarbleMadness, sizeof(MarbleMadness));
+    crc.AddData(&NonMarbleMadness, sizeof(NonMarbleMadness));
+    crc.AddData(&TilesPerSetInstances, sizeof(TilesPerSetInstances));
+
+    uint8 flags = 0;
+    if (Morphable)     flags |= 0x01;
+    if (AllowToPlace)  flags |= 0x02;
+    if (AllowBurrowing) flags |= 0x04;
+    crc.AddData(&flags, sizeof(flags));
+
+    crc.AddData(&ToSnowTheater, sizeof(ToSnowTheater));
+    crc.AddData(&ToTemperateTheater, sizeof(ToTemperateTheater));
+    crc.AddData(&TileAttachesTo, sizeof(TileAttachesTo));
+
+    return 0;
+}
+
+// asm: IsometricTileTypeClass_PointerGotInvalid(this, p, removed) retn 8 (asm:892)
+void IsometricTileType::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
+{
+    (void)removed;
+
+    // asm: if ([ecx+2BCh] == p) [ecx+2BCh] = 0
+    if (AttachesToType == reinterpret_cast<IsometricTileType*>(pInvalid))
+        AttachesToType = nullptr;
+
+    // asm: if ([ecx+2C8h] != -1 && vec_AnimTypes[[ecx+2C8h]] == p)
+    //        [ecx+2C8h] = -1
+    // OpenYR 未持有 vec_AnimTypes 表；按语义只要该索引有效即视为命中并置 -1。
+    if (AnimTypeIndex != -1 && pInvalid != nullptr)
+        AnimTypeIndex = -1;
+}
+
+// asm: IsometricTileTypeClass_GetAbstractDerivationID -> 0x12 (asm:988)
+int32 IsometricTileType::GetAbstractDerivationID() const
+{
+    return 0x12;
+}
+
+// asm: IsometricTileTypeClass_GetSize -> 0x30Ch (asm:1017)
+int32 IsometricTileType::GetSize() const
+{
+    return 0x30C;
+}
+
+// asm: sub_54A160 -> [this+294h] (asm:1034)
+int32 IsometricTileType::GetArrayIndex() const
+{
+    return ArrayIndex;
+}
+
+// asm: sub_544CB0(this) (asm:349)
+//   if (![this+0A4h] && [this+2F4h]) sub_547020(this) ; return [this+0A4h]
+void* IsometricTileType::GetImageData()
+{
+    if (ImageData != nullptr || FileName[0] == '\0' || ImageLoadAttempted)
+        return ImageData;
+
+    // 素材缺失时不重试（否则每帧都会走一次 fopen）。
+    ImageLoadAttempted = true;
+
+    // asm: sub_547020 惰性构建图像数据 —— 整文件读入后按 cell 偏移表重定位。
+    //   文件名 = [TileSet 的 FileName] + 当前剧场扩展名。原版剧场扩展名来自
+    //   theatreData.ext（[Theater] 段的 Extension= 键）；此处按固定表回退，
+    //   与 ObjectTypeClass::TheaterSpecificID 的顺序一致。
+    static const char* const kTheaterExt[6] = {
+        ".tem", ".sno", ".urb", ".des", ".lun", ".nub"
+    };
+
+    int32 theater = static_cast<int32>(g_Theater);
+    if (theater < 0 || theater > 5)
+        theater = 0;
+
+    char fullName[0x88];
+    if (std::strrchr(FileName, '.') != nullptr)
+    {
+        std::snprintf(fullName, sizeof(fullName), "%s", FileName);
+    }
+    else
+    {
+        std::snprintf(fullName, sizeof(fullName), "%s%s",
+                      FileName, kTheaterExt[theater]);
+    }
+
+    SHPStruct* pShape = TMPFile::LoadFromFile(fullName);
+    ImageData = pShape;
+
+    // 渲染层的图集表按 IsoTileTypeIndex 取句柄；帧号 = TileSubIndex*3 + raster
+    // （每个 cell 最多 3 段，见 FileFormats/TMP.h）。
+    if (pShape != nullptr)
+        TileArt::Set_Tile_Shape(ArrayIndex, pShape);
+
+    return ImageData;
+}
+
+// asm: sub_544D30(this, out) retn 4 (asm:406)
+//   *out = 0x7FFF7FFF（wXY 哨兵）；返回全局脚印表头。
+const CellStruct* IsometricTileType::GetFoundationData(CellStruct* pOut) const
+{
+    if (pOut != nullptr)
+    {
+        pOut->X = static_cast<int16>(0x7FFF);   // asm: mov word [var], 7FFFh
+        pOut->Y = static_cast<int16>(0x7FFF);   // asm: mov word [var+2], 7FFFh
+    }
+    // asm: mov eax, offset byte_AA0E3C —— 静态脚印偏移表头；OpenYR 见
+    // DisplayClass::FoundationBoundsSize 的等价遍历，返回 pOut 作为表头。
+    return pOut;
+}
+
+// asm: sub_549B50(dst, src) retn 8 (asm:578) —— 拷贝 3 个 dword。
+void IsometricTileType::Copy3Dwords(void* pDst, const void* pSrc)
+{
+    if (pDst == nullptr || pSrc == nullptr)
+        return;
+    const uint32* s = static_cast<const uint32*>(pSrc);
+    uint32*       d = static_cast<uint32*>(pDst);
+    d[0] = s[0];
+    d[1] = s[1];
+    d[2] = s[2];
+}
+
+// asm: IsometricTileTypeClass_ReturnFalse (asm:479)
+bool IsometricTileType::ReturnFalse()
+{
+    return false;
 }
 
 // Reads one [TileSet%04d] block.  The per tile arrays are sized from
@@ -754,7 +1033,13 @@ void IsometricTileType::CreateFromINIList(CCINIClass* pINI, bool bTheater)
             continue;
         }
 
-        Apply_Special_Tile_Indices(pINI, bTheater, pTileSet->SetName, i);
+        // asm 0x546C30：`dword_AA1140[setIndex] = 全局起点` 在累加**之前**
+        // 填入，ebx 就是这一集的全局起点。特殊瓦片键（tile_ClearTile /
+        // tile_BridgeSet / tile_GreenTile ...）存的也是这个全局起点，
+        // 判定式形如 `start <= idx < start + 0x10`。
+        const int32 setStart = TileSet_TotalTileCount;
+        pTileSet->GlobalStartIndex = setStart;
+        Apply_Special_Tile_Indices(pINI, bTheater, pTileSet->SetName, setStart);
 
         TileSet_TotalTileCount += pTileSet->TilesInSet;
     }

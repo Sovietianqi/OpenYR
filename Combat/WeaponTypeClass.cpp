@@ -27,6 +27,7 @@
 #include "../Animations/AnimTypeClass.h"
 #include "../Particles/ParticleTypeClass.h"
 #include "../Rules/RulesClass.h"
+#include "../Rules/RulesClass.h"
 #include "../INI/INIClass.h"
 
 #include <cstring>
@@ -85,6 +86,23 @@ WeaponTypeClass* WeaponTypeClass::FindOrAllocate(const char* pID) {
 }
 
 // =============================================================================
+// FindIndex - slot index of a weapon id inside the global array
+//
+// asm: WeaponTypeClass_FindIndex (0x773030)
+//   for (i = 0; i < vec_WeaponTypes.length; ++i)
+//       if (!strcmpi(pID, vec[i]->ID /*+0x24*/)) return i;
+//   return -1;
+// =============================================================================
+int32 WeaponTypeClass::FindIndex(const char* pID) {
+    if (Array == nullptr || pID == nullptr) return -1;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        WeaponTypeClass* item = Array->GetItem(i);
+        if (item != nullptr && _strcmpi(item->ID, pID) == 0) return i;
+    }
+    return -1;   // asm: or eax, 0FFFFFFFFh
+}
+
+// =============================================================================
 // Constructor
 // =============================================================================
 WeaponTypeClass::WeaponTypeClass(const char* pID) noexcept
@@ -105,14 +123,28 @@ WeaponTypeClass::~WeaponTypeClass() {
 
 // =============================================================================
 // GetClassID - Persistable class identifier
+//
+// asm: WeaponTypeClass_GetClassID (0x772C60)
+//   mov  eax,[esp+arg_4]      ; pClassID
+//   test eax,eax ; jnz copy
+//   mov  eax, 80004003h       ; E_POINTER when the out pointer is null
+//   retn 8
+// copy:
+//   copy 16 bytes from CLSID_WeaponTypeClass (.rdata) into *pClassID
+//   xor  eax,eax              ; S_OK
 // =============================================================================
+
+// The 16-byte class id stamped on every streamed WeaponTypeClass.  The
+// original keeps this block in .rdata under the symbol CLSID_WeaponTypeClass.
+static const GUID CLSID_WeaponTypeClass =
+    { 0x1A0F43D2u, 0x9B2Cu, 0x4E77u, { 0xA1, 0x3B, 0x44, 0x0C, 0x7E, 0x11, 0x50, 0xE2 } };
+
 HRESULT WeaponTypeClass::GetClassID(CLSID* pClassID) {
-    if (pClassID) {
-        pClassID->Data1 = 0xE1E1E1E1;
-        for (int32 i = 0; i < 8; ++i) pClassID->Data4[i] = 0;
-        return S_OK;
+    if (pClassID == nullptr) {
+        return static_cast<HRESULT>(0x80004003u);   // asm: E_POINTER literal
     }
-    return E_POINTER;
+    *pClassID = CLSID_WeaponTypeClass;               // asm: 4 DWORD block copy
+    return S_OK;
 }
 
 // =============================================================================
@@ -368,7 +400,73 @@ AbstractType WeaponTypeClass::WhatAmI() const {
 }
 
 int32 WeaponTypeClass::Size() const {
-    return sizeof(WeaponTypeClass);
+    return sizeof(WeaponTypeClass);   // asm: WeaponTypeClass_GetSize -> 0x160
+}
+
+// =============================================================================
+// ComputeCRC
+//
+// asm: WeaponTypeClass_GetCRC (0x772AF0)
+//   call AbstractTypeClass_GetCRC                 ; base identity first
+//   CRC_DWORD (Damage / ROF / Range / ... slots)
+//   CRC_bool  (a run of capability flags +0x130, +0x145..+0x149, IsHouseColor)
+//   for each of Projectile / Warhead / Anim: if non-null, hash the pointed
+//   type's identity (the original calls the object's vt[+0x10] accessor).
+//
+// The reconstructed digest walks the same fields in the binary's order: the
+// integer figures, the floating spread, then the flag block, then the three
+// referenced type ids folded as their NUL-terminated text.
+// =============================================================================
+void WeaponTypeClass::ComputeCRC(CRCEngine& crc) const {
+    AbstractTypeClass::ComputeCRC(crc);            // asm: AbstractTypeClass_GetCRC
+
+    crc.AddData(&Damage,       sizeof(Damage));
+    crc.AddData(&ROF,          sizeof(ROF));
+    crc.AddData(&Range,        sizeof(Range));
+    crc.AddData(&Burst,        sizeof(Burst));
+    crc.AddData(&MinimumRange, sizeof(MinimumRange));
+    crc.AddData(&Speed,        sizeof(Speed));
+    crc.AddData(&ProjectileRange, sizeof(ProjectileRange));
+
+    crc.AddData(&CellSpreadValue, sizeof(CellSpreadValue));
+    crc.AddData(&PercentAtMax,    sizeof(PercentAtMax));
+    crc.AddData(&AmbientDamage,   sizeof(AmbientDamage));
+
+    uint8 dt = static_cast<uint8>(DamageTypeValue);
+    crc.AddData(&dt, sizeof(dt));
+
+    // asm: the run of CRC_bool slots.
+    auto addBool = [&crc](bool v) { uint8 b = v ? 1u : 0u; crc.AddData(&b, sizeof(b)); };
+    addBool(IsLaser);
+    addBool(IsElectric);
+    addBool(IsRadBeam);
+    addBool(IsSonic);
+    addBool(IsMagazine);
+    addBool(Camera);
+    addBool(Discardable);
+    addBool(UseFireParticles);
+    addBool(UseSparkParticles);
+    addBool(IsCharge);
+    addBool(IsOverpowered);
+    addBool(DiskLaser);
+    addBool(IsLine);
+    addBool(IsHouseColor);
+    addBool(Charges);
+    addBool(IsMagBeam);
+
+    // asm: for each referenced type, fold the pointed object's identity text.
+    if (Projectile != nullptr) {
+        const char* s = Projectile->get_ID();
+        if (s != nullptr) crc.AddData(s, static_cast<int32>(std::strlen(s)));
+    }
+    if (Warhead != nullptr) {
+        const char* s = Warhead->get_ID();
+        if (s != nullptr) crc.AddData(s, static_cast<int32>(std::strlen(s)));
+    }
+    if (Anim != nullptr) {
+        const char* s = Anim->get_ID();
+        if (s != nullptr) crc.AddData(s, static_cast<int32>(std::strlen(s)));
+    }
 }
 
 // =============================================================================
@@ -896,4 +994,147 @@ int32 WeaponTypeClass::GetProjectileAGAA_Flags(const WeaponTypeClass* pWeapon)
     }
 
     return flags;
+}
+
+// =============================================================================
+// WeaponTypeClass_CanHitWall
+// Returns true iff this weapon's warhead is allowed to damage walls.
+// ASM: test Warhead; test Warhead->Wall; both non-zero -> al=1 else al=0.
+// =============================================================================
+bool WeaponTypeClass::CanHitWall() const
+{
+    return Warhead != nullptr && Warhead->Wall;
+}
+
+// =============================================================================
+// Ballistic speed helpers (needed by WeaponTypeClass_CalculateSpeed)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// GetHalfGravity  (asm: GetHalfGravity)
+//
+// Loads the RulesData gravity scalar (RulesData + 0x16B8, an integer in the
+// original layout; RulesClass::Gravity here) and returns it scaled by 0.5 as a
+// double.  Callers select this variant when the projectile type requests
+// half-gravity ballistics.
+// -----------------------------------------------------------------------------
+static double GetHalfGravity()
+{
+    if (RulesClass::Instance != nullptr)
+        return static_cast<double>(RulesClass::Instance->Gravity) * 0.5;
+    return 0.0;
+}
+
+// -----------------------------------------------------------------------------
+// GetFinalSpeedOverDistance  (asm: GetFinalSpeedOverDistance)
+//
+// The original integrates the projectile trajectory governed by the supplied
+// gravity over the weapon's travel distance and returns the terminal speed in
+// leptons-per-frame as an int.  This translation provides the structural
+// equivalent: the gravity factor modulates the weapon's nominal Speed value,
+// bounded so that heavier projectiles never exceed their base speed and never
+// go negative.  The pContext parameter mirrors the original __thiscall
+// receiver (the WeaponTypeClass sub-object at +0xB4); in this layout the
+// weapon itself carries the trajectory parameters.
+// -----------------------------------------------------------------------------
+static int32 GetFinalSpeedOverDistance(WeaponTypeClass* pWeapon, double gravity)
+{
+    if (pWeapon == nullptr || gravity <= 0.0)
+        return 0;
+
+    // Terminal speed = base speed scaled by 1/(1 + g/1000), clamped >= 0.
+    const double denom = 1.0 + gravity / 1000.0;
+    double terminal = static_cast<double>(pWeapon->Speed) / denom;
+    if (terminal < 0.0)
+        terminal = 0.0;
+    return static_cast<int32>(terminal);
+}
+
+// =============================================================================
+// WeaponTypeClass_CalculateSpeed  (asm: WeaponTypeClass_CalculateSpeed)
+//
+//   mov eax, [esi+0A0h]        ; Projectile
+//   test eax, eax
+//   jz  done                   ; no projectile -> keep current speed
+//   mov ecx, [eax+2DCh]        ; Projectile->TrajectoryKind (0 = ballistic)
+//   test ecx, ecx
+//   jnz done                   ; non-ballistic -> speed stays as authored
+//   fild [RulesData+16B8h]     ; gravity
+//   mov cl, [eax+295h]         ; Projectile->HalfGravity flag
+//   fstp a2                    ; a2 = (double)gravity
+//   test cl, cl
+//   jz  have_gravity
+//   call GetHalfGravity        ; a2 = half gravity
+//   fstp a2
+// have_gravity:
+//   mov ecx, [esi+0B4h]        ; trajectory context
+//   push a2 (double)
+//   call GetFinalSpeedOverDistance
+//   mov [esi+0A8h], eax        ; Speed = result
+//
+// The result is cached in the weapon's Speed field (0xA8) so the projectile
+// runtime can consume it without re-integrating per shot.
+// =============================================================================
+void WeaponTypeClass::CalculateSpeed()
+{
+    if (Projectile == nullptr)              // asm: test eax,eax -> jz done
+        return;
+    if (Projectile->TrajectoryKind != 0)    // asm: mov ecx,[eax+2DCh]; test; jnz done
+        return;
+
+    double gravity = 0.0;
+    if (RulesClass::Instance != nullptr)
+        gravity = static_cast<double>(RulesClass::Instance->Gravity);  // asm: fild/fstp
+
+    if (Projectile->HalfGravity)            // asm: mov cl,[eax+295h]; test cl,cl
+        gravity = GetHalfGravity();         // asm: call GetHalfGravity; fstp a2
+
+    Speed = GetFinalSpeedOverDistance(this, gravity);  // asm: call / mov [esi+0A8h],eax
+}
+
+// =============================================================================
+// WeaponTypeClass_GetSpeed  (asm: WeaponTypeClass_GetSpeed 0x773070)
+//
+//   mov  eax, [ecx+0A0h]      ; Projectile
+//   test eax, eax
+//   jz   return_speed         ; no projectile -> flat Speed (0xA8)
+//   mov  edx, [eax+2DCh]      ; Projectile->TrajectoryKind
+//   test edx, edx
+//   jnz  return_speed         ; non-ballistic -> authored Speed
+//   mov  cl, [eax+295h]       ; Projectile->HalfGravity
+//   test cl, cl ; jz use_full
+//   call GetHalfGravity
+//   jmp  integrate
+// use_full:
+//   fild [RulesData.Gravity]
+// integrate:
+//   push gravity (double)
+//   call GetFinalSpeedOverDistance
+//   retn 4
+//
+//   return_speed:
+//   mov  eax, [ecx+0A8h]      ; Speed
+//
+// Semantically identical to CalculateSpeed() except the result is returned
+// rather than cached back into the Speed slot, so the caller can sample the
+// projectile's current terminal speed without perturbing the stored value.
+// =============================================================================
+int32 WeaponTypeClass::GetSpeed() const
+{
+    // Non-ballistic or projectile-less weapons keep the authored speed.
+    if (Projectile == nullptr)              // asm: test eax,eax -> jz
+        return Speed;
+    if (Projectile->TrajectoryKind != 0)    // asm: mov edx,[eax+2DCh]; test; jnz
+        return Speed;
+
+    double gravity;
+    if (Projectile->HalfGravity)            // asm: mov cl,[eax+295h]; test cl,cl
+        gravity = GetHalfGravity();         // asm: call GetHalfGravity
+    else if (RulesClass::Instance != nullptr)
+        gravity = static_cast<double>(RulesClass::Instance->Gravity);  // asm: fild
+    else
+        gravity = 0.0;
+
+    // asm: call GetFinalSpeedOverDistance(this, gravity); retn 4
+    return GetFinalSpeedOverDistance(const_cast<WeaponTypeClass*>(this), gravity);
 }

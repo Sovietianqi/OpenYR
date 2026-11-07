@@ -28,7 +28,7 @@ void VersionClass::SetV()
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知第三态版本读取在请求超出槽位时按槽位内容
+// asm: signed int __thiscall VersionClass_GetVer3(VersionClass *this, unsigned int a2, unsigned int a3)   (asm:1725452)
 // 截断返回。
 // ------------------------------------------------------------------------
 int32 VersionClass::GetVer3(int32 a2, int32 a3) const
@@ -39,7 +39,7 @@ int32 VersionClass::GetVer3(int32 a2, int32 a3) const
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知版本文件读取只在 VERSION.TXT 存在时生效，
+// asm: VersionClass_ReadVer1
 // 且行尾的回车符会被剥离。
 // ------------------------------------------------------------------------
 bool VersionClass::ReadVer1()

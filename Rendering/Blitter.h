@@ -74,11 +74,34 @@ public:
                                   uint16 tint) = 0;
 
 protected:
+    // asm: Blit_Copy_Tinted 的通道混合 —— 结果 = (src + tint) / 2（逐通道）。
+    //   原版 blitter 的 tinted 版本就是这条；旧实现直接转调 Blit_Copy，
+    //   把 tint 参数整个丢掉，于是铁幕/超时空/力场染色全都不显示。
+    static uint16 Tint565(uint16 src, uint16 tint) noexcept
+    {
+        const uint32 r = (((src >> 11) & 0x1Fu) + ((tint >> 11) & 0x1Fu)) >> 1;
+        const uint32 g = (((src >>  5) & 0x3Fu) + ((tint >>  5) & 0x3Fu)) >> 1;
+        const uint32 b = (( src        & 0x1Fu) + ( tint        & 0x1Fu)) >> 1;
+        return static_cast<uint16>((r << 11) | (g << 5) | b);
+    }
+
     static uint16* Lookup_Alpha_Remapper(int32 alvl, AlphaLightingRemapClass* remapper)
     {
         if (!remapper) return nullptr;
         int32 level = std::min(254, (261 * std::max(0, alvl)) >> 11);
         return remapper->Table[level];
+    }
+
+    // 深度测试。
+    //   asm 里每张 DSurface 都带 z 缓冲，CC_Draw_Shape 一定会传非空指针；
+    //   本工程的 Surface 还没有 z 缓冲，因此传 nullptr。历史实现用
+    //   `if (idx && zbuf && ...)` 直接跳过，导致所有 ZRead 类提笔器
+    //   一个像素都不落（0x2600 / 0x2601 / 0x4E00 这些真实 flags 全中招）。
+    //   这里把"没有 z 缓冲"定义为"不做深度测试"，与 asm 在有缓冲时的
+    //   语义一致，且不改变选槽结果 —— 等 Surface 补上 z 缓冲后自动生效。
+    static bool ZPass(uint16 zVal, const uint16* zbuf) noexcept
+    {
+        return zbuf == nullptr || zVal >= *zbuf;
     }
 };
 
@@ -103,6 +126,12 @@ protected:
         if (!remapper) return nullptr;
         int32 level = std::min(254, (261 * std::max(0, alvl)) >> 11);
         return remapper->Table[level];
+    }
+
+    // 与 Blitter::ZPass 同义（RLE 侧独立基类，不能直接继承）。
+    static bool ZPass(uint16 zVal, const uint16* zbuf) noexcept
+    {
+        return zbuf == nullptr || zVal >= *zbuf;
     }
 
     // RLE pre-line processing: skip lines before the current one
@@ -281,8 +310,8 @@ public:
         auto dest = reinterpret_cast<T*>(dst);
         while (len--)
         {
-            BYTE idx = *src++;
-            if (idx) *dest = PaletteData[idx];
+            // Plain 不带色键：索引 0 也照写（原版 BlitPlainXlat）。
+            *dest = PaletteData[*src++];
             ++dest;
         }
     }
@@ -291,7 +320,13 @@ public:
                                   uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
                                   uint16 tint) override final
     {
-        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        while (len--)
+        {
+            *dest = Tint565(PaletteData[*src++], tint);
+            ++dest;
+        }
     }
 
     virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
@@ -336,7 +371,14 @@ public:
                                   uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
                                   uint16 tint) override final
     {
-        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        while (len--)
+        {
+            BYTE idx = *src++;
+            if (idx) *dest = Tint565(PaletteData[idx], tint);
+            ++dest;
+        }
     }
 
     virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
@@ -922,9 +964,9 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf)
+            if (idx)
             {
-                if (zVal >= *zbuf)
+                if (ZPass(zVal, zbuf))
                     *dest = PaletteData[idx];
             }
             ++dest;
@@ -975,7 +1017,7 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf && zVal >= *zbuf)
+            if (idx && ZPass(zVal, zbuf))
                 *dest = static_cast<T>(BlitterTables::Blend25(*dest, PaletteData[idx], Mask));
             ++dest;
             if (zbuf) ++zbuf;
@@ -1026,7 +1068,7 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf && zVal >= *zbuf)
+            if (idx && ZPass(zVal, zbuf))
                 *dest = static_cast<T>(BlitterTables::Blend50(*dest, PaletteData[idx], Mask));
             ++dest;
             if (zbuf) ++zbuf;
@@ -1077,7 +1119,7 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf && zVal >= *zbuf)
+            if (idx && ZPass(zVal, zbuf))
                 *dest = static_cast<T>(BlitterTables::Blend75(*dest, PaletteData[idx], Mask));
             ++dest;
             if (zbuf) ++zbuf;
@@ -1131,12 +1173,12 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf)
+            if (idx)
             {
-                if (zVal >= *zbuf)
+                if (ZPass(zVal, zbuf))
                 {
                     *dest = PaletteData[idx];
-                    *zbuf = zVal;
+                    if (zbuf) *zbuf = zVal;
                 }
             }
             ++dest;
@@ -1396,7 +1438,7 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (zbuf && zVal >= *zbuf)
+            if (ZPass(zVal, zbuf))
                 *dest = PaletteData[idx];
             ++dest;
             if (zbuf) ++zbuf;
@@ -1443,10 +1485,10 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (zbuf && zVal >= *zbuf)
+            if (ZPass(zVal, zbuf))
             {
                 *dest = PaletteData[idx];
-                *zbuf = zVal;
+                if (zbuf) *zbuf = zVal;
             }
             ++dest;
             if (zbuf) ++zbuf;
@@ -1494,7 +1536,7 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf && zVal >= *zbuf)
+            if (idx && ZPass(zVal, zbuf))
                 *dest = static_cast<T>(BlitterTables::Darken(*dest, PaletteData[idx], Mask));
             ++dest;
             if (zbuf) ++zbuf;
@@ -1543,10 +1585,10 @@ public:
         while (len--)
         {
             BYTE idx = *src++;
-            if (idx && zbuf && zVal >= *zbuf)
+            if (idx && ZPass(zVal, zbuf))
             {
                 *dest = static_cast<T>(BlitterTables::Darken(*dest, PaletteData[idx], Mask));
-                *zbuf = zVal;
+                if (zbuf) *zbuf = zVal;
             }
             ++dest;
             if (zbuf) ++zbuf;
@@ -1872,4 +1914,692 @@ public:
 private:
     T* PaletteData;
     BYTE** ZRemapTables;
+};
+// ============================================================================
+// 组合型提笔器（asm SelectBlitter0 的 36/45/10/20/26/37/46 槽）
+//
+// 这几个槽在零售版里真实可达（例如 0x2E00 / 0x4E00 的建筑/动画阴影路径），
+// 语义就是已有几种效果的并集：透明色键 + 可选 z 重映射 + 可选 alpha 缓冲 +
+// 可选 z 读写。下面按 asm 的分支结构逐个组合，不新增任何"大概像"的行为。
+// ============================================================================
+
+// --- BlitTransXlatAlphaZRead ---（asm 槽 36）
+// 透明色键 + alpha 缓冲混合 + z 只读：被更近的像素挡住时不落笔。
+DEFINE_BLITTER(BlitTransXlatAlphaZRead)
+{
+public:
+    explicit BlitTransXlatAlphaZRead(T* data, AlphaLightingRemapClass* alphaRemap) noexcept
+        : PaletteData(data), AlphaRemap(alphaRemap) {}
+    virtual ~BlitTransXlatAlphaZRead() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        uint16* alphaTable = Lookup_Alpha_Remapper(alvl, AlphaRemap);
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const uint16 srcColor = PaletteData[idx];
+                if (alphaTable && abuf)
+                {
+                    const uint16 alpha = *abuf++;
+                    const uint16 blended = alphaTable[alpha & 0xFF];
+                    *dest = static_cast<T>(BlitterTables::Blend50(*dest, srcColor, blended));
+                }
+                else
+                {
+                    *dest = srcColor;
+                }
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// --- BlitTransXlatAlphaZReadWrite ---（asm 槽 45）
+// 同上，但通过 z 测试时同时把 zval 写回 z 缓冲。
+DEFINE_BLITTER(BlitTransXlatAlphaZReadWrite)
+{
+public:
+    explicit BlitTransXlatAlphaZReadWrite(T* data, AlphaLightingRemapClass* alphaRemap) noexcept
+        : PaletteData(data), AlphaRemap(alphaRemap) {}
+    virtual ~BlitTransXlatAlphaZReadWrite() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        uint16* alphaTable = Lookup_Alpha_Remapper(alvl, AlphaRemap);
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const uint16 srcColor = PaletteData[idx];
+                if (alphaTable && abuf)
+                {
+                    const uint16 alpha = *abuf++;
+                    const uint16 blended = alphaTable[alpha & 0xFF];
+                    *dest = static_cast<T>(BlitterTables::Blend50(*dest, srcColor, blended));
+                }
+                else
+                {
+                    *dest = srcColor;
+                }
+                if (zbuf) *zbuf = zVal;
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// --- BlitTransZRemapXlatZRead ---（asm 槽 10）
+DEFINE_BLITTER(BlitTransZRemapXlatZRead)
+{
+public:
+    explicit BlitTransZRemapXlatZRead(T* data, BYTE** zRemap) noexcept
+        : PaletteData(data), ZRemapTables(zRemap) {}
+    virtual ~BlitTransZRemapXlatZRead() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        BYTE* zrmp = (ZRemapTables && zval >= 0) ? ZRemapTables[zval] : nullptr;
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const BYTE mapped = zrmp ? zrmp[idx] : idx;
+                *dest = PaletteData[mapped];
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    BYTE** ZRemapTables;
+};
+
+// --- BlitTransZRemapXlatZReadWrite ---（asm 槽 20）
+DEFINE_BLITTER(BlitTransZRemapXlatZReadWrite)
+{
+public:
+    explicit BlitTransZRemapXlatZReadWrite(T* data, BYTE** zRemap) noexcept
+        : PaletteData(data), ZRemapTables(zRemap) {}
+    virtual ~BlitTransZRemapXlatZReadWrite() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        BYTE* zrmp = (ZRemapTables && zval >= 0) ? ZRemapTables[zval] : nullptr;
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const BYTE mapped = zrmp ? zrmp[idx] : idx;
+                *dest = PaletteData[mapped];
+                if (zbuf) *zbuf = zVal;
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    BYTE** ZRemapTables;
+};
+
+// --- BlitTransZRemapXlatAlpha ---（asm 槽 26）
+DEFINE_BLITTER(BlitTransZRemapXlatAlpha)
+{
+public:
+    explicit BlitTransZRemapXlatAlpha(T* data, BYTE** zRemap,
+                                      AlphaLightingRemapClass* alphaRemap) noexcept
+        : PaletteData(data), ZRemapTables(zRemap), AlphaRemap(alphaRemap) {}
+    virtual ~BlitTransZRemapXlatAlpha() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        BYTE* zrmp = (ZRemapTables && zval >= 0) ? ZRemapTables[zval] : nullptr;
+        uint16* alphaTable = Lookup_Alpha_Remapper(alvl, AlphaRemap);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx)
+            {
+                const BYTE mapped = zrmp ? zrmp[idx] : idx;
+                const uint16 srcColor = PaletteData[mapped];
+                if (alphaTable && abuf)
+                {
+                    const uint16 alpha = *abuf++;
+                    const uint16 blended = alphaTable[alpha & 0xFF];
+                    *dest = static_cast<T>(BlitterTables::Blend50(*dest, srcColor, blended));
+                }
+                else
+                {
+                    *dest = srcColor;
+                }
+            }
+            ++dest;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    BYTE** ZRemapTables;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// --- BlitTransZRemapXlatAlphaZRead ---（asm 槽 37）
+DEFINE_BLITTER(BlitTransZRemapXlatAlphaZRead)
+{
+public:
+    explicit BlitTransZRemapXlatAlphaZRead(T* data, BYTE** zRemap,
+                                           AlphaLightingRemapClass* alphaRemap) noexcept
+        : PaletteData(data), ZRemapTables(zRemap), AlphaRemap(alphaRemap) {}
+    virtual ~BlitTransZRemapXlatAlphaZRead() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        BYTE* zrmp = (ZRemapTables && zval >= 0) ? ZRemapTables[zval] : nullptr;
+        uint16* alphaTable = Lookup_Alpha_Remapper(alvl, AlphaRemap);
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const BYTE mapped = zrmp ? zrmp[idx] : idx;
+                const uint16 srcColor = PaletteData[mapped];
+                if (alphaTable && abuf)
+                {
+                    const uint16 alpha = *abuf++;
+                    const uint16 blended = alphaTable[alpha & 0xFF];
+                    *dest = static_cast<T>(BlitterTables::Blend50(*dest, srcColor, blended));
+                }
+                else
+                {
+                    *dest = srcColor;
+                }
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    BYTE** ZRemapTables;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// --- BlitTransZRemapXlatAlphaZReadWrite ---（asm 槽 46）
+DEFINE_BLITTER(BlitTransZRemapXlatAlphaZReadWrite)
+{
+public:
+    explicit BlitTransZRemapXlatAlphaZReadWrite(T* data, BYTE** zRemap,
+                                                AlphaLightingRemapClass* alphaRemap) noexcept
+        : PaletteData(data), ZRemapTables(zRemap), AlphaRemap(alphaRemap) {}
+    virtual ~BlitTransZRemapXlatAlphaZReadWrite() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+        auto dest = reinterpret_cast<T*>(dst);
+        BYTE* zrmp = (ZRemapTables && zval >= 0) ? ZRemapTables[zval] : nullptr;
+        uint16* alphaTable = Lookup_Alpha_Remapper(alvl, AlphaRemap);
+        const uint16 zVal = static_cast<uint16>(zval);
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && ZPass(zVal, zbuf))
+            {
+                const BYTE mapped = zrmp ? zrmp[idx] : idx;
+                const uint16 srcColor = PaletteData[mapped];
+                if (alphaTable && abuf)
+                {
+                    const uint16 alpha = *abuf++;
+                    const uint16 blended = alphaTable[alpha & 0xFF];
+                    *dest = static_cast<T>(BlitterTables::Blend50(*dest, srcColor, blended));
+                }
+                else
+                {
+                    *dest = srcColor;
+                }
+                if (zbuf) *zbuf = zVal;
+            }
+            ++dest;
+            if (zbuf) ++zbuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    BYTE** ZRemapTables;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// ============================================================================
+// 组合提笔器：Lucent × {ZRead / ZReadWrite / Warp / Alpha}
+//
+// 这 15 个 asm 槽（14/15/16、21/22/23、38/39/40、41/42/43、47/48/49）此前
+// 在 SlotToBlitter[] 里是 -1，选到就退回 BlitTransXlat。它们不是"另一种
+// 混合公式"，而是三条已验证语义的正交组合：
+//
+//   ① 混合系数 —— 与同档 Lucent 完全一致，取自 asm 的移位/乘加：
+//        25%: shr ax,2 / lea eax,[eax+eax*2]  → 3/4 src + 1/4 dst
+//        50%: shr ax,1 / add                  → 1/2 src + 1/2 dst
+//        75%: shr ax,2 ×3 + ...               → 1/4 src + 3/4 dst
+//      对应项目里已有的 Blend25 / Blend50 / Blend75。
+//   ② z 深度 —— 读：`cmp zval, *zbuf / jge 跳过`（等价 ZPass）；
+//                写：落笔后 `mov [zbuf], zval`。
+//   ③ Warp —— 背景采样取 `dst[warp]` 而不是 `dst[0]`。
+//      证据：sub_4933D0（BlitTransLucent25ZReadWarp::Blit_Copy）
+//            mov ebp,[esp+arg_1C] / mov bp,[edi+ebp*2]   ; 背景 = dst[warp]
+//      注意写回仍在 dst[0]，warp 只影响"读哪一颗背景像素"。
+//   ④ Alpha —— 读 `*abuf` 当 alpha，经 Lookup_Alpha_Remapper(alvl) 取表，
+//      再按本工程既有的 alpha 语义混合（与 BlitTransXlatAlpha 同一套，
+//      asm sub_495250 的 (261*alvl)>>11 与之逐位一致）。
+//
+// 之所以用模板而不是抄 15 份：15 份手抄必然漂移，而它们的差异只有这 4 个
+// 布尔量和 1 个档位。命名仍按 asm 的类名做别名，调用方看不出区别。
+// ============================================================================
+template<typename T, int Level, bool UseZRead, bool UseZWrite, bool UseWarp, bool UseAlpha>
+class BlitTransLucentVariant final : public Blitter
+{
+public:
+    BlitTransLucentVariant(T* data, uint16 mask, AlphaLightingRemapClass* alphaRemap = nullptr) noexcept
+        : PaletteData(data), Mask(mask), AlphaRemap(alphaRemap) {}
+
+    virtual ~BlitTransLucentVariant() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+
+        auto dest = reinterpret_cast<T*>(dst);
+        const uint16 zVal = static_cast<uint16>(zval);
+        uint16* const alphaTable = UseAlpha ? Lookup_Alpha_Remapper(alvl, AlphaRemap) : nullptr;
+
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx)
+            {
+                if (!UseZRead || ZPass(zVal, zbuf))
+                {
+                    // ③ Warp：背景取 dst[warp]；非 warp 变体取 dst[0]。
+                    const T back = UseWarp ? dest[warp] : *dest;
+                    const T fore = PaletteData[idx];
+
+                    T out;
+                    if constexpr (Level == 25)
+                        out = static_cast<T>(BlitterTables::Blend25(back, fore, Mask));
+                    else if constexpr (Level == 50)
+                        out = static_cast<T>(BlitterTables::Blend50(back, fore, Mask));
+                    else
+                        out = static_cast<T>(BlitterTables::Blend75(back, fore, Mask));
+
+                    // ④ Alpha：与 BlitTransXlatAlpha 同一套（表项当掩码用）。
+                    if constexpr (UseAlpha)
+                    {
+                        if (alphaTable != nullptr && abuf != nullptr)
+                        {
+                            const uint16 a = alphaTable[static_cast<uint16>(*abuf) & 0xFF];
+                            out = static_cast<T>(BlitterTables::Blend50(out, fore, a));
+                        }
+                    }
+
+                    *dest = out;
+
+                    // ② 写深度：asm 只在真正落笔的分支里写 zbuf。
+                    if constexpr (UseZWrite)
+                    {
+                        if (zbuf != nullptr) *zbuf = zVal;
+                    }
+                }
+            }
+
+            ++dest;
+            if (zbuf != nullptr) ++zbuf;
+            if (abuf != nullptr) ++abuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    {
+        Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp);
+    }
+
+private:
+    T* PaletteData;
+    uint16 Mask;
+    AlphaLightingRemapClass* AlphaRemap;
+};
+
+// asm 槽 14/15/16 —— Lucent75/50/25 + ZRead + Warp
+template<typename T> using BlitTransLucent75ZReadWarp = BlitTransLucentVariant<T, 75, true, false, true, false>;
+template<typename T> using BlitTransLucent50ZReadWarp = BlitTransLucentVariant<T, 50, true, false, true, false>;
+template<typename T> using BlitTransLucent25ZReadWarp = BlitTransLucentVariant<T, 25, true, false, true, false>;
+
+// asm 槽 21/22/23 —— Lucent75/50/25 + ZRead + ZWrite
+template<typename T> using BlitTransLucent75ZReadWrite = BlitTransLucentVariant<T, 75, true, true, false, false>;
+template<typename T> using BlitTransLucent50ZReadWrite = BlitTransLucentVariant<T, 50, true, true, false, false>;
+template<typename T> using BlitTransLucent25ZReadWrite = BlitTransLucentVariant<T, 25, true, true, false, false>;
+
+// asm 槽 38/39/40 —— Lucent75/50/25 + Alpha + ZRead
+template<typename T> using BlitTransLucent75AlphaZRead = BlitTransLucentVariant<T, 75, true, false, false, true>;
+template<typename T> using BlitTransLucent50AlphaZRead = BlitTransLucentVariant<T, 50, true, false, false, true>;
+template<typename T> using BlitTransLucent25AlphaZRead = BlitTransLucentVariant<T, 25, true, false, false, true>;
+
+// asm 槽 41/42/43 —— Lucent75/50/25 + Alpha + ZRead + Warp
+template<typename T> using BlitTransLucent75AlphaZReadWarp = BlitTransLucentVariant<T, 75, true, false, true, true>;
+template<typename T> using BlitTransLucent50AlphaZReadWarp = BlitTransLucentVariant<T, 50, true, false, true, true>;
+template<typename T> using BlitTransLucent25AlphaZReadWarp = BlitTransLucentVariant<T, 25, true, false, true, true>;
+
+// asm 槽 47/48/49 —— Lucent75/50/25 + Alpha + ZRead + ZWrite
+template<typename T> using BlitTransLucent75AlphaZReadWrite = BlitTransLucentVariant<T, 75, true, true, false, true>;
+template<typename T> using BlitTransLucent50AlphaZReadWrite = BlitTransLucentVariant<T, 50, true, true, false, true>;
+template<typename T> using BlitTransLucent25AlphaZReadWrite = BlitTransLucentVariant<T, 25, true, true, false, true>;
+
+// ============================================================================
+// 写 alpha 缓冲的两个提笔器（asm 槽 30 / 31）
+//
+// 反汇编依据：
+//   sub_494490  BlitTransXlatWriteAlpha::Blit_Copy
+//     mov  cl,[esi] / test cl,cl / jz skip        ; 色键 0：连 alpha 都不写
+//     and  ecx,0FFh / add ecx,ebx                 ; ebx = 第 4 参 zval
+//     cmp  ecx,0FFh / jl ok / mov ecx,0FFh        ; 钳到 255
+//     mov  [eax],cx                               ; eax = 第 6 参 abuf
+//   → **只写 alpha，一个颜色字节都不写**。
+//
+//   sub_494590  BlitTransXlatMultWriteAlpha::Blit_Copy
+//     and  ecx,0FFh / imul ecx,edi / add ecx,ebx  ; edi = 第 7 参 alvl，ebx = zval
+//     cmp  ecx,0FFh / jl ok / mov ecx,0FFh
+//     mov  [eax],cx
+//   → alpha = clamp(srcIdx * alvl + zval)。
+//
+// 两者都不接受 palette —— asm 里这两个函数连 pal 都不读，颜色通道完全不动。
+// ============================================================================
+template<typename T>
+class BlitTransXlatWriteAlpha final : public Blitter
+{
+public:
+    explicit BlitTransXlatWriteAlpha(T* /*data*/) noexcept {}
+    virtual ~BlitTransXlatWriteAlpha() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+
+        auto dest = reinterpret_cast<T*>(dst);
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && abuf != nullptr)
+            {
+                int32 a = static_cast<int32>(idx) + zval;   // asm: add ecx,ebx
+                if (a > 255) a = 255;                       // asm: cmp 0FFh / jl / mov 0FFh
+                *abuf = static_cast<uint16>(a);
+            }
+            ++dest;
+            if (abuf != nullptr) ++abuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
+};
+
+template<typename T>
+class BlitTransXlatMultWriteAlpha final : public Blitter
+{
+public:
+    explicit BlitTransXlatMultWriteAlpha(T* /*data*/) noexcept {}
+    virtual ~BlitTransXlatMultWriteAlpha() override final = default;
+
+    virtual void Blit_Copy(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    {
+        if (len < 0) return;
+
+        auto dest = reinterpret_cast<T*>(dst);
+        while (len--)
+        {
+            const BYTE idx = *src++;
+            if (idx && abuf != nullptr)
+            {
+                int32 a = static_cast<int32>(idx) * alvl + zval;   // asm: imul ecx,edi / add ecx,ebx
+                if (a > 255) a = 255;
+                if (a < 0)   a = 0;
+                *abuf = static_cast<uint16>(a);
+            }
+            ++dest;
+            if (abuf != nullptr) ++abuf;
+        }
+    }
+
+    virtual void Blit_Copy_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
+
+    virtual void Blit_Move(void* dst, BYTE* src, int32 len, int32 zval,
+                           uint16* zbuf, uint16* abuf, int32 alvl, int32 warp) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
+
+    virtual void Blit_Move_Tinted(void* dst, BYTE* src, int32 len, int32 zval,
+                                  uint16* zbuf, uint16* abuf, int32 alvl, int32 warp,
+                                  uint16 tint) override final
+    { Blit_Copy(dst, src, len, zval, zbuf, abuf, alvl, warp); }
 };

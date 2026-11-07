@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex14.cpp
+start=1792
+end=2145
+symbol=LaserDrawClass_Draw_InHouseColor
+target=Rendering/LaserDrawClass.cpp

@@ -5,6 +5,27 @@
 class IsometricTileType;
 
 // ============================================================================
+// FoundationData - one entry of a building's footprint descriptor.
+//
+//   In the original binary this is the wXY pair at FoundationData: a list of
+//   cell offsets (relative to the building's origin cell) that the structure
+//   covers, terminated by the sentinel entry { 0x7FFF, 0x7FFF }.  Callers
+//   (BuildingClass_GetShrouded, placement code) walk it until they hit the
+//   sentinel.  The 7FFF/7FFF "invalid" descriptor is shared by every type
+//   whose FoundationData was never assigned.
+// ============================================================================
+struct FoundationData {
+    int16 X;
+    int16 Y;
+
+    static const int16 Invalid = 0x7FFF;
+
+    bool IsValid() const {
+        return X != Invalid || Y != Invalid;
+    }
+};
+
+// ============================================================================
 // BuildingTypeClass - type definition for buildings
 // ============================================================================
 class NOVTABLE BuildingTypeClass : public TechnoTypeClass {
@@ -56,6 +77,40 @@ public:
     virtual bool IsPowerPlant() const;
     virtual bool IsWall() const;
     virtual bool IsTiberiumStorage() const;
+
+    // ------------------------------------------------------------------------
+    // asm vtable probes / overrides
+    // ------------------------------------------------------------------------
+
+    // asm: BuildingTypeClass_GetFacing (0x45F3C0).  Buildings have no free
+    // heading; the type-level facing is the fixed deploy direction parsed from
+    // the "DeployFacing" rules key.
+    virtual int32 GetFacing() const;
+
+    // asm: BuildingTypeClass_CanAttackOnTheMove (0x465960).  Structures never
+    // fire while relocating, so the type answers false unconditionally.
+    virtual bool CanAttackOnTheMove() const override;
+
+    // asm: BuildingTypeClass_GetMaxPips (0x45ECC0).  Caps the number of pips
+    // drawn over the structure: a scaled cell-count for the storage/weeder
+    // cases, otherwise the PipScale-driven TechnoTypeClass figure.
+    virtual int32 GetMaxPips() const;
+
+    // asm: BuildingTypeClass_GetCost (0x45ED70).  The build cost, adjusted by
+    // the paired power-plant variant and reduced by any free unit granted with
+    // the structure.  Never negative.
+    virtual int32 GetCost() const;
+
+    // asm: BuildingTypeClass_GetFoundationData (0x45EC30).  Returns the
+    // footprint descriptor: the type's own FoundationData entry, or the shared
+    // 7FFF/7FFF "invalid" descriptor when none was assigned.
+    FoundationData* GetFoundationData();
+
+    // asm: BuildingTypeClass_GetArrayIndex (0x465DA0).  Index of this type
+    // within the owning base-node table (-1 when the pointer is null).
+    virtual int32 GetArrayIndex() const;
+    virtual HRESULT Load(IStream* pStm) override;
+    virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
 
     int32 Get_Width() const;
     int32 Get_Height() const;
@@ -649,14 +704,61 @@ public:
     virtual void   InitFoundations();
     virtual void   InitFoundationOutlines();
     virtual void   LoadImageSHP(int32 idxTheater);
+    // Queries the loaded building image dimensions into pOut[0..2]:
+    // original writes the SHP frame width into both pOut[0] and pOut[1] and
+    // the frame height into pOut[2]; zeros when no image is loaded.
+    // Mirrors BuildingTypeClass_GetImageDimensions.
+    virtual void   GetImageDimensions(int32* pOut);
     virtual void   LoadArt();
     virtual BuildingClass* SpawnAtCoords(const CoordStruct& coord, HouseClass* pOwner);
+    // asm: BuildingTypeClass_CreateBuilding (0x45E860).  Allocates a fresh
+    // BuildingClass bound to this type and the given owner; returns null when
+    // the allocation fails.  Placement is left to the caller.
+    virtual BuildingClass* CreateBuilding(HouseClass* pOwner);
     static  BuildingTypeClass* FindOrAllocateFromList(DynamicVectorClass<BuildingTypeClass*>& list, const char* pID);
+
+    // Footprint descriptor: a {0x7FFF,0x7FFF}-terminated table of cell offsets
+    // this structure covers.  Null until InitFoundations (or the INI loader)
+    // assigns one; GetFoundationData substitutes the shared invalid entry.
+    FoundationData* FoundationDataPtr = nullptr;
 
     DynamicVectorClass<int32> FoundationCells;     // 地基覆盖的格偏移序列
     DynamicVectorClass<int32> FoundationOutlines;  // 地基描边格偏移序列
+    // asm: BuildingTypeClass +0x1784 -- a runtime VectorClass<TPoint3D<int>>
+    //   (vftable +0x1784, data +0x1788, count +0x178C).  The 12-byte entries
+    //   are the per-dock offsets consulted by BuildingClass_GetDockCoord; the
+    //   table is streamed verbatim by BuildingTypeClass_Load/Save.  OpenYR
+    //   models it as a vector of 3-int points (CoordStruct).
+    DynamicVectorClass<CoordStruct> DockingOffsets; // +0x1784 入坞点偏移表
     bool  DemandLoadBuildup = false;      // 建造图是否按需加载
     void* BuildupData = nullptr;            // 已装载的建造图动画句柄
     bool  BuildupLoaded = false;          // 建造图装载标志
+
+    // ------------------------------------------------------------------------
+    // +0x1701 原版 BuildingTypeClass 的免疫/忽略标志字节。
+    //   Damage_At_Cell 在结算建筑伤害前检查该位：非零表示该建筑类型
+    //   不接受范围伤害（如特殊结构）。取自 IDA 结构偏移。
+    // ------------------------------------------------------------------------
+    uint8 field_1701 = 0;                 // +0x1701  范围伤害免疫标志
+
+    // ------------------------------------------------------------------------
+    // BaseClass_Placed (0x42F270) 依赖的两个字段。
+    //
+    // IDA 没有给这两个偏移命名，但两处用法都能确定语义：
+    //
+    //   +0x408  field_408 -- "这个建筑类型是否参与基地节点表"的开关。原版
+    //     BaseClass_Placed 的第二分支先用它做前置门（test eax,eax / jz ret），
+    //     为 0 时整段跳过、不写任何节点。
+    //
+    //   +0x0DF8 field_DF8 -- BuildingTypeClass 的专属区首字段（紧跟在 0xDF8
+    //     字节的 TechnoTypeClass t 之后）。原版在该分支里用它和节点的
+    //     BaseNodeClass::pType 做**指针**比较，所以它存的是另一个
+    //     BuildingTypeClass*（即"此建筑对应哪个基地节点原型"）。
+    //
+    // 两个偏移在 1:1 复刻中是分开的、不可互换 —— 门用的是前者，比较用的是
+    // 后者。
+    // ------------------------------------------------------------------------
+    int32 field_408 = 0;                     // +0x408  参与基地节点表的开关
+    BuildingTypeClass* field_DF8 = nullptr;  // +0x0DF8 对应节点原型的类型指针
 
 };

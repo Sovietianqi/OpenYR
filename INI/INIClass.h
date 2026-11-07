@@ -45,6 +45,67 @@ class UnitTypeClass;
 enum class Powerup : uint32;
 
 //========================================================================
+// INIIntrusiveList - 侵入式双向链表（节点就是对象本身）
+//
+//   INIEntry / INISection 都以 Node<T> 为基类，对象自己带 Next / Prev，
+//   原版 ListClass<T> 因此不需要额外的节点开销，遍历直接走 `p->Next`。
+//
+//   本工程通用的 List<T>（Containers/ListClass.h）是"自持节点"形态：AddTail
+//   另 new 一个空节点、把元素丢掉，First() 又把那个空节点当元素返回。这套
+//   语义与 INI 的侵入式用法不兼容（LoadFromBuffer 会在第一次建条目时崩），
+//   所以 INI 层改用下面这个容器，只实现 INI 需要的三个动作。
+//========================================================================
+
+template <typename TNode>
+class INIIntrusiveList
+{
+public:
+    TNode* Head;
+    TNode* Tail;
+    int32  Count;
+
+    // ------------------------------------------------------------------------
+    // asm: list_INIClass_INISection_CTOR (0x55A8C0) —— List<INISection*> 的
+    //   构造：本对象 +0x04 / +0x10 是两个内嵌哨兵 Node，先把两个哨兵的
+    //   Next/Prev 清零、各自盖上 GenericNode vtable，再用 GenericList vtable
+    //   盖头，然后交叉链接成环：
+    //     tmp = First.Next ; Last.Next = First ; Last.Prev = tmp ;
+    //     tmp ? tmp.Prev = Last ; First.Next = Last
+    //   最后把 List<INISection*> vtable 盖到 [this] 上。
+    //
+    //   降级点：本类的链表用 Head/Tail 指针 + Count（不内嵌哨兵节点），空表
+    //   的语义（First()/Size() 一致）相同；哨兵环的链接动作没有对应物，
+    //   故只保留"空表"这一可观察状态。
+    // ------------------------------------------------------------------------
+    INIIntrusiveList() : Head(nullptr), Tail(nullptr), Count(0) {}
+
+    // 尾部追加；pItem 必须非空，且不能已在别的链上。
+    void AddTail(TNode* pItem)
+    {
+        if (pItem == nullptr) return;
+
+        pItem->Next = nullptr;
+        pItem->Prev = Tail;
+        if (Tail != nullptr) Tail->Next = pItem;
+        else                 Head = pItem;
+        Tail = pItem;
+        ++Count;
+    }
+
+    TNode* First() const { return Head; }
+    int32  GetCount() const { return Count; }
+    int32  Size() const { return Count; }
+
+    // 摘链归零（不析构元素——元素的所有权在调用方，与原版 ListClass 一致）。
+    void Reset()
+    {
+        Head  = nullptr;
+        Tail  = nullptr;
+        Count = 0;
+    }
+};
+
+//========================================================================
 // INIComment - Comment node in a linked list
 //========================================================================
 
@@ -113,7 +174,7 @@ public:
     }
 
     char* Name;
-    List<INIEntry*> Entries;
+    INIIntrusiveList<INIEntry> Entries;
     INIComment* Comments;
 };
 
@@ -143,6 +204,12 @@ public:
 
     // Load an INI file from a CCFileClass
     bool LoadFile(CCFileClass* pFile);
+
+    // asm: CCINIClass::Load 把真正的逐行解析交给 FileStraw/INIFile 管道
+    //   （asm: sub_525A60），本函数就是那条管道的重建版：喂进一段文本与长度，
+    //   原地切段/切键并填充 Sections 链表。空指针或长度为 0 返回 false。
+    //   bLoadComments 为真时保留 ';' 注释（挂到节/条目的 Comments 链上）。
+    bool LoadFromBuffer(const char* pData, size_t nSize, bool bLoadComments = false);
 
     // Save the INI data to a file
     bool SaveFile(CCFileClass* pFile) const;
@@ -176,6 +243,12 @@ public:
 
     int32 GetString(const char* pSection, const char* pKey,
                     char* pBuffer, size_t bufferSize);
+
+    // asm: INIClass_GetString 的二元重载（retn 8）—— 上述五参数版的"只问值
+    //  指针"形态：命中返回条目值的内部指针（**只读、不得改写、下次写入即失效**），
+    //  未命中/无值返回 nullptr。原版里有大量调用点直接把它交给
+    //  XXXTypeClass_FindOrAllocate，省掉本地缓冲。
+    const char* GetString(const char* pSection, const char* pKey);
 
     // Write a string value
     bool WriteString(const char* pSection, const char* pKey, const char* pString);
@@ -261,6 +334,10 @@ public:
     // "%f" float writer.
     bool WriteLepton(const char* pSection, const char* pKey, int32 nValue);
 
+    // asm 名对齐：原版这几个入口叫 Put_Lepton，实现即 WriteLepton。
+    bool Put_Lepton(const char* pSection, const char* pKey, int32 nValue)
+    { return WriteLepton(pSection, pKey, nValue); }
+
     //========================================================================
     // UU Block Reading/Writing
     //========================================================================
@@ -275,6 +352,14 @@ public:
     // numbered keys, base64-decode each and pack the bytes back into pBuffer.
     // Returns the number of decoded bytes, capped at nSize.
     int32 ReadUUBlock(const char* pSection, void* pBuffer, size_t nSize);
+
+    // asm 名对齐：原版这两个入口分别叫 Put_UUBlock / Get_UUBlock，实现即
+    // WriteUUBlock / ReadUUBlock。INIClass::Get_PKey 依赖 Get_UUBlock 取
+    // "PrivateKey" / "PublicKey" 段。
+    bool Put_UUBlock(const char* pSection, const void* pValue, size_t nSize)
+    { return WriteUUBlock(pSection, pValue, nSize); }
+    int32 Get_UUBlock(const char* pSection, void* pBuffer, size_t nSize)
+    { return ReadUUBlock(pSection, pBuffer, nSize); }
 
     //========================================================================
     // Multi-Value Reading
@@ -342,6 +427,32 @@ public:
     const char* Section_GetKeyName(const char* pSection, int32 nKeyIndex);
     int32 Section_GetValueCount(const char* pSection);
 
+    // asm: INIClass_Section_GetKeyName (0x5291F0) 的四/五参数形态
+    //   char* __thiscall Section_GetKeyName(this, section, index, dest, size, def)
+    // 语义：
+    //   - 节不存在或下标越界 → 把 pDefault（可为 null，即空串）按 size 拷进
+    //     pBuffer，返回 pBuffer（**不返回 null**）；
+    //   - 命中 → strncpy(pBuffer, entry->Key, size) 并返回 pBuffer。
+    //   原版用它把"第 N 个键的名字"直接写进 0x20 字节的栈缓冲（[Movies] /
+    //   [InfantryTypes] 等"键只是序号"的段都走这条路）。
+    const char* Section_GetKeyName(const char* pSection, int32 nKeyIndex,
+                                   char* pBuffer, size_t bufferSize,
+                                   const char* pDefault = nullptr);
+
+    // asm: INIClass::Find_Section (asm:4867) —— 以节名（先 CRC32 哈希）在节表
+    //  中查找；命中返回该节对象，未命中/空名返回 null。它是 GetString /
+    //  GetInteger 等所有读取函数内部"节查找"那一步的独立入口。
+    INISection* Find_Section(const char* pSection);
+
+    // asm 里没有独立的 Find_Key：键查找内联在 GetString/GetInteger 的
+    //  CRC 比对流程中（Find_Section 找节后，再在节内按键 CRC 二分）。这里把
+    //  同一语义单独暴露成 Find_Key，命中返回条目指针，否则 null，与 FindEntry 等价。
+    INIEntry* Find_Key(const char* pSection, const char* pKey) const;
+
+    // asm: 读取族统一先 Find_Section / 键存在性判定的两个布尔的命名入口。
+    bool Section_Exists(const char* pSection) { return SectionExists(pSection); }
+    bool Key_Exists(const char* pSection, const char* pKey) { return KeyExists(pSection, pKey); }
+
     // 根据游戏行为，可知 Get_Hex 走无符号裸十六进制读取，等价于 ReadHex。
     int32 GetHex(const char* pSection, const char* pKey, int32 nDefault);
 
@@ -369,8 +480,26 @@ public:
     // 根据游戏行为，可知地图预览包按 Base64 编码、切成固定宽度的多行写入。
     bool SaveMapPreview(const char* pSection, const void* pData, int32 nSize);
 
-    // 根据游戏行为，可知阵营房屋表按逗号拆开、去空白后回写规范化串。
-    bool ParseSideHouses(const char* pSection, const char* pKey);
+    // asm: INIClass_ParseSideHouses (asm:275442, retn 28h)
+    //
+    //   [Sides] 的值是"逗号分隔的**房屋类型名**"，这个函数把它翻成房屋序号
+    //   向量（不是把字符串回写！旧实现把它当成"去空白后回写规范化串"，与
+    //   asm 完全不符，此处按 asm 重写）：
+    //
+    //     if (!GetString(section, key, "", Str, 0x80)) -> 结果 = 空向量
+    //     for (tok = strtok(Str, ","); tok && tok[0]; tok = strtok(NULL, ",")) {
+    //         i = HouseTypeClass::From_Name(tok);   // 名字 -> 房屋表序号
+    //         if (i != -1) push(i);                 // 查不到丢弃，不占位
+    //     }
+    //     return vector;
+    //
+    //   RulesClass_Addition_Sides 把返回值直接拷进 SideClass::Houses
+    //   （asm:4246 `VectorClass_Copy(side+0x98, vec)`），随后 SideClass 遍历
+    //   这些序号给每个 HouseTypeClass 打上 Side 归属。注意**没有**"某个 token
+    //   是另一个阵营名就把它整串展开"的分支——asm 只有 HouseTypeClass::From_Name
+    //   一次查找。
+    void ParseSideHouses(const char* pSection, const char* pKey,
+                         DynamicVectorClass<int32>& rList);
 
     // 根据游戏行为，可知宽字符写出口中非 ASCII 字符以 \xXXXX 转义。
     bool WriteUnicodeEscaped(const char* pSection, const char* pKey, const wchar_t* pValue);
@@ -433,7 +562,7 @@ protected:
 public:
     char* CurrentSectionName;
     INISection* CurrentSection;
-    List<INISection*> Sections;
+    INIIntrusiveList<INISection> Sections;
     INIComment* LineComments;
 
 private:
@@ -539,6 +668,18 @@ public:
     bool WriteRect(const char* pSection, const char* pKey,
                    const RectangleStruct* pRect);
 
+    // asm 名对齐（asm: INIClass::Get_Point / INIClass::Get_Rect /
+    // INIClass::Put_Rect）：分别等价 ReadPoint / ReadRect / WriteRect。
+    void Get_Point(const char* pSection, const char* pKey,
+                   int32* pX, int32* pY)
+    { ReadPoint(pSection, pKey, pX, pY); }
+    void Get_Rect(const char* pSection, const char* pKey,
+                  RectangleStruct* pRect)
+    { ReadRect(pSection, pKey, pRect); }
+    bool Put_Rect(const char* pSection, const char* pKey,
+                  const RectangleStruct* pRect)
+    { return WriteRect(pSection, pKey, pRect); }
+
 
     //========================================================================
     // Audio Enumeration Parsing
@@ -585,14 +726,62 @@ public:
     static void         ParseAbilities(const char* pValue, int32* pOut, int32 nCount);
 
     //========================================================================
+    // Map save helpers
+    //========================================================================
+
+    // ------------------------------------------------------------------------
+    // asm: Overlay_Pack_Type_SaveToINI (0x5FD680, __thiscall, retn 0)
+    //   this = CCINIClass（调用点 ScenarioClass_SaveMap 传的是 ccINI）
+    //
+    //   mangleStuff_("OVERLAY", 0) ; mangleStuff_("OverlayPack", 0)
+    //   for (y = 0; y < 200h; ++y) for (x = 0; x < 200h; ++x):
+    //       cell = MapClass::Coord_Cell(Map, {x,y})
+    //       total += sub_5520A0(&bufpipe, cell + 44h)      ; 1 字节/格
+    //   if (total): Put_UUBlock(this, "OverlayPack", <base64 文本>)
+    //   ... 对 OverlayDataPack 重复同样管线，取 cell + 11Eh（OverlayFrame）
+    //
+    //   本项目等价：把 512x512 的逐格字节图直接交给 Put_UUBlock ——
+    //   WriteUUBlock 内部就是 Base64Pipe + 0x46 字符分行，和原版
+    //   BufferPipe/Base64Pipe 管线的产出**同一份文本**，所以不再手工串
+    //   Pipe（避免二次编码）。
+    //   降级点：mangleStuff_（节名混淆）在本项目的 INI 层没有对应物，
+    //   节名按明文写入。
+    // ------------------------------------------------------------------------
+    bool Put_Overlay_Pack();
+
+    //========================================================================
     // Typed getters by name lookup
     //========================================================================
 
     // 根据游戏行为，可知类型读取一族都走"读名字 → 在对应类型表里查 →
     // 校验类别"三步：名字为空或类别不符时一律回落到调用者给的缺省值。
     TechnoTypeClass*   FindTechnoTypeByName(const char* pSection, const char* pKey);
-    TechnoTypeClass*   GetTechnoPrerequisite(const char* pSection, const char* pKey,
-                                             TechnoTypeClass* pDefault);
+
+    // asm: INIClass_GetTechnoPrerequisite (asm:273851, retn 0Ch = 3 参数)
+    //   uint32 __thiscall GetTechnoPrerequisite(this, section, key, fallback)
+    //
+    //   **不是**"按名字查一个 TechnoType"，而是一个**位图累加器**——这一点与
+    //   GetPrerequisiteList 返回"索引向量"完全不同，两者不可混用：
+    //
+    //     if (!GetString(section, key, "", Str, 0x80)) return fallback;
+    //     mask = 0;
+    //     for (tok = strtok(Str, ","); tok; tok = strtok(NULL, ",")) {
+    //         if (tok[0] == 0) break;
+    //         if (!strcmpi(tok, "POWER"))    mask |= 0x80000000;  // bit31
+    //         if (!strcmpi(tok, "FACTORY"))  mask |= 0x40000000;  // bit30
+    //         if (!strcmpi(tok, "BARRACKS")) mask |= 0x20000000;  // bit29
+    //         if (!strcmpi(tok, "RADAR"))    mask |= 0x10000000;  // bit28
+    //         i = BuildingTypeClass_FindIndex(tok);
+    //         if (i != -1) mask |= (1u << i);                     // 低 28 位
+    //     }
+    //     return mask;
+    //
+    //   四个关键字位落在高 4 位、建筑索引位落在低 28 位，所以"建筑索引 > 27"
+    //   会与关键字位重叠——原版就是这样（YR 建筑表远小于 28，不会真的撞上）。
+    //   注意:缺键返回 fallback，而"键存在但为空串"返回 0（GetString 成功、
+    //   strtok 立即为空）。这与 GetPrerequisiteList 缺键返回空向量一致。
+    uint32             GetTechnoPrerequisite(const char* pSection, const char* pKey,
+                                             uint32 nDefault);
     AircraftTypeClass* GetAircraftType(const char* pSection, const char* pKey,
                                        AircraftTypeClass* pDefault);
     BuildingTypeClass* GetBuildingType(const char* pSection, const char* pKey,
@@ -614,6 +803,20 @@ public:
     int32      GetCategoryIdx(const char* pSection, const char* pKey, int32 nDefault);
     int32      GetSWTypeIndex(const char* pSection, const char* pKey, int32 nDefault);
     int32      FindHouseIndex(const char* pSection, const char* pKey);
+
+    // 根据游戏行为，可知 Action 以既知名字表（strlist_Actions）存取：
+    // 读字符串默认取表中第 nDefault 项，再在整表中大小写不敏感查找，
+    // 命中返回表内下标，未命中返回 0（asm 如此，不返回 nDefault）。
+    int32      GetAction(const char* pSection, const char* pKey, int32 nDefault);
+
+    // 根据游戏行为，可知这是"从 INI 读国家名 → 在注册表里找到或分配一个
+    // 多人可用国家 → 返回其序号"的一站式入口：先按名字取玩家项，命中且
+    // 该序号属于七个多人专用国有槽位就直接返回；否则退回按类型名查找，
+    // 查不到时若允许则新建类型并登记，最后返回该类型在表里的序号；
+    // 读不到键或名字查不到类型时返回调用者给的缺省值。
+    int32      HouseType_FindOrAllocate_YesMP(const char* pSection, const char* pKey,
+                                              int32 nDefault);
+
     LandType   GetLand(const char* pSection, const char* pKey, LandType nDefault);
     TheaterType GetTheater(const char* pSection, const char* pKey, TheaterType nDefault);
     AbstractType GetFactory(const char* pSection, const char* pKey, AbstractType nDefault);
@@ -682,6 +885,13 @@ public:
                               int32* pValues);
     bool         Get3Bytes(const char* pSection, const char* pKey,
                            uint8* pValues);
+
+    // asm: INIClass_GetColor (0x474ED0)。语义：把缺省颜色按 "%d,%d,%d"
+    // 格式串成 "R,G,B" 作为读取缺省值，读回后再按 "%d,%d,%d" 解析成
+    // 三个字节写入 pOut；键不存在时直接把缺省颜色拷入 pOut。始终返回
+    // pOut（与原版一致，调用者不检查空指针）。
+    ColorStruct* GetColor(ColorStruct* pOut, const char* pSection,
+                          const char* pKey, const ColorStruct* pDefault);
     bool         Get2Integers(const char* pSection, const char* pKey,
                               int32* pValues);
     bool         GetVectorIntegers(const char* pSection, const char* pKey,
@@ -718,11 +928,31 @@ public:
     bool         GetVectorColors(const char* pSection, const char* pKey,
                                  DynamicVectorClass<ColorStruct>& rList);
 
-    // Prerequisites are a comma separated run of techno IDs.  The literal
-    // "POWER" is stored as -1, everything else is resolved through
-    // TechnoTypeClass and stored as its array index.
+    // Prerequisites are a comma separated run of building IDs plus six literal
+    // keywords.  asm: CCINIClass_GetPrerequisiteList (asm:276562) ——
+    //
+    //   每个 token 先比六个关键字，命中就往结果向量里压一个**负哨兵**，
+    //   然后再无条件试一次 BuildingTypeClass_FindIndex（关键字必然查不到，
+    //   互不干扰）：
+    //       "POWER"    -> -1        "FACTORY"  -> -2
+    //       "BARRACKS" -> -3        "RADAR"    -> -4
+    //       "TECH"     -> -5        "PROC"     -> -6
+    //   普通名字 -> BuildingTypeClass::FindIndex()，命中才压入（**排在最后**，
+    //   即关键字哨兵永远在向量最前面，因为六次比较先做）。
+    //   缺键/空值:结果向量被清空（原版构造一个空向量再 operator= 覆盖）。
     bool         GetPrerequisiteList(const char* pSection, const char* pKey,
                                      DynamicVectorClass<int32>& rList);
+
+    // asm: INIClass_Get_Vector_Voc_525430 (asm:643239, retn 0Ch = 3 参数)
+    //   void __thiscall Get_Vector_Voc(this, section, key, VectorPtrInteger out)
+    //
+    //   **声音名向量**：值是逗号分隔的 VOC 名字（不是编号），逐个走
+    //   VocClass_Find(name) -> 非空再 VocClass_FindIndex(ptr) 取索引，压进
+    //   结果向量；查不到的名字直接丢弃（不像 GetVectorIntegers 那样把无法
+    //   解析的项当 0 存进去）。缺键:结果向量被清空。
+    //   [AudioVisual] IceCrackSounds 就是这条路径（asm:1275355）。
+    void         Get_Vector_Voc(const char* pSection, const char* pKey,
+                                DynamicVectorClass<int32>& rList);
 
     // Retrieve the 20-byte digest computed when the file was read
     bool GetDigest(uint8* pDigest, size_t digestSize) const;

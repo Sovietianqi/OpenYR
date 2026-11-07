@@ -145,6 +145,15 @@ public:
     virtual void Place(bool captured);
     virtual void UpdateConstructionOptions();
     virtual void Draw(const Point2D& point, const RectangleStruct& rect);
+    // ------------------------------------------------------------------------
+    // asm: BuildingClass_DrawRadialIndicator (1 arg, retn 4).  Paints the
+    //  structure's radial indicator (psychic detection / gap / cloak / weapon
+    //  range).  Gated on a positive GetRangeOfRadial, an online structure and
+    //  a player owner.  When the type requests ConcentricRadialIndicator the
+    //  indicator is animated over time (inner pulse plus an outer scaled ring),
+    //  otherwise a single ring is drawn in the owner's colour.
+    // ------------------------------------------------------------------------
+    void DrawRadialIndicator(int32 color) const;
     virtual DirStruct FireAngleTo(ObjectClass* pObject) const;
     virtual void Destroy(DWORD dwUnused, TechnoClass* pTechno, bool NoSurvivor, CellStruct& cell);
     virtual bool TogglePrimaryFactory();
@@ -157,6 +166,28 @@ public:
     // current firing stage (+0x140), advanced for multi-stage weapons
     // (gattling / prism towers).
     int32 GetCurrentWeaponStage() const;
+
+    // ------------------------------------------------------------------------
+    // asm: BuildingClass_GetWeapon (1 arg, retn 4) - the weapon the structure
+    //  would use for the given slot.  Resolves, in order:
+    //    1. an installed upgrade module that carries a weapon in that slot,
+    //    2. the garrison occupant currently designated to fire (its infantry
+    //       type's OccupyWeapon / EliteOccupyWeapon),
+    //    3. the structure type's own weapon slot.
+    // ------------------------------------------------------------------------
+    WeaponStruct* GetWeapon(int32 weaponIndex) const;
+
+    // asm: BuildingClass_GetSomeInt - a second, identical reader of the
+    // multi-stage firing counter (+0x140); kept for name fidelity with the
+    // binary's tail-merged accessor.
+    int32 GetSomeInt() const;
+
+    // ------------------------------------------------------------------------
+    // asm: BuildingClass_SellUpgrades_unused.  Refunds and strips every
+    //  installed upgrade module, most-recent first, then plays the structure's
+    //  sell animation.  Each module refunds through its own GetRefund.
+    // ------------------------------------------------------------------------
+    void SellUpgrades_unused();
     virtual bool ForceCreate(CoordStruct& coord, DWORD dwUnk);
     virtual CellStruct FindExitCell(DWORD dwUnk, DWORD dwUnk2) const;
     virtual int32 DistanceToDockingCoord(ObjectClass* pObj) const;
@@ -170,6 +201,32 @@ public:
     virtual void EnableTemporal();
     virtual void DisableTemporal();
     virtual void UpdateAnimations();
+
+    // ------------------------------------------------------------------------
+    // asm: BuildingClass_Update (asm:175489).  The structure's per-frame driver.
+    //
+    //  In the binary's order:
+    //   1. Latch the "power on" predicate (IsPowerOnline && mission is neither
+    //      Selling nor Repair).  When it flips, play the structure's power
+    //      transition sound and run UpdatePowered(); otherwise keep the looping
+    //      location sound alive.
+    //   2. Refresh the damage-fire latch and (de)spawn fire animations from the
+    //      health ratio against Rules->ConditionYellow.
+    //   3. Tick the attached temporal effect.
+    //   4. Run the refinery "cash machine" payout off CashMachineTimer.
+    //   5. ProcessAnims, then TechnoClass::Update() (base frame work).
+    //   6. Update_Prism, Abandon (civilian structures), Update_Repair and
+    //      Update_Factory.
+    // ------------------------------------------------------------------------
+    virtual void Update() override;
+
+    // ------------------------------------------------------------------------
+    // asm: BuildingClass_UpdatePowered (asm:213345).  Called whenever the
+    //  structure's power-on state changes.  Keeps the powered-centre
+    //  registration, cloak-generator latch, gap-field and the low-power
+    //  animation set in sync with the new state.
+    // ------------------------------------------------------------------------
+    void UpdatePowered();
     virtual int32 GetCurrentFrame() const;
     virtual bool IsAllFogged() const;
     virtual void SetRallypoint(CellStruct* pTarget, bool bPlayEVA);
@@ -370,6 +427,17 @@ public:
     // array writing every placed, non-limbo structure into the map INI.
     static void SaveToMapINIList(INIClass* pINI);
 
+    // ------------------------------------------------------------------------
+    // asm: int __thiscall BuildingClass_CreateFromINIList(CCINIClass *INI_)
+    //
+    //  The mirror of SaveToMapINIList: reads [Structures] back out of a scenario
+    //  INI and rebuilds every placed structure.  Each record is
+    //  "owner,type,health,facing(x[,y]),mission,flags...,upgrades..." (the field
+    //  layout switches on NewINIFormat).  Returns the number of structures
+    //  successfully created.
+    // ------------------------------------------------------------------------
+    int32 CreateFromINIList(INIClass* pINI);
+
  // BuildingClass_SaveToMapINI.  Serializes one structure's
     // placement record into the map INI under [Structures].
     void SaveToMapINI(INIClass* pINI) const;
@@ -424,6 +492,47 @@ public:
     // 根据游戏行为，可知 Update_Factory 是工厂生产线的一帧推进入口。
     // ========================================================================
     void Update_Factory();
+
+    // ========================================================================
+    // asm: void __thiscall BuildingClass_Update_Repair(BuildingClass *this)
+    //
+    //  建筑维修的每帧入口。分两件事：
+    //   1. 玩家 AI 挂自动维修许可——当本建筑有维修价值、房主是人类（或某个
+    //      非人类房主满足对应条件）时，把房主的"允许维修"标记置位，并按房主
+    //      的 RepairDelay 随机推开一个维修计时器。
+    //   2. 真正推进维修：每隔固定帧数（房主 RepairDelay×900）走一步——交替
+    //      切换维修动画、按类型 RepairStepCost 扣钱、按 RepairStep 回血，回满
+    //      或钱不够就停下。血线跨过 ConditionYellow 门槛时刷新受损动画。
+    // ========================================================================
+    void Update_Repair();
+
+    // ========================================================================
+    // asm: void __thiscall BuildingClass_RegisterDestruction(BuildingClass *this,
+    //       _TechnoClass *killer)
+    //
+    //  建筑被摧毁时的登记：若类型带 UnitAbsorb/InfantryAbsorb，先把肚子里吞
+    //  进去的载具/步兵逐个"吐"出来（以支援逃生单位形式重新登场）；随后按
+    //  CrewCount 生成幸存者步兵（技师标记、随机残血、按归属决定是否倒戈），
+    //  最后把摧毁事件登记给触发器系统。
+    // ========================================================================
+    void RegisterDestruction(TechnoClass* pKiller);
+
+    // ========================================================================
+    // asm: void __thiscall BuildingClass_Abandon(BuildingClass *this)
+    //
+    //  中立/平民建筑的"弃守"处理：红血时先撤出驻守步兵；找到平民阵营的房主
+    //  作为接管方，按是否玩家所有播放语音与雷达事件，把建筑转交给平民或就
+    //  地移除，并重播待机动画。非中立建筑（Type 指定了特定 House）直接跳过。
+    // ========================================================================
+    void Abandon();
+
+    // ========================================================================
+    // asm: BuildingClass_CanTraverse - [Gate] structures (gates, laser fences)
+    //  override the base "can drive across" test.  A non-gate always returns
+    //  true; a gate lets traffic through while its door is open, otherwise it
+    //  forces the door open and reports false for this frame.
+    // ========================================================================
+    bool CanTraverse() const override;
 
     // ========================================================================
     // 根据游戏行为，可知 KillOccupiers 把驻守步兵全部处死并清空名册（区别
@@ -514,6 +623,9 @@ public:
     virtual int32 GetBuildTime() const;
     virtual DirStruct GetDirection() const;
     virtual void SetDirection(DirStruct dir);
+    // Re-expose the inherited pointer-out-param GetCoords(CoordStruct*); the
+    // value-returning override below would otherwise hide it for BuildingClass*.
+    using ObjectClass::GetCoords;
     virtual CoordStruct GetCoords() const;
     virtual void SetCoords(CoordStruct coords);
     virtual void Stop();
@@ -653,6 +765,10 @@ public:
     int32               DockedUnitsCapacity;
     int32               FiringOccupantIndex;           // occupant whose weapon fires next
     bool                WasOnline;                     // online state at last Update()
+    // asm: BuildingClass.RegisteredAsPowerUnitSource —— 已向所属方登记为电力中心
+    bool                RegisteredAsPowerUnitSource;
+    // asm: BuildingClass.CloakingData —— 隐身发生器当前蓄力量（<=0 表示未启用）
+    int32               CloakingData;
     bool                StuffEnabled;                  // set by EnableStuff/DisableStuff
     bool                BeingProduced;                 // AI_REBUILDABLE flag
     bool                ShouldRebuild;                 // AI_REPAIRABLE flag
@@ -680,8 +796,7 @@ public:
     DWORD               StorageFilledSlots;            // silo occupancy
     CellStruct          RallyPoint;                    // factory rally point
     AbstractClass*      Target;                        // current target object
-    Mission             CurrentMission;               // active mission
-    Mission             QueuedMission;                 // mission to switch to
+    // ★ 任务状态由基类 MissionClass 持有（原版 +0xA8/+0xB0），本类不再重复。
 
     // Reserved layout buffers for binary compatibility with original engine.
     // These bytes correspond to internal state fields in the original binary
@@ -696,5 +811,44 @@ public:
     // Per-instance serialization for the save-game stream (base + derived).
     void Save(class SaveGameClass& saver) const;
     void Load(class LoadGameClass& loader);
+
+    // ------------------------------------------------------------------------
+    // Repair state machine - backs BuildingClass_Update_Repair.
+    //   IsBeingRepaired (+0x6E8): a player/AI repair order is in progress.
+    //   RepairAnimToggle (+0x6DE): alternates the repair animation each step so
+    //     the wrench frames animate at half the repair-step rate.
+    //   RepairStepTimer: frames remaining before the next paid repair step.
+    // ------------------------------------------------------------------------
+    bool                IsBeingRepaired;
+    bool                RepairAnimToggle;
+    int32               RepairStepTimer;
+
+    // ------------------------------------------------------------------------
+    // BuildingClass_Update scratch state (asm field names in comments).
+    //   CashMachineTimer (+CashMachineTimer.TimeLeft): frames remaining before
+    //     a refinery / cash-granting structure hands its owner
+    //     `Type->ProduceCashAmount` credits (or bills `-amount`).
+    //   PostFactoryLagTimer (+PostFactoryLagTimer.TimeLeft): cooldown before a
+    //     war factory may start the next production run after a unit rolled
+    //     off the line.
+    //   PowerOnLatch (+0x6C8): the power-on predicate latched last frame; the
+    //     flip edge drives UpdatePowered() and the transition sound.
+    //   NeedsDamageFires (+NeedsDamageFires): latched "this structure should
+    //     have damage fires" state.
+    // ------------------------------------------------------------------------
+    int32               CashMachineTimer;
+    int32               PostFactoryLagTimer;
+    bool                PowerOnLatch;
+    bool                NeedsDamageFires;
+
+    // A structure may leave crew behind when destroyed (RegisterDestruction).
+    //   IsTechnicianStructure (+0x6E9): the survivors are flagged as technicians.
+    bool                IsTechnicianStructure;
+    //   IsBaseDefenseStructure (+0x6E0): controls which idle-anim set the
+    //     structure replays and whether survivors face a direction on spawn.
+    bool                IsBaseDefenseStructure;
     BYTE ReservedLayout[0x70C - 0x548];
+
+    // 最近一次本体绘制的屏幕包围盒（SHP 帧 dst），供血条/选中框定位。
+    RectangleStruct LastRenderRect;
 };

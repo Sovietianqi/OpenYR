@@ -45,6 +45,9 @@ file(GLOB_RECURSE GAMERECON_SOURCES CONFIGURE_DEPENDS
 # Never pull in files from the build directory itself.
 list(FILTER GAMERECON_SOURCES EXCLUDE REGEX "${CMAKE_BINARY_DIR}/")
 
+# tools/ 下是独立的诊断/回归程序（各有自己的 main），不能编进 gamerecon。
+list(FILTER GAMERECON_SOURCES EXCLUDE REGEX "${CMAKE_SOURCE_DIR}/tools/")
+
 add_executable(gamerecon ${GAMERECON_SOURCES})
 
 target_include_directories(gamerecon PRIVATE

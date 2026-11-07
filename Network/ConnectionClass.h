@@ -106,7 +106,8 @@ struct PendingAck {
     uint8* Data;
     int32 Length;
     bool Sent;
-    int32 SendTime;
+    int32 SendTime;        // 最近一次发送时刻
+    int32 FirstSendTime;   // asm [entry+4]：首次发送时刻（生命期判定）
     int32 Retransmits;
     bool Acked;
 };
@@ -130,6 +131,21 @@ public:
     void QueuePacket(const uint8* data, int32 len);
     bool ProcessQueue();
 
+    // ------------------------------------------------------------------
+    // asm: ConnectionClass_ServiceSendQueue (asm:621)
+    //   __fastcall(this) -> char
+    //   第一趟结算"已收到 ACK"的条目并更新往返时延，第二趟按超时重发；
+    //   任一条目超过重发上限/生命期即标记坏连接并返回 0。
+    // asm: sub_48C3B0 —— 依次调用发送/接收两个服务口的包装。
+    // asm: sub_48BF10 —— 复位计数器（Init）。
+    // asm: sub_48C630 —— 包类型码 -> "ADATA"/... 的名字表。
+    // ------------------------------------------------------------------
+    bool Service_Send_Queue();
+    bool Service_Receive_Queue();
+    int32 RetireAcknowledged();
+    void Reset_Connection();
+    static const char* GetPacketKindName(int32 code);
+
     // Reliable transmission
     int32 BuildReliablePacket(const uint8* data, int32 len, uint8* outBuffer, int32 outMaxLen);
     bool ProcessIncomingPacket(const uint8* data, int32 len);
@@ -152,6 +168,8 @@ public:
     uint32 Address;
     uint16 Port;
     bool Connected;
+    // asm: 连接表项 +0x24 —— 对端玩家名（Neqotiate / ModemHost 都按它比对）
+    char PeerName[0x40];
     int32 Timeout;
     VectorClass<PacketData*> PacketQueue;
     CDTimerClass LastActivity;
@@ -240,6 +258,12 @@ public:
     uint32 IPXNetwork;
     uint32 IPXNode;
     uint16 IPXSocket;
+
+    // asm: 连接项 +0xC8 —— 监听开关。IPXManagerClass 的 Stop_Listening
+    // (0x543080) / Start_Listening (0x543090) 直接翻转该字节。
+    bool Listening;
+    // asm: 接收队列里尚未被上层取走的数据报数（[conn+4]->+28h 的语义）。
+    int32 PendingReceive;
 };
 
 class UDPConnectionClass : public ConnectionClass {

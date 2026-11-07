@@ -1,14 +1,54 @@
 #include "WalkLocomotionClass.h"
 #include "../Map/MapClass.h"
+#include "../Map/CellClass.h"
+#include "../Rules/RulesClass.h"
+#include "../Scenario/ScenarioClass.h"
+#include "../Abstract/FootClass.h"
 
 #include <cmath>
 #include <cstdlib>
 
 // ============================================================================
-// WalkLocomotionClass - Infantry walking locomotion.
-// Per-cell movement processing, crawling/prone states, terrain-aware speed,
-// sound effects, and direction-based animation sequencing.
+// WalkLocomotionClass - 步兵行走移位器。
+//
+// 权威来源：
+//   asm: WalkLocomotionClass_CTOR                        (asm:23)
+//   asm: WalkLocomotionClass_ILocomotion_Destination      (asm:168)
+//   asm: WalkLocomotionClass_ILocomotion_HeadToCoord      (asm:232)
+//   asm: WalkLocomotionClass_ILocomotion_Process          (asm:310)
+//   asm: WalkLocomotionClass_ILocomotion_MoveTo           (asm:348)
+//   asm: WalkLocomotionClass_ILocomotion_StopMoving       (asm:454)
+//   asm: WalkLocomotionClass_ILocomotion_DoTurn           (asm:514)
+//   asm: WalkLocomotionClass_ILocomotion_ForceImmediateDestination (asm:549)
+//   asm: WalkLocomotionClass_ILocomotion_MarkAllOccupationBits (asm:1256)
+//   asm: WalkLocomotionClass_ILocomotion_IsMovingHere     (asm:1319)
+//   asm: WalkLocomotionClass_ILocomotion_IsReallyMovingNow(asm:1418)
+//   asm: WalkLocomotionClass_ILocomotion_Lock             (asm:1446)
+//   asm: sub_75AEC0  —— 每帧行走仿真（asm 主库行 1747664..1749553）
+//   asm: sub_75C240  —— Force_Immediate_Destination 的落点助手（asm:1749562）
+//
+// 对象布局（相对 WalkLocomotionClass 基址）：
+//   +0x18 Destination      朝往目的地
+//   +0x24 HeadTo           本帧真正推进到的坐标
+//   +0x30 IsMoving         移动旗标
+//   +0x31 处理中临时旗标
+//   +0x32 IsReallyMovingNow
+//   +0x34/0x35/0x36 逐帧布尔（坡道 / 落地 / 挤压）
+//   +0x38 Piggyback        IPiggyback 的 ILocomotion* 槽
 // ============================================================================
+
+namespace {
+// asm: WalkLocomotionClass_Default_Pos —— 全零哨兵坐标，代表"无目标"。
+inline bool IsDefaultPos(const CoordStruct& c)
+{
+    return c.X == 0 && c.Y == 0 && c.Z == 0;
+}
+
+// asm: WalkLocomotionClass_ILocomotion_IsMovingNow 里 dword_B45C2C(=128) 的
+// 高度容差：同格判定时 Z 之差不超过它即视为"就在此地"。
+constexpr int32 kCellZTolerance = 128;
+constexpr int32 kLeptonPerCell = 256;
+} // namespace
 
 WalkLocomotionClass::WalkLocomotionClass()
     : LocomotionClass()
@@ -21,6 +61,11 @@ WalkLocomotionClass::WalkLocomotionClass()
     , IsCrawling(false)
     , MoveStepTimer(0)
     , StepSize(8)
+    , HeadTo(0, 0, 0)
+    , IsReallyMovingNow(false)
+    , OnRamp(false)
+    , JustLanded(false)
+    , WasCrushed(false)
 {
     Speed = 64;
 }
@@ -50,17 +95,43 @@ int32 WalkLocomotionClass::Size()
 }
 
 // ============================================================================
-// Move_To - Sets infantry destination. Generates a cell-by-cell path
-// from the current position to the target coordinate using a simple
-// Bresenham-like line algorithm.
+// Move_To - 登记朝往点并（按需）生成逐格路径。
+// asm: WalkLocomotionClass_ILocomotion_MoveTo   (asm:348)
+//   * 载体正处于"不可下达移动命令"的三种状态时直接返回（asm 里三次虚表
+//     调用 +0x37C/+0x1D4/+0x1D8）。
+//   * 目标非零：写 Destination，取目标格；若目标格带桥梁位（cell+0x140 的
+//     第 9 位），给目的地 Z 加上 ScenarioClass::Random(0x3C) 的抖动。
+//     最后置 IsMoving。
+//   * 目标为零：清 IsMoving；若原先在动，则通知载体停止移动（虚表+0x54C）。
 // ============================================================================
 
 void WalkLocomotionClass::Move_To(CoordStruct to)
 {
-    Dest = to;
-    IsMoving = true;
-    IsFalling = false;
+    if (Owner) {
+        if (Owner->IsInLimbo || Owner->InOpenTopped || Owner->IsDead()) {
+            return;
+        }
+    }
 
+    Dest = to;
+
+    if (IsDefaultPos(to)) {
+        // 停机分支：目标归零。
+        const bool wasMoving = IsMoving;
+        IsMoving = false;
+        HeadTo = CoordStruct(0, 0, 0);
+        Path.Clear();
+        PathIndex = 0;
+        PathLength = 0;
+        if (wasMoving) {
+            Stop_Movement_Animation();
+        }
+        return;
+    }
+
+    HeadTo = to;
+
+    // 生成逐格路径（原版由寻路系统写入路径表；此处按直线补全）。
     Path.Clear();
     PathIndex = 0;
     PathLength = 0;
@@ -69,140 +140,401 @@ void WalkLocomotionClass::Move_To(CoordStruct to)
     CellStruct destCell = CoordMath::CoordToCell(to);
 
     CurrentCell = startCell;
+    NextCell = destCell;
 
     int32 dx = static_cast<int32>(destCell.X) - static_cast<int32>(startCell.X);
     int32 dy = static_cast<int32>(destCell.Y) - static_cast<int32>(startCell.Y);
+    const int32 adx = std::abs(dx);
+    const int32 ady = std::abs(dy);
+    const int32 steps = (adx > ady) ? adx : ady;
 
-    int32 adx = std::abs(dx);
-    int32 ady = std::abs(dy);
-    int32 steps = adx > ady ? adx : ady;
-    if (steps == 0) {
-        IsMoving = false;
+    if (steps > 0) {
+        for (int32 i = 1; i <= steps; ++i) {
+            CellStruct cs;
+            cs.X = static_cast<int16>(static_cast<int32>(startCell.X)
+                + (dx * i) / steps);
+            cs.Y = static_cast<int16>(static_cast<int32>(startCell.Y)
+                + (dy * i) / steps);
+            Path.Add(cs);
+        }
+        PathLength = Path.GetCount();
+        if (PathLength > 0) {
+            NextCell = Path[0];
+        }
+    }
+
+    // asm: MapClass_Get_Target_Cell -> cell+0x140 的桥位（bit8）会触发
+    //   `Random(0x3C)` 的高度抖动，避免多名步兵在同一桥格完全重叠。
+    CellClass* pCell = MapClass::Instance->GetCellAt(destCell);
+    if (pCell && pCell->IsBridge()) {
+        int32 jitter = ScenarioClass::Instance->Random.Next(0, 0x3C);
+        Dest.Z += jitter;
+        HeadTo.Z += jitter;
+    }
+
+    IsMoving = true;
+    IsFalling = false;
+    SpeedAccum = 0;
+}
+
+void WalkLocomotionClass::Move_To(AbstractClass* target)
+{
+    if (!target) {
         return;
     }
-
-    float stepX = static_cast<float>(dx) / static_cast<float>(steps);
-    float stepY = static_cast<float>(dy) / static_cast<float>(steps);
-
-    int32 lastCellX = static_cast<int32>(startCell.X);
-    int32 lastCellY = static_cast<int32>(startCell.Y);
-
-    for (int32 i = 0; i <= steps; ++i) {
-        int32 cx = static_cast<int32>(startCell.X) + static_cast<int32>(stepX * static_cast<float>(i));
-        int32 cy = static_cast<int32>(startCell.Y) + static_cast<int32>(stepY * static_cast<float>(i));
-
-        if (cx == lastCellX && cy == lastCellY && i > 0) {
-            continue;
-        }
-
-        CellStruct cs;
-        cs.X = static_cast<int16>(cx);
-        cs.Y = static_cast<int16>(cy);
-        Path.Add(cs);
-
-        lastCellX = cx;
-        lastCellY = cy;
-    }
-
-    PathLength = Path.GetCount();
-    if (PathLength > 0) {
-        NextCell = Path[0];
-    }
+    Move_To(target->GetCoords());
 }
 
 // ============================================================================
-// Stop_Moving - Halts infantry movement and clears the path.
+// Stop_Moving - 清空目的地与朝往点。
+// asm: WalkLocomotionClass_ILocomotion_StopMoving   (asm:454)
+//   先写 Destination = 0；然后仅当 HeadTo 也归零时，才清 IsMoving /
+//   IsReallyMovingNow 并调用载体的虚表 +0x54C（停止移动动画）。
 // ============================================================================
 
 void WalkLocomotionClass::Stop_Moving()
 {
+    Dest = CoordStruct(0, 0, 0);
+
+    if (!IsDefaultPos(HeadTo)) {
+        return;
+    }
+
     IsMoving = false;
+    IsReallyMovingNow = false;
     IsFalling = false;
     IsJumping = false;
     Path.Clear();
     PathIndex = 0;
     PathLength = 0;
     MoveStepTimer = 0;
+    Stop_Movement_Animation();
 }
 
 // ============================================================================
-// Process - Main infantry movement loop. Each frame, accumulates speed
-// and makes step-by-step progress along the cell path.
+// Do_Turn - 直接把朝向写入载体的 FacingStruct。
+// asm: WalkLocomotionClass_ILocomotion_DoTurn   (asm:514)
+//   步兵不做限速转身：一次调用即到位（FacingStruct_SetFacing 语义）。
+// ============================================================================
+
+void WalkLocomotionClass::Do_Turn(DirStruct coord)
+{
+    if (!Owner) {
+        return;
+    }
+
+    if (Owner->GetFacing().Value != coord.Value) {
+        Owner->SetFacing(coord);
+    }
+}
+
+// ============================================================================
+// Head_To_Coord - 朝往点。
+// asm: WalkLocomotionClass_ILocomotion_HeadToCoord   (asm:232)
+//   HeadTo 非零 → 返回 HeadTo；否则返回载体的缓存绘制点（+0x9C）。
+// ============================================================================
+
+CoordStruct WalkLocomotionClass::Head_To_Coord() const
+{
+    if (!IsDefaultPos(HeadTo)) {
+        return HeadTo;
+    }
+    return Owner ? Owner->CachedLocation : CoordStruct(0, 0, 0);
+}
+
+CoordStruct WalkLocomotionClass::Head_To_Coord()
+{
+    return static_cast<const WalkLocomotionClass*>(this)->Head_To_Coord();
+}
+
+// ============================================================================
+// Destination - 只有正在移动时才回传目的地。
+// asm: WalkLocomotionClass_ILocomotion_Destination   (asm:168)
+//   Is_Moving() 为假 → 回传全零哨兵（而非上一次的残留目的地）。
+// ============================================================================
+
+CoordStruct WalkLocomotionClass::Destination()
+{
+    if (Is_Moving()) {
+        return Dest;
+    }
+    return CoordStruct(0, 0, 0);
+}
+
+// ============================================================================
+// Lock - 把目的地与朝往点一起归零。
+// asm: WalkLocomotionClass_ILocomotion_Lock   (asm:1446)
+// ============================================================================
+
+void WalkLocomotionClass::Lock()
+{
+    Dest = CoordStruct(0, 0, 0);
+    HeadTo = CoordStruct(0, 0, 0);
+    IsMoving = false;
+    IsReallyMovingNow = false;
+    Path.Clear();
+    PathIndex = 0;
+    PathLength = 0;
+}
+
+// ============================================================================
+// Force_Immediate_Destination - 立即落点。
+// asm: WalkLocomotionClass_ILocomotion_ForceImmediateDestination   (asm:549)
+//   先把传入点交给 sub_75C240（行进落点助手）登记；随后若 HeadTo 与
+//   Destination 同时归零，则清 IsMoving 且在原先移动时通知载体停手。
+// ============================================================================
+
+void WalkLocomotionClass::Force_Immediate_Destination(CoordStruct coord)
+{
+    const bool wasMoving = IsMoving;
+
+    HeadTo = coord;
+    Dest = coord;
+
+    if (IsDefaultPos(HeadTo) && IsDefaultPos(Dest)) {
+        IsMoving = false;
+        IsReallyMovingNow = false;
+        if (wasMoving) {
+            Stop_Movement_Animation();
+        }
+    }
+}
+
+// ============================================================================
+// Is_Moving_Here - 目标是否与给定坐标同格且高度接近。
+// asm: WalkLocomotionClass_ILocomotion_IsMovingHere   (asm:1319)
+//   取朝往点，比较 (X>>8, Y>>8) 与目标同格，且 |Z 差| <= 容差。
+// ============================================================================
+
+bool WalkLocomotionClass::Is_Moving_Here(CoordStruct to)
+{
+    CoordStruct head = Head_To_Coord();
+
+    const int16 hx = static_cast<int16>(head.X >> 8);
+    const int16 hy = static_cast<int16>(head.Y >> 8);
+    const int16 tx = static_cast<int16>(to.X >> 8);
+    const int16 ty = static_cast<int16>(to.Y >> 8);
+
+    if (hx != tx || hy != ty) {
+        return false;
+    }
+
+    return std::abs(head.Z - to.Z) <= kCellZTolerance;
+}
+
+// ============================================================================
+// Stop_Movement_Animation - 停止行走动画。
+// asm: WalkLocomotionClass_ILocomotion_StopMovementAction   (asm:1577)
+// ============================================================================
+
+void WalkLocomotionClass::Stop_Movement_Animation()
+{
+    if (Owner) {
+        Owner->SetSequence(Sequence::Ready);
+    }
+}
+
+// ============================================================================
+// Process - 每帧行走推进入口。
+// asm: WalkLocomotionClass_ILocomotion_Process   (asm:310)
+//   置"处理中"旗标（+0x31 = 1），调用 sub_75AEC0 做一帧仿真，清旗标后再
+//   回传 Is_Moving()。sub_75AEC0 的控制流按三块组织：
+//     1) 瘫痪/速度闸门：载体 SpeedPercentage(+0x578) 为 0 则整帧冻结；
+//     2) 到达判定：到朝往点距离小于 Rules->CloseEnough 即收脚；
+//     3) 逐格推进：按速度累积满 256 个单位推进一格，写回坐标/朝向，
+//        坡道做 Z 插值，按节拍播放脚步音，并刷新占用位。
 // ============================================================================
 
 bool WalkLocomotionClass::Process()
 {
-    if (!IsMoving) {
+    // asm: sub_75AEC0 开头 —— HeadTo 与 Destination 同时归零则直接返回。
+    if (!IsMoving && IsDefaultPos(HeadTo) && IsDefaultPos(Dest)) {
+        IsReallyMovingNow = false;
         return false;
     }
 
+    if (!Owner) {
+        IsReallyMovingNow = false;
+        return false;
+    }
+
+    // 先跑空格落逻辑（下坠 / 跳跃期间不走地面步进）。
     if (IsFalling) {
         return ProcessFall();
     }
-
     if (IsJumping) {
         return ProcessJump();
     }
 
-    if (!Powered) {
+    // asm: 载体 SpeedPercentage(+0x578) 为 0 → 被定身，本帧不推进。
+    if (Owner->SpeedPercentage <= 0.0) {
+        IsReallyMovingNow = false;
+        return true;
+    }
+
+    CoordStruct target = !IsDefaultPos(HeadTo) ? HeadTo : Dest;
+    if (IsDefaultPos(target)) {
+        IsReallyMovingNow = false;
         IsMoving = false;
         return false;
     }
 
-    int32 effectiveSpeed = static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage);
-    if (effectiveSpeed <= 0) {
-        effectiveSpeed = 1;
+    // ---- 到达判定（asm: RulesClass CloseEnough 比较） ----
+    if (IsAtDestination()) {
+        // 收脚：贴合目标点，停止移动。
+        CurrentCoord = target;
+        Owner->SetCoords(CurrentCoord);
+        IsMoving = false;
+        IsReallyMovingNow = false;
+        HeadTo = CoordStruct(0, 0, 0);
+        Dest = CoordStruct(0, 0, 0);
+        Path.Clear();
+        PathIndex = 0;
+        PathLength = 0;
+        Owner->SetSequence(Sequence::Ready);
+        return false;
     }
 
-    MoveStepTimer += effectiveSpeed;
-    int32 stepThreshold = 256;
+    // ---- 朝向朝往点（步兵转身不设限速） ----
+    Do_Turn(CoordMath::DirectionTo(CurrentCoord, target));
 
-    while (MoveStepTimer >= stepThreshold) {
-        MoveStepTimer -= stepThreshold;
+    // ---- 逐格推进 ----
+    const int32 effectiveSpeed = GetCurrentSpeed();
+    SpeedAccum += (effectiveSpeed > 0) ? effectiveSpeed : 1;
+
+    IsReallyMovingNow = false;
+    while (SpeedAccum >= kLeptonPerCell) {
+        SpeedAccum -= kLeptonPerCell;
 
         if (!MoveOneStep()) {
             IsMoving = false;
-            Stop_Movement_Animation();
+            IsReallyMovingNow = false;
+            Owner->SetSequence(Sequence::Ready);
             return false;
         }
-
-        UpdatePosition();
+        IsReallyMovingNow = true;
     }
 
-    if (IsMoving && Owner) {
-        Owner->SetSequence(Sequence::Walk);
+    UpdatePosition();
+
+    if (IsMoving && IsReallyMovingNow) {
+        Owner->SetSequence(IsCrawling ? Sequence::Crawl : Sequence::Walk);
+        PlayStepSound();
     }
 
     return IsMoving;
 }
 
 // ============================================================================
-// UpdatePosition - Smoothly interpolates the current coordinate toward
-// the current cell's center coordinate.
+// GetCurrentSpeed - 本帧生效速度。
+//   载体侧把老兵加成与 SpeedPercentage 折进来；这里再乘本类的 Speed。
+// ============================================================================
+
+int32 WalkLocomotionClass::GetCurrentSpeed() const
+{
+    int32 base = Owner ? Owner->GetCurrentSpeed() : Speed;
+    if (base <= 0) {
+        base = Speed;
+    }
+    if (base <= 0) {
+        base = 1;
+    }
+    return base;
+}
+
+// ============================================================================
+// UpdatePosition - 沿当前格朝下一格做逐帧插值，坡道/楼梯做高度过渡。
+// asm: sub_75AEC0 的坐标写回段（对 [esi+0x0C] 载体调用 +0x0F0 设坐标）。
 // ============================================================================
 
 void WalkLocomotionClass::UpdatePosition()
 {
-    CoordStruct targetCoord = CoordMath::CellToCoord(CurrentCell);
-    if (CurrentCoord != targetCoord) {
-        int32 effectiveSpeed = static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage);
-        CurrentCoord = VectorMath::MoveTowards(CurrentCoord, targetCoord, effectiveSpeed);
+    if (!Owner) {
+        return;
+    }
 
-        if (Owner) {
-            Owner->SetCoords(CurrentCoord);
+    CellStruct curCell = CoordMath::CoordToCell(CurrentCoord);
+    CellStruct aimCell = (PathIndex < PathLength) ? Path[PathIndex] : NextCell;
+    CoordStruct cellCenter = CoordMath::CellToCoord(aimCell);
+
+    // 水平插值：按速度向前推进，不允许越过格中心。
+    const int32 speed = GetCurrentSpeed();
+    int32 dx = cellCenter.X - CurrentCoord.X;
+    int32 dy = cellCenter.Y - CurrentCoord.Y;
+    const int32 dist = static_cast<int32>(std::sqrt(
+        static_cast<double>(dx) * dx + static_cast<double>(dy) * dy));
+
+    if (dist > 0) {
+        if (dist <= speed) {
+            CurrentCoord.X = cellCenter.X;
+            CurrentCoord.Y = cellCenter.Y;
+        } else {
+            CurrentCoord.X += (dx * speed) / dist;
+            CurrentCoord.Y += (dy * speed) / dist;
         }
     }
+
+    // 高度：目标格地面高度做逐帧逼近（上坡抬升 / 下坡下沉）。
+    CellClass* pAim = MapClass::Instance->GetCellAt(aimCell);
+    if (pAim) {
+        OnRamp = InterpolateHeight(pAim->Get_Ground_Height());
+    }
+
+    Owner->SetCoords(CurrentCoord);
+    CurrentCell = curCell;
 }
 
 // ============================================================================
-// MoveOneStep - Advances the infantry to the next cell in the path.
-// Returns false if the path is exhausted or blocked.
+// InterpolateHeight - 坡道 / 楼梯高度插值。
+// asm: sub_75AEC0 的高度段——每帧把 Z 朝目标格地面高度推进固定步长 8，
+//   差值在一个步长内则直接贴合，并把"刚落地"旗标（+0x35）置上。
+//   返回本帧是否存在高度差（即是否在坡道上）。
+// ============================================================================
+
+bool WalkLocomotionClass::InterpolateHeight(int32 targetZ)
+{
+    const int32 dz = targetZ - CurrentCoord.Z;
+    if (dz == 0) {
+        return false;
+    }
+
+    const int32 step = StepSize > 0 ? StepSize : 8;
+    if (std::abs(dz) <= step) {
+        CurrentCoord.Z = targetZ;
+        JustLanded = true;
+    } else {
+        CurrentCoord.Z += (dz > 0) ? step : -step;
+    }
+    return true;
+}
+
+// ============================================================================
+// IsAtDestination - 到达判定（距离 <= Rules->CloseEnough）。
+// asm: sub_75AEC0 的收脚判定段。
+// ============================================================================
+
+bool WalkLocomotionClass::IsAtDestination() const
+{
+    CoordStruct target = !IsDefaultPos(HeadTo) ? HeadTo : Dest;
+    if (IsDefaultPos(target)) {
+        return false;
+    }
+    const int32 dist = CurrentCoord.DistanceFrom(target);
+    int32 closeEnough = RulesClass::Instance->GetCloseEnoughSpeed();
+    if (closeEnough <= 0) {
+        closeEnough = 1;
+    }
+    return dist <= closeEnough;
+}
+
+// ============================================================================
+// MoveOneStep - 推进到路径中的下一格；被占用时改走替代格。
+// asm: sub_75AEC0 的逐格步进段（含 MapClass 的通行/占用判定）。
 // ============================================================================
 
 bool WalkLocomotionClass::MoveOneStep()
 {
     if (PathIndex >= PathLength) {
-        IsMoving = false;
         return false;
     }
 
@@ -210,40 +542,27 @@ bool WalkLocomotionClass::MoveOneStep()
     if (!CanMoveToCell(nextCell)) {
         CellStruct altCell = FindAlternativeCell(nextCell);
         if (altCell.X == 0 && altCell.Y == 0) {
-            IsMoving = false;
             return false;
         }
         nextCell = altCell;
     }
 
-    DirStruct moveDir = CoordMath::DirectionTo(
-        CoordMath::CellToCoord(CurrentCell),
-        CoordMath::CellToCoord(nextCell)
-    );
-
-    if (Owner) {
-        Do_Turn(moveDir);
-    }
-
     CurrentCell = nextCell;
-    CurrentCoord = CoordMath::CellToCoord(nextCell);
+    NextCell = nextCell;
+    CoordStruct cellCoord = CoordMath::CellToCoord(nextCell);
+    cellCoord.Z = CurrentCoord.Z;
+
+    CurrentCoord.X = cellCoord.X;
+    CurrentCoord.Y = cellCoord.Y;
+    CurrentCoord.Z = cellCoord.Z;
 
     if (Owner) {
         Owner->SetCoords(CurrentCoord);
     }
 
     ++PathIndex;
-
-    if (PathIndex < PathLength) {
-        NextCell = Path[PathIndex];
-    }
-
     return true;
 }
-
-// ============================================================================
-// MoveToNextCell - Advances to the next cell in the path.
-// ============================================================================
 
 bool WalkLocomotionClass::MoveToNextCell()
 {
@@ -251,8 +570,8 @@ bool WalkLocomotionClass::MoveToNextCell()
 }
 
 // ============================================================================
-// CanMoveToCell - Validates whether an infantry unit can enter a cell.
-// Checks map bounds, terrain, and occupancy.
+// CanMoveToCell - 单格通行性判定（步兵视角）。
+// asm: MapClass 侧的通行判定 + 占用位。
 // ============================================================================
 
 bool WalkLocomotionClass::CanMoveToCell(CellStruct cell)
@@ -272,11 +591,6 @@ bool WalkLocomotionClass::CanMoveToCell(CellStruct cell)
 
     return true;
 }
-
-// ============================================================================
-// FindAlternativeCell - When the target cell is blocked, searches for
-// a nearby passable cell to navigate around obstacles.
-// ============================================================================
 
 CellStruct WalkLocomotionClass::FindAlternativeCell(CellStruct blocked)
 {
@@ -299,21 +613,21 @@ CellStruct WalkLocomotionClass::FindAlternativeCell(CellStruct blocked)
 }
 
 // ============================================================================
-// ProcessFall - Handles falling state (e.g., from a cliff or bridge).
+// ProcessFall - 下坠：每帧下落，着地即转趴下姿态。
+// asm: sub_75AEC0 的下坠分支（载体姿态切 Prone/Tumble）。
 // ============================================================================
 
 bool WalkLocomotionClass::ProcessFall()
 {
     CurrentCoord.Z -= 8;
-    if (CurrentCoord.Z < 0) {
-        CurrentCoord.Z = 0;
-    }
 
     int32 groundZ = MapClass::Instance->GetGroundHeight(CurrentCoord);
     if (CurrentCoord.Z <= groundZ) {
         CurrentCoord.Z = groundZ;
         IsFalling = false;
         IsMoving = false;
+        JustLanded = true;
+        IsReallyMovingNow = false;
 
         if (Owner) {
             Owner->SetCoords(CurrentCoord);
@@ -331,14 +645,15 @@ bool WalkLocomotionClass::ProcessFall()
 }
 
 // ============================================================================
-// ProcessJump - Handles jump animation state (e.g., jumping over obstacles).
+// ProcessJump - 跳跃：抛物线式升-降，落回地面高度。
+// asm: sub_75AEC0 的跳跃分支。
 // ============================================================================
 
 bool WalkLocomotionClass::ProcessJump()
 {
     static int32 jumpHeight = 0;
     static int32 jumpPhase = 0;
-    static int32 jumpMax = 128;
+    const int32 jumpMax = 128;
 
     int32 groundZ = MapClass::Instance->GetGroundHeight(CurrentCoord);
 
@@ -367,14 +682,9 @@ bool WalkLocomotionClass::ProcessJump()
     return IsJumping;
 }
 
-// ============================================================================
-// BeginCrawl - Puts the infantry into crawl/prone state.
-// ============================================================================
-
 void WalkLocomotionClass::BeginCrawl()
 {
     IsCrawling = true;
-    SpeedPercentage *= 0.5f;
     StepSize = 4;
 
     if (Owner) {
@@ -382,14 +692,9 @@ void WalkLocomotionClass::BeginCrawl()
     }
 }
 
-// ============================================================================
-// EndCrawl - Returns the infantry to normal walking state.
-// ============================================================================
-
 void WalkLocomotionClass::EndCrawl()
 {
     IsCrawling = false;
-    SpeedPercentage = 1.0f;
     StepSize = 8;
 
     if (Owner) {
@@ -398,22 +703,24 @@ void WalkLocomotionClass::EndCrawl()
 }
 
 // ============================================================================
-// Mark_All_Occupation_Bits - Infantry-specific occupation bit marking.
-// Infantry only occupies a single cell.
+// Mark_All_Occupation_Bits - 把占用位交给载体统一登记。
+// asm: WalkLocomotionClass_ILocomotion_MarkAllOccupationBits   (asm:1256)
+//   mark == 0 时取朝往点坐标并转交载体的 +0xF4 槽；mark != 0 时（清位）原版
+//   直接返回，由载体的更新循环统一撤销。
 // ============================================================================
 
 void WalkLocomotionClass::Mark_All_Occupation_Bits(MarkType mark)
 {
-    if (mark == MarkType::Up) {
-        MapClass::Instance->MarkCellOccupied(CurrentCell, true);
-    } else {
-        MapClass::Instance->MarkCellOccupied(CurrentCell, false);
+    if (mark != MarkType::Up) {
+        return;
     }
-}
+    if (!Owner) {
+        return;
+    }
 
-// ============================================================================
-// Limbo - Infantry limbo state.
-// ============================================================================
+    CellStruct cell = CoordMath::CoordToCell(CurrentCoord);
+    MapClass::Instance->MarkCellOccupied(cell, true);
+}
 
 void WalkLocomotionClass::Limbo()
 {
@@ -422,33 +729,17 @@ void WalkLocomotionClass::Limbo()
     IsFalling = false;
     IsJumping = false;
     IsCrawling = false;
+    IsReallyMovingNow = false;
     MoveStepTimer = 0;
+    HeadTo = CoordStruct(0, 0, 0);
     Path.Clear();
     PathIndex = 0;
     PathLength = 0;
 }
 
 // ============================================================================
-// Do_Turn - Infantry rotation with smooth directional change.
-// Infantry turns instantly toward the target direction.
-// ============================================================================
-
-void WalkLocomotionClass::Do_Turn(DirStruct coord)
-{
-    if (!Owner) {
-        return;
-    }
-
-    DirStruct currentDir = Owner->GetFacing();
-    if (currentDir.Value == coord.Value) {
-        return;
-    }
-
-    Owner->SetFacing(coord);
-}
-
-// ============================================================================
-// Can_Enter_Cell - Infantry-specific cell traversal check.
+// Can_Enter_Cell - 步兵通行判定。
+//   水面/墙不可入；岩石只能临时停留（Move::Temp）；其余可入。
 // ============================================================================
 
 Move WalkLocomotionClass::Can_Enter_Cell(CellStruct cell)
@@ -470,7 +761,8 @@ Move WalkLocomotionClass::Can_Enter_Cell(CellStruct cell)
 }
 
 // ============================================================================
-// GetStepSound - Returns the appropriate footstep sound based on terrain.
+// GetStepSound - 脚步音编号按地表类型分档。
+// asm: sub_75AEC0 里 VocClass_Play 的地表判定段。
 // ============================================================================
 
 int32 WalkLocomotionClass::GetStepSound() const
@@ -479,45 +771,67 @@ int32 WalkLocomotionClass::GetStepSound() const
     LandType land = MapClass::Instance->GetLandType(cell);
 
     switch (land) {
-        case LandType::Road:
-            return 1;
-        case LandType::Ice:
-            return 2;
-        case LandType::Weeds:
-            return 3;
-        case LandType::Tiberium:
-            return 4;
-        case LandType::Rough:
-            return 5;
+        case LandType::Road:     return 1;
+        case LandType::Ice:      return 2;
+        case LandType::Weeds:    return 3;
+        case LandType::Tiberium: return 4;
+        case LandType::Rough:    return 5;
+        case LandType::Beach:    return 6;
         case LandType::Clear:
-        default:
-            return 0;
+        default:                 return 0;
     }
 }
 
 // ============================================================================
-// PlayStepSound - Plays the footstep sound effect for the current terrain.
+// PlayStepSound - 脚步音按固定节拍触发。
+// asm: sub_75AEC0 —— 载体 +0x68A 为步伐节拍旗标，到点后 VocClass_Play
+//   播放一次并清旗标。
 // ============================================================================
 
 void WalkLocomotionClass::PlayStepSound()
 {
-    int32 soundId = GetStepSound();
-    if (Owner) {
-        Owner->PlaySoundEffect(soundId);
+    // 每推进两格响一次（原版按载体动画帧触发，这里以步进计数近似同一节拍）。
+    ++MoveStepTimer;
+    if ((MoveStepTimer & 1) != 0) {
+        return;
+    }
+
+    const int32 sound = GetStepSound();
+    if (sound != 0 && Owner) {
+        Owner->PlaySoundEffect(sound);
     }
 }
 
 // ============================================================================
-// Is_Really_Moving_Now - Infantry is moving if not falling and path active.
+// Is_Moving_Now - 是否此刻真正在动。
+// asm: WalkLocomotionClass_ILocomotion_IsMovingNow   (asm:106)
+//   Is_Moving() && 载体 SpeedPercentage(+0x578) > 0 && HeadTo != (0,0,0)。
+// ============================================================================
+
+bool WalkLocomotionClass::Is_Moving_Now()
+{
+    if (!IsMoving) {
+        return false;
+    }
+    if (Owner && Owner->SpeedPercentage <= 0.0) {
+        return false;
+    }
+    return !IsDefaultPos(HeadTo);
+}
+
+// ============================================================================
+// Is_Really_Moving_Now - 本帧真的推进过。
+// asm: WalkLocomotionClass_ILocomotion_IsReallyMovingNow   (asm:1418)
+//   直接读 +0x32 的逐帧旗标。
 // ============================================================================
 
 bool WalkLocomotionClass::Is_Really_Moving_Now() const
 {
-    return IsMoving && !IsFalling && !IsJumping && PathIndex < PathLength;
+    return IsReallyMovingNow && !IsFalling && !IsJumping;
 }
 
 // ============================================================================
-// Get_Status - Infantry-specific status code.
+// Get_Status - 步兵动作状态码。
 // ============================================================================
 
 int32 WalkLocomotionClass::Get_Status() const
@@ -528,17 +842,15 @@ int32 WalkLocomotionClass::Get_Status() const
     if (IsCrawling) {
         return static_cast<int32>(Sequence::Crawl);
     }
-    if (IsJumping) {
-        return static_cast<int32>(Sequence::Walk);
-    }
-    if (IsMoving) {
+    if (IsMoving || IsJumping) {
         return static_cast<int32>(Sequence::Walk);
     }
     return static_cast<int32>(Sequence::Ready);
 }
 
 // ============================================================================
-// Movement_AI - Infantry movement AI with terrain-aware speed adjustment.
+// Movement_AI - 地形感知的速度修正。
+// asm: WalkLocomotionClass_ILocomotion_Process 内的地表速度段。
 // ============================================================================
 
 void WalkLocomotionClass::Movement_AI()
@@ -552,27 +864,13 @@ void WalkLocomotionClass::Movement_AI()
 
     float baseSpeedMod = 1.0f;
     switch (land) {
-        case LandType::Road:
-            baseSpeedMod = 1.1f;
-            break;
-        case LandType::Rough:
-            baseSpeedMod = 0.75f;
-            break;
-        case LandType::Ice:
-            baseSpeedMod = 0.8f;
-            break;
-        case LandType::Weeds:
-            baseSpeedMod = 0.85f;
-            break;
-        case LandType::Tiberium:
-            baseSpeedMod = 0.6f;
-            break;
-        case LandType::Beach:
-            baseSpeedMod = 0.9f;
-            break;
-        default:
-            baseSpeedMod = 1.0f;
-            break;
+        case LandType::Road:     baseSpeedMod = 1.1f;  break;
+        case LandType::Rough:    baseSpeedMod = 0.75f; break;
+        case LandType::Ice:      baseSpeedMod = 0.8f;  break;
+        case LandType::Weeds:    baseSpeedMod = 0.85f; break;
+        case LandType::Tiberium: baseSpeedMod = 0.6f;  break;
+        case LandType::Beach:    baseSpeedMod = 0.9f;  break;
+        default:                 baseSpeedMod = 1.0f;  break;
     }
 
     if (IsCrawling) {
@@ -582,30 +880,18 @@ void WalkLocomotionClass::Movement_AI()
     SpeedPercentage = baseSpeedMod;
 
     CellStruct destCell = CoordMath::CoordToCell(Dest);
-    int32 dist = CoordMath::CellDistance(currentCell, destCell);
-    if (dist <= 1) {
+    if (CoordMath::CellDistance(currentCell, destCell) <= 1) {
         SpeedPercentage *= 0.8f;
     }
 }
 
-// ============================================================================
-// Can_Fire - Infantry can fire unless falling or jumping.
-// ============================================================================
-
 FireError WalkLocomotionClass::Can_Fire() const
 {
-    if (IsFalling) {
-        return FireError::Movement;
-    }
-    if (IsJumping) {
+    if (IsFalling || IsJumping) {
         return FireError::Movement;
     }
     return FireError::OK;
 }
-
-// ============================================================================
-// Is_To_Have_Moving_Anim - Infantry shows walking animation when moving.
-// ============================================================================
 
 bool WalkLocomotionClass::Is_To_Have_Moving_Anim() const
 {
@@ -613,39 +899,28 @@ bool WalkLocomotionClass::Is_To_Have_Moving_Anim() const
 }
 
 // ============================================================================
-// Apparent_Speed - Infantry apparent speed considering crawl state.
+// Apparent_Speed - 表观速度（爬行减半）。
 // ============================================================================
 
 int32 WalkLocomotionClass::Apparent_Speed() const
 {
+    const int32 base = GetCurrentSpeed();
     if (IsCrawling) {
-        return static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage * 0.5f);
+        return base / 2;
     }
-    return static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage);
+    return base;
 }
 
 // ============================================================================
-// Move_To overload for AbstractClass target.
-// ============================================================================
-
-void WalkLocomotionClass::Move_To(AbstractClass* target)
-{
-    if (!target) {
-        return;
-    }
-    CoordStruct targetPos = target->GetCoords();
-    Move_To(targetPos);
-}
-
-// ============================================================================
-// Force_New_Slope - Infantry slope handling.
+// Force_New_Slope - 坡道处理。
+//   陡坡（ramp > 2）直接转入下坠；缓坡按坡度降低速度。
 // ============================================================================
 
 void WalkLocomotionClass::Force_New_Slope(int32 ramp)
 {
     if (ramp > 2) {
         IsFalling = true;
-        CurrentCoord.Z = 0;
+        CurrentCoord.Z = MapClass::Instance->GetGroundHeight(CurrentCoord);
     } else {
         SpeedPercentage = 1.0f - static_cast<float>(ramp) * 0.1f;
         if (SpeedPercentage < 0.5f) {
@@ -653,8 +928,9 @@ void WalkLocomotionClass::Force_New_Slope(int32 ramp)
         }
     }
 }
+
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知搭车（IPiggyback）槽位：COM 三槽转发到本体；搭车
+// asm: WalkLocomotionClass_IPiggyback_QueryInterface
 // 状态由一个 ILocomotion* 槽承载——开始搭车登记、结束搭车交出并清槽、
 // 是否搭车看槽位占用、能否结束要确认本体已经停下。
 // ------------------------------------------------------------------------
@@ -680,7 +956,6 @@ bool WalkLocomotionClass::IPiggyback_IsPiggybacking() const
 
 HRESULT WalkLocomotionClass::IPiggyback_BeginPiggyback(ILocomotion* pLoco)
 {
-    // 根据游戏行为，可知空指针与重复登记都以指针错误拒绝。
     if (!pLoco)
         return static_cast<HRESULT>(0x80004003); // E_POINTER
     if (Piggyback && Piggyback != pLoco)
@@ -691,7 +966,6 @@ HRESULT WalkLocomotionClass::IPiggyback_BeginPiggyback(ILocomotion* pLoco)
 
 HRESULT WalkLocomotionClass::IPiggyback_EndPiggyback(ILocomotion** ppOut)
 {
-    // 根据游戏行为，可知出参为空以指针错误拒绝；槽位为空时无物可交。
     if (!ppOut)
         return static_cast<HRESULT>(0x80004003); // E_POINTER
     if (!Piggyback)
@@ -703,8 +977,7 @@ HRESULT WalkLocomotionClass::IPiggyback_EndPiggyback(ILocomotion** ppOut)
 
 bool WalkLocomotionClass::IPiggyback_IsOKToEnd()
 {
-    // 根据游戏行为，可知结束搭车前要确认：本体已经停下、搭车对象仍在、
-    // 下落状态已清。
+    // 本体必须已经停下、且仍挂着搭车对象、且不在下坠中。
     if (IsMoving)
         return false;
     if (!Piggyback)
@@ -716,8 +989,6 @@ bool WalkLocomotionClass::IPiggyback_IsOKToEnd()
 
 HRESULT WalkLocomotionClass::IPiggyback_PiggybackCLSID(GUID* pGUID)
 {
-    // 根据游戏行为，可知取搭车对象的类别标识：出参或槽位为空都以指针
-    // 错误拒绝；否则向搭车对象索要 CLSID。
     if (!pGUID || !Piggyback)
         return static_cast<HRESULT>(0x80004003); // E_POINTER
     LocomotionClass* pLoco = static_cast<LocomotionClass*>(Piggyback);

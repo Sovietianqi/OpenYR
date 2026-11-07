@@ -16,6 +16,9 @@ public:
 
     static WarheadTypeClass* Find(const char* pID);
     static WarheadTypeClass* FindOrAllocate(const char* pID);
+    // asm: WarheadTypeClass_FindByName (0x75E4A0) - same as Find but compares
+    // against the class Name (ini name) field instead of the ID.
+    static WarheadTypeClass* FindByName(const char* pName);
     static WarheadTypeClass* GetDefault() { return Array && Array->Count > 0 ? (*Array)[0] : nullptr; }
 
     // The broadcast RulesClass_Addition_SpecialWeapons performs once the
@@ -33,7 +36,15 @@ public:
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
 
     virtual AbstractType WhatAmI() const override;
+    virtual AbstractType GetAbstractDerivationID() const;
     virtual int32 Size() const override;
+    virtual int32 GetCRC() const;
+    virtual bool LoadFromINI(CCINIClass* pINI) override;
+
+    // asm: WarheadTypeClass_PointerGotInvalid (0x75E440) - clears the cached
+    // DetachedSplash anim (asm +0x140) if it was the expired pointer and pulls
+    // the same entry out of the per-instance splash anim list (asm +0x104).
+    virtual void PointerGotInvalid(AbstractClass* pAbstract, bool removed);
 
     bool LoadFromINIList(CCINIClass* pINI);
     bool SaveToINIList(CCINIClass* pINI);
@@ -113,6 +124,18 @@ public:
     int32 DebrisMaximumsCount;
     TechnoTypeClass** DebrisTypes;
     int32* DebrisMaximums;
+    // ------------------------------------------------------------------
+    // asm backing fields for GetCRC / PointerGotInvalid.
+    //   +0x98/+0x9C  : CellInset (double)   [already CellInset below]
+    //   +0xF8/+0xFC  : CombatLightSize (double)
+    //   +0x100       : a DWORD
+    //   +0x140       : DetachedSplash anim (cached, cleared on invalidate)
+    //   +0x1B8/+0x1BC: DebrisMaximums vector count/cap mirror
+    // ------------------------------------------------------------------
+    int32 DetachSplashDword;
+    AnimTypeClass* DetachedSplash;
+    int32 DebrisMaximumsCapacity;
+    int32 DebrisMaximumsCap2;
     // ------------------------------------------------------------------
     // Rules / Art INI fields
     // ------------------------------------------------------------------

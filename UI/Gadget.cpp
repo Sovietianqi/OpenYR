@@ -27,6 +27,7 @@ GadgetClass::GadgetClass() noexcept
     , BackColor(0, 0, 0)
     , Callback(nullptr)
     , CallbackData(nullptr)
+    , IsVisibleFlag(1)          // asm +0x1C: default-visible for base ctor
     , Parent(nullptr)
 {
 }
@@ -40,6 +41,7 @@ GadgetClass::GadgetClass(int32 x, int32 y, int32 w, int32 h, int32 id) noexcept
     , BackColor(0, 0, 0)
     , Callback(nullptr)
     , CallbackData(nullptr)
+    , IsVisibleFlag(1)          // asm +0x1C: default-visible for base ctor
     , Parent(nullptr)
 {
 }

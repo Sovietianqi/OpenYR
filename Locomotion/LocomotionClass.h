@@ -54,7 +54,11 @@ public:
     virtual HRESULT Link_To_Object(void* pointer) override { return S_OK; }
     virtual bool Is_Moving() override { return IsMoving; }
     virtual CoordStruct Destination() override { return Dest; }
-    virtual CoordStruct Head_To_Coord() override { return Dest; }
+    // asm: LocomotionClass_ILocomotion_HeadToCoord   (asm:750696)
+    //  基类默认把载体现行坐标（ObjectClass +0x9C 的缓存绘制点）作为朝往点返回。
+    virtual CoordStruct Head_To_Coord() override {
+        return Owner ? Owner->CachedLocation : CoordStruct(0, 0, 0);
+    }
     virtual CoordStruct Head_To_Coord() const;
     virtual bool Is_To_Have_Shadow() override { return true; }
 
@@ -120,6 +124,14 @@ public:
     CoordStruct Destination_Coord() const;
     bool Can_Traverse_To(CellStruct targetCell);
     int32 Get_Speed() const;
+    // 现行坐标访问器（HeadToCoord 计算与外部查询用）。
+    CoordStruct Get_Coord() const { return CurrentCoord; }
+    // 写实坐标并同步给载体。
+    void Set_Coord(CoordStruct coord);
+    // 载体的当前离地高度（TechnoClass::GetHeight）；无载体时用自身坐标 Z。
+    int32 Get_Height() const;
+    // 载体的技术类型（TechnoType）；无载体时给空指针。
+    TechnoTypeClass* Get_Unit_Type() const;
     void Appear_At(CoordStruct coord);
     void Power_Off_Track();
     bool Is_Limboed() const;

@@ -15,6 +15,10 @@ public:
 
     static WeaponTypeClass* Find(const char* pID);
     static WeaponTypeClass* FindOrAllocate(const char* pID);
+    // asm: WeaponTypeClass_FindIndex (0x773030) --- linear scan of the type
+    // array comparing each entry's ID (this+0x24) against pID, returning the
+    // slot index or -1 when absent.
+    static int32 FindIndex(const char* pID);
 
     virtual ~WeaponTypeClass();
 
@@ -24,6 +28,9 @@ public:
 
     virtual AbstractType WhatAmI() const override;
     virtual int32 Size() const override;
+    // asm: WeaponTypeClass_GetCRC (0x772AF0) --- folds the base type digest
+    // followed by the weapon's numeric fields and capability flags.
+    virtual void ComputeCRC(CRCEngine& crc) const override;
 
     bool LoadFromINIList(CCINIClass* pINI);
     bool SaveToINIList(CCINIClass* pINI);
@@ -43,6 +50,11 @@ public:
     int32 GetAttackRange() const;
     int32 GetMinimumAttackRange() const;
     int32 GetProjectileSpeed() const;
+    // asm: WeaponTypeClass_GetSpeed (0x773070) --- the projectile's terminal
+    // speed at fire time.  A missing / non-ballistic projectile returns the
+    // flat Speed field; a ballistic one re-integrates the trajectory with the
+    // rules gravity (halved when the projectile requests half-gravity).
+    int32 GetSpeed() const;
     DamageType GetDamageType() const;
 
  // 根据游戏行为，可知 _GetProjectileAGAA_Flags 负责下面这段逻辑。
@@ -52,6 +64,16 @@ public:
     //  and every SelectAutoTarget override.  Returns 0 when the weapon has no
     //  projectile (instant-hit ray weapons are treated as "all targets").
     static int32 GetProjectileAGAA_Flags(const WeaponTypeClass* pWeapon);
+
+    // True if this weapon's warhead is allowed to damage walls (used by
+    // infantry/vehicle wall-clipping checks).  Mirrors WeaponTypeClass_CanHitWall.
+    bool CanHitWall() const;
+
+    // Recomputes the ballistic terminal speed into Speed (asm 0xA8) using the
+    // RulesData gravity and the projectile's half-gravity flag.  Skipped when
+    // the projectile is missing or non-ballistic.  Mirrors
+    // WeaponTypeClass_CalculateSpeed (called from RulesData_LoadTypeData).
+    void CalculateSpeed();
 
     WeaponTypeClass(const char* pID) noexcept;
 

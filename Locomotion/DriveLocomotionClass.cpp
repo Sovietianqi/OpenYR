@@ -124,7 +124,14 @@ void DriveLocomotionClass::Stop_Moving()
 
 void DriveLocomotionClass::Do_Turn(DirStruct coord)
 {
+    // asm: 载具不做瞬转——把目标朝向登记到 FacingClass，由每帧的
+    //   RotateTowards 按 RotationSpeed 逐帧逼近；到位前 Is_Moving_Now
+    //   恒为真，其它系统据此知道"车还在转"。
     TargetFacing = coord;
+    if (CurrentFacing.Value == coord.Value) {
+        IsRotating = false;
+        return;
+    }
     IsRotating = true;
 }
 
@@ -170,17 +177,85 @@ void DriveLocomotionClass::Do_Turret_Turn(DirStruct coord)
 }
 
 // ============================================================================
-// Process - Main vehicle movement loop. Handles rotation, driving,
-// terrain checks, and crush detection.
+// Is_Moving - 目的地/朝往点任一非零即为在动。
+// asm: DriveLocomotionClass_ILocomotion_IsMoving   (asm:372)
+//   先看 Destination(+0x34)：非零 → true；否则看 HeadTo(+0x40)：非零且与载体
+//   的缓存绘制点（+0x9C）不相等 → true；两者都归零 → false。
+// ============================================================================
+
+bool DriveLocomotionClass::Is_Moving()
+{
+    if (!(Destination == CoordStruct(0, 0, 0))) {
+        return true;
+    }
+
+    if (HeadToCoord == CoordStruct(0, 0, 0)) {
+        return false;
+    }
+
+    if (Owner) {
+        const CoordStruct cached = Owner->CachedLocation;
+        if (cached == HeadToCoord) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Is_Moving_Now - 转身未完成也算在动（原版先看朝向是否到位）。
+// asm: DriveLocomotionClass_ILocomotion_IsMovingNow   (asm:467)
+//   1) 载体 FacingStruct 尚未到位（IsReady 为假）→ true；
+//   2) 否则 Is_Moving() && HeadTo != 0 && 载体当前速度 > 0 → true；
+//   3) 其它 → false。
+// ============================================================================
+
+bool DriveLocomotionClass::Is_Moving_Now()
+{
+    if (Owner && IsRotating) {
+        return true;
+    }
+
+    if (!Is_Moving()) {
+        return false;
+    }
+    if (HeadToCoord == CoordStruct(0, 0, 0)) {
+        return false;
+    }
+    if (Owner && Owner->GetCurrentSpeed() <= 0) {
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Process - 载具每帧驱动入口。
+// asm: 由 sub_4B0F20 承载（Drive 的每帧仿真）。控制流：
+//   1) 被锁（Lock）或不在动 → 直接返回；
+//   2) 若在摇车（过断桥坠落）→ 走摇车分支；
+//   3) 若在转身 → 朝目标朝向逐帧旋转，转到位后清旗标；
+//   4) 若在驾驶 → 地形速度修正、加减速曲线、逐格推进、碾压判定、
+//      桥梁检查、坡道俯仰；
+//   5) 回传是否仍在活动。
 // ============================================================================
 
 bool DriveLocomotionClass::Process()
 {
-    blah();
+    UpdateDrive();
     return IsDriving || IsRotating || IsRocking;
 }
 
-void DriveLocomotionClass::blah()
+// ============================================================================
+// UpdateDrive - 载具每帧驱动主体。
+// asm: sub_4B0F20   —— 控制流：
+//   1) 被锁（Lock）或不在动 → 直接返回；
+//   2) 若在摇车（过断桥坠落）→ 走摇车分支；
+//   3) 若在转身 → 朝目标朝向逐帧旋转，转到位后清旗标；
+//   4) 若在驾驶 → 地形速度、坡道收敛、到达减速、逐格推进、碾压判定、
+//      桥梁检查、坡道俯仰。
+// ============================================================================
+
+void DriveLocomotionClass::UpdateDrive()
 {
     if (IsLocked) {
         return;
@@ -195,7 +270,7 @@ void DriveLocomotionClass::blah()
         return;
     }
 
-    // --- turning (stationary or while driving) ---
+    // --- 转身（原地或行进中） ---
     if (IsRotating) {
         RotateTowards(TargetFacing);
         if (CurrentFacing.Value == TargetFacing.Value) {
@@ -210,11 +285,15 @@ void DriveLocomotionClass::blah()
         return;
     }
 
-    // --- terrain speed modifiers ---
+    // --- 地形速度修正 ---
     Movement_AI();
 
-    // --- speed with acceleration curve & arrival deceleration ---
-    float targetSpeed = static_cast<float>(Speed) * SpeedPercentage * MovementSpeed;
+    // --- 坡道速度收敛（爬坡降速、下坡恢复） ---
+    UpdateSlopeSpeed();
+
+    // --- 到达减速曲线 ---
+    float targetSpeed = static_cast<float>(Speed) * SpeedPercentage
+        * static_cast<float>(MovementSpeed);
 
     int32 distToDest = CurrentCoord.DistanceFrom(Destination);
     const int32 decelDist = (Speed > 0) ? Speed * 4 : 256;
@@ -228,7 +307,7 @@ void DriveLocomotionClass::blah()
         effectiveSpeed = 1;
     }
 
-    // --- slope adaptation: climbing slows down, descending speeds up ---
+    // --- 坡差：上坡减速、下坡加速 ---
     if (MapClass::Instance != nullptr) {
         CellStruct curCell = CoordMath::CoordToCell(CurrentCoord);
         CellStruct dstCell = CoordMath::CoordToCell(Destination);
@@ -237,23 +316,71 @@ void DriveLocomotionClass::blah()
         if (pCur != nullptr && pDst != nullptr) {
             int32 heightDelta = pDst->Get_Ground_Height() - pCur->Get_Ground_Height();
             if (heightDelta > 0) {
-                effectiveSpeed = (effectiveSpeed * 3) / 4;   // uphill penalty
+                effectiveSpeed = (effectiveSpeed * 3) / 4;   // 上坡
             } else if (heightDelta < 0) {
-                effectiveSpeed = (effectiveSpeed * 5) / 4;   // downhill bonus
+                effectiveSpeed = (effectiveSpeed * 5) / 4;   // 下坡
             }
         }
     }
 
     SpeedAccum += effectiveSpeed;
 
-    // --- step-based movement ---
+    // --- 逐格推进 ---
+    StepTowardsDestination(effectiveSpeed);
+
+    if (IsDriving) {
+        CheckCrush();
+        CheckBridge();
+
+        if (IsOnBridge() && CheckBridge()) {
+            SlopeTimer.Update(effectiveSpeed);
+        }
+
+        Tilt_Pitch_AI();
+    }
+}
+
+// ============================================================================
+// UpdateSlopeSpeed - 由 CurrentRamp 推目标速度系数并逐帧逼近。
+// asm: sub_4B0F20 中 MovementSpeed 由坡度与 SlopeTimer 收敛的段。
+// ============================================================================
+
+void DriveLocomotionClass::UpdateSlopeSpeed()
+{
+    float rampTarget = 1.0f;
+    if (CurrentRamp > 0) {
+        rampTarget = 1.0f - static_cast<float>(CurrentRamp) * 0.08f;
+        if (rampTarget < 0.3f) {
+            rampTarget = 0.3f;
+        }
+    }
+
+    double delta = static_cast<double>(rampTarget) - MovementSpeed;
+    MovementSpeed += delta * 0.25;
+
+    if (MovementSpeed < 0.3) {
+        MovementSpeed = 0.3;
+    }
+    if (MovementSpeed > 1.0) {
+        MovementSpeed = 1.0;
+    }
+}
+
+// ============================================================================
+// StepTowardsDestination - 按速度累积逐格推进并做到达判定。
+// asm: sub_4B0F20 的 SpeedAccum >= 256 步进段（含 UpdatePosition 与履带计数）。
+// ============================================================================
+
+void DriveLocomotionClass::StepTowardsDestination(int32 effectiveSpeed)
+{
     const int32 stepThreshold = 256;
+
     while (SpeedAccum >= stepThreshold && IsDriving) {
         SpeedAccum -= stepThreshold;
 
         UpdatePosition();
 
-        // Track animation advances with each step (tread rendering).
+        // 每推进一格履带动画前进一帧。
         ++TrackNumber;
 
         int32 dist = CurrentCoord.DistanceFrom(Destination);
@@ -267,17 +394,57 @@ void DriveLocomotionClass::blah()
             break;
         }
     }
+}
 
-    if (IsDriving) {
-        CheckCrush();
-        CheckBridge();
+// ============================================================================
+// ApplyTerrainSpeed - 按地表类型设置 SpeedPercentage（水面非两栖即停车）。
+// asm: sub_4B0F20 的地表速度段。
+// ============================================================================
 
-        if (IsOnBridge() && CheckBridge()) {
-            SlopeTimer.Update(effectiveSpeed);
-        }
-
-        Tilt_Pitch_AI();
+void DriveLocomotionClass::ApplyTerrainSpeed()
+{
+    if (!IsDriving) {
+        return;
     }
+
+    CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
+    LandType land = MapClass::Instance->GetLandType(currentCell);
+
+    float baseMod = 1.0f;
+    switch (land) {
+        case LandType::Road:
+            baseMod = 1.1f;
+            break;
+        case LandType::Rough:
+            baseMod = 0.7f;
+            break;
+        case LandType::Ice:
+            baseMod = 0.75f;
+            break;
+        case LandType::Weeds:
+            baseMod = 0.8f;
+            break;
+        case LandType::Tiberium:
+            baseMod = 0.65f;
+            break;
+        case LandType::Beach:
+            baseMod = 0.9f;
+            break;
+        case LandType::Water:
+            if (IsAmphibious) {
+                baseMod = 0.6f;
+            } else {
+                IsDriving = false;
+                IsMoving = false;
+                return;
+            }
+            break;
+        default:
+            baseMod = 1.0f;
+            break;
+    }
+
+    SpeedPercentage = baseMod;
 }
 
 
@@ -594,45 +761,14 @@ void DriveLocomotionClass::Movement_AI()
         return;
     }
 
-    CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
-    LandType land = MapClass::Instance->GetLandType(currentCell);
-
-    float baseMod = 1.0f;
-    switch (land) {
-        case LandType::Road:
-            baseMod = 1.1f;
-            break;
-        case LandType::Rough:
-            baseMod = 0.7f;
-            break;
-        case LandType::Ice:
-            baseMod = 0.75f;
-            break;
-        case LandType::Weeds:
-            baseMod = 0.8f;
-            break;
-        case LandType::Tiberium:
-            baseMod = 0.65f;
-            break;
-        case LandType::Beach:
-            baseMod = 0.9f;
-            break;
-        case LandType::Water:
-            if (IsAmphibious) {
-                baseMod = 0.6f;
-            } else {
-                IsDriving = false;
-                IsMoving = false;
-                return;
-            }
-            break;
-        default:
-            baseMod = 1.0f;
-            break;
+    // 地表速度（水面非两栖会直接停车）。
+    ApplyTerrainSpeed();
+    if (!IsDriving) {
+        return;
     }
 
-    SpeedPercentage = baseMod;
-
+    // 坡道降速。
+    CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
     int32 slope = MapClass::Instance->GetCellSlope(currentCell);
     if (slope > 0) {
         SpeedPercentage *= 1.0f - static_cast<float>(slope) * 0.05f;
@@ -641,6 +777,7 @@ void DriveLocomotionClass::Movement_AI()
         }
     }
 
+    // 断桥处停车（后续转摇车分支）。
     if (Is_Moving_On_Bridge() && Is_Bridge_Destroyed()) {
         IsDriving = false;
         IsMoving = false;

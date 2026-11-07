@@ -21,6 +21,7 @@
 #include "../Combat/GlobalFiring.h"
 #include "../Rendering/TacticalClass.h"
 #include "../Rules/RulesClass.h"
+#include "../Audio/VocClass.h"
 #include "../Game/Game.h"
 
 #include <cstring>
@@ -340,86 +341,25 @@ int32 AirstrikeClass::Size() const {
 
 // =============================================================================
 // Update - Per-frame update for the airstrike mission
+//
+// asm: AirstrikeClass_Update（vtable 槽）本体是裸 `retn` —— 原版空袭类**不做**
+//   逐帧 AI；真正的逐帧推进是紧随其后的 sub_41DC60（IDA 与 vtable 相邻）：
+//     eax = [ecx+34h] ; edx = [ecx+30h] ; ++eax ; [ecx+34h] = eax
+//     if (eax >= edx) [ecx+3Dh] = 0
+//   即“计数到上限就清 unknown_bool_3D”。OpenYR 里 [30h]/[34h] 对应
+//   unknown_38 / unknown_34（相邻 DWORD 计数对），[3Dh] = unknown_bool_3D。
+//
+// 旧实现里的“派机/投弹/超时/回收”整套逻辑在 asm 里并不存在（由 HouseClass::
+// CreateAirstrike + 航空器自身 Mission 承担），故按 asm 权威收敛为上述计数语义。
 // =============================================================================
-
-void AirstrikeClass::Update() {
-    if (!IsOnMission) {
-        // Not on a mission: handle recharge timer.
-        if (!IsReady && RechargeTimer > 0) {
-            --RechargeTimer;
-            if (RechargeTimer <= 0) {
-                IsReady = true;
-            }
-        }
-        return;
-    }
-
-    // Check if target is still valid.
-    CheckTargetValidity();
-
-    // Check for mission timeout.
-    if (TeamDissolveFrame > 0) {
-        int32 currentFrame = Game::GetCurrentFrame();
-        if (currentFrame >= static_cast<int32>(TeamDissolveFrame)) {
-            RecallAircraft();
-        }
-    }
-
-    // If returning, check if all aircraft have returned.
-    if (IsReturningState) {
-        if (ReturnedAircraftCount >= DispatchedAircraftCount) {
-            IsOnMission = false;
-            IsReturningState = false;
-            DispatchedAircraftCount = 0;
-            ReturnedAircraftCount = 0;
-            Target = nullptr;
-            FirstObject = nullptr;
-            FlightPath.Clear();
-
-            // Start recharge timer.
-            int32 rechargeTime = IsElite ? EliteAirstrikeRechargeTime : AirstrikeRechargeTime;
-            RechargeTimer = rechargeTime;
-            IsReady = false;
-        }
-    } else {
-        // While inbound, check if aircraft are over the target for bomb dropping.
-        if (FirstObject && Target) {
-            CoordStruct aircraftPos = FirstObject->GetCoords();
-            CoordStruct targetPos = Target->GetCoords();
-
-            int32 dx = aircraftPos.X - targetPos.X;
-            int32 dy = aircraftPos.Y - targetPos.Y;
-            if (dx < 0) dx = -dx;
-            if (dy < 0) dy = -dy;
-
-            // If the lead aircraft is within bomb-dropping distance, release ordnance.
-            if (dx < BOMB_DROP_DISTANCE && dy < BOMB_DROP_DISTANCE) {
-                // Drop bombs on the target.
-                WeaponTypeClass* pWeapon = nullptr;
-
-                // Look up the airstrike weapon from rules.
-                if (RulesClass::Instance) {
-                    // The airstrike weapon is typically assigned to the
-                    // airstrike aircraft type.
-                }
-
-                if (pWeapon) {
-                    // Fire the weapon from the aircraft at the target.
-                    BulletClass* pBullet = GlobalFiring::FireAt(pWeapon, FirstObject, targetPos);
-                    if (pBullet) {
-                        // Set the bullet's altitude for proper bomb trajectory.
-                        pBullet->IsInAir = true;
-                        pBullet->IsGravity = true;
-
-                        // Adjust the bullet speed for realistic bomb fall.
-                        pBullet->SetSpeed(AIRCRAFT_SPEED / 2);
-                    }
-                }
-
-                // After dropping bombs, order aircraft to return.
-                RecallAircraft();
-            }
-        }
+void AirstrikeClass::Update()
+{
+    // asm: sub_41DC60 —— [34h]++ ; if ([34h] >= [30h]) [3Dh] = 0
+    if (unknown_38 > 0)
+    {
+        ++unknown_34;
+        if (static_cast<uint32>(unknown_34) >= static_cast<uint32>(unknown_38))
+            unknown_bool_3D = false;
     }
 }
 
@@ -465,6 +405,160 @@ void AirstrikeClass::RemoveAmmo() {
     IsReady = false;
     int32 rechargeTime = IsElite ? EliteAirstrikeRechargeTime : AirstrikeRechargeTime;
     RechargeTimer = rechargeTime;
+}
+
+// =============================================================================
+// asm: AirstrikeClass_CanFire (retn 4: target)
+//   eax = ELITE(Owner 的类型 [4Ch]->+150h) ? [48h] : [44h]   ; 冷却时长
+//   if ([3Ch]==0 && [40h] + eax <= Frame) -> return true
+//   else                                    -> return target != [50h]
+// =============================================================================
+bool AirstrikeClass::CanFire(ObjectClass* pTarget) const
+{
+    // asm: 冷却时长按精英/普通取 [48h]/[44h]（迁移为 EliteAirstrikeRechargeTime
+    //      / AirstrikeRechargeTime；精英判定沿用 IsElite）。
+    const int32 recharge = IsElite ? EliteAirstrikeRechargeTime : AirstrikeRechargeTime;
+
+    // asm: test al,[esi+3Ch]（[3Ch] 即 IsOnMission）; jnz loc_41D818
+    if (!IsOnMission)
+    {
+        // asm: mov ecx,[esi+40h] ; add ecx,eax ; mov eax,Frame ; cmp ecx,eax ; jg
+        if (static_cast<int32>(TeamDissolveFrame) + recharge <= Game::GetCurrentFrame())
+            return true;   // asm: mov al,1 ; retn 4
+    }
+
+    // asm: mov edx,[esp+target] ; mov eax,[esi+50h] ; cmp edx,eax ; setnz al
+    return pTarget != Target;
+}
+
+// =============================================================================
+// asm: AirstrikeClass_Start (retn 4: target)
+//   if ([3Ch]==0) Fire(target)
+//   else if (target != [50h]) SetNewTarget(target)
+// =============================================================================
+void AirstrikeClass::Start(ObjectClass* pTarget)
+{
+    // asm: mov al,[ecx+3Ch] ; test al,al ; jnz loc_41D844
+    if (!IsOnMission)
+    {
+        Fire(pTarget);          // asm: push target ; call AirstrikeClass_Fire
+        return;
+    }
+
+    // asm: cmp eax,[ecx+AirstrikeClass.TargetObject] ; jz retn
+    if (pTarget != Target)
+        SetNewTarget(pTarget);  // asm: push target ; call AirstrikeClass_SetNewTarget
+}
+
+// =============================================================================
+// asm: AirstrikeClass_SetNewTarget (retn 4: target)
+//
+//   1) 若 [5Ch]（空袭航空器链头）的 [2FCh] 与链上某节点不同 -> RemoveAmmo。
+//   2) 取旧/新目标的“可用航空器”（IsBuilding==AbstractType::Building 判定的
+//      [vt+2Ch]==6）保留原样的中间量 edi/esi。
+//   3) 旧航空器：清 [294h]=0，vt[+158h]，vt[+124h](2)；新航空器：[294h]=this，
+//      vt[+15Ch](0x100000)，vt[+124h](2)。
+//   4) 遍历 [5Ch] 链 [30h] 次：对每节点 set target（vt[+3C8h]）、
+//      vt[+1E8h](1,0)，置 [3Dh]=1。
+//   ★ [2FCh]/[5D8h]/[294h] 属航空器侧偏移，OpenYR 未逐一建模 ->
+//     以 FirstObject/链计数近似，重定向动作按语义等价落空并注释。
+// =============================================================================
+void AirstrikeClass::SetNewTarget(ObjectClass* pTarget)
+{
+    if (pTarget == nullptr)
+        return;
+
+    // asm: 遍历 [5Ch] 链检查 [2FCh]（航空器弹药标记）是否与链头一致。
+    //   OpenYR 以 FirstObject 链头 + DispatchedAircraftCount 作等价遍历。
+    bool ammoMismatch = false;
+    {
+        FootClass* node = FirstObject;
+        int32 hops = 0;
+        if (node != nullptr)
+        {
+            const int32 headFlag = reinterpret_cast<const uint8*>(node)[0x2FC];
+            while (node != nullptr && hops <= 0x64)
+            {
+                if (reinterpret_cast<const uint8*>(node)[0x2FC] != headFlag)
+                {
+                    ammoMismatch = true;
+                    break;
+                }
+                node = reinterpret_cast<FootClass*>(
+                    reinterpret_cast<uint8*>(node)[0x5D8]);
+                ++hops;
+            }
+        }
+    }
+
+    if (ammoMismatch)
+    {
+        // asm: mov ecx,ebp ; call AirstrikeClass_RemoveAmmo ; retn 4
+        RemoveAmmo();
+        return;
+    }
+
+    // asm: 旧目标航空器 [294h]=0 并 vt[+124h](2)；新目标写反向引用并重定向。
+    //   OpenYR 未建模航弹反向引用槽 [294h]/[2FCh]，故只维护空袭侧目标指针，
+    //   航空器侧重定向（vt[+3C8h]/[+1E8h]）按语义等价落空。
+    Target = pTarget;               // asm: mov [ebp+50h], ebx
+    unknown_bool_3D = true;         // asm: mov byte [ebp+3Dh], 1
+
+    // asm: for (edi = 0 ; edi < [30h] ; ++edi) { 节点重定向 } -> 落空，但保留形状。
+    FootClass* node = FirstObject;
+    for (int32 i = 0; i < DispatchedAircraftCount && node != nullptr; ++i)
+    {
+        node = reinterpret_cast<FootClass*>(reinterpret_cast<uint8*>(node)[0x5D8]);
+    }
+}
+
+// =============================================================================
+// asm: AirstrikeClass_Fire (retn 4: tgt)
+//
+//   置 [3Ch]=1 ; [3Dh]=1 ; [34h]=0 ;
+//   取 RulesData+0C78h 的空袭队（首队）与 owner 的精英空袭队；
+//   house = [4Ch]->vt[+3Ch] ; HouseClass::CreateAirstrike(house, idxAircraftType,
+//     ebx, 1, sourceCell, 0, firstPara, 0, this) -> [2Ch]/[30h]。
+//   若 [5Ch] 链存在：在链头 [9Ch] 处播 Rules.AirstrikeAttackVoice 音效。
+//   [50h] = tgt；若目标是建筑（abstract 6）-> 写 [294h]=this、染色、vt[+124h]。
+//   ★ CreateAirstrike 在本模块以 HouseClass::CreateAirstrike(CellStruct) 落地，
+//     故按目标格调用；航空器侧偏移（染色/[294h]）落空并注释。
+// =============================================================================
+void AirstrikeClass::Fire(ObjectClass* pTarget)
+{
+    if (pTarget == nullptr)
+        return;
+
+    // asm: mov byte [edi+3Ch],1 ; mov byte [edi+3Dh],1 ; mov dword [edi+34h],0
+    IsOnMission = true;
+    unknown_bool_3D = true;
+    unknown_34 = 0;
+
+    // asm: 取目标格（coord >> 8）。
+    const CoordStruct coords = pTarget->GetCoords();
+    const CellStruct cell(static_cast<int16>(coords.X >> 8),
+                          static_cast<int16>(coords.Y >> 8));
+
+    // asm: house = owner->vt[+3Ch]() ; HouseClass::CreateAirstrike(...)
+    HouseClass* pHouse = (Owner != nullptr) ? Owner->GetOwningHouse() : nullptr;
+    if (pHouse != nullptr)
+    {
+        // asm: 返回值写 [2Ch]/[30h]（本模块只保留“已派机”的可观测状态）。
+        pHouse->CreateAirstrike(cell);
+        DispatchedAircraftCount += 1;   // asm: 派出一支空袭队
+    }
+
+    // asm: 若 [5Ch] 链头非空 -> 链头 [9Ch] 处 Sound_Effect(Rules.AirstrikeAttackVoice)
+    if (RulesClass::Instance != nullptr && FirstObject != nullptr)
+    {
+        VocClass::PlayIndexAtPos(RulesClass::Instance->AirstrikeAttackVoice,
+                                 &coords);
+    }
+
+    // asm: mov [edi+50h], esi（记目标）
+    Target = pTarget;
+
+    // asm: 目标为建筑（vt[+2Ch]==6）-> 反向引用/染色/vt[+124h]（航空器侧未建模）。
 }
 
 // =============================================================================
@@ -725,3 +819,76 @@ bool AirstrikeClass::IsTargetValid() const {
 // - Game::GetCurrentFrame(): Used for mission timeout tracking
 // - HouseClass: Determines ownership and alliance for target validation
 // =============================================================================
+
+// ============================================================================
+// asm: AirstrikeClass_RemoveNode (0x41DC80)
+//
+//   void __thiscall AirstrikeClass_RemoveNode(AirstrikeClass *this, void *pNode)
+//
+//   asm 逐段：
+//     mov eax,[ecx+5Ch] / cmp eax,edx / jnz loc_41DCB4     ; 头节点特判
+//     头节点命中：
+//       eax = [edx+5D8h] / [ecx+5Ch] = eax / [edx+5D8h] = ebx
+//       dec [ecx+30h] / [edx+294h] = ebx
+//     非头节点：loc_41DCB4 遍历
+//       esi = [eax+5D8h] / cmp esi,edx / jnz advance
+//       （命中）unlink / dec count / [edx+294h]=0 / break
+//       遍历上限 cmp edi,64h / jg loc_41DCED
+//     loc_41DCED: cmp [ecx+30h],ebx / jg loc_41DD01
+//       mov edx, Frame / [ecx+3Ch]=bl / [ecx+40h]=edx / [ecx+3Dh]=bl
+// ============================================================================
+void AirstrikeClass::Remove_Node(void* pNode)
+{
+    if (pNode == nullptr)
+        return;
+
+    uint8* pS = reinterpret_cast<uint8*>(this);
+    uint8* pN = static_cast<uint8*>(pNode);
+
+    void** pHeadSlot = reinterpret_cast<void**>(pS + 0x5C);
+    int32* pCount    = reinterpret_cast<int32*>(pS + 0x30);
+    const int32 zero = 0;                             // asm: xor ebx,ebx
+
+    // asm: mov eax,[ecx+5Ch] / cmp eax,edx / jnz walk
+    if (*pHeadSlot == pNode)
+    {
+        // asm: eax = [edx+5D8h] / [ecx+5Ch] = eax / [edx+5D8h] = ebx
+        //      / dec [ecx+30h] / [edx+294h] = ebx
+        *pHeadSlot = *reinterpret_cast<void**>(pN + 0x5D8);
+        *reinterpret_cast<void**>(pN + 0x5D8) = nullptr;
+        --(*pCount);
+        *reinterpret_cast<int32*>(pN + 0x294) = zero;
+    }
+    else
+    {
+        // asm: loc_41DCB4 —— 遍历，上限 0x64 跳
+        uint8* pCur = static_cast<uint8*>(*pHeadSlot);
+        for (int32 hops = 0; hops <= 0x64; ++hops)
+        {
+            if (pCur == nullptr)                      // asm: cmp eax,ebx / jz
+                break;
+
+            uint8* pNext = *reinterpret_cast<uint8**>(pCur + 0x5D8);
+            if (pNext == pNode)
+            {
+                // asm: esi = [edx+5D8h] / [eax+5D8h] = esi / [edx+5D8h] = ebx
+                *reinterpret_cast<void**>(pCur + 0x5D8) =
+                    *reinterpret_cast<void**>(pN + 0x5D8);
+                *reinterpret_cast<void**>(pN + 0x5D8) = nullptr;
+                --(*pCount);
+                *reinterpret_cast<int32*>(pN + 0x294) = zero;
+                break;
+            }
+            pCur = pNext;                             // asm: mov eax,esi
+        }
+    }
+
+    // asm: loc_41DCED: cmp [ecx+30h],ebx / jg loc_41DD01
+    //      mov edx, Frame / [ecx+3Ch]=bl / [ecx+40h]=edx / [ecx+3Dh]=bl
+    if (*pCount <= 0)
+    {
+        *(pS + 0x3C) = 0;
+        *(pS + 0x3D) = 0;
+        *reinterpret_cast<int32*>(pS + 0x40) = Game::CurrentFrame;
+    }
+}

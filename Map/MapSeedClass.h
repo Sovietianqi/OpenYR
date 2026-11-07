@@ -55,6 +55,18 @@ public:
     // ------------------------------------------------------------------------
     bool Generate();
     bool Generate_InitRandomMap();
+
+    // ------------------------------------------------------------------------
+    // asm: Place_Trees (0x5A4280 区, thiscall; 密度 double 取自调用者帧 ebp+28h，
+    //   闸门字节取自 ebp+45h，此处显式作参数)
+    //   ① 清 scratch 单元的游程字段（cell*50h+3Ch）；
+    //   ② 逐格：空地 && [+11Ch]==0 && 闸门通过 && 随机数小于密度 → 种一块
+    //      "粗糙地块"（抖动夹在 [4,60]）；
+    //   ③ 逐格重算 LAT；
+    //   ④ 按 ([+64h]*0.1+0.7)*([+5Ch]*0.01)*[+2FCh] 求棵数，用拒绝采样把
+    //      树撒到空格上（每次尝试最多 200 次落点、最多 100 轮）。
+    // ------------------------------------------------------------------------
+    void Place_Trees(double density, uint8 gate);
     void Generate_SeedWater_Inland();
     void Generate_SeedWater_Archipelago();
     void Generate_SeedWater_Islands();

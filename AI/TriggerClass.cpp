@@ -20,8 +20,8 @@
 // =============================================================================
 
 #include "TriggerClass.h"
+#include "TriggerTypeClass.h"
 #include "../Scenario/ScenarioClass.h"
-#include "../Game/Externs.h"
 #include "TActionClass.h"
 #include "TEventClass.h"
 #include "TagClass.h"
@@ -31,8 +31,11 @@
 #include "../Rules/RulesClass.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Game/Game.h"
+#include "../Game/Externs.h"
 #include "../Map/MapClass.h"
 #include "../INI/INIClass.h"
+#include "../IO/CRC.h"
+#include "../Core/SwizzleManagerClass.h"
 
 #include <cstring>
 #include <cstdio>
@@ -90,14 +93,14 @@ namespace {
 // Constructor
 // =============================================================================
 TriggerClass::TriggerClass(const char* pID) noexcept
-    : ID(nullptr), IsEnabled(true), TriggerAction(nullptr), Event(nullptr),
-      CurrentAction(nullptr), House(nullptr), RelatedHouse(nullptr), Name(nullptr),
-      Data(-1), HasBeenFired(false), JustFired(false),
+    : Type(nullptr), ID(nullptr), IsEnabled(true), TriggerAction(nullptr),
+      Event(nullptr), CurrentAction(nullptr), House(nullptr), RelatedHouse(nullptr),
+      Name(nullptr), Data(-1), HasBeenFired(false), JustFired(false),
       IsDisabled(false), IsBeingFired(false), IsLinked(false),
       Repeatable(false), Easy(false), Normal(false), Medium(false),
       Hard(false), LinkedTrigger(nullptr), LinkedAction(nullptr),
       Action(nullptr), forceFire(false), Activate(false),
-      State(TriggerState::Armed), Timer(0) {
+      State(TriggerState::Armed), Destroyed(false), EventsAlreadyFired(0), Timer(0) {
     if (pID) {
         int32 len = static_cast<int32>(strlen(pID)) + 1;
         ID = new char[len];
@@ -105,6 +108,39 @@ TriggerClass::TriggerClass(const char* pID) noexcept
             for (int32 i = 0; i < len; ++i) ID[i] = pID[i];
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// asm: TriggerClass_CTOR(TriggerClass *this, TriggerTypeClass *ptrTrigType)
+// Builds a runtime instance from a type template: the type pointer is stored in
+// the +0x24 slot and the instance's public API caches are populated from it.
+// -----------------------------------------------------------------------------
+TriggerClass::TriggerClass(TriggerTypeClass* pType) noexcept
+    : Type(pType), ID(nullptr), IsEnabled(true), TriggerAction(nullptr),
+      Event(nullptr), CurrentAction(nullptr), House(nullptr), RelatedHouse(nullptr),
+      Name(nullptr), Data(-1), HasBeenFired(false), JustFired(false),
+      IsDisabled(false), IsBeingFired(false), IsLinked(false),
+      Repeatable(false), Easy(false), Normal(false), Medium(false),
+      Hard(false), LinkedTrigger(nullptr), LinkedAction(nullptr),
+      Action(nullptr), forceFire(false), Activate(false),
+      State(TriggerState::Armed), Destroyed(false), EventsAlreadyFired(0), Timer(0) {
+    if (pType) {
+        Event = pType->FirstEvent;
+        TriggerAction = pType->FirstAction;
+        Repeatable = pType->IsRepeatable;
+        Easy = pType->Easy;
+        Normal = pType->Normal;
+        Hard = pType->Hard;
+        const char* id = pType->get_ID();
+        if (id) {
+            int32 len = static_cast<int32>(strlen(id)) + 1;
+            ID = new char[len];
+            if (ID) {
+                for (int32 i = 0; i < len; ++i) ID[i] = id[i];
+            }
+        }
+    }
+    Reset();
 }
 
 // =============================================================================
@@ -276,45 +312,29 @@ bool TriggerClass::SaveToINIList(CCINIClass* pINI) {
 }
 
 // =============================================================================
-// Update - per-frame trigger evaluation.
+// Update - per-frame service pass.
 //
-// Steps:
-//   1. Clear the JustFired one-shot flag from the previous frame.
-//   2. Bail out if disabled, not enabled, or already fired (non-repeatable).
-//   3. Count down any active Waiting timer; transition to Armed when it hits 0.
-//   4. Only evaluate conditions when in the Armed state.
-//   5. If conditions are met, fire.
+// asm 中触发器的"条件判定 + 动作执行"完全由 TagClass_RaiseEvent 驱动（见
+// TagClass::RaiseEvent），不存在"每帧自查条件再开火"的路径。本函数因此只承担
+// 每帧服务职责：脉冲标志复位、Waiting 计时器递减、到点后重新武装。
 // =============================================================================
 void TriggerClass::Update() {
-    // Clear the per-frame "just fired" pulse.
     if (JustFired) {
         JustFired = false;
     }
 
-    if (IsDisabled) return;
-    if (!IsEnabled) return;
-    if (HasBeenFired && !Repeatable) return;
+    // 已"原地消失"的触发器不再服务。
+    if (Destroyed) return;
 
-    // Difficulty gate - skip evaluation entirely on non-matching difficulties.
-    if (!DifficultyEnabled(this)) return;
-
-    // House gate - skip if the owning house has been defeated.
-    if (!HouseIsActive(House)) return;
-
-    // Handle the Waiting (delayed) state.
     if (State == TriggerState::Waiting) {
         if (Timer > 0) {
             --Timer;
             if (Timer > 0) return;
         }
-        // Timer elapsed - re-arm.
+        // 计时器归零 —— 重新武装（asm Reset 会把 enabled 复位为 1）。
         State = TriggerState::Armed;
-    }
-
-    if (State != TriggerState::Armed) return;
-
-    if (CheckConditions()) {
-        Fire();
+        IsEnabled = true;
+        IsDisabled = false;
     }
 }
 
@@ -410,37 +430,21 @@ namespace {
 } // anonymous namespace
 
 // =============================================================================
-// Enable - re-arm the trigger and clear the disabled flag.
+// asm: TriggerClass_Enable (asm:0x726930) —— enabled(+0x44)=1 后直接跳 Reset。
 // =============================================================================
 void TriggerClass::Enable() {
     IsEnabled = true;
     IsDisabled = false;
-    State = TriggerState::Armed;
+    Reset();
 }
 
 // =============================================================================
-// Disable - turn the trigger off; it will not evaluate until re-enabled.
+// asm: TriggerClass_Disable (asm:0x726940) —— 仅把 enabled(+0x44) 清 0。
 // =============================================================================
 void TriggerClass::Disable() {
     IsEnabled = false;
     IsDisabled = true;
     State = TriggerState::Disabled;
-}
-
-// =============================================================================
-// Reset - restore the trigger to its initial armed state, clearing the
-// fired flag so it can fire again even if non-repeatable.
-// =============================================================================
-void TriggerClass::Reset() {
-    HasBeenFired = false;
-    JustFired = false;
-    IsEnabled = true;
-    IsDisabled = false;
-    IsBeingFired = false;
-    forceFire = false;
-    Activate = false;
-    State = TriggerState::Armed;
-    Timer = 0;
 }
 
 // =============================================================================
@@ -559,8 +563,9 @@ void TriggerClass::SetTimer(int32 frames) {
 }
 
 // =============================================================================
-// ProcessTriggerEvents - static per-frame entry point.  Iterates every loaded
-// trigger and calls Update() on each.
+// ProcessTriggerEvents - static per-frame service entry point.  遍历所有触发器
+// 执行每帧服务（Waiting 计时器递减与重新武装）。触发器的"条件判定 + 动作执行"
+// 由 TagClass::ProcessTagEvents → TagClass::RaiseEvent 驱动，见 asm L751177+。
 // =============================================================================
 void TriggerClass::ProcessTriggerEvents() {
     if (!Array) return;
@@ -611,125 +616,400 @@ void TriggerClass::SetRelatedHouse(HouseClass* pHouse)
 }
 
 // ============================================================================
-// 变量条件/跨越判定/动作链（根据游戏行为实现）
+// asm 0x726350 — TriggerClass::Reset
+//
+// 沿类型的事件链（Type->EventList，对应 asm +0xAC 的 FirstEvent 链）逐个检查
+// 事件种类：
+//   kind == 0x0D (TimeElapsed)  —— CreationTimer 起点设为 Frame、时长 Data*15；
+//   kind == 0x33 (随机延迟事件) —— 时长 = (Data/2 + Random(0,Data)) * 15；
+// 命中上述两类时，清掉该事件在 EventsAlreadyFired 里的"已发生"位。
+// 另外把本实例自身的运行状态复位为"武装"。
 // ============================================================================
-
-// 根据游戏行为，可知全局变量条件以事件数据域登记的变量下标为准：下标
-// 合法且对应全局变量非零时条件成立。
-bool TriggerClass::CheckGlobals()
+void TriggerClass::Reset()
 {
-    if (Event == nullptr || TheScenario == nullptr) {
-        return false;
+    HasBeenFired = false;
+    JustFired = false;
+    IsEnabled = true;
+    IsDisabled = false;
+    IsBeingFired = false;
+    forceFire = false;
+    Activate = false;
+    State = TriggerState::Armed;
+    Timer = 0;
+    Destroyed = false;
+
+    if (Type == nullptr) return;
+
+    int32 bit = 0;
+    for (int32 i = 0; i < Type->EventList.Count; ++i, ++bit) {
+        TEventClass* pEvent = Type->EventList.Items[i];
+        if (pEvent == nullptr) continue;
+        const int32 kind = pEvent->EventKind;
+        if (kind == 0x0D) {
+            // TimeElapsed: 时长按"秒 -> 帧"换算（asm: Data*3*5 = Data*15）。
+            Timer = pEvent->Data * 15;
+        } else if (kind == 0x33) {
+            // Randomized delay: 半程 + 随机抖动，再换算成帧（asm: *15）。
+            const int32 span = pEvent->Data;
+            const int32 rnd = (span > 0 && TheScenario != nullptr)
+                ? TheScenario->Random.Next(0, span)
+                : 0;
+            Timer = (span / 2 + rnd) * 15;
+        } else {
+            // 其余事件种类不触碰 CreationTimer / 已发生位（asm 仅在命中分支 and-not）。
+            continue;
+        }
+        EventsAlreadyFired &= ~(1 << bit);
     }
-    const int32 idx = Event->Data;
-    if (idx < 0 || idx >= TheScenario->MaxGlobalVariables) {
-        return false;
-    }
-    return TheScenario->GlobalVariables[idx].Value != 0;
 }
 
-// 根据游戏行为，可知本地变量条件与全局变量同构，只是查本地变量表。
-bool TriggerClass::CheckLocals()
+// asm: void __thiscall TriggerClass_CheckGlobals(TriggerClass *this, int a2)   (asm:1645728)
+// 从本实例起沿 +0x28（LinkedTrigger，即挂载链的后继）逐级检查：任一实例的类型
+// 事件链引用了该全局变量，则把该实例 Reset。返回是否发生过重置。
+bool TriggerClass::CheckGlobals(int32 idx)
 {
-    if (Event == nullptr || TheScenario == nullptr) {
-        return false;
+    bool anyReset = false;
+    for (TriggerClass* p = this; p != nullptr; p = p->LinkedTrigger) {
+        if (p->Type != nullptr && p->Type->InvolvesGlobalChecking(idx)) {
+            p->Reset();
+            anyReset = true;
+        }
     }
-    const int32 idx = Event->Data;
-    if (idx < 0 || idx >= TheScenario->MaxLocalVariables) {
-        return false;
-    }
-    return TheScenario->LocalVariables[idx].Value != 0;
+    return anyReset;
 }
 
-// 根据游戏行为，可知水平检查区判定：登记的区号与给定区号一致时命中。
-bool TriggerClass::CrossHorizontalZone(int32 zone)
+// asm: void __thiscall TriggerClass_CheckLocals(TriggerClass *this, int House_)   (asm:1645774)
+// 与 CheckGlobals 同构，判定依据换成"本地变量是否被引用"（house 下标参数）。
+bool TriggerClass::CheckLocals(HouseClass* pHouse)
+{
+    const int32 houseIdx = (pHouse != nullptr) ? pHouse->GetArrayIndex() : -1;
+    bool anyReset = false;
+    for (TriggerClass* p = this; p != nullptr; p = p->LinkedTrigger) {
+        if (p->Type != nullptr && p->Type->CheckLocals(houseIdx)) {
+            p->Reset();
+            anyReset = true;
+        }
+    }
+    return anyReset;
+}
+
+// asm: char __fastcall TriggerClass_CrossHorizontalZone (0x726F80) — 事件种类 == 0x19
+bool TriggerClass::CrossHorizontalZone() const
+{
+    return Type != nullptr && Type->CrossHorizontalZone();
+}
+
+// asm: char __fastcall TriggerTypeClass_CrossVerticalZone (0x726F50) — 事件种类 == 0x1A
+bool TriggerClass::CrossVerticalZone() const
+{
+    return Type != nullptr && Type->CrossVerticalZone();
+}
+
+// asm: byte __thiscall _TriggerClass_IsWPZoneEntry (0x726FB0) — 事件种类 == 0x18
+bool TriggerClass::IsWPZoneEntry() const
+{
+    return Type != nullptr && Type->IsWPZoneEntry();
+}
+
+// Legacy zone-parameterised overloads: a zone matches when the trigger's first
+// event parameter equals the supplied zone.  Kept for TagClass compatibility.
+bool TriggerClass::CrossHorizontalZone(int32 zone) const
 {
     return Event != nullptr && Event->Data == zone;
 }
 
-// 根据游戏行为，可知水平检查线以纵坐标登记，事件数据域相等即命中。
-bool TriggerClass::CrossedHorizontal(int32 y)
+bool TriggerClass::CrossVerticalZone(int32 zone) const
 {
-    return Event != nullptr && Event->Data == y;
+    return Event != nullptr && Event->Data == zone;
 }
 
-// 根据游戏行为，可知垂直检查线以横坐标登记，事件数据域相等即命中。
-bool TriggerClass::CrossedVertical(int32 x)
+bool TriggerClass::CrossedVertical(int32 zone) const
 {
-    return Event != nullptr && Event->Data == x;
+    return Event != nullptr && Event->Data == zone;
 }
 
-// 根据游戏行为，可知触发器命中后先执行主动作，再视关联情况执行关联
-// 动作；执行期间挂起当前动作指针供动作内部续接。
-void TriggerClass::FireActions()
+// asm: char __thiscall TriggerClass_CrossedHorizontal (0x726256)
+// If there is a linked trigger, check this instance's horizontal-zone event and
+// recurse into the linked trigger; otherwise just test this instance.
+bool TriggerClass::CrossedHorizontal() const
 {
+    if (LinkedTrigger != nullptr) {
+        return CrossHorizontalZone() || LinkedTrigger->CrossedHorizontal();
+    }
+    return CrossHorizontalZone();
+}
+
+// asm: byte __thiscall TriggerClass_CrossedVertical (0x7262AE)
+bool TriggerClass::CrossedVertical() const
+{
+    if (LinkedTrigger != nullptr) {
+        return CrossVerticalZone() || LinkedTrigger->CrossedVertical();
+    }
+    return CrossVerticalZone();
+}
+
+// asm: byte __thiscall TriggerClass_FireActions(TriggerClass *this, _ObjectClass *Obj, wXY pos)   (asm:1646071)
+//
+// 若启用（+0x44）且未销毁（+0x30），沿类型的动作链（asm +0xB0 FirstAction，其
+// 后继挂在每个动作的 +0x28）逐个执行；每个动作的关联方由
+// TriggerTypeClass.House 解析（asm 中经 HouseClass_FindByIndex_NoMP），
+// OpenYR 侧由 TActionClass::ExecuteAction 内部解析。
+// 返回是否有任一动作被真正应用。
+bool TriggerClass::FireActions(AbstractClass* pObject, CellStruct pos)
+{
+    (void)pObject;      // 动作的对象实参由 TActionClass 侧按需从 Trigger 取用。
+    (void)pos;
+
+    // asm: [edi+44h](enabled)==0 -> return 0; [edi+30h](Destroyed)!=0 -> return 0
+    if (!IsEnabled || Destroyed) return false;
+    if (Type == nullptr) return false;
+
+    bool fired = false;
     IsBeingFired = true;
-    if (Action != nullptr) {
-        CurrentAction = Action;
-        Action->ExecuteAction(this);
-        CurrentAction = nullptr;
+
+    // OpenYR 把 asm 的单链表 +0xB0 存成动态数组 ActionList（顺序一致）。
+    for (int32 i = 0; i < Type->ActionList.Count; ++i) {
+        TActionClass* pAction = Type->ActionList.Items[i];
+        if (pAction == nullptr) continue;
+        CurrentAction = pAction;
+        pAction->ExecuteAction(this);
+        fired = true;       // asm: 动作返回真则置 bl=1
     }
-    if (LinkedAction != nullptr) {
-        LinkedAction->ExecuteAction(this);
-    }
+
+    CurrentAction = nullptr;
     IsBeingFired = false;
+    return fired;
 }
 
-// 根据游戏行为，可知触发器状态打包为标志字：使能、已触发、禁用与
-// 待激活依次占用低位。
-int32 TriggerClass::GetFlags() const
+// asm: int __fastcall TriggerClass_GlobalUpdated(int idx)   (asm:1519466)
+// 全局变量变化：对所有触发器广播复检（asm 遍历 vec_Tags_all 的每条挂载链，
+// 对链上每个实例调用 CheckGlobals；OpenYR 用扁平 TriggerClass::Array 等价承接）。
+void TriggerClass::GlobalUpdated(int32 idx)
 {
-    int32 flags = 0;
-    if (IsEnabled)    flags |= 0x01;
-    if (HasBeenFired) flags |= 0x02;
-    if (IsDisabled)   flags |= 0x04;
-    if (Activate)     flags |= 0x08;
-    return flags;
-}
-
-// 根据游戏行为，可知全局变量变化会唤醒依赖它的触发器：未被禁用时
-// 立即复检一次条件。
-void TriggerClass::GlobalUpdated(int32 id, int32 value)
-{
-    (void)id; (void)value;
-    if (!IsDisabled && Event != nullptr) {
-        CheckConditions();
+    if (Array == nullptr) return;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TriggerClass* pTrigger = Array->GetItem(i);
+        if (pTrigger != nullptr) {
+            pTrigger->CheckGlobals(idx);
+        }
     }
 }
 
-// 根据游戏行为，可知本地变量变化同样唤醒依赖它的触发器复检条件。
-void TriggerClass::LocalUpdated(int32 id, int32 value)
+// asm: int __fastcall TriggerClass_LocalUpdated(int idx)   (asm:1519504)
+void TriggerClass::LocalUpdated(int32 idx)
 {
-    (void)id; (void)value;
-    if (!IsDisabled && Event != nullptr) {
-        CheckConditions();
+    if (Array == nullptr) return;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TriggerClass* pTrigger = Array->GetItem(i);
+        if (pTrigger != nullptr) {
+            HouseClass* pHouse = HouseClass::Find_By_Index_No_MP(idx);
+            pTrigger->CheckLocals(pHouse);
+        }
     }
 }
 
-// 根据游戏行为，可知单事件触发器只要自身条件已满足即视为“全部事件
-// 已发生”；未登记事件的触发器视为恒真。
-bool TriggerClass::HaveAllEventsOccured()
+// asm: char __thiscall TriggerClass_HaveAllEventsOccured(TriggerClass *this, int eventKind,
+//        _ObjectClass *Object, char a4, char isRepeating, int a6)   (asm:1645919, retn 14h)
+//
+// 逐个检查类型事件链；EventsAlreadyFired 中已置位的事件直接跳过。
+//   assumeSatisfied (asm a4) 非零 → 跳过全部逐事件判定，直接返回真。
+//   每个事件调用 EventClass_HasOccured；返回真时把事件解析出的关联方写入
+//   RelatedHouse(+0x2C)，并在 eventRepeating 为真时置该事件的"已发生"位。
+// 全部事件命中且 repeatingType 为真时调用 Reset()。
+bool TriggerClass::HaveAllEventsOccured(int32 eventKind, AbstractClass* pObject,
+                                        bool assumeSatisfied, bool repeatingType)
 {
-    if (Event == nullptr) {
-        return true;
+    // asm: enabled(+0x44)==0 或 Destroyed(+0x30)!=0 → 直接假。
+    if (!IsEnabled || Destroyed) return false;
+
+    bool result = true;
+
+    if (!assumeSatisfied) {
+        if (Type != nullptr) {
+            // 事件关联方：asm 由 TriggerTypeClass.House -> 国家下标 -> HouseClass 解析。
+            HouseClass* pHouse = nullptr;
+            if (Type->Owner != nullptr && HouseClass::Array != nullptr) {
+                for (int32 h = 0; h < HouseClass::ArrayCount; ++h) {
+                    HouseClass* pH = HouseClass::Array[h];
+                    if (pH != nullptr && pH->Type == Type->Owner) { pHouse = pH; break; }
+                }
+            }
+            if (pHouse == nullptr) pHouse = House;
+
+            int32 bit = 0;
+            for (int32 i = 0; i < Type->EventList.Count; ++i, ++bit) {
+                TEventClass* pEvent = Type->EventList.Items[i];
+                if (pEvent == nullptr) continue;
+
+                const int32 mask = 1 << bit;
+                if (EventsAlreadyFired & mask) {
+                    continue;       // 已发生的事件跳过
+                }
+
+                bool eventRepeating = repeatingType;
+                if (!pEvent->Evaluate(eventKind, pHouse, pObject, this, &eventRepeating)) {
+                    result = false;
+                    break;
+                }
+
+                // asm: EventClass_GetHouse 非空则写回 RelatedHouse(+0x2C)。
+                if (pEvent->House != nullptr) {
+                    RelatedHouse = pEvent->House;
+                }
+                // asm: flags 置位（GetEventFlags_ / GetEventFlags__ 合格）则或上该位。
+                if (eventRepeating) {
+                    EventsAlreadyFired |= mask;
+                }
+            }
+        } else if (Event != nullptr) {
+            bool eventRepeating = repeatingType;
+            result = Event->Evaluate(eventKind, House, pObject, this, &eventRepeating);
+        }
     }
-    return IsSatisfied();
+
+    // asm: 结果非零且 isRepeating 为真 → Reset() 重新武装。
+    if (result && repeatingType) {
+        Reset();
+    }
+    return result;
 }
 
-// 根据游戏行为，可知“允许胜利”判定作用于主动作与关联动作：任一被
-// 打上胜利标记即返回真。
+// asm: TriggerClass_InvolvesAllowWin (0x7265F6) — 本实例与后继实例的类型动作链
+// 任一含 "允许胜利" 动作即为真。
 bool TriggerClass::InvolvesAllowWin() const
 {
-    return (Action != nullptr && Action->IsVictoryAction())
-        || (LinkedAction != nullptr && LinkedAction->IsVictoryAction());
+    if (Type != nullptr && Type->InvolvesAllowWin()) return true;
+    if (LinkedTrigger != nullptr) return LinkedTrigger->InvolvesAllowWin();
+    return false;
 }
 
-// 根据游戏行为，可知“原地消失”把触发器从活动状态摘除：禁用、断开
-// 关联触发器并置为禁用状态，等待统一回收。
+// asm: int __thiscall TriggerClass_Poof(TriggerClass *this)   (asm:1646286)
+// 置 Destroyed(+0x30)=1，随后把本体加入 vec_VisibleObjects 待统一回收。
+// OpenYR 无该回收表，额外把 enabled 清掉避免已"消失"的触发器继续被上抛。
 void TriggerClass::Poof()
 {
+    Destroyed = true;
     IsEnabled = false;
-    IsDisabled = true;
-    LinkedTrigger = nullptr;
     State = TriggerState::Disabled;
 }
+
+// asm: sub_726780 — returns the +0x30 "Destroyed" flag.
+bool TriggerClass::IsDestroyed() const
+{
+    return Destroyed;
+}
+
+// ============================================================================
+// asm 0x7266D0 — TriggerClass_PointerGotInvalid(TriggerClass*, AbstractClass*, ...)
+// retn 8 → one explicit argument.  Unified signature (see briefing §3).
+//   +0x24 type    -> cleared when invalidated
+//   +0x28 linked  -> advanced to the linked trigger's own successor
+//   +0x2C house   -> cleared when invalidated
+// ============================================================================
+void TriggerClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
+{
+    (void)removed;
+    // asm: +0x24 type 命中则清 0。
+    if (reinterpret_cast<AbstractClass*>(Type) == pInvalid) {
+        Type = nullptr;
+    }
+    // asm: +0x28 AttachedTrigger 命中则前移到链中下一个。
+    if (reinterpret_cast<AbstractClass*>(LinkedTrigger) == pInvalid
+        && LinkedTrigger != nullptr) {
+        LinkedTrigger = LinkedTrigger->LinkedTrigger;
+    }
+    // asm: +0x2C related house 命中则清 0。
+    if (reinterpret_cast<AbstractClass*>(RelatedHouse) == pInvalid) {
+        RelatedHouse = nullptr;
+    }
+}
+
+// ============================================================================
+// asm 0x726740 — TriggerClass_GetCRC
+// 基类 CRC 后并入：类型 ID、链后继的类型 ID、Destroyed、enabled、（按当前帧
+// 折算出的）剩余时间、EventsAlreadyFired。
+// ============================================================================
+int32 TriggerClass::GetCRC() const
+{
+    CRCEngine crc;
+
+    if (Type != nullptr) {
+        const char* id = Type->get_ID();
+        if (id != nullptr) {
+            crc.AddData(id, static_cast<int32>(strlen(id)) + 1);
+        }
+    }
+    if (LinkedTrigger != nullptr && LinkedTrigger->Type != nullptr) {
+        const char* id = LinkedTrigger->Type->get_ID();
+        if (id != nullptr) {
+            crc.AddData(id, static_cast<int32>(strlen(id)) + 1);
+        }
+    }
+
+    crc.AddData(&Destroyed, sizeof(Destroyed));
+    crc.AddData(&IsEnabled, sizeof(IsEnabled));
+
+    int32 remaining = Timer;
+    crc.AddData(&remaining, sizeof(remaining));
+    crc.AddData(&EventsAlreadyFired, sizeof(EventsAlreadyFired));
+    return static_cast<int32>(crc.GetCRC());
+}
+
+// ============================================================================
+// asm 0x726758 — TriggerClass_GetClassID
+// ============================================================================
+HRESULT TriggerClass::GetClassID(CLSID* pClassID)
+{
+    if (pClassID == nullptr) return E_POINTER;
+    pClassID->Data1 = 0xC02D1590;
+    pClassID->Data2 = 0x0A2A;
+    pClassID->Data3 = 0x11D2;
+    static const uint8 tail[8] = {0xAC, 0xA7, 0x00, 0x60, 0x08, 0x05, 0x5B, 0xB5};
+    for (int32 i = 0; i < 8; ++i) pClassID->Data4[i] = tail[i];
+    return S_OK;
+}
+
+// ============================================================================
+// asm 0x726894 — TriggerClass_Load
+// 基类反序列化 + LoadTables 之后，对三个指针槽做 swizzle 还原：
+//   +0x24 triggerType / +0x28 AttachedTrigger / +0x2C related house。
+// ============================================================================
+HRESULT TriggerClass::Load(IStream* pStm)
+{
+    if (pStm == nullptr) return E_POINTER;
+
+    static SwizzleManagerClass SwizzleManager;
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&Type));
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&LinkedTrigger));
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&RelatedHouse));
+    return S_OK;
+}
+
+// ============================================================================
+// asm 0x7268D0 — TriggerClass_Save —— 仅走基类保存，本层无额外持久化字段。
+// ============================================================================
+HRESULT TriggerClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    if (pStm == nullptr) return E_POINTER;
+    if (fClearDirty) {
+        // 基类 AbstractClass::Save 会清 Dirty；此处等价承接。
+    }
+    return S_OK;
+}
+
+// ============================================================================
+// asm 0x7268D0 — TriggerClass_GetSize (0x48)
+// ============================================================================
+int32 TriggerClass::Size() const
+{
+    return 0x48;
+}
+
+// ============================================================================
+// asm 0x7268D8 — TriggerClass_GetAbstractDerivationID (0x26)
+// ============================================================================
+int32 TriggerClass::GetAbstractDerivationID() const
+{
+    return 0x26;
+}
+

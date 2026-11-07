@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex13.cpp
+start=52
+end=281
+symbol=ProgressScreenClass_DrawPlayerSpot
+target=Game/LoadProgressMgr.cpp

@@ -143,6 +143,25 @@ struct Rectangle
         return Width * Height;
     }
 
+    //========================================================================
+    // Position assignment
+    //========================================================================
+
+    // asm: Rect_SetPos (0x50E4A0 area) —— __thiscall，retn 0Ch
+    //   dwLTRB *__thiscall Rect_SetPos(dwLTRB *this, dwXY *TopLeft, int R, int B)
+    //   [this+0] = TopLeft->x ; [this+4] = TopLeft->y
+    //   [this+8] = R          ; [this+0Ch] = B
+    //
+    // 按项目 Rectangle 的 X/Y/Width/Height 布局，即左上角取 TopLeft，
+    // 右下边界（原版存 right/bottom）分别落到 Width/Height 槽位。
+    void SetPos(const Point2D& topLeft, int32 right, int32 bottom) noexcept
+    {
+        X = topLeft.X;
+        Y = topLeft.Y;
+        Width = right;
+        Height = bottom;
+    }
+
     static const Rectangle Empty;
 };
 

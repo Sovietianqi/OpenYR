@@ -2,6 +2,8 @@
 #include "../Map/MapClass.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Game/Game.h"
+#include "../Math/Timer.h"
+#include "../Rendering/TacticalClass.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -956,4 +958,371 @@ int32 LightSourcePoolClass_DumpDiagnostics(LightSourcePoolClass* pool,
     }
 
     return offset;
+}
+
+// ============================================================================
+// LightSourceClass_ChangeLevels  (asm: LightSourceClass_ChangeLevels, 0x554A80)
+//
+//   eax = [this+24h]                 ; current intensity
+//   cmp eax, intensity ; jnz change
+//   eax = [this+28h]                 ; current red tint
+//   cmp eax, tintR ; jnz change
+//   cmp eax, tintB ; jz done         ; (original compares the red slot
+//                                    ;  against tintB -- reproduced verbatim)
+// change:
+//   [24h] = intensity ; [2Ch] = tintG ; [28h] = tintR ; [30h] = tintB
+//   al = [48h] ; if (al) sub_554AF0(mode)   ; refresh cell lighting
+// done: retn 14h
+// ============================================================================
+void LightSourceClass::ChangeLevels(int32 intensity, int32 tintR, int32 tintG, int32 tintB, int32 mode)
+{
+    // asm guard: unchanged levels skip the refresh entirely.  The third
+    // comparison reads the red slot against tintB exactly as the binary does.
+    if (Intensity == intensity &&
+        static_cast<int32>(Color.R) == tintR &&
+        static_cast<int32>(Color.R) == tintB) {
+        return;                                   // asm: jz loc_554AE1
+    }
+
+    Intensity   = intensity;                      // asm: mov [ecx+24h], esi
+    Color.G     = static_cast<uint8>(tintG);      // asm: mov [ecx+2Ch], eax
+    Color.R     = static_cast<uint8>(tintR);      // asm: mov [ecx+28h], edx
+    Color.B     = static_cast<uint8>(tintB);      // asm: mov [ecx+30h], edi
+
+    if (IsActive) {                               // asm: mov al,[ecx+48h]; test al,al
+        UpdateCellLighting();                     // asm: call sub_554AF0
+    }
+}
+
+// ============================================================================
+// asm: sub_554AF0 —— 重算本光源覆盖的格子（Start/Stop/ChangeLevels 共用入口）
+//
+//   原版会重新遍历光源半径内的格并叠加/撤销光照贡献。OpenYR 以
+//   UpdateCellLighting 等价实现（撤销路径未单独建模：光源池以 Release 收敛）。
+//   mode 参数原样透传（asm 里作为 flags 传给内层例程）。
+// ============================================================================
+void LightSourceClass::ApplyLevels(int32 mode)
+{
+    (void)mode;                 // asm: push mode / call sub_554AF0(mode)
+    if (!IsActive)
+        return;
+    UpdateCellLighting();       // asm: vecLightSources_UpdateCells 的逐光源入口
+}
+
+// ============================================================================
+// asm: LightSourceClass_Start (retn 4: mode)
+//
+//   mov al,[ecx+48h] ; test al,al ; jnz retn        ; 已启用 -> 直接返回
+//   mov eax,[esp+mode] ; mov byte [ecx+48h],1 ; push eax ; call sub_554AF0
+// ============================================================================
+void LightSourceClass::Start(int32 mode)
+{
+    // asm: mov al,[ecx+48h] ; test al,al ; jnz locret_554A75
+    if (IsActive)
+        return;
+
+    IsActive = true;            // asm: mov byte [ecx+48h],1
+    ApplyLevels(mode);          // asm: call sub_554AF0(mode)
+}
+
+// ============================================================================
+// asm: LightSourceClass_Stop (retn 4: mode)
+//
+//   mov al,[ecx+48h] ; test al,al ; jz retn         ; 未启用 -> 直接返回
+//   mov eax,[esp+mode] ; mov byte [ecx+48h],0 ; push eax ; call sub_554AF0
+// ============================================================================
+void LightSourceClass::Stop(int32 mode)
+{
+    // asm: mov al,[ecx+48h] ; test al,al ; jz locret_554A95
+    if (!IsActive)
+        return;
+
+    IsActive = false;           // asm: mov byte [ecx+48h],0
+    ApplyLevels(mode);          // asm: call sub_554AF0(mode)
+}
+
+// ============================================================================
+// asm: LightSourceClass_DeleteAll (0x5549A0)
+//
+//   for (每项 vec_LightSources) { vt[+20h](1) }      ; 标量删除析构
+//   再逐项删除 vec_LightSourcePendingCells 里的缓冲
+//   byte_829AE4 = 1
+//   OpenYR 以光源池等价实现：ReleaseAllLights 复用池槽（等价于逐项销毁）。
+// ============================================================================
+void LightSourceClass::DeleteAll()
+{
+    LightSourcePoolClass* pool = LightSourcePoolClass::GetInstance();
+    if (pool != nullptr)
+        pool->ReleaseAllLights();
+}
+
+// asm: LightSourceClass_GetSize —— mov eax,4Ch ; retn
+int32 LightSourceClass::GetSize() const
+{
+    return 0x4C;
+}
+
+// asm: LightSourceClass_GetAbstractDerivationID —— mov eax,36h ; retn
+int32 LightSourceClass::GetAbstractDerivationID() const
+{
+    return 0x36;
+}
+
+// ============================================================================
+// asm: vec_LightSourcePendingCells 家族
+//
+//   vecLightSources_UpdateCells (0x554D80 区, dl = flag, retn)
+//     全局：unk_884D88（计时器）、dword_ABCA74/78/7C/80、byte_ABCA84、
+//           dword_829AE8、vec_LightSourcePendingCells、Map。
+// ============================================================================
+
+// asm: vec_LightSourcePendingCells
+DynamicVectorClass<LightSourceClass::PendingCellStruct*>* LightSourceClass::PendingCells = nullptr;
+// asm: dword_ABCA74 / dword_ABCA78 / dword_ABCA7C / dword_ABCA80
+int32 LightSourceClass::PendingFrame    = 0;
+int32 LightSourceClass::PendingLastRun  = 0;
+int32 LightSourceClass::PendingCursor   = 0;
+int32 LightSourceClass::PendingBudget   = 0;
+// asm: byte_ABCA84
+uint8 LightSourceClass::PendingPhaseDone = 0;
+// asm: dword_829AE8
+int32 LightSourceClass::TwinkleAccum     = 0;
+
+namespace {
+
+// ----------------------------------------------------------------------------
+// asm: sub_5B1E40 —— 秒级浮点计时器读数（ecx = unk_884D88）
+//
+// 降级点：原版是 CDTimerClass 的 double 秒读数，本树 TimerClass 只有整型
+// 帧计数，故以 SystemTimer 的毫秒读数折算成秒（同为单调时钟，差值语义一致）。
+// ----------------------------------------------------------------------------
+float LightClock()
+{
+    return static_cast<float>(SystemTimer::GetTime()) * 0.001f;
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_484050 —— 格子光照取样
+//
+//   先把输出槽置成"无光照"默认值：a1 = 10000h、a2 = 0、a3 = 3E8h、
+//   tintB = 3E8h、tintG = 3E8h；随后依 [cell+24h]/[cell+26h] 的光照字与
+//   色调字继续细化。
+//
+// 降级点：本树 CellClass 尚无 +24h/+26h 两个光照字（光照系统未落地），
+//   取样退化为默认值 + 当前格色三分量，供上层按 asm 的写回顺序落位。
+// ----------------------------------------------------------------------------
+void SampleCellLight(CellClass* pCell, const CoordStruct& coords,
+                     int32* pField00, int32* pField04,
+                     uint16* pIntensity, uint16* pAmbient,
+                     uint16* pTintB, uint16* pTintG)
+{
+    (void)coords;
+    *pIntensity = 0x0000;             // asm: mov [a1],10000h —— 高 16 位在 word 写回时截断
+    *pField00   = 0;                  // asm: mov [a2],0
+    *pField04   = 0x3E8;              // asm: mov [a3],3E8h
+    *pAmbient   = 0x3E8;              // asm: mov [tintB],3E8h
+    *pTintB     = 0x3E8;              // asm: mov [tintG],3E8h
+    *pTintG     = 0x3E8;
+
+    uint8 r = 0, g = 0, b = 0;
+    if (pCell != nullptr)
+        pCell->GetColourComponents(&r, &g, &b);   // 等价取样：格色三分量
+    *pIntensity = static_cast<uint16>(b) << 8 | r;
+    *pAmbient   = static_cast<uint16>(g) << 8 | r;
+}
+
+}  // namespace
+
+// ============================================================================
+// asm: vecLightSources_UpdateCells (0x554D80 区)
+//
+//   t0 = Timer() ; ++dword_ABCA74
+//   if (length == 0 || byte_ABCA84) goto phase2                     ; 554EE6
+//   cursor = dword_ABCA7C
+//   if (cursor <= 0) {                                              ; 554D9A
+//       dword_ABCA80 = length ; cursor = length-1 ; dword_ABCA7C = cursor
+//       if (cursor < 0) goto check_done                             ; 554ED6
+//   }
+//   loop:                                                           ; 554DB2
+//     if (!flag && (cursor & 0Fh) == 0Fh) {                         ; 每 16 格探时
+//         if (thisD <= Timer() - t0) goto check_done
+//     }
+//     entry = data[cursor]
+//     if (entry->Field_00 != 0) --dword_ABCA80
+//     else { cell = Map.Coord_Cell(entry+10h) ; sub_484050(cell, entry+10h,
+//              &a2,&arg0,&Intensity,&Ambient,&tintB,&tintG)
+//            entry->[0]=a2; [4]=arg0; [8]=Intensity; [A]=Ambient;
+//            [C]=tintB; [E]=tintG ; --dword_ABCA80 }
+//     if (--cursor >= 0) goto loop                                  ; 554ECA
+//   check_done:                                                     ; 554ED6
+//     if (dword_ABCA80 <= 0) byte_ABCA84 = 1
+//   phase2:                                                         ; 554EE6
+//     remaining = thisD - (Timer() - t0)
+//     if (!byte_ABCA84) goto tail
+//     if (!flag && remaining < (double)(this-1)) goto tail
+//     for each entry: CellClass_SetColourComponents(Map.Coord_Cell(entry+10h),
+//                       Convert=[0], coords, [4], [8], [A], [C], [E]) ; delete
+//     length = 0 ; free(data) ; IsAllocated = 0 ; count = 0
+//     byte_ABCA84 = 0 ; GScreen_FlagToRedraw(Map, 1)
+//   tail:                                                           ; 554FE4
+//     dt = thisD - (Timer() - t0)
+//     if (!(dt > 0)) return
+//     if (dword_ABCA74 > dword_ABCA78 + dword_829AE8) {
+//         v = min(dt*0.5, 1.0) ; iv = (int)floor(v)
+//         acc = IsometricTileTypeClass_ReturnFalse() ? -1 : 0   ; 恒 false
+//         acc &= 0CFh ; acc += 32h ; dword_829AE8 = acc
+//         dword_ABCA78 = dword_ABCA74
+//     }
+// ============================================================================
+void LightSourceClass::UpdatePendingCells(const void* pThis, bool flag)
+{
+    if (PendingCells == nullptr)
+        return;
+
+    const double thisD = static_cast<double>(
+        static_cast<int32>(reinterpret_cast<intptr_t>(pThis)));   // asm: fild var_28
+
+    const float t0 = LightClock();                     // asm: call sub_5B1E40 / fstp var_8
+    ++PendingFrame;                                    // asm: dword_ABCA74++
+
+    int32 count = PendingCells->Count;                 // vec.length
+    if (count == 0)                                    // asm: jz loc_554EE6
+        goto phase2_entry;
+    if (PendingPhaseDone)                              // asm: byte_ABCA84 / jnz
+        goto phase2_entry;
+
+    {
+        int32 cursor = PendingCursor;                  // dword_ABCA7C
+        if (cursor <= 0) {
+            PendingBudget = count;                     // dword_ABCA80 = length
+            cursor = count - 1;                        // asm: dec eax
+            PendingCursor = cursor;
+            if (cursor < 0)                            // asm: jl loc_554ED6
+                goto check_done;
+        }
+        for (;;) {                                     // asm: loc_554DB2
+            if (!flag && (cursor & 0xF) == 0xF) {      // test bl,bl / and 0Fh
+                const float el = LightClock() - t0;    // fsub var_8
+                // fild this / fcompp / test ah,41h —— st0 = thisD 低于 elapsed 即退出
+                if (thisD <= static_cast<double>(el))
+                    goto check_done;                   // asm: loc_554ED6
+            }
+            PendingCellStruct* obj = (*PendingCells)[cursor];
+            if (obj->Field_00 != 0) {                  // asm: cmp [edx],0 / jz
+                --PendingBudget;                       // asm: dec dword_ABCA80
+            } else {
+                int32 a2 = 0, arg0 = 0;
+                uint16 intensity = 0, ambient = 0, tintB = 0, tintG = 0;
+                CellClass* pCell = MapClass::Instance != nullptr
+                                 ? MapClass::Instance->GetCellAt(obj->Coords)
+                                 : nullptr;            // asm: Map::Coord_Cell
+                SampleCellLight(pCell, obj->Coords, &a2, &arg0,
+                                &intensity, &ambient, &tintB, &tintG);
+                obj->Field_00 = a2;                    // asm loc_554E42 写回
+                obj->Field_04 = arg0;
+                obj->Field_08 = intensity;
+                obj->Field_0A = ambient;
+                obj->Field_0C = tintB;
+                obj->Field_0E = tintG;
+                --PendingBudget;
+            }
+            --cursor;                                  // asm: dec eax
+            PendingCursor = cursor;
+            if (cursor < 0)                            // asm: jns loc_554DB2
+                break;
+        }
+    }
+
+check_done:                                            // asm: loc_554ED6
+    if (PendingBudget <= 0)                            // asm: test/jg loc_554EE6
+        PendingPhaseDone = 1;                          // asm: mov byte_ABCA84,1
+
+phase2_entry:                                          // asm: loc_554EE6
+    {
+        const float now = LightClock();
+        const double elapsed = static_cast<double>(now) - static_cast<double>(t0);
+        const double remainingD = thisD - elapsed;     // fsubr
+        if (!PendingPhaseDone)                         // asm: test al,al / jz loc_554FE2
+            goto tail;
+        if (!flag) {                                   // asm: test bl,bl / jnz 554F2B
+            // fild (this-1) / fxch / fcompp / test ah,1
+            if (remainingD < static_cast<double>(
+                    static_cast<int32>(reinterpret_cast<intptr_t>(pThis)) - 1))
+                goto tail;
+        }
+        // ---- 应用阶段（asm loc_554F2D）-----------------------------------
+        {
+            const int32 n = PendingCells->Count;
+            for (int32 i = 0; i < n; ++i) {
+                PendingCellStruct* obj = (*PendingCells)[i];
+                CellClass* pCell = MapClass::Instance != nullptr
+                                 ? MapClass::Instance->GetCellAt(obj->Coords)
+                                 : nullptr;
+                // asm 推参顺序 B(+0Eh) G(+0Ch) R(+0Ah) Ambient(+8) Intensity(+4)
+                //      Convert([0]) coords(+10h)；
+                // 降级点：本树 CellClass::SetColourComponents 只取 R/G/B 三参，
+                //         故按 asm 的 R=[+0A]、G=[+0C]、B=[+0E] 落位，另两参
+                //         属光照等级语义，需光照系统落地后再接。
+                if (pCell != nullptr)
+                    pCell->SetColourComponents(
+                        static_cast<uint8>(obj->Field_0A & 0xFF),
+                        static_cast<uint8>(obj->Field_0C & 0xFF),
+                        static_cast<uint8>(obj->Field_0E & 0xFF));
+                delete obj;                            // asm: call delete
+            }
+            // asm loc_554F8C：清空待刷新向量
+            PendingCells->Count = 0;
+            if (PendingCells->Items != nullptr) {
+                YRMemory::Deallocate(PendingCells->Items);
+                PendingCells->Items = nullptr;
+                PendingCells->Capacity = 0;
+            }
+            PendingPhaseDone = 0;                      // asm: byte_ABCA84 = 0
+            // asm: GScreen_FlagToRedraw(Map, 1)
+            // 降级点：本树 MapClass 未继承 GScreenClass（已知架构缺口），
+            //   以 Tactical 的重绘标志等价触发本帧重绘。
+            if (TacticalClass::Instance != nullptr)
+                TacticalClass::Instance->Redrawing = true;
+        }
+        goto tail;
+    }
+
+tail:                                                  // asm: loc_554FE4
+    {
+        const float now2 = LightClock();
+        const double dt = thisD - (static_cast<double>(now2) - static_cast<double>(t0));
+        if (!(dt > 0.0))                               // asm: fcom double_0 / test 41h
+            return;
+        if (PendingFrame > PendingLastRun + TwinkleAccum) {
+            double v = dt * 0.5;                       // asm: fmul dbl0_5
+            if (v >= 1.0)                              // asm: fcom dbl1_0 / test ah,1
+                v = 1.0;
+            // asm: iv = (int)floor(v) ; call IsometricTileTypeClass_ReturnFalse
+            //      （0x549E60: xor al,al / retn，恒 false）→ acc 恒为 32h。
+            const bool r = false;
+            int32 acc = r ? -1 : 0;                    // asm: neg al / sbb eax,eax
+            acc &= 0xCF;                               // asm: and al,0CFh
+            acc += 0x32;                               // asm: add eax,32h
+            TwinkleAccum = acc;                        // asm: dword_829AE8
+            PendingLastRun = PendingFrame;             // asm: dword_ABCA78
+        }
+    }
+}
+
+// ============================================================================
+// asm: LightSourceClass::ComputeCRC（vt+34h）—— 同步日志的 Light Source 段
+// ============================================================================
+
+// asm: 同步日志的 Light Source 段对每个光源调 vt+34h；这里把主状态
+//  （世界坐标 / 半径 / 强度 / 颜色分量）按声明顺序折进累积器。
+void LightSourceClass::ComputeCRC(CRCEngine& crc) const
+{
+    crc.AddData(&Position.X, sizeof(Position.X));
+    crc.AddData(&Position.Y, sizeof(Position.Y));
+    crc.AddData(&Position.Z, sizeof(Position.Z));
+    crc.AddData(&Radius, sizeof(Radius));
+    crc.AddData(&Intensity, sizeof(Intensity));
+    crc.AddData(&RedComponent, sizeof(RedComponent));
+    crc.AddData(&GreenComponent, sizeof(GreenComponent));
+    crc.AddData(&BlueComponent, sizeof(BlueComponent));
 }

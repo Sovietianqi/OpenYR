@@ -1,4 +1,5 @@
 #include <Abstract/UnitTypeClass.h>
+#include <Abstract/UnitClass.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
@@ -903,4 +904,49 @@ UnitTypeClass* UnitTypeClass::FindOrAllocate(const char* pID)
     }
     if (newItem && Array) Array->Add(newItem);
     return newItem;
+}
+
+// =============================================================================
+// UnitTypeClass_CreateUnit
+// Allocate a UnitClass for this type and bind its Type back-pointer.  Returns
+// nullptr if the allocation failed (mirrors the original new/ctor guard).
+// =============================================================================
+UnitClass* UnitTypeClass::CreateUnit(HouseClass* pOwner) const
+{
+    UnitClass* pUnit = new UnitClass(pOwner);
+    if (pUnit) {
+        pUnit->Type = const_cast<UnitTypeClass*>(this);
+    }
+    return pUnit;
+}
+
+// =============================================================================
+// UnitTypeClass_SetTurretWeapon  (asm: UnitTypeClass_SetTurretWeapon)
+//
+//   mov eax, [esp+idxWeapon]
+//   mov edx, [esp+idxTur]
+//   mov [ecx+eax*4+814h], edx      ; TurretWeaponTable[idxTur] = idxWeapon
+//   retn 8
+//
+// The table base 0x814 is the first turret-weapon slot (NormalTurretWeapon);
+// each entry is a plain int32 weapon index.
+// =============================================================================
+void UnitTypeClass::SetTurretWeapon(int32 idxTur, int32 idxWeapon)
+{
+    (&NormalTurretWeapon)[idxTur] = idxWeapon;
+}
+
+// =============================================================================
+// UnitTypeClass_GetTurretWeaponIndex  (asm: UnitTypeClass_GetTurretWeaponIndex)
+//
+//   mov eax, [esp+IFVMode]
+//   mov eax, [ecx+eax*4+814h]      ; return TurretWeaponTable[IFVMode]
+//   retn 4
+//
+// Called by UnitClass_SwitchGunner to pick the weapon matching the current
+// IFV mode (0..17).
+// =============================================================================
+int32 UnitTypeClass::GetTurretWeaponIndex(int32 IFVMode) const
+{
+    return const_cast<int32&>((&NormalTurretWeapon)[IFVMode]);
 }

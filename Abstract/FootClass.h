@@ -16,7 +16,10 @@ public:
     FootClass() noexcept : TechnoClass(), Pitch(0), CurrentSequence(Sequence::Ready), Locomotion(nullptr),
         Team(nullptr), NextTeamMember(nullptr), IsTeamLeader(false), Recruitable(false), Group(-1),
         IsEnteringBioReactor(false), IsEnteringBattleBunker(false), IsEnteringGarrison(false),
-        CurrentTarget(nullptr), Transporter(nullptr) {}
+        CurrentTarget(nullptr), Transporter(nullptr),
+        IsVisibleNowFlag(false), PlanningToken(-1), PlanningTokenIdx(-1), IsUnselectable(false),
+        WalkFrameCounter(0), BalloonHoverTainted(false), MoveSoundPlaying(false),
+        MoveSoundCooldown(0), IsHunting(false) {}
     virtual ~FootClass() {}
 
     virtual AbstractType WhatAmI() const override { return AbstractType::Foot; }
@@ -99,6 +102,17 @@ public:
     void Update_Movement();
 
     // ========================================================================
+    // FootClass::AI  (asm:481281 .. 482328)
+    //
+    //  足类逐帧主体。原版由 UnitClass_Update / InfantryClass_Update /
+    //  AircraftClass_Update 在各自 Update 里调用（asm 481281 处首行先 call
+    //  TechnoClass_Update）。本实现把父类逐帧交给 FootClass::Update() 统一
+    //  处理，AI() 只承载足类增量：辐射结算、气球悬停腐蚀、友军视野重揭、
+    //  行走帧节流、移动音效、地面散射与传送收尾。
+    // ========================================================================
+    virtual void AI();
+
+    // ========================================================================
     // Misc inline compatibility methods preserved from the original header
     // ========================================================================
     void SetAlpha(uint8 /*alpha*/) {}
@@ -106,9 +120,8 @@ public:
     void TakeDamage(int32 /*damage*/, ObjectClass* /*source*/, WarheadTypeClass* /*warhead*/) {}
 
     // ========================================================================
-    // CRC
+    // CRC (declared later, next to the other foot-layer overrides)
     // ========================================================================
-    virtual void ComputeCRC(CRCEngine& crc) const override;
 
     // ==========================================================================
  // Mission-controller overrides (xx block of the FootClass vtable)
@@ -145,6 +158,139 @@ public:
     bool Set_Destination(const CoordStruct& dest);
     bool Can_Enter_Cell(const CellStruct& cell) const;
     void Scatter(const CoordStruct& from, bool ignoreMission = true);
+
+    // ========================================================================
+    // Mission-controller overrides (the FootClass layer of the vtable)
+    //
+    //  Infantry and vehicles share the same walk-there / enter / get-scattered
+    //  behaviour, so the mission handlers that are common to both live here and
+    //  are reused by the concrete types.  Each returns the current mission step
+    //  (a value <= the pass threshold means "keep going").
+    // ========================================================================
+    virtual int32 Mission_Move();
+    virtual int32 Mission_Guard();
+    virtual int32 Mission_AreaGuard();
+    virtual int32 Mission_Patrol();
+    virtual int32 Mission_Retreat();
+    virtual int32 Mission_Enter();
+    virtual int32 Mission_Unload();
+
+    // ========================================================================
+    // Motion / speed
+    // ========================================================================
+    // FootClass_GetCurrentSpeed: the unit's effective movement speed after the
+    // owning house's speed multiplier, the per-instance multiplier, the FASTER
+    // veteran bonus and the SpeedPercentage are folded in.  A harvester
+    // carrying ore is halved.
+    virtual int32 GetCurrentSpeed() const;
+
+    // ========================================================================
+    // Layer / status probes and handlers
+    // ========================================================================
+    // FootClass_InAir: thunk to the TechnoClass air-layer test.
+    virtual bool InAir() const;
+    // FootClass_InWhichLayer: the draw layer reported by the locomotor.
+    virtual int32 InWhichLayer() const;
+    // FootClass_Get_ZAdjustment: the ground-snap height this unit draws at.
+    virtual int32 Get_ZAdjustment() const;
+    // FootClass_CanCloak: cloakable, and either the type allows cloaking while
+    // the locomotor is stationary, or the locomotor permits it outright.
+    virtual bool CanCloak() const;
+    // FootClass_CanBeSold: a mobile unit may be sold only while carrying
+    // nothing and only when it is standing on a service depot.
+    virtual bool CanBeSold() const;
+
+    // FootClass_IronCurtain: applies the iron-curtain effect.  Organic units
+    // take direct damage instead of being shielded; everything else gets the
+    // shield timer and the tint.
+    virtual void IronCurtain(ObjectClass* pSource, int32 a3, int32 a4) const;
+
+    // FootClass_Crash: an airborne unit that is about to come down hard fires
+    // the crash / destroyed events and drops out of the sky.
+    virtual void Crash();
+
+    // FootClass_ChronowarpTo: teleport the unit to a target cell, creating a
+    // teleport locomotor and snapping the position when it is a vehicle.
+    virtual void ChronowarpTo(AbstractClass* pTarget, int32 a3);
+
+    // FootClass_Destroyed: raise the "unit lost" radar event and EVA line for
+    // the local player, then chain to the parent.
+    virtual void Destroyed(ObjectClass* Killer) override;
+
+    // ========================================================================
+    // Drawing / pick and per-frame updates
+    // ========================================================================
+    // FootClass_DrawSHP: forwards to the SHP blitter with the 16-argument
+    // signature the original uses.
+    void DrawSHP(void* pSHP, int32 frameCount, int32 a3, int32 a4, int32 a5,
+                 int32 a6, int32 zDelta, int32 a8, int32 a9, int32 a10,
+                 int32 tintColour, int32 buildingZ_sha, int32 zsX, int32 zsY,
+                 int32 a15, int32 a16);
+    // FootClass_GetImage: the drawing image (SHP plus frame) for this unit.
+    void* GetImage(void* pImage, bool a2);
+    // FootClass_GetCursorOverObject: the mouse cursor to show over a target.
+    virtual int32 GetCursorOverObject(AbstractClass* pTarget, int32 a3);
+    // FootClass_UpdatePosition: the per-frame position / layer bookkeeping.
+    void UpdatePosition(int32 a2) const;
+
+    // ========================================================================
+    // Lifecycle / bookkeeping
+    // ========================================================================
+    // FootClass_UnInit: tears the unit down - releases any capture manager,
+    // detaches from its transporter, leaves its team and unlinks from the map.
+    virtual void UnInit();
+    // FootClass_ResetMission: restores the saved mission and re-issues the
+    // stored destination.
+    virtual bool ResetMission();
+    // FootClass_AssignPlanningPath: starts following the player's planning path
+    // `idxPath` from waypoint `idxWP`, or clears the path when idxPath is -1.
+    void AssignPlanningPath(int32 idxPath, uint8 idxWP);
+    // FootClass_Exists: true when the unit is live, has not been removed, and
+    // (unless the scenario is initialising) is not limboed.
+    bool Exists() const;
+    // FootClass_PointerGotInvalid: clears any internal pointer that still names
+    // the object being invalidated.
+    // asm: FootClass_PointerGotInvalid proc near
+    //          coords = dword ptr 4   ; a2
+    //          a3     = dword ptr 8   ; int removed
+    //          (ends with `retn 8` -> __thiscall, 2 args, virtual)
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed);
+    // FootClass_GetCRC: chains the parent CRC and mixes in the foot-layer
+    // state (paralysis timer, speeds, facings).
+    virtual void ComputeCRC(CRCEngine& crc) const override;
+    // FootClass_ReceiveDamage: the foot-layer damage entry point.
+    virtual int32 ReceiveDamage(int32* pDamage, int32 typeSource,
+                                WarheadTypeClass* pWarhead, int32 target,
+                                int32 ignoreDefenses, int32 arg10,
+                                HouseClass* pSourceHouse);
+    // FootClass_ClickedMission: handles a left-click selecting this unit for a
+    // mission (currently only the "enter building" click is meaningful).
+    virtual bool ClickedMission(int32 a2, int32 a3, int32 a4) const;
+
+    // FootClass_LoadTables: called by the container loaders after a saved unit
+    // has been reconstructed.  Chains the parent, re-stamps the pathfinding
+    // vectors' vtable, clears the (stale) locomotion pointer and re-installs
+    // the four interface vtables.
+    virtual void LoadTables(IStream* pStm) override;
+
+    // ========================================================================
+    // Original vtable slots the disassembler left unnamed (foot-layer offsets
+    // 0xC0 / 0x138 / 0x2F0 / 0x47C / 0x4AC)
+    // ========================================================================
+    // FootClass_138 (vt+0x138): a unit may be selected unless it is flagged as
+    // temporarily unselectable (the "hidden" byte at +0x6A9).
+    virtual bool CanBeSelected() const override;
+    // FootClass_C0 (vt+0xC0): the "visible in the current draw pass" byte at
+    // +0x6B2, cleared every frame by UpdatePosition.
+    bool IsVisibleNow() const;
+    // FootClass_2F0: the height gradient reported by the locomotor, or 2 when
+    // the unit has no locomotion.
+    int32 GetZ_Gradient() const;
+    // FootClass_47C: stores the waypoint token at +0x5A0.
+    void Set_Planning_Token(int32 token);
+    // FootClass_4AC: true when the planning-token slot (+0x5C4) holds a valid
+    // index (i.e. is not -1).
+    bool Has_Planning_Token() const;
 
     DirStruct PrimaryFacing;
     DirStruct TurretFacing;
@@ -221,6 +367,26 @@ public:
     bool  CanGetCrushed(ObjectClass* pSource) const;
     bool  CanBeRecruited(HouseClass* pHouse) const;
     bool  CanFightBack() const;
+
+    // ------------------------------------------------------------------------
+    // asm: FootClass::Greatest_Threat (_FootClass *this, int projFlags,
+    //        int curThreat, char a4)   (asm:5770)   retn 0Ch
+    //
+    //   追猎状态（+0x688）为真时，强制把 projFlags 的"只打可移动目标"位
+    //   （bit1）清掉、并置上"优先"位（bit0），再交给 TechnoClass 的通用
+    //   威胁评估；若追猎状态为真却评估不到任何目标，则自动摘掉追猎位。
+    // ------------------------------------------------------------------------
+    virtual ObjectClass* Greatest_Threat(int32 projFlags, int32 curThreat, int32 a4) override;
+
+    // ------------------------------------------------------------------------
+    // asm: FootClass::Captured (_FootClass *this, HouseClass *newOwner, int a3)
+    //        (asm:7874)   retn 8
+    //
+    //   被占领 / 心灵控制易主：先把本单位从所在格的传感器圈里撤下（若类型
+    //   带传感器视野），链到 TechnoClass::Captured 完成易主；成功后退出所属
+    //   队伍、按新位置重挂传感器；无论成败都按新归属重挂传感器视野。
+    // ------------------------------------------------------------------------
+    bool Captured(HouseClass* newOwner, int32 a3 = 1);
     void  Sensors_AddAt(const CellStruct& cell);
     void  Sensors_RemoveAt(const CellStruct& cell);
     void  AddThreatIntoCell(class CellClass* pCell);
@@ -303,10 +469,45 @@ public:
     bool IsEnteringBattleBunker;
     bool IsEnteringGarrison;
 
+    // ========================================================================
+    // 原版 vt+0xC0 / 0x47C / 0x4AC 三个槽位背后的状态：
+    //   IsVisibleNowFlag (+0x6B2)：本帧可否绘制；每帧 UpdatePosition = 2 时清空。
+    //   PlanningToken   (+0x5A0)：vt+0x47C 写入的规划航点令牌。
+    //   PlanningTokenIdx(+0x5C4)：vt+0x4AC 读取的规划索引；-1 表示无。
+    //   IsUnselectable  (+0x6A9)：vt+0x138 判定用的"暂不可选"标记。
+    // ========================================================================
+    bool  IsVisibleNowFlag;
+    int32 PlanningToken;
+    int32 PlanningTokenIdx;
+    bool  IsUnselectable;
+
+    // ========================================================================
+    // FootClass::AI 的逐帧暂存状态（asm 各分支读写的私有槽位）
+    //
+    //  这些槽位在 asm 里散落在 FootClass 尾部（+0x3D5 / +0x538 / +0x53C /
+    //  +0x6B8 等），只服务于 FootClass::AI 一轮里的判定与节流，不参与存档。
+    // ========================================================================
+    // WalkFrameCounter (+0x6B8): 行走帧计数（走路动画节流用）。
+    int32 WalkFrameCounter;
+    // BalloonHoverTainted (+0x3D5): 气球悬停单位落到被泰伯利亚污染的格子上
+    //   后置位，避免每帧重复检测。
+    bool  BalloonHoverTainted;
+    // MoveSoundPlaying (+0x538) / MoveSoundCooldown (+0x53C): 移动音效正在
+    //   播放 / 收尾倒计时（行走逻辑停下后还要多响几帧）。
+    bool  MoveSoundPlaying;
+    int32 MoveSoundCooldown;
+    // SightRevealTimer (+0x65C/+0x660/+0x664): 友军空中单位周期性重揭视野
+    //   的节流计时器（帧起点 + 上次揭开时的 Z + 间隔）。
+    CDTimerClass SightRevealTimer;
+    // IsHunting (+0x688): 单位正处于"主动追猎"状态。真时 Greatest_Threat
+    //   会强制带上"优先锁定可移动目标"的标志，并在找不到目标时自动摘掉。
+    bool IsHunting;
+
 
 protected:
     explicit __forceinline FootClass(noinit_t) noexcept : TechnoClass(noinit), Pitch(0), CurrentSequence(Sequence::Ready), Locomotion(nullptr),
         Team(nullptr), NextTeamMember(nullptr), IsTeamLeader(false), Recruitable(false), Group(-1),
         IsEnteringBioReactor(false), IsEnteringBattleBunker(false), IsEnteringGarrison(false),
-        CurrentTarget(nullptr), Transporter(nullptr) {}
+        CurrentTarget(nullptr), Transporter(nullptr),
+        IsVisibleNowFlag(false), PlanningToken(-1), PlanningTokenIdx(-1), IsUnselectable(false) {}
 };

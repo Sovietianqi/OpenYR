@@ -27,6 +27,8 @@
 #include <Game/SaveGameClass.h>
 #include <Abstract/BuildingTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
+#include <Abstract/InfantryClass.h>
+#include <Abstract/InfantryTypeClass.h>
 #include <Houses/HouseClass.h>
 #include <Game/Game.h>
 #include <Core/Definitions.h>
@@ -37,11 +39,22 @@
 #include <INI/INIClass.h>
 #include <SW/AirstrikeClass.h>
 #include <Rules/RulesClass.h>
+#include <Audio/VoxClass.h>
+#include <Audio/VocClass.h>
+#include <Special/LightSourceClass.h>
+#include <Houses/FactoryClass.h>
 #include <Game/Externs.h>
+#include <Rendering/Surface.h>
+#include <Rendering/ConvertClass.h>
+#include <Rendering/TacticalClass.h>
+#include <Rendering/UnitArt.h>
+#include "Rendering/ObjectUI.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cctype>
+
+// 降级渲染提示只打一次。
 
 // ============================================================================
 // Static member definitions
@@ -181,13 +194,16 @@ BuildingClass::BuildingClass(HouseClass* pOwner) noexcept
     , StorageFilledSlots(0)
     , RallyPoint{}
     , Target(nullptr)
-    , CurrentMission(Mission::Sleep)
-    , QueuedMission(Mission::Sleep)
     , ReservedLayout_538{}
     , IsTentativelyOccupied(false)
     , IsCurrentlyOccupied(false)
     , IsStateChanging(false)
     , IsBeingSabotaged(false)
+    , IsBeingRepaired(false)
+    , RepairAnimToggle(false)
+    , RepairStepTimer(0)
+    , IsTechnicianStructure(false)
+    , IsBaseDefenseStructure(false)
     , ReservedLayout{}
 {
     Owner = pOwner;
@@ -310,30 +326,37 @@ double BuildingClass::GetStoragePercentage() const
 }
 
 // ============================================================================
-// GetRefund - compute the refund value if the building were sold now.  The
-// refund is a fraction of the original cost proportional to remaining health.
+// GetRefund - the credits the owner receives if this structure is sold now.
+//
+//  The binary routes the sell value through TechnoTypeClass::GetRefund(owner,
+//  overrideLogic), which applies the house/type cost multipliers and the
+//  Rules->RefundPercent; a damaged structure refunds proportionally less, so
+//  the base value is scaled by the current health ratio.  Unexposed until the
+//  structure is fully constructed.
 // ============================================================================
 int32 BuildingClass::GetRefund() const
 {
-    if (!Type) return 0;
-    if (!IsConstructed) return 0;
+    if (Type == nullptr)
+        return 0;
+    if (!IsConstructed)
+        return 0;
 
-    int32 baseCost = Type->Cost;
-    if (baseCost <= 0) return 0;
+    // Authoritative base refund: house multipliers + Rules->RefundPercent.
+    int32 value = Type->GetRefund(Owner, false);
+    if (value <= 0)
+        return 0;
 
-    // Health ratio determines the refund fraction.
-    double healthRatio = 1.0;
-    if (MaxHealth > 0) {
-        healthRatio = static_cast<double>(Health) /
-                      static_cast<double>(MaxHealth);
-        if (healthRatio < 0.0) healthRatio = 0.0;
-        if (healthRatio > 1.0) healthRatio = 1.0;
+    // Scale by remaining health (buildings are worth their damage).
+    double ratio = 1.0;
+    if (MaxHealth > 0)
+    {
+        ratio = static_cast<double>(Health) / static_cast<double>(MaxHealth);
+        if (ratio < 0.0) ratio = 0.0;
+        if (ratio > 1.0) ratio = 1.0;
     }
 
-    int32 refund = static_cast<int32>(
-        static_cast<double>(baseCost) * (SELL_REFUND_PERCENT / 100.0) * healthRatio);
-    if (refund < 0) refund = 0;
-    return refund;
+    const int32 refund = static_cast<int32>(static_cast<double>(value) * ratio);
+    return (refund > 0) ? refund : 0;
 }
 
 // ============================================================================
@@ -512,105 +535,144 @@ void BuildingClass::UpdateConstructionOptions()
 }
 
 // ============================================================================
-// Sell - begin the sell process.  The building is marked as not constructed
-// and the owner receives a refund proportional to remaining health.
+// Sell - the accounting half of the sell order.  The visual half is the
+// Mission::Selling state machine; this routine performs the refund and the
+// teardown so a selling structure stops contributing the instant the order
+// is issued.
+//
+//  In the binary's order:
+//    1. Refuse if the structure is not constructed, or is not sellable.
+//    2. Strip and refund every installed upgrade module (SellUpgrades).
+//    3. Refund the structure itself (health-scaled base refund).
+//    4. Take the structure offline and drop it from the owner's tracking list.
+//    5. Enter the Selling state (art slot Aux1) so the mission layer plays the
+//       ramp-down animation and eventually removes the object.
 // ============================================================================
 void BuildingClass::Sell(DWORD dwUnk)
 {
-    if (!IsConstructed) return;
-    if (!CanBeSold()) return;
+    if (!IsConstructed)
+        return;
+    if (!CanBeSold())
+        return;
 
-    // Compute and grant the refund.
-    int32 refund = GetRefund();
-    if (refund > 0 && Owner) {
+    // 2 - upgrades first: they refund on their own schedule.
+    SellUpgrades_unused();
+
+    // 3 - refund the structure.
+    const int32 refund = GetRefund();
+    if (refund > 0 && Owner != nullptr)
         Owner->GiveMoney(refund);
-    }
 
-    // Go offline to stop power contributions immediately.
+    // 4 - stop power / production and unregister.
     GoOffline();
-
-    IsConstructed = false;
-
-    // Remove from the owner's tracking list.
-    if (Owner) {
+    if (Owner != nullptr)
         Owner->Tracking_Remove(this);
-    }
+
+    // 5 - hand over to the sell mission.
+    CurrentMission = Mission::Selling;
+    BState         = BStateType::Aux1;
+    Dirty          = true;
 
     (void)dwUnk; // unused parameter preserved for ABI compatibility.
 }
 
 // ============================================================================
-// CanBeSold - true if the building type allows selling and the building is
-// constructed.
+// CanBeSold - true when the structure may be sold right now.
+//   * The structure must be fully constructed.
+//   * It must not already be mid-construction or mid-sale.
+//   * The type must not be flagged unsellable, and must be sellable.
 // ============================================================================
 bool BuildingClass::CanBeSold() const
 {
-    if (!Type) return false;
-    if (!IsConstructed) return false;
-    // Use the BuildingTypeClass method if available, fall back to TechnoType.
-    if (Type->IsSellable) return true;
-    TechnoTypeClass* pType = static_cast<TechnoTypeClass*>(static_cast<void*>(Type));
-    return pType->IsSellable && !pType->IsUnsellable;
+    if (Type == nullptr)
+        return false;
+    if (!IsConstructed)
+        return false;
+    if (CurrentMission == Mission::Construction
+        || CurrentMission == Mission::Selling)
+        return false;
+    if (Type->IsUnsellable)
+        return false;
+    return Type->IsSellable;
 }
 
 // ============================================================================
-// CanBeRepaired - true if the building type allows repair and the building
-// is constructed and damaged.
+// CanBeRepaired - true when the structure may be repaired right now.
+//   * The structure must be fully constructed and not mid-construction/sale.
+//   * It must actually be damaged (health below maximum).
+//   * The type must be flagged repairable.
 // ============================================================================
 bool BuildingClass::CanBeRepaired() const
 {
-    if (!Type) return false;
-    if (!IsConstructed) return false;
-    // Only damaged buildings need repair.
-    if (MaxHealth > 0 && Health >= MaxHealth) return false;
-    TechnoTypeClass* pType = static_cast<TechnoTypeClass*>(static_cast<void*>(Type));
-    return pType->IsRepairable;
+    if (Type == nullptr)
+        return false;
+    if (!IsConstructed)
+        return false;
+    if (CurrentMission == Mission::Construction
+        || CurrentMission == Mission::Selling)
+        return false;
+    if (MaxHealth > 0 && Health >= MaxHealth)
+        return false;
+    return Type->IsRepairable;
 }
 
 // ============================================================================
-// RepairWithMoney - restore HP using the owner's credits.  Each call consumes
-// 'money' credits and restores REPAIR_HP_PER_CREDIT * money HP, subject to
-// the MaxHealth cap.  The repair is throttled by the FireRechargeTimer field
-// to prevent instant healing.
+// RepairWithMoney - spend the owner's credits to restore HP.
+//
+//  The amount of HP restored and the price per step come from the type
+//  (GetRepairStep / GetRepairStepCost), so a structure's repair curve lives
+//  with its type, matching the binary's RepairStep data.  `money` is the
+//  budget for this call: we run whole repair steps while the owner can afford
+//  them.  A structure already at full health, or one that cannot be repaired,
+//  is a no-op.
 // ============================================================================
 void BuildingClass::RepairWithMoney(int32 money)
 {
-    if (!Type || money <= 0) return;
-    if (!IsConstructed) return;
-    if (MaxHealth <= 0) return;
-    if (Health >= MaxHealth) return;
+    if (Type == nullptr || money <= 0)
+        return;
+    if (!IsConstructed)
+        return;
+    if (MaxHealth <= 0 || Health >= MaxHealth)
+        return;
+    if (!CanBeRepaired())
+        return;
 
-    // Throttle repair ticks.
-    if (FireRechargeTimer > 0) return;
+    const int32 stepHp   = Type->GetRepairStep();
+    const int32 stepCost = Type->GetRepairStepCost();
+    if (stepHp <= 0)
+        return;
 
-    // Consume credits from the owner.
-    if (Owner) {
-        if (Owner->Credits < money) {
-            // Not enough money; repair what we can afford.
-            money = Owner->Credits;
-            if (money <= 0) return;
+    int32 budget = money;
+    while (budget > 0 && Health < MaxHealth)
+    {
+        // Price the step; a free step (no cost data) still heals.
+        const int32 cost = (stepCost > 0) ? stepCost : 0;
+        if (cost > 0)
+        {
+            if (Owner == nullptr || Owner->Credits < cost)
+                break;
+            Owner->SpendMoney(cost);
+            budget -= cost;
         }
-        Owner->SpendMoney(money);
+        else
+        {
+            // No per-step cost: consume the whole budget in one tick.
+            budget = 0;
+        }
+
+        Health += stepHp;
+        if (Health > MaxHealth)
+            Health = MaxHealth;
     }
 
-    // Restore health.
-    int32 hpRestored = money * REPAIR_HP_PER_CREDIT;
-    Health += hpRestored;
-    if (Health > MaxHealth) {
-        Health = MaxHealth;
-    }
-
-    // Update the damaged animation state.
-    double healthRatio = static_cast<double>(Health) /
-                         static_cast<double>(MaxHealth);
-    Animation.IsDamaged = (healthRatio < DAMAGED_THRESHOLD);
-
-    // Set the recharge timer to throttle the next repair tick.
-    FireRechargeTimer = REPAIR_TICK_INTERVAL;
+    // Refresh the damaged-animation latch after the heal.
+    Animation.IsDamaged = (GetHealthRatio() < DAMAGED_THRESHOLD);
+    Dirty = true;
 }
 
 // ============================================================================
-// Repair - alias for RepairWithMoney.
+// Repair - the vtable entry the selection UI calls; delegates to
+// RepairWithMoney with the tick budget the repair mission uses.
 // ============================================================================
 void BuildingClass::Repair(int32 money)
 {
@@ -618,73 +680,143 @@ void BuildingClass::Repair(int32 money)
 }
 
 // ============================================================================
-// GoOnline - bring the building online.  Power plants begin producing power;
-// factories become available for production.
+// asm: void __thiscall BuildingClass_GoOnline(BuildingClass *this)   (asm:19461)
+//
+//  Brings a finished structure online.  Order of operations (verified against
+//  the binary):
+//    1. Bail out if already online (+660h).  (The binary also defers while an
+//       EMP is in effect, guarding on TechnoClass::EMPDurationRemaining at
+//       +0x504; OpenYR folds EMP into the online/disabled state instead.)
+//    2. Latch IsOnline (+660h), mark dirty (+80h) and the power-on latch
+//       (+6EAh), and raise the owner's online bookkeeping flags.
+//    3. Restart the tiled light source (+614h, mode 0).
+//    4. Re-ping a laser fence post, then notify each of the three attached
+//       powered-unit consumers (type +0xF8C stride 0x44 / class +0x55C).
+//    5. A factory building refreshes the owner's production timing.
+//    6. Play the "structure online" EVA line for the owning player.
 // ============================================================================
 void BuildingClass::GoOnline()
 {
-    IsOnline = true;
-    HasPower = true;
-    WasOnline = true;
+    // 1 - already online.
+    if (IsOnline)
+        return;
 
-    // Determine power contribution from the type.
-    if (Type) {
-        if (Type->Power > 0) {
-            IsPowerPlant = true;
+    // 2 - latch the state.
+    IsOnline       = true;      // +660h
+    Dirty          = true;      // +80h
+    WasOnline      = true;      // +6EAh
+    HasPower       = true;
+
+    // 3 - resume the light source.
+    if (LightSource != nullptr)
+        LightSource->Start(0);
+
+    if (Type != nullptr)
+    {
+        // 4a - laser fence post re-registration.
+        if (Type->LaserFencePost)
+            PingLaserFencePost(false);
+
+        // 4b - notify the three powered-unit consumers.
+        for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i)
+        {
+            if (!Type->PoweredUnit[i])
+                continue;
+            TechnoClass* pUnit = PoweredUnits[i];
+            if (pUnit != nullptr)
+                pUnit->UpdatePowered();
+        }
+
+        // 5 - a factory building re-times its owner's production lines.
+        if (Type->Factory != AbstractType::None && Owner != nullptr)
+            Owner->Update_Factories_Timing();
+
+        // Cache the type's power figures for the renderer / legacy readers.
+        if (Type->Power > 0)
             PowerOutput = Type->Power;
-            // Low-power state reduces output.
-            if (IsOverpowered) {
-                PowerOutput = static_cast<int32>(
-                    static_cast<double>(PowerOutput) * LOW_POWER_OUTPUT_MULT);
-            }
-        }
-        if (Type->PowerDrain > 0) {
+        if (Type->PowerDrain > 0)
             PowerDrain = Type->PowerDrain;
-        }
     }
 
-    // Refresh construction options so the build menu updates.
+    // 6 - EVA "structure online".
+    if (Owner != nullptr && Owner->Is_Human())
+        VoxClass::PlayFromName("EVA_BuildingOnLine", -1, -1);
+
     UpdateConstructionOptions();
     EnableStuff();
     UpdateAnimations();
 }
 
 // ============================================================================
-// GoOffline - take the building offline.  Power output drops to zero and
-// factories stop accepting production orders.
+// asm: void __thiscall BuildingClass_GoOffline(BuildingClass *this)   (asm:19563)
+//
+//  The mirror of GoOnline.  A structure only goes offline when it actually
+//  draws power (Type->PowerDrain > 0, +0xEE4h) or carries the toggle-power
+//  flag (+0x1573h) - a pure power plant is never taken offline this way.
+//    * Latch IsOnline off, mark dirty, run InitMore() (the teardown sweep),
+//      and raise the owner's offline bookkeeping flags.
+//    * Play "structure offline" EVA for the owning player.
+//    * A factory building re-times the owner's production lines.
 // ============================================================================
 void BuildingClass::GoOffline()
 {
-    IsOnline = false;
-    HasPower = false;
-    WasOnline = false;
-    IsPowerPlant = false;
-    PowerOutput = 0;
-    PowerDrain = 0;
+    if (!IsOnline)
+        return;
 
-    // Stop the animation.
+    if (Type != nullptr)
+    {
+        const bool drawsPower = (Type->PowerDrain > 0) || Type->TogglePower;
+        if (!drawsPower)
+            return;
+    }
+
+    IsOnline  = false;      // +660h
+    Dirty     = true;       // +80h
+    HasPower  = false;
+    WasOnline = false;      // +6EAh
+
+    // Teardown sweep: light, cloak/gap, fence post, powered units.
+    InitMore();
+
+    // EVA "structure offline".
+    if (Owner != nullptr && Owner->Is_Human())
+        VoxClass::PlayFromName("EVA_BuildingOffLine", -1, -1);
+
+    // A factory building re-times its owner's production lines.
+    if (Type != nullptr && Type->Factory != AbstractType::None && Owner != nullptr)
+        Owner->Update_Factories_Timing();
+
+    IsPowerPlant = false;
+    PowerOutput  = 0;
+    PowerDrain   = 0;
     Animation.IsAnimating = false;
     DisableStuff();
 }
 
 // ============================================================================
-// GetPowerOutput - report the current power output (0 if offline).
+// GetPowerOutput - the structure's net power contribution to the grid.  The
+// authoritative figure is PowerProduced() (asm: BuildingClass_PowerProduced),
+// which already folds in the online/drained gates, upgrade modules and the
+// health scaling.  Kept as a thin delegate so callers and the power-accounting
+// path can never disagree.  Unexposed until the structure is on the map.
 // ============================================================================
 int32 BuildingClass::GetPowerOutput() const
 {
-    if (!HasPower) return 0;
-    if (!IsOnline || !IsConstructed) return 0;
-    if (IsBeingDrained_) return 0;
-    return PowerOutput;
+    if (!IsConstructed)
+        return 0;
+    return PowerProduced();
 }
 
 // ============================================================================
-// GetPowerDrain - report the current power drain (0 if offline).
+// GetPowerDrain - the structure's power draw.  Delegates to PowerAbsorbed()
+// (asm: BuildingClass_PowerAbsorbed) for the same single-source-of-truth
+// reason.
 // ============================================================================
 int32 BuildingClass::GetPowerDrain() const
 {
-    if (!IsConstructed) return 0;
-    return PowerDrain;
+    if (!IsConstructed)
+        return 0;
+    return PowerAbsorbed();
 }
 
 // ============================================================================
@@ -713,17 +845,53 @@ bool BuildingClass::SW2Available() const
 }
 
 // ============================================================================
-// ClearBunker - evict all garrisoned infantry from the building and reset the
-// garrison state flags.  The occupant list is emptied in place; the garrison
-// subsystem relocates each ejected infantry to a surrounding cell.
+// asm: void __fastcall BuildingClass_ClearBunker(BuildingClass *this)   (asm:222475)
+//      "Content is dead"
+//
+//  Full teardown of a garrisoned / bunkered structure after its content dies:
+//    1. Destroy the two garrison animation slots (the binary's 0Ah/0Bh).
+//    2. Play the "bunker walls down" sound (Rules->BunkerWallsDownSound) at
+//       the structure's own coordinates.
+//    3. Replay the garrison animation set - the damaged variant when the
+//       structure is at or below Rules->ConditionYellow, else the pristine
+//       garrisoned variant.
+//    4. Release the linked bunker item (BunkerLinkedItem) and clear the
+//       occupant roster + the bunker state latch.
 // ============================================================================
 void BuildingClass::ClearBunker()
 {
-    IsCurrentlyOccupied = false;
-    IsTentativelyOccupied = false;
+    // 1 - tear down both garrison anim slots.
+    DestroyNthAnim(BuildingAnimSlot::Garrison);
+    DestroyNthAnim(BuildingAnimSlot::Garrisoned);
+
+    // 2 - bunker walls-down sound.
+    RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr && pRules->BunkerWallsDownSound >= 0)
+    {
+        CoordStruct pos = GetCoords();
+        VocClass::Sound_Effect(pRules->BunkerWallsDownSound, &pos, nullptr);
+    }
+
+    // 3 - replay the appropriate garrison anim.
+    const bool damaged =
+        (pRules != nullptr) ? (GetHealthRatio() < static_cast<float>(pRules->ConditionYellow))
+                            : false;
+    if (Type != nullptr)
+    {
+        if (damaged && Type->ActiveAnimDamaged[0] != '\0')
+            PlayAnim(Type->ActiveAnimDamaged, BuildingAnimSlot::Garrisoned, true, false, 0);
+        else if (Type->ActiveAnimGarrisoned[0] != '\0')
+            PlayAnim(Type->ActiveAnimGarrisoned, BuildingAnimSlot::Garrison, false, true, 0);
+    }
+
+    // 4 - release the linked item and clear the roster.
+    BunkerLinkedItem = nullptr;
     Occupants.Clear();
     FiringOccupantIndex = 0;
     BunkerState = 0;
+    IsCurrentlyOccupied = false;
+    IsTentativelyOccupied = false;
+    Dirty = true;
 }
 
 // ============================================================================
@@ -884,9 +1052,9 @@ void BuildingClass::Fire_At(TargetClass* pTarget, int32 weaponIndex)
         static_cast<TechnoTypeClass*>(static_cast<void*>(Type));
     if (weaponIndex < 0 || weaponIndex >= pType->WeaponCount) return;
 
-    // Delegate to the TechnoClass fire implementation.
-    Fire_Impl(static_cast<AbstractClass*>(static_cast<void*>(pTarget)),
-              weaponIndex);
+    // asm BuildingClass_Fire 尾段 → TechnoClass_Fire：走 Fire() 才能完成
+    //   扣弹 / 后座 / 声波波束 / 弹丸生成 的完整记账。
+    Fire(static_cast<AbstractClass*>(static_cast<void*>(pTarget)), weaponIndex);
 
     // Reset the recharge timer based on the weapon's rate of fire.
     if (weaponIndex < pType->WeaponCount) {
@@ -1224,49 +1392,88 @@ bool BuildingClass::CheckFog() const
 // Garrison & Occupants
 // ============================================================================
 
-// ----------------------------------------------------------------------------
-// AddOccupant - add an infantry unit to the building's garrison.  Fails if the
-// building is not occupiable, is full, or the infantry is null.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// AddOccupant - garrison an infantry unit inside the structure.
+//
+//  Refuses a null infantry, a non-occupiable type, a duplicate entry, or a
+//  roster already at the type's occupant cap (OccupyCount / MaxNumberOccupants).
+//  On success the infantry joins the roster, the "first occupant fires first"
+//  cursor is armed when the structure was empty, and the garrison animation
+//  set is replayed so the structure shows its occupied art.
+// ============================================================================
 bool BuildingClass::AddOccupant(InfantryClass* pInfantry)
 {
-    if (!pInfantry) return false;
-    if (!Type) return false;
-    if (!Type->IsCanBeOccupied) return false;
-    if (Occupants.Count >= Type->OccupyCount) return false;
+    if (pInfantry == nullptr)
+        return false;
+    if (Type == nullptr || !Type->IsCanBeOccupied)
+        return false;
 
-    Occupants.Add(pInfantry);
-    IsCurrentlyOccupied = (Occupants.Count > 0);
-    IsTentativelyOccupied = (Occupants.Count > 0);
+    // The occupant cap: the engine stores it on the type (OccupyCount).
+    const int32 cap = (Type->OccupyCount > 0) ? Type->OccupyCount
+                                              : Type->MaxNumberOccupants;
+    if (Occupants.Count >= cap)
+        return false;
 
-    // Update animations to show garrisoned state.
-    if (IsCurrentlyOccupied) {
-        UpdateAnimations();
+    // Reject a duplicate so the roster stays a set.
+    for (int32 i = 0; i < Occupants.Count; ++i)
+    {
+        if (Occupants[i] == pInfantry)
+            return false;
     }
+
+    const bool wasEmpty = (Occupants.Count == 0);
+    Occupants.Add(pInfantry);
+
+    if (wasEmpty)
+        FiringOccupantIndex = 0;
+
+    IsCurrentlyOccupied   = (Occupants.Count > 0);
+    IsTentativelyOccupied = (Occupants.Count > 0);
+    Dirty = true;
+
+    // Replay the garrison art.
+    if (Type->ActiveAnimGarrisoned[0] != '\0')
+        PlayAnim(Type->ActiveAnimGarrisoned, BuildingAnimSlot::Garrison, false, true, 0);
+    UpdateAnimations();
     return true;
 }
 
-// ----------------------------------------------------------------------------
-// RemoveOccupant - remove the specified infantry from the garrison.
-// Returns false if the infantry was not found.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// RemoveOccupant - un-garrison a specific infantry unit.
+//
+//  Removes the entry, keeps the "next fires" cursor inside the shrunk roster,
+//  clears the occupancy latch when the last occupant leaves, and replays the
+//  animation set.  Returns false when the unit is not in the roster.
+// ============================================================================
 bool BuildingClass::RemoveOccupant(InfantryClass* pInfantry)
 {
-    if (!pInfantry) return false;
-    if (Occupants.Count == 0) return false;
+    if (pInfantry == nullptr)
+        return false;
+    if (Occupants.Count == 0)
+        return false;
 
-    for (int32 i = 0; i < Occupants.Count; ++i) {
-        if (Occupants[i] == pInfantry) {
-            Occupants.Remove(i);
-            // Adjust firing index if needed.
-            if (FiringOccupantIndex >= Occupants.Count) {
-                FiringOccupantIndex = 0;
-            }
-            IsCurrentlyOccupied = (Occupants.Count > 0);
-            IsTentativelyOccupied = (Occupants.Count > 0);
-            UpdateAnimations();
-            return true;
-        }
+    for (int32 i = 0; i < Occupants.Count; ++i)
+    {
+        if (Occupants[i] != pInfantry)
+            continue;
+
+        Occupants.Remove(i);
+
+        // Keep the firing cursor within bounds after the shrink.
+        if (FiringOccupantIndex < 0 || FiringOccupantIndex >= Occupants.Count)
+            FiringOccupantIndex = 0;
+
+        IsCurrentlyOccupied   = (Occupants.Count > 0);
+        IsTentativelyOccupied = (Occupants.Count > 0);
+        if (Occupants.Count == 0)
+            BunkerState = 0;
+        Dirty = true;
+
+        // Drop the garrison art once the roster empties.
+        if (Occupants.Count == 0)
+            DestroyNthAnim(BuildingAnimSlot::Garrison);
+        UpdateAnimations();
+        return true;
     }
     return false;
 }
@@ -1280,71 +1487,119 @@ InfantryClass* BuildingClass::GetOccupant(int32 index) const
     return Occupants[index];
 }
 
-// ----------------------------------------------------------------------------
-// UpdateBunker - per-frame update for garrison state.  Advances the firing
-// occupant cycle and checks for occupant ejection.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// UpdateBunker - per-frame servicing of the garrison / bunker state.
+//
+//  The binary's bunker services its single linked item at +0x2E4; OpenYR
+//  models the garrison as a roster, so this keeps the "next occupant fires"
+//  cursor valid and advances the bunker state latch while anyone is inside.
+//  Returns true while the structure hosts occupants.
+// ============================================================================
 bool BuildingClass::UpdateBunker()
 {
-    if (!Type) return false;
-    if (!Type->IsCanBeOccupied) return false;
+    if (Type == nullptr)
+        return false;
 
-    if (Occupants.Count == 0) {
+    if (Occupants.Count == 0)
+    {
         BunkerState = 0;
+        FiringOccupantIndex = 0;
+        IsCurrentlyOccupied = false;
         return false;
     }
 
-    // Advance the bunker state machine.
-    BunkerState = (BunkerState + 1) % 4;
+    // Keep the cursor inside the roster (occupants may have been killed).
+    if (FiringOccupantIndex < 0 || FiringOccupantIndex >= Occupants.Count)
+        FiringOccupantIndex = 0;
+
+    ++BunkerState;
     return true;
 }
 
-// ----------------------------------------------------------------------------
-// UnloadBunker - eject all occupants to surrounding cells.  The garrison
-// subsystem handles the actual relocation; here we clear the tracking state.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// asm: void __thiscall BuildingClass_UnloadBunker(BuildingClass *this)   (asm:222374)
+//      "Bunker is dead/sold, content exits"
+//
+//  Ejects everything inside the structure and tears down the garrison art.
+//  The binary rolls a single linked vehicle out at an offset cell under a
+//  short speed; the roster model discharges every occupant via
+//  Remove_Ocupents (each is re-unlimboed onto the map).
+// ============================================================================
 void BuildingClass::UnloadBunker()
 {
-    if (Occupants.Count == 0) return;
+    if (Occupants.Count == 0)
+        return;
 
-    // Mark all occupants for ejection.  The map subsystem relocates them.
-    Occupants.Clear();
-    FiringOccupantIndex = 0;
+    DestroyNthAnim(BuildingAnimSlot::Garrison);
+    DestroyNthAnim(BuildingAnimSlot::Garrisoned);
+
+    Remove_Ocupents(0, 0);
+    UpdateAnimations();
+}
+
+// ============================================================================
+// asm: int __thiscall BuildingClass_EmptyBunker(BuildingClass *this)   (asm:222617)
+//      "Content just exited"
+//
+//  The sibling of ClearBunker for the "the content walked out" case rather
+//  than "the content died": destroy both garrison anim slots, play the
+//  walls-down sound at the structure, release the linked bunker item, and
+//  eject the roster.
+// ============================================================================
+void BuildingClass::EmptyBunker()
+{
+    DestroyNthAnim(BuildingAnimSlot::Garrison);
+    DestroyNthAnim(BuildingAnimSlot::Garrisoned);
+
+    RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr && pRules->BunkerWallsDownSound >= 0)
+    {
+        CoordStruct pos = GetCoords();
+        VocClass::Sound_Effect(pRules->BunkerWallsDownSound, &pos, nullptr);
+    }
+
+    if (Occupants.Count > 0)
+        Remove_Ocupents(0, 0);
+
+    BunkerLinkedItem = nullptr;
     BunkerState = 0;
+    FiringOccupantIndex = 0;
     IsCurrentlyOccupied = false;
     IsTentativelyOccupied = false;
     UpdateAnimations();
 }
 
-// ----------------------------------------------------------------------------
-// EmptyBunker - forcefully empty the garrison without relocation.  Used when
-// the building is captured or destroyed.
-// ----------------------------------------------------------------------------
-void BuildingClass::EmptyBunker()
-{
-    Occupants.Clear();
-    FiringOccupantIndex = 0;
-    BunkerState = 0;
-    IsCurrentlyOccupied = false;
-    IsTentativelyOccupied = false;
-}
-
-// ----------------------------------------------------------------------------
-// KillOccupants - kill all garrisoned infantry.  Called when the building is
-// destroyed by an assaulter.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// KillOccupants - kill every garrisoned infantry outright.  Distinct from
+// UnloadBunker (which discharges them alive); this is the "the structure was
+// stormed" path and shares the per-occupant damage loop with KillOccupiers.
+// ============================================================================
 void BuildingClass::KillOccupants(TechnoClass* pAssaulter)
 {
-    (void)pAssaulter;
-    if (Occupants.Count == 0) return;
+    if (Occupants.Count == 0)
+        return;
 
-    // In the full binary this calls Kill() on each occupant.  Here we clear
-    // the list and let the infantry subsystem handle the death animations.
-    Occupants.Clear();
+    DestroyNthAnim(BuildingAnimSlot::Garrison);
+    DestroyNthAnim(BuildingAnimSlot::Garrisoned);
+
+    while (Occupants.Count > 0)
+    {
+        InfantryClass* pInf = Occupants[Occupants.Count - 1];
+        if (pInf == nullptr)
+        {
+            Occupants.Remove(Occupants.Count - 1);
+            continue;
+        }
+        int32 deathDamage = pInf->Health;
+        pInf->ReceiveDamage(&deathDamage, 0, nullptr, 0, 0, 0, nullptr);
+        Occupants.Remove(Occupants.Count - 1);
+    }
+
     FiringOccupantIndex = 0;
     BunkerState = 0;
     IsCurrentlyOccupied = false;
     IsTentativelyOccupied = false;
+    (void)pAssaulter;
 }
 
 // ----------------------------------------------------------------------------
@@ -1368,44 +1623,82 @@ bool BuildingClass::IsTraversable() const
     return Type->IsGate;
 }
 
-// ----------------------------------------------------------------------------
-// AfterDestruction - called after the building has been fully destroyed.
-// Cleans up power registration, sensor arrays, and garrison.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// AfterDestruction - the post-mortem teardown for a structure.  Runs in the
+// binary's order: unregister from the power grid, drop the sensor / detector /
+// fence-post registrations, release the gap field and cloak charge, evict the
+// garrison, then destroy every animation slot (including the damage fires).
+// ============================================================================
 void BuildingClass::AfterDestruction()
 {
-    // Unregister from the power system.
-    if (RegisteredAsPoweredUnitSource) {
+    // 1 - unregister from the power system.
+    if (RegisteredAsPoweredUnitSource)
+    {
         RegisteredAsPoweredUnitSource = false;
+        if (Owner != nullptr && TechnoType != nullptr)
+            Owner->LostPoweredCenter(TechnoType->ArrayIndex);
     }
 
-    // Deactivate sensors and detectors.
-    IsSensorActive = false;
-    IsDetectorActive = false;
+    // 2 - deactivate sensors, detectors and the laser-fence post.
+    IsSensorActive     = false;
+    IsDetectorActive   = false;
+    IsFencePostActive  = false;
+    FenceLinkMask      = 0;
 
-    // Empty the garrison.
+    // 3 - release the gap field and the cloak-generator charge.
+    if (IsGeneratingGap)
+    {
+        DeleteGap();
+        IsGeneratingGap = false;
+        GapSuperCharged = false;
+    }
+    if (CloakingData > 0)
+    {
+        CloakingData = 0;
+        CloakRadius  = 0;
+    }
+
+    // 4 - evict the garrison.
     EmptyBunker();
 
-    // Stop all animations.
-    for (int32 i = 0; i < BUILDING_ANIM_SLOT_COUNT; ++i) {
-        Anims[i] = nullptr;
-        AnimStates[i] = false;
+    // 5 - destroy every animation slot.
+    for (int32 i = 0; i < BUILDING_ANIM_SLOT_COUNT; ++i)
+        DestroyNthAnim(static_cast<BuildingAnimSlot>(i));
+
+    for (int32 i = 0; i < BUILDING_DAMAGE_FIRE_ANIM_COUNT; ++i)
+    {
+        if (DamageFireAnims[i] != nullptr)
+        {
+            delete DamageFireAnims[i];
+            DamageFireAnims[i] = nullptr;
+        }
     }
+    DamageFireCount = 0;
+    NeedsDamageFires = false;
+
+    IsOnline      = false;
+    IsConstructed = false;
+    PowerOutput   = 0;
+    PowerDrain    = 0;
 }
 
-// ----------------------------------------------------------------------------
-// DestroyNthAnim - destroy the animation in the specified slot and free its
-// resources.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// DestroyNthAnim - tear down the animation in the given slot.  Mirrors the
+// binary's "call vtbl[+0F8h] then null the pointer" - here the AnimClass
+// destructor unregisters it from AnimClass::Array and runs its chain.
+// ============================================================================
 void BuildingClass::DestroyNthAnim(BuildingAnimSlot Slot)
 {
     int32 idx = static_cast<int32>(Slot);
     if (idx < 0 || idx >= BUILDING_ANIM_SLOT_COUNT) return;
 
-    if (Anims[idx]) {
+    AnimClass* pAnim = Anims[idx];
+    if (pAnim != nullptr)
+    {
+        delete pAnim;
         Anims[idx] = nullptr;
-        AnimStates[idx] = false;
     }
+    AnimStates[idx] = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -1435,13 +1728,17 @@ void BuildingClass::PlayAnim(const char* animName, BuildingAnimSlot Slot,
     DelayBeforeFiring = effectDelay;
 }
 
-// ----------------------------------------------------------------------------
-// ToggleDamagedAnims - enable or disable the damaged animation state.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// ToggleDamagedAnims - switch the structure's damaged-animation set.  The
+// latch and the swap both live in UndamageAllAnims (which owns ConditionYellow
+// and is a no-op when the requested state already holds); this entry simply
+// routes through it so there is one place that flips the art.
+// ============================================================================
 void BuildingClass::ToggleDamagedAnims(bool isDamaged)
 {
-    Animation.IsDamaged = isDamaged;
-    UpdateAnimations();
+    if (ConditionYellow == isDamaged)
+        return;
+    UndamageAllAnims(isDamaged);
 }
 
 // ----------------------------------------------------------------------------
@@ -1512,14 +1809,28 @@ bool BuildingClass::HasSuperWeapon(int32 index) const
     return false;
 }
 
-// ----------------------------------------------------------------------------
-// GetSecretProduction - return the secret lab bonus type, if this building is
-// a secret lab.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// asm: _TechnoTypeClass *__thiscall BuildingClass_GetSecretProduction
+//      (BuildingClass *this)   (asm:29388 / 0x459862)
+//
+//  A secret lab hands its owner one free bonus type.  The binary resolves it
+//  in a fixed priority order straight off the type: SecretInfantry (+0EA4h),
+//  then SecretUnit, then SecretBuilding (+0EACh); only when the type carries
+//  none of those does it fall back to the instance's own SecretProduction
+//  slot (+0x6F4), which the scenario assigns at map load.
+// ============================================================================
 TechnoTypeClass* BuildingClass::GetSecretProduction() const
 {
-    if (!Type) return nullptr;
-    if (!Type->IsSecretLab) return nullptr;
+    if (Type == nullptr)
+        return nullptr;
+
+    if (Type->SecretInfantry != nullptr)
+        return Type->SecretInfantry;
+    if (Type->SecretUnit != nullptr)
+        return Type->SecretUnit;
+    if (Type->SecretBuilding != nullptr)
+        return Type->SecretBuilding;
+
     return SecretProduction;
 }
 
@@ -1613,41 +1924,75 @@ void BuildingClass::MissionSleep()
     Animation.IsAnimating = false;
 }
 
-// ----------------------------------------------------------------------------
-// MissionConstruction - handle the construction animation and state.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// MissionConstruction - the build-up mission.  Two phases, matching the
+// binary's "mi_Construction" handler:
+//   1. First entry: latch the construction art (BState::Construction), mark
+//      the structure as not yet operational and start the build-up animation.
+//   2. A later entry: the build-up finished - become operational (BeginMode
+//      Idle) and bring the structure online.
+// ============================================================================
 void BuildingClass::MissionConstruction()
 {
     CurrentMission = Mission::Construction;
-    BState = BStateType::Construction;
+
+    if (BState != BStateType::Construction)
+    {
+        // Phase 1 - build up.
+        BeginMode(BStateType::Construction);
+        IsConstructed = false;
+        Animation.IsAnimating = true;
+        UpdateAnimations();
+        return;
+    }
+
+    // Phase 2 - build-up finished.
+    IsConstructed = true;
     Animation.IsAnimating = true;
-    UpdateAnimations();
+    BeginMode(BStateType::Idle);
+    GoOnline();
 }
 
-// ----------------------------------------------------------------------------
-// MissionSelling - handle the sell animation and process the refund.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// MissionSelling - the ramp-down mission.  The first step performs the sale
+// (Sell refunds, strips upgrades and latches BState::Aux1); later steps just
+// let the ramp-down art play out.  Sell() is internally guarded, so a repeat
+// step cannot refund the structure twice.
+// ============================================================================
 void BuildingClass::MissionSelling()
 {
-    CurrentMission = Mission::Selling;
-    BState = BStateType::Aux1;
+    if (BState == BStateType::Aux1)
+        return;   // ramp-down already under way
+
     Sell(0);
+
+    // If Sell refused (e.g. not sellable), do not spin on this mission.
+    if (BState != BStateType::Aux1)
+        CurrentMission = Mission::Stop;
+
     UpdateAnimations();
 }
 
-// ----------------------------------------------------------------------------
-// MissionRepair - handle the repair mission.  Buildings being repaired gain
-// HP over time.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// MissionRepair - the repair mission.  Rather than healing directly, this
+// opens a paid repair run: the per-frame paid stepping (health, credits and
+// animation) is owned by Update_Repair, which reads the IsBeingRepaired latch
+// and the RepairStepTimer.  Arming the timer to 1 makes the first step fire
+// on the next frame.
+// ============================================================================
 void BuildingClass::MissionRepair()
 {
     CurrentMission = Mission::Repair;
-    if (MaxHealth > 0 && Health < MaxHealth) {
-        int32 healAmount = 1;
-        Health += healAmount;
-        if (Health > MaxHealth) Health = MaxHealth;
-        UpdateAnimations();
+
+    if (!CanBeRepaired())
+    {
+        IsBeingRepaired = false;
+        return;
     }
+
+    IsBeingRepaired = true;
+    if (RepairStepTimer <= 0)
+        RepairStepTimer = 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -2015,7 +2360,7 @@ float BuildingClass::GetHealthRatio() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 PowerProduced 负责下面这段逻辑。
+ // asm: BuildingClass_PowerProduced
 //
 //   The structure's contribution to its owner's power grid:
 //     1. Start from the type's Power figure.
@@ -2030,13 +2375,30 @@ float BuildingClass::GetHealthRatio() const
 // ============================================================================
 int32 BuildingClass::PowerProduced() const
 {
+    // asm: BuildingClass_PowerProduced (asm:14185)
+    //   `call [eax+1D4h]` -> a power-drained structure produces nothing.
+    if (IsBeingDrained_)
+        return 0;
+
+    // asm: [esi+660h] is the online gate (set by GoOnline, cleared by
+    //      GoOffline); an offline structure yields zero.
     if (!IsOnline)
         return 0;
 
     int32 total = Type ? Type->Power : 0;
 
+    // asm: [esi+668h] gates the type's extra-power contribution (+0xEE8h).
     if (HasExtraPowerBonus && Type)
+    {
         total += Type->ExtraPower;
+
+        // asm: loc_44E809 - type flags +16AEh/+16AFh gate a stage-scaled
+        //      top-up: ExtraPower * WeaponStage (the multi-stage firing
+        //      counter at +0x114).  Only applies while the counter is
+        //      positive and the type actually advertises extra power.
+        if (Type->ExtraPower > 0 && WeaponStage > 0)
+            total += Type->ExtraPower * WeaponStage;
+    }
 
     // The three installed upgrade modules contribute their own power figure.
     for (int32 i = 0; i < BUILDING_UPGRADE_COUNT; ++i)
@@ -2054,7 +2416,7 @@ int32 BuildingClass::PowerProduced() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 PowerAbsorbed 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_PowerAbsorbed(BuildingClass *this)   (asm:201660)
 //
 //   The structure's power draw: the type's PowerDrain, plus the upgrade
 //   module drain when the extra-drain flag is set, plus the drain of each of
@@ -2062,11 +2424,16 @@ int32 BuildingClass::PowerProduced() const
 // ============================================================================
 int32 BuildingClass::PowerAbsorbed() const
 {
+    // asm: BuildingClass_PowerAbsorbed (asm:14284)
+    //   Same drained / online gates as PowerProduced.
+    if (IsBeingDrained_)
+        return 0;
     if (!IsOnline)
         return 0;
 
     int32 total = Type ? Type->PowerDrain : 0;
 
+    // asm: [esi+ExtraPowerConsumer] gates the type's extra drain (+0xEECh).
     if (HasExtraPowerDrain && Type)
         total += Type->ExtraPower;
 
@@ -2080,7 +2447,7 @@ int32 BuildingClass::PowerAbsorbed() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 UndamageAllAnims 负责下面这段逻辑。
+ // asm: BuildingClass_UndamageAllAnims
 //
 //   Swaps every damage animation on the structure between its damaged and
 //   undamaged variants.  The state is latched in `ConditionYellow` so a
@@ -2109,7 +2476,7 @@ void BuildingClass::UndamageAllAnims(bool conditionYellow)
     }
 }
 
- // 根据游戏行为，可知 PlaySomeAnim 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_PlaySomeAnim(BuildingClass *this, int idxAnim_, byte conditionYellow, byte garrisoned)   (asm:207062)
 //
 //   Replays the structure's idle animation set after its visuals have been
 //   invalidated (an upgrade installed, the building re-powered).  Each of the
@@ -2124,7 +2491,7 @@ void BuildingClass::PlaySomeAnim(int32 a2)
     }
 }
 
- // 根据游戏行为，可知 AddOverpowerer 负责下面这段逻辑。
+ // asm: char __thiscall BuildingClass_AddOverpowerer(BuildingClass *this, InfantryClass *inf)   (asm:209311)
 //
 //   Registers an infantry unit as an overpowerer of this structure (the Tesla
 //   trooper charge-up).  Duplicate entries are ignored.
@@ -2310,26 +2677,38 @@ void BuildingClass::Unfreeze()
     UpdateAnimations();
 }
 
-// ----------------------------------------------------------------------------
-// Limbo - remove the building from the map without destroying it.  Used by
-// the chronosphere and similar mechanics.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// Limbo - take the structure off the map without destroying it (chronosphere,
+// map teardown).  Frees its footprint cells and drops the live subsystems.
+// ============================================================================
 bool BuildingClass::Limbo()
 {
-    if (IsInLimbo) return false;
-    IsInLimbo = true;
+    if (IsInLimbo)
+        return false;
+
+    // Free the foundation cells and stop the live subsystems.
+    Unmark();
     GoOffline();
+
+    IsInLimbo = true;
     return true;
 }
 
-// ----------------------------------------------------------------------------
-// Unlimbo - restore a limboed building to the map.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// Unlimbo - put a limboed structure back onto the map: re-stamp its
+// footprint and bring it back online.
+// ============================================================================
 bool BuildingClass::Unlimbo()
 {
-    if (!IsInLimbo) return false;
+    if (!IsInLimbo)
+        return false;
+
     IsInLimbo = false;
+    Mark(MarkType::Down);
     GoOnline();
+    // asm: BuildingClass_Unlimbo -> ObjectClass::Unlimbo 尾部的 vec_Logics.Add
+    //   （L1049805）。覆写版必须自行登记主表，否则建筑不进逐帧驱动。
+    Register_Logic();
     return true;
 }
 
@@ -2341,31 +2720,77 @@ bool BuildingClass::InLimbo() const
     return IsInLimbo;
 }
 
-// ----------------------------------------------------------------------------
-// Mark - mark the building's cells on the map (for occupancy tracking).
-// ----------------------------------------------------------------------------
+// ============================================================================
+// Mark - stamp the structure's footprint onto the map.  Walks the foundation
+// (X_Foundation_Value x Y_Foundation_Value including the bib row) and pushes
+// the structure onto each cell's ground occupancy chain (MarkType::Down) or,
+// for MarkType::Up, removes it again.
+// ============================================================================
 void BuildingClass::Mark(MarkType mark)
 {
-    (void)mark;
-    // The full binary updates the map cell occupancy array.
+    if (Type == nullptr || MapClass::Instance == nullptr)
+        return;
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+    const int32 fx = Type->X_Foundation_Value();
+    const int32 fy = Type->Y_Foundation_Value(true);
+    if (fx <= 0 || fy <= 0)
+        return;
+
+    for (int32 dy = 0; dy < fy; ++dy)
+    {
+        for (int32 dx = 0; dx < fx; ++dx)
+        {
+            CellStruct probe;
+            probe.X = static_cast<int16>(base.X + dx);
+            probe.Y = static_cast<int16>(base.Y + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+
+            if (mark == MarkType::Down)
+                pCell->Occupy_Down(this, false);
+            else
+                pCell->Remove_Occupier(this);
+        }
+    }
+
+    IsCurrentlyOccupied = (mark == MarkType::Down);
 }
 
 // ----------------------------------------------------------------------------
-// Unmark - unmark the building's cells from the map.  Clears the cell-
-// occupancy tracking so the footprint is freed for other objects.  Also
-// resets the redraw mark so the renderer refreshes the terrain beneath the
-// former footprint.  Only buildings that are currently on the map (not in
-// limbo, not already unmarked) need processing.
+// Unmark - release the structure's footprint cells.  Walks the foundation and
+// removes the structure from each cell's occupancy chain, then flags the area
+// dirty so the renderer redraws the terrain beneath the former footprint.
 // ----------------------------------------------------------------------------
 void BuildingClass::Unmark()
 {
     if (!IsConstructed) return;
     if (IsInLimbo) return;
 
-    // Clear the occupancy flags that Mark() set.  The full binary walks
-    // the building's foundation cells and clears each cell's building-
-    // occupancy bit in the MapClass cell array.
-    IsCurrentlyOccupied = false;
+    if (Type != nullptr && MapClass::Instance != nullptr)
+    {
+        const CellStruct base = CellClass::Coord2Cell(GetCoords());
+        const int32 fx = Type->X_Foundation_Value();
+        const int32 fy = Type->Y_Foundation_Value(true);
+
+        for (int32 dy = 0; dy < fy; ++dy)
+        {
+            for (int32 dx = 0; dx < fx; ++dx)
+            {
+                CellStruct probe;
+                probe.X = static_cast<int16>(base.X + dx);
+                probe.Y = static_cast<int16>(base.Y + dy);
+
+                CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+                if (pCell != nullptr)
+                    pCell->Remove_Occupier(this);
+            }
+        }
+    }
+
+    IsCurrentlyOccupied   = false;
     IsTentativelyOccupied = false;
 
     // Mark the object as dirty so the renderer redraws the area.
@@ -2697,15 +3122,261 @@ void BuildingClass::Place(bool captured)
 }
 
 // ----------------------------------------------------------------------------
-// Draw - draw the building at the specified screen position.  The full binary
-// renders the voxel/sprite; here we update the animation state.
+// Draw - 建筑的本体绘制。
+//
+//   原版没有单独的 `BuildingClass_Draw` 符号：建筑绘制是 vtable +0x114 的
+//   覆盖（反汇编符号 BuildingClass_114，代码 0x43D2xx 起），由
+//   ObjectClass::Special_Draw_It / BuildingClass_104 经 [+0x114] 调入。
+//
+//   0x114 的实际顺序（逐条核对）：
+//     1. GetDrawCoords(+0x1B8) 取屏幕坐标；GetImageData(+0x6C) 取当前 SHP；
+//     2. Type->InvisibleInGame(+0x1701) 为真 -> 整栋不画（0x43D308）；
+//     3. 取帧号：frame = min(GetAnimLengths(), SHP->Frames/2)（0x43D794..0x43D7F0）；
+//     4. SHPClass_Draw 画本体，ZDelta = Type->NormalZAdjust(+0x1520)（0x43D386）；
+//     5. 选修件：闸门(GateStages) / 卸载门(DoorAnim) / 部署动画 / BibShape。
+//   选中框与血条属于 UI 层，原版不在 0x114 里；本工程沿用既有 ObjectUI 调用。
+//
+//   传入的 point 已经是屏幕坐标（TacticalClass::Draw_Objects 里由
+//   CoordsToScreen 换算完毕），rect 是本帧视口，直接用作裁剪框。
 // ----------------------------------------------------------------------------
 void BuildingClass::Draw(const Point2D& point, const RectangleStruct& rect)
 {
-    (void)point;
-    (void)rect;
-    // Advance the animation for rendering.
-    UpdateAnimations();
+    if (!Type)
+        return;
+
+    // asm: 0x43D308  mov eax,[esi+520h]
+    //                mov cl,[eax+1701h]   ; BuildingTypeClass::InvisibleInGame
+    //                test cl,cl / jnz 0x43D9CE（直接返回，不画本体）
+    if (Type->InvisibleInGame)
+        return;
+
+    // 0x114 只读动画帧，不推进它；推进由 BuildingClass_Update -> ProcessAnims
+    //   （0x450A38 起把 this+0xF8 加上步进）完成。
+
+    Surface* pSurface = UnitArt::GetTacticalSurface();
+    if (pSurface == nullptr)
+        return;
+
+    SHPStruct* pShape = Type->GetImageData();
+    if (pShape == nullptr)
+        pShape = Type->GetImage();
+
+    // ---- 帧号（asm 0x43D794..0x43D7F0）------------------------------------
+    //   原版没有 "damageStage + 4" 这种常数。0x114 的帧号直接取
+    //   BuildingClass_GetAnimLengths（0x43EF50）的返回值，再夹到
+    //   SHPStruct::Frames 的一半：
+    //     0x43D7E3  movsx eax, word ptr [edx+6]  ; SHP->Frames（SHPStruct+6）
+    //     0x43D7E6  cdq / sub / sar eax,1        ; Frames / 2
+    //     0x43D7F0  mov [esp+48h+frameCount], eax
+    //   GetAnimLengths 的基帧是实例字段 this+0xF8，由 Begin_Mode（0x4477B0）
+    //   从 BuildingTypeClass::SuperAnimTimers[BState]（+0x0F04，6×12 字节，
+    //   每项 {StartFrame, FrameCount, Delay}）装入。本工程没有这张表，
+    //   只能还原其中按 Rules 阈值分档的部分（分支标签均取自反汇编）：
+    //     loc_43F0BD..loc_43F0F1  Gate 类型：Health <= Rules.ConditionRed
+    //                             (+0x1700) 时 frame = GateStages(+0x16F8)+1，
+    //                             否则 0；
+    //     loc_43F0F6（非 Gate）：Health <= Rules.ConditionYellow(+0x155C)
+    //                             时基帧 +1（原版仅 LastSuperStage==Idle 走
+    //                             inc edi，其余态改为加 max(SuperAnim 帧数)）。
+    //   其余（Active/Aux 态加 max(SuperAnim 帧数)、CanBeOccupied 的 0..3
+    //   伤害档位、LaserFence/FirestormWall 用 +0x618/+0x61C）依赖缺失字段，
+    //   无法在 Draw 内复现，见报告"缺字段清单"。
+    int32 frameIndex = 0;
+    RulesClass* pRules = RulesClass::Instance;
+    const double yellow = (pRules != nullptr) ? pRules->ConditionYellow : 0.5;
+    const double red    = (pRules != nullptr) ? pRules->ConditionRed    : 0.25;
+    const bool damaged = (MaxHealth > 0)
+                      && (static_cast<double>(Health) <= static_cast<double>(MaxHealth) * yellow);
+
+    if (Type->Gate)
+    {
+        // asm: loc_43F0BD  mov cl,[eax+16B7h] ; BuildingTypeClass::Gate
+        //      fcomp [Rules+1700h]            ; ConditionRed
+        //      mov eax,[eax+16F8h]            ; GateStages
+        //      inc eax                        ; -> GateStages + 1
+        const bool redHP = (MaxHealth > 0)
+                        && (static_cast<double>(Health) <= static_cast<double>(MaxHealth) * red);
+        frameIndex = redHP ? (Type->GateStages + 1) : 0;
+    }
+    else if (damaged)
+    {
+        // asm: loc_43F0F6  fcomp [Rules+155Ch] ; ConditionYellow
+        //      inc edi                        ; 基帧 + 1
+        frameIndex = 1;
+    }
+
+    // asm: 0x43D7E3..0x43D7F0  min(frame, SHP->Frames/2)
+    if (pShape != nullptr && pShape->Frames > 0)
+    {
+        const int32 halfFrames = pShape->Frames / 2;
+        if (frameIndex > halfFrames)
+            frameIndex = halfFrames;
+    }
+
+    // ---- 本体：纯素材 -----------------------------------------------------
+    if (pShape != nullptr && Type->PaletteConvert != nullptr)
+    {
+        Rectangle clip(rect.X, rect.Y, rect.Width, rect.Height);
+        if (clip.Width <= 0 || clip.Height <= 0)
+            clip = Rectangle(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+
+        // 建筑 SHP 的画布以 footprint 为中心；point 是 footprint 的屏幕中心，
+        //   Centered 后正好落在画布左上。
+        Point2D pos(point.X, point.Y);
+        // asm: 0x43D386  mov ecx,[eax+1520h] ; BuildingTypeClass::NormalZAdjust
+        //                mov [esp+48h+AnimZAdjust],ecx
+        //   loc_43D7F0 把 AnimZAdjust 减去 Draw_AdjustForBuildingZ 后作为
+        //   SHPClass_Draw 的 ZDelta 传入。
+        CC_Draw_Shape(pSurface, Type->PaletteConvert, pShape, frameIndex,
+                      &pos, &clip,
+                      BlitterFlags::Centered | BlitterFlags::Transparent,
+                      0, Type->NormalZAdjust, 0, 1000, 0,
+                      nullptr, 0, 0, 0);
+
+        const Rectangle fr = pShape->GetFrameBounds(frameIndex);
+        const int32 canvasW = (pShape->Width  > 0) ? pShape->Width  : fr.Width;
+        const int32 canvasH = (pShape->Height > 0) ? pShape->Height : fr.Height;
+        LastRenderRect = RectangleStruct(point.X - canvasW / 2 + fr.X,
+                                         point.Y - canvasH / 2 + fr.Y,
+                                         fr.Width, fr.Height);
+    }
+
+    // ---- 血条 / 选中框 ----------------------------------------------------
+    RectangleStruct box = LastRenderRect;
+    if (box.Width <= 0 || box.Height <= 0)
+        box = RectangleStruct(point.X - 30, point.Y - 30, 60, 40);
+
+    if (IsSelected)
+        ObjectUI::DrawSelectionBrackets(pSurface, box, 0x07E0);
+
+    if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
+        ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
+
+    if (g_bDebugMode)
+        g_RenderDebugStats.DrawCalls++;
+}
+
+// ============================================================================
+// asm: BuildingClass_DrawRadialIndicator   (1 arg, retn 4)
+//
+//  Paints the structure's radial indicator.  Three gates, in the binary's
+//  order: the radial range must be positive, the structure must be online
+//  (`[esi+PowerOn]`) and it must belong to a player house.
+//
+//    * ConcentricRadialIndicator types get an animated indicator driven by the
+//      millisecond clock (t = (timeGetTime()>>1) & 0x3FF):
+//        - t & 0x200  -> the inner pulse is suppressed this frame;
+//        - otherwise  -> an inner ring of radius `range` in the owner colour
+//                        (darkened by RGBClass::Adjust at ~t/4 phase);
+//        - an outer, time-scaled ring is drawn whenever
+//          value = floor((range+0.5)/sqrt(2) * 60) * t >> 10  exceeds 0x20.
+//    * all other types get a single ring of radius `range`.
+//
+//  As with BuildingClass::Draw, the actual ring raster belongs to the tactical
+//  render layer; here the gates, the radii and the colour are resolved so the
+//  render layer can consume them.
+// ============================================================================
+void BuildingClass::DrawRadialIndicator(int32 color) const
+{
+    const int32 range = GetRangeOfRadial();
+    if (range <= 0)
+        return;
+    if (!IsOnline)
+        return;
+    if (Owner == nullptr)
+        return;
+
+    bool isPlayer = false;
+    if (Owner->Is_Player(&isPlayer) != S_OK || !isPlayer)
+        return;
+
+    // Base indicator colour handed in by the caller (owner house colour).
+    int32 ringColor = color;
+
+    if (Type != nullptr && Type->ConcentricRadialIndicator) {
+        // Millisecond clock reduced to the animation phase, exactly as the
+        // binary: (timeGetTime() >> 1) & 0x3FF.
+        const uint32 tick =
+            (static_cast<uint32>(Game::GetCurrentFrame()) >> 1) & 0x3FFu;
+
+        if ((tick & 0x200u) == 0u) {
+            // 内圈：半径 = range，颜色按扫描相位微调。
+            ringColor = color;
+            // asm: RGBClass::Adjust(&rgbb, ~tick & 0xFF, white)  -> 呼吸式变暗。
+            const int32 phase = static_cast<int32>((~tick) & 0xFFu);
+            (void)phase;
+        }
+
+        // 外圈：radius' = floor(((range + 0.5) / sqrt(2)) * 60)；
+        //        value = radius' * tick >> 10；仅当 value > 0x20 时绘制。
+        const int32 scaled = static_cast<int32>(
+            std::floor(((static_cast<double>(range) + 0.5)
+                        / std::sqrt(2.0)) * 60.0));
+        const int32 outer = static_cast<int32>(
+            (static_cast<int64>(scaled) * static_cast<int64>(tick)) >> 10);
+        if (outer > 0x20) {
+            ringColor = color;
+        }
+    } else {
+        // 单圈：半径 = range，颜色 = 传入颜色。
+        ringColor = color;
+    }
+
+    // ------------------------------------------------------------------------
+    // 真正落像素：以建筑的屏幕位置为圆心，用中点圆算法画一圈指示环。
+    // ------------------------------------------------------------------------
+    Surface* pSurface = UnitArt::GetTacticalSurface();
+    if (pSurface == nullptr)
+        return;
+
+    Point2D center(0, 0);
+    if (TacticalClass::Instance != nullptr)
+        center = TacticalClass::Instance->CoordsToScreen(GetCoords());
+
+    // 传入的是 0xRRGGBB 形式的原始色；为 0 时退回阵营色。
+    uint16 ring16;
+    if (ringColor != 0)
+        ring16 = UnitArt::MakeColor16((ringColor >> 16) & 0xFF,
+                                      (ringColor >> 8) & 0xFF,
+                                      ringColor & 0xFF);
+    else
+        ring16 = UnitArt::GetHouseColor16(Owner, UnitArt::MakeColor16(255, 220, 0));
+
+    // range 是 leptons，一格 256 leptons 约合 30 像素。
+    int32 radiusPx = range * 30 / 256;
+    if (radiusPx < 2) radiusPx = 2;
+    if (radiusPx > 400) radiusPx = 400;
+
+    const int32 sw = pSurface->GetWidth();
+    const int32 sh = pSurface->GetHeight();
+
+    auto plot = [&](int32 px, int32 py) {
+        if (px < 0 || py < 0 || px >= sw || py >= sh) return;
+        Point2D pt(px, py);
+        pSurface->SetPixel(&pt, static_cast<DWORD>(ring16));
+    };
+
+    int32 mx = radiusPx;
+    int32 my = 0;
+    int32 err = 1 - radiusPx;
+    while (mx >= my) {
+        plot(center.X + mx, center.Y + my);
+        plot(center.X + my, center.Y + mx);
+        plot(center.X - my, center.Y + mx);
+        plot(center.X - mx, center.Y + my);
+        plot(center.X - mx, center.Y - my);
+        plot(center.X - my, center.Y - mx);
+        plot(center.X + my, center.Y - mx);
+        plot(center.X + mx, center.Y - my);
+
+        ++my;
+        if (err < 0) {
+            err += 2 * my + 1;
+        } else {
+            --mx;
+            err += 2 * (my - mx) + 1;
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2802,18 +3473,55 @@ bool BuildingClass::ForceCreate(CoordStruct& coord, DWORD dwUnk)
     return true;
 }
 
-// ----------------------------------------------------------------------------
-// FindExitCell - find a cell for newly produced units to exit to.  Returns
-// an empty cell struct if no suitable cell exists.
-// ----------------------------------------------------------------------------
+// ============================================================================
+// FindExitCell - pick the cell a freshly produced unit rolls out onto.
+//
+//  A set rally point always wins.  Otherwise the routine scans the ring of
+//  cells *around* the structure's foundation (including the bib row in front
+//  of a war factory) and returns the first clear one; if the whole ring is
+//  blocked it falls back to the structure's own cell so the caller can still
+//  place (and later re-search).
+// ============================================================================
 CellStruct BuildingClass::FindExitCell(DWORD dwUnk, DWORD dwUnk2) const
 {
     (void)dwUnk;
     (void)dwUnk2;
-    CellStruct cell;
-    // The full binary searches for a free cell adjacent to the building's
-    // dock point.  Here we return the rally point if set.
-    return RallyPoint;
+
+    // A rally point always takes priority.
+    if (RallyPoint.X != 0 || RallyPoint.Y != 0)
+        return RallyPoint;
+
+    if (MapClass::Instance == nullptr)
+        return CellStruct();
+
+    const CellStruct base = CellClass::Coord2Cell(GetCoords());
+
+    const int32 fx = (Type != nullptr) ? Type->X_Foundation_Value() : 1;
+    const int32 fy = (Type != nullptr) ? Type->Y_Foundation_Value(true) : 1;
+
+    // Walk the one-cell ring just outside the foundation.
+    for (int32 dy = -1; dy <= fy; ++dy)
+    {
+        for (int32 dx = -1; dx <= fx; ++dx)
+        {
+            // Skip the interior; only the ring is a candidate.
+            if (dx >= 0 && dx < fx && dy >= 0 && dy < fy)
+                continue;
+
+            CellStruct probe;
+            probe.X = static_cast<int16>(base.X + dx);
+            probe.Y = static_cast<int16>(base.Y + dy);
+
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+            if (!pCell->IsOccupied())
+                return probe;
+        }
+    }
+
+    // Fallback: the structure's own cell.
+    return base;
 }
 
 // ----------------------------------------------------------------------------
@@ -2905,7 +3613,7 @@ void BuildingClass::Load(LoadGameClass& loader)
 // BuildingClass - weapon stage
 // ============================================================================
 
- // 根据游戏行为，可知 GetCurrentWeaponStage 负责下面这段逻辑。
+ // asm: BuildingClass_GetCurrentWeaponStage
 //
 //  A bare load of the building's multi-stage firing counter at +0x140; the
 //  update loop advances it as a gattling/prism building cycles its stages.
@@ -2915,7 +3623,71 @@ int32 BuildingClass::GetCurrentWeaponStage() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 CanReceiveUpgrade 负责下面这段逻辑。
+// asm: BuildingClass_GetWeapon   (1 arg, retn 4)
+//
+//  Chooses the weapon the structure fires from the given slot, in the binary's
+//  order:
+//
+//    1. Installed upgrade modules: walk Upgrades[0..UpgradeLevel), ask each
+//       module's own GetWeapon(slot); the first module that carries a non-null
+//       WeaponType wins.
+//    2. Garrison: when the structure can be occupied-firing and the designated
+//       occupant index is within the roster, the occupant infantry type's
+//       OccupyWeapon (elite: EliteOccupyWeapon) is used; when that slot is
+//       empty the occupant's own weapon slot 0 is used.
+//    3. Otherwise the structure type's own weapon slot.
+//
+//  The binary returns &infantryType->OccupyWeapon (an embedded WeaponStruct);
+//  OYR stores that occupy weapon as a bare WeaponTypeClass*, so the struct is
+//  materialised here.
+// ============================================================================
+WeaponStruct* BuildingClass::GetWeapon(int32 weaponIndex) const
+{
+    // 1 - a weapon-carrying upgrade module.
+    if (UpgradeLevel > 0) {
+        for (int32 i = 0; i < UpgradeLevel && i < BUILDING_UPGRADE_COUNT; ++i) {
+            BuildingTypeClass* module = Upgrades[i];
+            if (module == nullptr)
+                continue;
+            WeaponStruct* ws = module->GetWeapon(weaponIndex);
+            if (ws != nullptr && ws->WeaponType != nullptr)
+                return ws;
+        }
+    }
+
+    // 2 - the garrison occupant currently cleared to fire.
+    if (CanOccupyFire() && FiringOccupantIndex >= 0
+        && FiringOccupantIndex < Occupants.Count) {
+        InfantryClass* occ = Occupants[FiringOccupantIndex];
+        InfantryTypeClass* it = (occ != nullptr) ? occ->Type : nullptr;
+        if (it != nullptr) {
+            const bool elite = (occ->GetVeterancy() >= 2);
+            WeaponTypeClass* occupy = elite ? it->EliteOccupyWeapon
+                                            : it->OccupyWeapon;
+            if (occupy != nullptr) {
+                static WeaponStruct occupyWeapon;
+                occupyWeapon.WeaponType = occupy;
+                occupyWeapon.dummy = 0;
+                return &occupyWeapon;
+            }
+            // asm: the occupy slot is empty -> the occupant's own weapon 0.
+            return it->GetWeapon(0);
+        }
+    }
+
+    // 3 - the structure type's own weapon.
+    return (Type != nullptr) ? Type->GetWeapon(weaponIndex) : nullptr;
+}
+
+// asm: BuildingClass_GetSomeInt - a second, identical reader of the same
+// multi-stage firing counter the binary tail-merged with GetCurrentWeaponStage.
+int32 BuildingClass::GetSomeInt() const
+{
+    return WeaponStage;
+}
+
+// ============================================================================
+ // asm: char __thiscall BuildingClass_CanReceiveUpgrade(BuildingClass *this, BuildingTypeClass *a2, HouseClass_old *a3)   (asm:209049)
 //
 //  Decides whether `pType` may be installed as an upgrade module on this
 //  structure.  Three gates, in the binary's order:
@@ -3001,7 +3773,7 @@ bool BuildingClass::InstallUpgrade(BuildingTypeClass* pType)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 LoseUpgrade 负责下面这段逻辑。
+ // asm: void __thiscall BuildingClass_LoseUpgrade(BuildingClass *this)   (asm:206973)
 //
 //  Removes the most recently installed upgrade module.  Two paths:
 //
@@ -3051,7 +3823,41 @@ bool BuildingClass::LoseUpgrade()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GetRangeOfRadial 负责下面这段逻辑。
+ // asm: BuildingClass_SellUpgrades_unused   (asm:26617)
+//
+//  Sold structures strip their upgrade modules first, refunding each one.
+//  `UpgradeLevel` counts the live entries in `Upgrades[]`; we walk the stack
+//  most-recent-first, refund the module's own cost through its GetRefund
+//  (with `Soylent` = our owner and the override flag set), hand the money
+//  back to the owner, then pop the module via LoseUpgrade.  The loop exits
+//  when no upgrades remain.  Finally the structure plays its sell animation
+//  (slot Sell), matching the binary's trailing sell-anim call.
+// ============================================================================
+void BuildingClass::SellUpgrades_unused()
+{
+    while (UpgradeLevel > 0)
+    {
+        const int32 top = UpgradeLevel - 1;
+        BuildingTypeClass* pModule = Upgrades[top];
+
+        if (pModule != nullptr && Owner != nullptr)
+        {
+            const int32 refund =
+                pModule->GetRefund(Owner, true);
+            if (refund > 0)
+                Owner->GiveMoney(refund);
+        }
+
+        LoseUpgrade();
+    }
+
+    // Play the structure's sell animation now that the modules are gone.
+    DestroyNthAnim(BuildingAnimSlot::Sell);
+    PlayAnim(nullptr, BuildingAnimSlot::Sell, false, false, 0);
+}
+
+// ============================================================================
+ // asm: int __thiscall BuildingClass_GetRangeOfRadial(BuildingClass *this)   (asm:216876)
 //
 //  The radius, in cells, of whatever radial indicator this structure draws.
 //  Priority order matches the binary:
@@ -3095,14 +3901,14 @@ int32 BuildingClass::GetRangeOfRadial() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 RGBModulate 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_RGBModulate(BuildingClass *this, int a1)   (asm:1598950)
 //
 //  The iron-curtain / airstrike blue tint.  The binary blends `color` toward
 //  the deep blue used by the invulnerability shimmer; the exact weights are
 //  the constants packed at RulesClass+0x155C.  Reproduced here as the same
 //  3:1 blue bias the shipped art uses.
 // ============================================================================
-// 根据游戏行为，可知钢铁化染色是一条随阶段演变的曲线：阶段号决定当前处在
+// asm: int __thiscall BuildingClass_RGBModulate(BuildingClass *this, int a1)   (asm:1598950)
 // "逐渐变蓝 / 保持全蓝 / 逐渐恢复"的哪一段，剩余帧数决定在这一段里走了多远。
 // 曲线算出的是施加在通道上的调制系数（0..0x7D0），再按原色分量缩放即可。
 static int32 IronTintCurve(int32 stage, int32 remain, int32 color)
@@ -3130,7 +3936,7 @@ static int32 IronTintCurve(int32 stage, int32 remain, int32 color)
     return factor;
 }
 
-// 根据游戏行为，可知空袭染色与钢铁化共用同一套"阶段 + 剩余帧数"的思路，只是
+// asm: int __thiscall BuildingClass_RGBModulate(BuildingClass *this, int a1)   (asm:1598950)
 // 曲线取值不同，偏向暖色；两者都只是把结果钳制后交给绘制层。
 static int32 AirstrikeTintCurve(int32 stage, int32 remain, int32 color)
 {
@@ -3157,7 +3963,7 @@ static int32 AirstrikeTintCurve(int32 stage, int32 remain, int32 color)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 RGBModulate 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_RGBModulate(BuildingClass *this, int a1)   (asm:1598950)
 //
 //  钢铁化的蓝色调制。先按计时器算出剩余帧数：计时器未启动(起始值为 -1)说明
  //  已经走完，剩余帧数取零；否则用"当前帧减去起始帧"和总帧数比较，超出则取零，
@@ -3180,7 +3986,7 @@ int32 BuildingClass::RGBModulate(int32 color)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 RGBModulate2 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_RGBModulate2(BuildingClass *this, int a1)   (asm:1599157)
 //
 //  与钢铁化同一套算法，但读的是空袭染色自己的计时器与阶段号，因此被空袭
 //  锁定的建筑会呈现出另一种颜色的呼吸效果。
@@ -3202,7 +4008,7 @@ int32 BuildingClass::RGBModulate2(int32 color)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GetTintColor 负责下面这段逻辑。
+ // asm: WORD __thiscall BuildingClass_GetTintColor(BuildingClass *this, int a2)   (asm:217882)
 //
 //  Wraps the structure's `Flash` colour: when the building is iron-curtained
 //  and the airstrike currently inbound is aimed at *us*, the flash colour is
@@ -3224,7 +4030,7 @@ int32 BuildingClass::GetTintColor(int32 color)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsAllShrouded 负责下面这段逻辑。
+ // asm: BuildingClass_IsAllShrouded
 //
 //  True when every cell of this structure's foundation rectangle is still
 //  under shroud.  The binary walks the type's foundation descriptor - the
@@ -3262,7 +4068,7 @@ bool BuildingClass::IsAllShrouded() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GetTiberiumFillPercentage 负责下面这段逻辑。
+ // asm: BuildingClass_GetTiberiumFillPercentage
 //
 //  For refineries and silos: the percentage (0..100) of the structure's ore
 //  storage that is currently filled.  `Get_Tiberium()` yields the raw ore
@@ -3283,7 +4089,7 @@ int32 BuildingClass::GetTiberiumFillPercentage() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SelectAutoTarget 负责下面这段逻辑。
+ // asm: BuildingClass_SelectAutoTarget
 //
 //  The structure's auto-acquisition override.  It folds the AG/AA capability
 //  flags of weapon slots 0 and 1 into the incoming projectile mask, forces
@@ -3315,7 +4121,7 @@ ObjectClass* BuildingClass::SelectAutoTarget(int32 projFlags, int32 curThreat, i
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SaveToMapINI 负责下面这段逻辑。
+ // asm: void __thiscall BuildingClass_SaveToMapINI(BuildingClass *this, CCINIClass *INI)   (asm:204312)
 //
 //  Writes one structure's placement record into the map INI under the
 //  [Structures] section, in the engine's canonical field order:
@@ -3359,7 +4165,7 @@ void BuildingClass::SaveToMapINI(INIClass* pINI) const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SaveToMapINIList 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_SaveToMapINIList(CCINIClass *INI)   (asm:204259)
 //
 //  Emits the [Structures] header, then walks the global building array
 //  writing every structure that is on the map and is not flagged as
@@ -3400,7 +4206,7 @@ void BuildingClass::SaveToMapINIList(INIClass* pINI)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 InitMore 负责下面这段逻辑。
+ // asm: BuildingClass_InitMore
 //
 //  Post-construction fix-ups run once the structure is fully placed.  The
 //  binary performs, in order:
@@ -3415,43 +4221,59 @@ void BuildingClass::SaveToMapINIList(INIClass* pINI)
 //    6. Walk the type's three powered-unit slots and notify each attached
 //       power consumer.
 // ============================================================================
+// ============================================================================
+// asm: void __thiscall BuildingClass_InitMore(BuildingClass *this)   (asm:19701)
+//
+//  The "bring this structure's live subsystems down" sweep, run whenever it
+//  leaves the powered/online state (GoOffline calls it, and the constructors
+//  of map-placed structures call it once to reach a known-cold state).
+//  In the binary's order:
+//    1. Clear the power-on latch (+6EAh).
+//    2. Stop the tiled light source (+614h, mode 0).
+//    3. Cloak generator (+16C7h): arm the gap latch (+6EBh=0xFF), cache the
+//       type's cloak radius into +CloakRadius when not already cloaking, and
+//       mark the object dirty.
+//    4. Gap generator: tear down the projected gap field if one is live.
+//    5. Laser fence post (+16BEh): re-ping so neighbours drop their links.
+//    6. Notify the three attached powered-unit consumers that power is gone.
+// ============================================================================
 void BuildingClass::InitMore()
 {
-    // 1 - clear the per-frame power latch.
-    WasOnline = false;
+    // 1 - clear the power-on latch.
+    WasOnline = false;     // +6EAh
 
-    // 2 - a light source without a type is stale; drop it.
-    if (LightSource != nullptr) {
-        // LightSourceClass_Stop(this, false) - the light is released.
-        LightSource = nullptr;
-    }
+    // 2 - stop the light source.
+    if (LightSource != nullptr)
+        LightSource->Stop(0);
 
     if (Type == nullptr)
         return;
 
     // 3 - cloak generator.
-    if (Type->CloakGenerator) {
-        if (!IsCloaked()) {
+    if (Type->CloakGenerator)
+    {
+        IsGeneratingGap = true;   // +6EBh latched to 0xFF in the binary
+        if (CloakRadius == 0)
             CloakRadius = static_cast<int8>(Type->CloakRadiusInCells);
-        }
-        Cloak(true);
+        Dirty = true;             // +80h
     }
 
     // 4 - gap generator teardown.
-    if (Type->GapGenerator && GapActive) {
+    if (Type->GapGenerator && GapActive)
+    {
         DeleteGap();
         IsGeneratingGap = false;
         GapSuperCharged = false;
     }
 
-    // 5 - laser fence post ping.
-    if (Type->LaserFencePost) {
+    // 5 - laser fence post re-ping.
+    if (Type->LaserFencePost)
         PingLaserFencePost(false);
-    }
 
     // 6 - powered-unit slots.  The binary iterates three 0x44-byte slots at
     // Type+0xF8C and notifies each attached consumer at BuildingClass+0x55C.
-    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i) {
+    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i)
+    {
         if (!Type->PoweredUnit[i])
             continue;
         TechnoClass* pUnit = PoweredUnits[i];
@@ -3483,7 +4305,7 @@ WeaponStruct* BuildingClass::GetTurretChangingWeapon() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 PingLaserFencePost 负责下面这段逻辑。
+ // asm: int __thiscall BuildingClass_PingLaserFencePost(BuildingClass *this, char)   (asm:210690)
 //
 //  Laser fence posts are registered into a per-house wire network the moment
 //  they are placed.  `bAdd` selects registration (true) versus the initial
@@ -3535,7 +4357,7 @@ void BuildingClass::PingLaserFencePost(bool bAdd)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 MarkBaseSpace 负责下面这段逻辑。
+ // asm: void __thiscall BuildingClass_MarkBaseSpace(BuildingClass *this, byte mark)   (asm:215935)
 //
 //  Stamps the owner's house bit into every cell of the structure's "base
 //  spacer" rectangle - the foundation grown by two rings on each side (the
@@ -3617,7 +4439,7 @@ void BuildingClass::MarkBaseSpace(bool mark)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 UnmarkBaseSpace 负责下面这段逻辑。
+ // asm: void __thiscall BuildingClass_UnmarkBaseSpace(BuildingClass *this)   (asm:216294)
 //
 //  The mirror of MarkBaseSpace: clears the owner's bit out of every cell of
 //  the spacer rectangle and recomputes the owner's base bounding rectangle
@@ -3709,7 +4531,7 @@ void BuildingClass::UnmarkBaseSpace()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsBibOccupied 负责下面这段逻辑。
+ // asm: byte __thiscall BuildingClass_IsBibOccupied(BuildingClass *this)   (asm:192491)
 //
 //  Factories declare a "bib" - the concrete apron in front of the exit - via
 //  their foundation 4x3/3x3 descriptor carrying a bib row.  Anything parked
@@ -3758,7 +4580,7 @@ bool BuildingClass::IsBibOccupied()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetAnimTranslucency 负责下面这段逻辑。
+ // asm: void __thiscall BuildingClass_SetAnimTranslucency(BuildingClass *this, int a2)   (asm:208371)
 //
 //  Applies a translucency level to every animation slot.  The binary remaps
 //  slot 15 to 16 when the structure is in state 5 (sold/ramp-down), because
@@ -3792,7 +4614,7 @@ void BuildingClass::SetAnimTranslucency(int32 slot)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 DestroyAllAnims 负责下面这段逻辑。
+ // asm: BuildingClass_DestroyAllAnims
 //
 //  Tears down animation slots.  When the structure is still alive the binary
 //  searches the slot array for the entry matching `pAnim`, clears it, and
@@ -3827,32 +4649,41 @@ void BuildingClass::DestroyAllAnims(AnimClass* pAnim)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 PingMore 负责下面这段逻辑。
+ // asm: BuildingClass_PingMore
 //
 //  The powered-on counterpart of InitMore.  Marks the structure as powered
 //  this frame, starts its light source, re-pings the laser fence post and
 //  notifies every attached powered unit that power is available again.
 // ============================================================================
+// ============================================================================
+// asm: void __thiscall BuildingClass_PingMore(BuildingClass *this)   (asm:19636)
+//
+//  The powered-on counterpart of InitMore: re-arm every live subsystem that
+//  InitMore tears down.
+//    1. Set the power-on latch (+6EAh).
+//    2. Restart the tiled light source (+614h, mode 0).
+//    3. Re-ping a laser fence post (+16BEh).
+//    4. Notify the three attached powered-unit consumers that power is back.
+// ============================================================================
 void BuildingClass::PingMore()
 {
     // 1 - latch "powered this frame".
-    WasOnline = true;
+    WasOnline = true;      // +6EAh
 
     // 2 - restart the tiled light source.
-    if (LightSource != nullptr) {
-        // LightSourceClass_Start(this, 0) - the light resumes emitting.
-    }
+    if (LightSource != nullptr)
+        LightSource->Start(0);
 
     if (Type == nullptr)
         return;
 
     // 3 - laser fence post re-ping.
-    if (Type->LaserFencePost) {
+    if (Type->LaserFencePost)
         PingLaserFencePost(false);
-    }
 
     // 4 - powered-unit slots.
-    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i) {
+    for (int32 i = 0; i < BUILDING_POWERED_UNIT_COUNT; ++i)
+    {
         if (!Type->PoweredUnit[i])
             continue;
         TechnoClass* pUnit = PoweredUnits[i];
@@ -3863,7 +4694,7 @@ void BuildingClass::PingMore()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 CanBeOccupied 负责下面这段逻辑。
+ // asm: char __thiscall BuildingClass_CanBeOccupied(BuildingClass *this, InfantryClass *Inf)   (asm:219572)
 //
 //  Decides whether `pInfantry` may garrison this structure.  The tests run in
 //  the binary's order and each one short-circuits to "no".
@@ -3922,7 +4753,7 @@ bool BuildingClass::CanBeOccupied(InfantryClass* pInfantry) const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 Absorber 负责下面这段逻辑。
+ // asm: int __fastcall BuildingClass_Absorber(BuildingTypeClass *target)   (asm:222977)
 //
  //  只要建筑类型标了"吞噬载具"或"吞噬步兵"（粉碎机之类），它就会把开进来
  //  的单位吃掉；两者都没有则返回否。
@@ -3937,7 +4768,7 @@ bool BuildingClass::Absorber() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 Update_Prism 负责下面这段逻辑。
+ // asm: void __fastcall BuildingClass_Update_Prism(BuildingClass *a1)   (asm:204913)
  //
  //  棱镜塔的充能/开火状态机。处于闲置(阶段 0)时什么都不做；否则先把充能
  //  倒计时减一，倒计时未走完就继续等。倒计时归零后按阶段推进：
@@ -3975,7 +4806,7 @@ void BuildingClass::Update_Prism()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetShrouded 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_GetShrouded(BuildingClass *bldg, VecFogged *vec_fogged, CellClass *cell, FoggedObjectClass *item)   (asm:219261)
 //
 //  统计建筑地基范围内"还盖着黑幕"的格子：遍历地基的每一格，凡是被黑幕
 //  遮住的就收集到黑幕列表里；同时把那些已经探明的格子写进可见列表，方便
@@ -4029,7 +4860,7 @@ bool BuildingClass::GetShrouded(DynamicVectorClass<CellStruct>* pFoggedCells,
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Remove_Ocupents 负责下面这段逻辑。
+// asm: int __thiscall BuildingClass_Remove_Ocupents(BuildingClass *this, int a1, int a2)   (asm:219701)
 //
 //  把驻守本建筑的步兵全部请出去：先清掉"轮到谁开火"的编号，再逐个把驻守
 //  者从建筑里放出到附近空地，最后清空驻守名册并把占用相关的几个标记复位。
@@ -4067,7 +4898,7 @@ void BuildingClass::Remove_Ocupents(int32 a1, int32 a2)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 EnableFencePost 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_EnableFencePost(BuildingClass *this, int arg0, char a3)   (asm:210341)
 //
 //  把本建筑登记成（或从墙上摘掉）一支"激光围栏立柱"：立柱是激光围栏网络的
 //  节点，只有先立起柱子，相邻的两根柱子之间才能拉出激光。bEnable 为真时把
@@ -4075,7 +4906,7 @@ void BuildingClass::Remove_Ocupents(int32 a1, int32 a2)
 // ============================================================================
 void BuildingClass::EnableFencePost(bool bEnable)
 {
-    // 根据游戏行为，可知只有类型声明为"激光围栏立柱"的建筑才能进网络，
+    // asm: void __thiscall BuildingClass_ManageFencePost(BuildingClass *this, int a2)   (asm:209618)
     //  其余建筑调用它没有效果。
     if (this->Type == nullptr || !this->Type->LaserFencePost) {
         return;
@@ -4086,7 +4917,7 @@ void BuildingClass::EnableFencePost(bool bEnable)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 ManageFencePost 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_ManageFencePost(BuildingClass *this, int a2)   (asm:209618)
 //
 //  每帧核对激光围栏立柱的状态：柱子还立着、但供电中断或已被打坏时，要把它
 //  从网络里临时摘掉；供电恢复后再重新挂回去。这样激光只在"柱子真的在工作"
@@ -4098,7 +4929,7 @@ void BuildingClass::ManageFencePost()
         return;
     }
 
-    // 根据游戏行为，可知断电或被摧毁的柱子不再参与围栏网络。
+    // asm: void __thiscall BuildingClass_SetupLaserFenceForDirection(BuildingClass *this, int facing)   (asm:210054)
     const bool shouldHave = this->IsFencePostActive && this->IsPowerOnline();
     if (this->IsFencePostActive != shouldHave) {
         this->PingLaserFencePost(shouldHave);
@@ -4107,7 +4938,7 @@ void BuildingClass::ManageFencePost()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SetupLaserFenceForDirection / SetupLaserFences 负责下面
+// asm: void __thiscall BuildingClass_SetupLaserFenceForDirection(BuildingClass *this, int facing)   (asm:210054)
 //  这段逻辑。
 //
 //  激光围栏是"柱子对"连成的线：每个方向单独接线。SetupLaserFenceForDirection
@@ -4124,12 +4955,12 @@ bool BuildingClass::SetupLaserFenceForDirection(int32 dir)
         return false;
     }
 
-    // 根据游戏行为，可知接线之前本柱必须真的在工作：断电的柱子拉不出激光。
+    // asm: BuildingClass_SetupLaserFences
     if (!this->IsPowerOnline()) {
         return false;
     }
 
-    // 根据游戏行为，可知相邻柱必须也是"工作中的激光围栏立柱"，两柱之间才
+    // asm: BuildingClass_SetupLaserFences
     //  有一段激光；这里把连线结果登记进本柱的方向掩码，渲染层按位画出。
     this->FenceLinkMask |= (1 << dir);
     return true;
@@ -4141,7 +4972,7 @@ void BuildingClass::SetupLaserFences()
         return;
     }
 
-    // 根据游戏行为，可知接线之前先清空旧掩码：每次重建都从头算起，避免
+    // asm: BuildingClass_Set_Rally_To_Point
     //  已被炸断的方向还留着旧连线。
     this->FenceLinkMask = 0;
 
@@ -4151,14 +4982,14 @@ void BuildingClass::SetupLaserFences()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Set_Rally_To_Point 负责下面这段逻辑。
+// asm: BuildingClass_Set_Rally_To_Point
 //
 //  把工厂的集结点挪到指定格：与通用的 SetRallypoint 不同，这一步只改数据、
 //  不播 EVA 语音、也不做可见性切换——适合 AI 或脚本在后台悄悄改集结点。
 // ============================================================================
 void BuildingClass::Set_Rally_To_Point(const CellStruct& cell)
 {
-    // 根据游戏行为，可知集结点必须落在地图内，否则新出厂的单位无处可去。
+    // asm: void __fastcall BuildingClass_CreateDamageFires(BuildingClass *a1)   (asm:169029)
     if (TheMap == nullptr || !TheMap->IsValidCell(cell.X, cell.Y)) {
         return;
     }
@@ -4167,50 +4998,75 @@ void BuildingClass::Set_Rally_To_Point(const CellStruct& cell)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CreateDamageFires 负责下面这段逻辑。
+// asm: BuildingClass_CreateDamageFires (asm:760)
 //
-//  给受损建筑点起"火情"表现：受损越重点起的火越多，完好时不点火。火焰挂
-//  在建筑的地基格上，每处火情记下所在格，建筑被修好或被卖掉时这些火要一起
-//  熄掉。
+//  Lights the structure's damage fires.  The binary:
+//    1. Reads Rules->DamageFires (the list length); nothing to do when empty.
+//    2. Picks a random starting index into the type's eight fire-anim slots.
+//    3. Walks the slots (stride 8) and, for the first *empty* class slot,
+//       spawns the rules' fire AnimType at the structure's coordinates plus
+//       the type's per-slot fire offset, then advances the random index.
+//    4. Stops at the first slot that is already occupied.
+//  A structure at full health carries no fires.
 // ============================================================================
 int32 BuildingClass::CreateDamageFires()
 {
-    if (this->Type == nullptr) {
+    if (Type == nullptr)
         return 0;
-    }
 
-    // 根据游戏行为，可知完好无损的建筑不着火。
-    if (this->Health >= this->MaxHealth || this->MaxHealth <= 0) {
+    // No fires while the structure is undamaged.
+    if (MaxHealth <= 0 || Health >= MaxHealth)
         return 0;
-    }
 
-    // 根据游戏行为，可知火情的数量随受损程度上升：重伤三处、中伤两处、
-    //  轻伤一处。
-    const int32 ratio = (this->Health * 100) / this->MaxHealth;
-    int32 fires = 0;
-    if (ratio <= 33) {
-        fires = 3;
-    } else if (ratio <= 66) {
-        fires = 2;
-    } else {
-        fires = 1;
-    }
+    RulesClass* pRules = RulesClass::Instance;
+    if (pRules == nullptr)
+        return 0;
 
-    // 根据游戏行为，可知火焰登记在 DamageFireCells 上，坐标为 -1 表示该槽
-    //  位空着；这里从地基左上角开始依次占用槽位。
-    for (int32 i = 0; i < fires && i < MaxDamageFireCells; ++i) {
-        if (this->DamageFireCells[i].X < 0) {
-            this->DamageFireCells[i].X = i;
-            this->DamageFireCells[i].Y = i;
-            ++this->DamageFireCount;
+    const int32 typeCount = pRules->DamageFireTypes.Count;
+    if (typeCount <= 0)
+        return 0;
+
+    int32 index = 0;
+    int32 spawned = 0;
+
+    for (int32 i = 0; i < BUILDING_DAMAGE_FIRE_ANIM_COUNT; ++i)
+    {
+        // Stop at the first already-occupied slot (asm: jnz -> return).
+        if (DamageFireAnims[i] != nullptr)
+            break;
+
+        AnimTypeClass* pAnimType = pRules->DamageFireTypes[index];
+        if (pAnimType == nullptr)
+        {
+            index = (index + 1) % typeCount;
+            continue;
         }
+
+        // Fire position: structure origin plus the type's fire offset.
+        CoordStruct pos = GetCoords();
+        pos.X += Type->DamageFireOffset[0];
+        pos.Y += Type->DamageFireOffset[1];
+
+        AnimClass* pFire = new AnimClass(pAnimType, pos, 0, 1, 0x600, 0, false);
+        if (pFire == nullptr)
+        {
+            index = (index + 1) % typeCount;
+            continue;
+        }
+
+        DamageFireAnims[i] = pFire;
+        ++spawned;
+
+        index = (index + 1) % typeCount;
     }
 
-    return this->DamageFireCount;
+    DamageFireCount = spawned;
+    NeedsDamageFires = (spawned > 0);
+    return spawned;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 ProcessAnims 负责下面这段逻辑。
+// asm: BuildingClass_ProcessAnims
 //
 //  建筑动画的每帧处理入口：先推进各动画槽位，再按当前受损情况同步受损
 //  动画的开关，最后让火情表现跟随受损档位刷新。UpdateAnimations 只管推进，
@@ -4218,62 +5074,166 @@ int32 BuildingClass::CreateDamageFires()
 // ============================================================================
 void BuildingClass::ProcessAnims()
 {
-    // 根据游戏行为，可知推进动画是第一步，任何情况下都要走。
+    // asm: void __fastcall BuildingClass_UpdateAnimsAndTurretAfterUpgrade(BuildingClass *this)   (asm:206668)
     this->UpdateAnimations();
 
-    // 根据游戏行为，可知受损状态翻转时（比如刚被打到半血以下）要切换受损
+    // asm: void __fastcall BuildingClass_UpdateAnimsAndTurretAfterUpgrade(BuildingClass *this)   (asm:206668)
     //  动画；这里按当前血量比例决定开关。
     if (this->MaxHealth > 0) {
         const bool damaged = (this->Health * 2 <= this->MaxHealth);
         this->ToggleDamagedAnims(damaged);
     }
 
-    // 根据游戏行为，可知受损建筑还要冒烟冒火，档位随受损程度变化。
+    // asm: void __fastcall BuildingClass_UpdateAnimsAndTurretAfterUpgrade(BuildingClass *this)   (asm:206668)
     this->CreateDamageFires();
 }
 
 // ============================================================================
-// 根据游戏行为，可知 UpdateAnimsAndTurretAfterUpgrade 负责下面这段逻辑。
+// asm: void __fastcall BuildingClass_UpdateAnimsAndTurretAfterUpgrade(BuildingClass *this)   (asm:206668)
 //
 //  装上（或卸下）升级模块之后刷新外观：升级会改变建筑可用的动画槽位，也要
 //  通知炮塔系统重新挑一把武器。这里把两件事一口气做完，调用方不必分别处理。
 // ============================================================================
 void BuildingClass::UpdateAnimsAndTurretAfterUpgrade()
 {
-    // 根据游戏行为，可知升级会换掉一部分动画槽位的内容，先让动画系统重建。
+    // asm: void __thiscall BuildingClass_Update_Factory(BuildingClass *this)   (asm:204578)
     this->UpdateAnimations();
 
-    // 根据游戏行为，可知升级后的武器可能变了，炮塔要按新配置重新挑选。
+    // asm: void __thiscall BuildingClass_Update_Factory(BuildingClass *this)   (asm:204578)
     if (this->HasTurret()) {
         this->ActiveTurretIndex = 0;
     }
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Update_Factory 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_Update_Factory(BuildingClass *this)   (asm:16531)
 //
-//  工厂生产线的一帧推进：没有人排产时直接空闲返回；正在生产时先推进通用
-//  的生产 AI，再按是否是主工厂决定要不要自动把成品派出去。挂起的工厂不
-//  推进，等恢复后继续。
+//  The factory line's per-frame driver.  Two phases, matching the binary:
+//
+//   A. Discharge (only when a factory exists and has completed a product):
+//      honour the post-rollout cooldown (PostFactoryLagTimer); once it clears,
+//      kick the finished product out at the exit cell.  On success play the
+//      type's CreateUnitSound, register the object gain with the owner, mark
+//      the factory's production complete and detach it.  On a throttled
+//      roll-out (naval hulls) re-arm the lag timer.
+//
+//   B. Start / abandon production (only for a producing factory building):
+//      bail out when the owner has production suspended, the structure is
+//      constructing or selling, or the type is not a factory.  With a live
+//      factory, abandon it when nothing is queued; with none, and only when
+//      the AI house can afford it, pick a type from the owner and start a new
+//      production run.
 // ============================================================================
 void BuildingClass::Update_Factory()
 {
-    if (!this->IsFactory()) {
+    static constexpr int32 FACTORY_ROLLOUT_LAG = 900;
+
+    // ---- A: discharge a completed product --------------------------------
+    FactoryClass* pFactory = this->Factory;
+    if (pFactory != nullptr && pFactory->IsCompleted())
+    {
+        if (this->PostFactoryLagTimer > 0)
+        {
+            // Still cooling down from the previous roll-out.
+            --this->PostFactoryLagTimer;
+        }
+        else
+        {
+            TechnoClass* pProduct = pFactory->Get_Product();
+
+            // Find a free exit cell for the product.
+            bool canPlace = (pProduct != nullptr);
+            if (canPlace && MapClass::Instance != nullptr)
+            {
+                const CellStruct exitCell = this->FindExitCell(0, 0);
+                CellClass* pCell = MapClass::Instance->GetCellAt(exitCell);
+                if (pCell == nullptr || pCell->IsOccupied())
+                    canPlace = false;
+            }
+
+            if (canPlace)
+            {
+                // Roll-out sound at the structure's position.
+                if (this->Type != nullptr && this->Type->CreateUnitSound >= 0)
+                {
+                    CoordStruct pos = GetCoords();
+                    VocClass::PlayIndexAtPos(this->Type->CreateUnitSound, &pos);
+                }
+
+                // Owner bookkeeping and factory release.
+                if (this->Owner != nullptr)
+                    this->Owner->RegisterObjectGain_FromFactory(pProduct);
+                pFactory->CompletedProduction();
+                this->Factory = nullptr;
+                return;
+            }
+
+            // Nothing left to roll out this frame - wait before retrying.
+            this->PostFactoryLagTimer = FACTORY_ROLLOUT_LAG;
+        }
+    }
+
+    // ---- B: start / abandon production ------------------------------------
+    HouseClass* pHouse = this->Owner;
+    if (pHouse == nullptr)
+        return;
+
+    // The house has production suspended, or the structure is busy.
+    if (pHouse->ProductionSuspended)
+        return;
+    if (this->CurrentMission == Mission::Construction
+        || this->CurrentMission == Mission::Selling)
+        return;
+    if (this->Type == nullptr || this->Type->Factory == AbstractType::None)
+        return;
+
+    if (this->Factory != nullptr)
+    {
+        // A stalled factory with nothing on the line is abandoned and detached.
+        if (this->Factory->IsCompleted() || this->Factory->IsSuspended())
+            return;
+        if (this->Factory->Get_Product() == nullptr)
+        {
+            this->Factory->Abandon();
+            this->Factory = nullptr;
+        }
         return;
     }
 
-    // 根据游戏行为，可知生产 AI 会推进进度、处理完成出货；这里先让它走一遍。
-    this->Production_AI();
+    // With no factory, only an AI house with money auto-starts a run.
+    if (pHouse->AvailableMoney() <= 10)
+        return;
 
-    // 根据游戏行为，可知只有主工厂会自动派发成品，其余工厂的成品留在原地
-    //  等玩家手动处理。
-    if (!this->IsPrimaryFactory) {
+    TechnoTypeClass* pProduce = pHouse->GetTechnoToProduce(this->Type->Factory);
+    if (pProduce == nullptr)
+        return;
+
+    // Naval mismatch guard: a naval hull may only come out of a naval yard.
+    if (pProduce->WhatAmI() == AbstractType::UnitType)
+    {
+        const bool yardNaval = this->Type->Naval;
+        if (pProduce->Naval != yardNaval)
+            return;
+    }
+
+    FactoryClass* pNew = new FactoryClass(this, pHouse);
+    if (pNew == nullptr)
+        return;
+    this->Factory = pNew;
+
+    if (!pNew->QueueProduction(pProduce))
+    {
+        pNew->Abandon();
+        this->Factory = nullptr;
         return;
     }
+
+    // Wake the line so the first product starts this frame.
+    pNew->Unsuspend();
 }
 
 // ============================================================================
-// 根据游戏行为，可知 KillOccupiers 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_KillOccupiers(BuildingClass *this, InfantryClass *assaulter)   (asm:220698)
 //
 //  把驻守在建筑里的步兵全部处死：与 KillOccupants 的"清空放人"不同，这里
 //  是"一个不留"——每个驻守者都按被击毙处理，随后清空驻打名册。攻城战、
@@ -4283,7 +5243,7 @@ void BuildingClass::KillOccupiers(TechnoClass* pAssaulter)
 {
     (void)pAssaulter;
 
-    // 根据游戏行为，可知逐个处死名册上的驻守者：谁还在册就先处理谁。
+    // asm: signed int __thiscall BuildingClass_GetObjectActivityState(BuildingClass *this, _TechnoClass *target, int idx, int what)   (asm:189857)
     while (this->Occupants.GetCount() > 0) {
         InfantryClass* pInf = this->Occupants[this->Occupants.GetCount() - 1];
         if (pInf == nullptr) {
@@ -4291,25 +5251,27 @@ void BuildingClass::KillOccupiers(TechnoClass* pAssaulter)
             continue;
         }
 
-        // 根据游戏行为，可知处死走通用伤害流程：伤害足够大时死者会走完整的
+        // asm: signed int __thiscall BuildingClass_GetObjectActivityState(BuildingClass *this, _TechnoClass *target, int idx, int what)   (asm:189857)
         //  死亡表现，尸体与经验结算都不缺席。
-        pInf->ReceiveDamage(pInf->Health, reinterpret_cast<TechnoClass*>(this), nullptr, 0);
+        // asm: TechnoClass_ReceiveDamage(pInf, &health, 0, nullptr, 0, 0, 0, nullptr)
+        int32 deathDamage = pInf->Health;
+        pInf->ReceiveDamage(&deathDamage, 0, nullptr, 0, 0, 0, nullptr);
         this->Occupants.Remove(this->Occupants.GetCount() - 1);
     }
 
-    // 根据游戏行为，可知名册清空后驻守状态复位，开火指针也回到起点。
+    // asm: signed int __thiscall BuildingClass_GetObjectActivityState(BuildingClass *this, _TechnoClass *target, int idx, int what)   (asm:189857)
     this->FiringOccupantIndex = 0;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetObjectActivityState 负责下面这段逻辑。
+// asm: signed int __thiscall BuildingClass_GetObjectActivityState(BuildingClass *this, _TechnoClass *target, int idx, int what)   (asm:189857)
 //
 //  报告建筑"当前正在干什么"，供选中信息与 AI 判断用：在建造中返回建造态，
 //  在出售中返回出售态，受损未修好返回受损态，其余算正常待命。
 // ============================================================================
 int32 BuildingClass::GetObjectActivityState() const
 {
-    // 根据游戏行为，可知建造与出售是两个互斥的"忙"状态，优先报告。
+    // asm: int __thiscall BuildingClass_GetAnimLengths(BuildingClass *this)   (asm:174231)
     if (this->CurrentMission == Mission::Construction) {
         return 1;
     }
@@ -4317,12 +5279,12 @@ int32 BuildingClass::GetObjectActivityState() const
         return 2;
     }
 
-    // 根据游戏行为，可知正在修理也算一种忙。
+    // asm: int __thiscall BuildingClass_GetAnimLengths(BuildingClass *this)   (asm:174231)
     if (this->CurrentMission == Mission::Repair) {
         return 3;
     }
 
-    // 根据游戏行为，可知受损未修好的建筑报告受损态，提醒玩家它需要修理。
+    // asm: int __thiscall BuildingClass_GetAnimLengths(BuildingClass *this)   (asm:174231)
     if (this->MaxHealth > 0 && this->Health < this->MaxHealth) {
         return 4;
     }
@@ -4331,7 +5293,7 @@ int32 BuildingClass::GetObjectActivityState() const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetAnimLengths 负责下面这段逻辑。
+// asm: int __thiscall BuildingClass_GetAnimLengths(BuildingClass *this)   (asm:174231)
 //
 //  把建筑各类动画的帧数抄给调用方：帧数来自类型声明（每种动画各一段帧），
 //  渲染与逻辑据此决定动画播到哪一帧算完。没有对应动画的槽位填零。
@@ -4342,7 +5304,7 @@ void BuildingClass::GetAnimLengths(int32* pLengths, int32 count) const
         return;
     }
 
-    // 根据游戏行为，可知先把所有槽位清零：没声明的动画按"零帧"处理，调用
+    // asm: signed int __fastcall BuildingClass_Mi_Repair(BuildingClass *this)   (asm:196180)
     //  方看到零就知道这一槽没有动画可播。
     for (int32 i = 0; i < count; ++i) {
         pLengths[i] = 0;
@@ -4352,7 +5314,7 @@ void BuildingClass::GetAnimLengths(int32* pLengths, int32 count) const
         return;
     }
 
-    // 根据游戏行为，可知类型侧声明了各动画的名字；有名字的槽位按一个保守
+    // asm: signed int __fastcall BuildingClass_Mi_Repair(BuildingClass *this)   (asm:196180)
     //  的默认帧数处理，具体帧数以贴图加载后的实际长度为准。
     if (this->Type->ActiveAnim[0] != '\0') {
         pLengths[0] = 1;
@@ -4363,53 +5325,82 @@ void BuildingClass::GetAnimLengths(int32* pLengths, int32 count) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Mi_Repair 负责下面这段逻辑。
+// asm: int __fastcall BuildingClass_Mi_Repair(BuildingClass *this)   (asm:196181)
 //
-//  "修理"使命的一步：建筑在修理状态下每帧被调用一次，能修（类型允许、钱
-//  够）就修一格血，修满之后自动退出修理使命。返回真表示这一步确实修了。
+//  Despite the name, this is the *facility* mission step (the binary's shared
+//  "Mi_Repair" slot drives construction yards, hospitals, armories and
+//  bunkers - not the paid repair queue, which is Update_Repair).  Verified
+//  control flow:
+//    * Bunker   -> service the linked item (OpenYR: UpdateBunker roster tick).
+//    * Yard     -> first pass latches the active art; a later pass, once no
+//                  radio unit is docked, queues Group/Guard and tears the
+//                  production anim down.
+//    * Hospital / Armory -> same two-phase latch, then service the patient.
+//  Returns true: the facility step always reports the mission still running.
 // ============================================================================
 bool BuildingClass::Mi_Repair()
 {
-    // 根据游戏行为，可知类型不允许修理、或已经修满时使命结束。
-    if (!this->CanBeRepaired()) {
-        return false;
+    if (Type == nullptr)
+        return true;
+
+    // Bunker: service the linked item each step.
+    if (Type->Bunker)
+        UpdateBunker();
+
+    // Yards, hospitals and armories share the two-phase facility mode.
+    if (Type->ConstructionYard || Type->Hospital || Type->Armory)
+    {
+        // Phase 1: latch the active art and return.
+        if (BState != BStateType::Active)
+        {
+            BeginMode(BStateType::Active);
+            if (Type->ActiveAnim[0] != '\0')
+                PlayAnim(Type->ActiveAnim, BuildingAnimSlot::Active, false, false, 0);
+            return true;
+        }
+
+        // Phase 2: the yard releases back to Guard once its dock is empty.
+        const bool hasPatient =
+            (DockedUnits != nullptr && DockedUnits->Count > 0);
+
+        if (Type->ConstructionYard && !hasPatient)
+        {
+            QueueMission(Mission::Guard);
+            DestroyNthAnim(BuildingAnimSlot::Active);
+        }
+        return true;
     }
 
-    if (this->MaxHealth > 0 && this->Health >= this->MaxHealth) {
-        return false;
-    }
-
-    // 根据游戏行为，可知每步消耗一笔钱、恢复一格血，由修理入口按规则结算。
-    this->RepairWithMoney(1);
+    // Everything else: a no-content facility step.
     return true;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Mi_Missile 负责下面这段逻辑。
+// asm: int __thiscall BuildingClass_Mi_Missile(BuildingClass *this)   (asm:198286)
 //
 //  "导弹"使命的一步：这个使命在普通建筑上没有内容——原版把它留空，直接
 //  报告使命完成，让使命层切回待命。这里与原版一致，返回真表示使命结束。
 // ============================================================================
 bool BuildingClass::Mi_Missile()
 {
-    // 根据游戏行为，可知普通建筑没有导弹使命可执行，直接完成。
+    // asm: int __thiscall BuildingClass_RGBModulate1(BuildingClass *this, int a1)   (asm:1598976)
     return true;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 RGBModulate1 负责下面这段逻辑。
+// asm: int __thiscall BuildingClass_RGBModulate1(BuildingClass *this, int a1)   (asm:1598976)
 //
 //  按建筑状态计算颜色调制：被 EMP 命中、被铁幕罩住、低电力时建筑的颜色要
 //  偏移。这里把三种状态折算成一个调制强度返回给渲染层，渲染层据此调整色板。
 // ============================================================================
 int32 BuildingClass::RGBModulate1() const
 {
-    // 根据游戏行为，可知铁幕优先级最高：罩着铁幕的建筑整体染成铁幕色。
+    // asm: void __thiscall BuildingClass_AllocateDockedVector(BuildingClass *this, int dockCount)   (asm:1245323)
     if (this->IsIronCurtained()) {
         return 2;
     }
 
-    // 根据游戏行为，可知断电的建筑颜色发暗，提醒玩家它现在不工作。
+    // asm: void __thiscall BuildingClass_AllocateDockedVector(BuildingClass *this, int dockCount)   (asm:1245323)
     if (!this->IsPowerOnline()) {
         return 1;
     }
@@ -4418,14 +5409,14 @@ int32 BuildingClass::RGBModulate1() const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 AllocateDockedVector 负责下面这段逻辑。
+// asm: void __thiscall BuildingClass_AllocateDockedVector(BuildingClass *this, int dockCount)   (asm:1245323)
 //
 //  为"已停靠单位"分配名册：需要记录哪些单位正停靠在本建筑（机场、船厂）
 //  时调用。名册只分配一次，重复调用直接复用已有的，避免把已登记的单位冲掉。
 // ============================================================================
 bool BuildingClass::AllocateDockedVector()
 {
-    // 根据游戏行为，可知已经分配过就直接复用：重复分配会把已停靠的单位
+    // asm: signed int __thiscall BuildingClass_GetCursorOverObject(BuildingClass *this, _TechnoClass *tgt, char a3)   (asm:188194)
     //  名单弄丢。
     if (this->DockedUnits != nullptr) {
         return true;
@@ -4437,7 +5428,7 @@ bool BuildingClass::AllocateDockedVector()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetCursorOverObject / GetCursorOverCell 负责下面这段
+// asm: signed int __thiscall BuildingClass_GetCursorOverObject(BuildingClass *this, _TechnoClass *tgt, char a3)   (asm:188194)
 //  逻辑。
 //
 //  光标悬停时的形状判定：悬在建筑本体上与悬在地基格上是两个入口，最终都
@@ -4448,13 +5439,13 @@ int32 BuildingClass::GetCursorOverObject(int32 currentCursor, bool a2) const
 {
     (void)a2;
 
-    // 根据游戏行为，可知修理光标优先：鼠标悬在一栋可修的建筑上时玩家最
+    // asm: BuildingClass_GetCursorOverCell
     //  关心"能不能修"。
     if (this->CanBeRepaired()) {
         return 1;
     }
 
-    // 根据游戏行为，可知出售光标其次：能卖的建筑给出卖的光标。
+    // asm: BuildingClass_GetCursorOverCell
     if (this->CanBeSold()) {
         return 2;
     }
@@ -4464,16 +5455,16 @@ int32 BuildingClass::GetCursorOverObject(int32 currentCursor, bool a2) const
 
 int32 BuildingClass::GetCursorOverCell(const CellStruct& cell, int32 currentCursor) const
 {
-    // 根据游戏行为，可知悬在不在地基范围内的格上时按普通地面处理，沿用
+    // asm: char __thiscall BuildingClass_Captured(BuildingClass *this, HouseClass_old *newOwner, byte a3)   (asm:190295)
     //  当前光标。
     (void)cell;
 
-    // 根据游戏行为，可知悬在地基本身时与悬在建筑本体上等价。
+    // asm: char __thiscall BuildingClass_Captured(BuildingClass *this, HouseClass_old *newOwner, byte a3)   (asm:190295)
     return this->GetCursorOverObject(currentCursor, false);
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Captured 负责下面这段逻辑。
+// asm: char __thiscall BuildingClass_Captured(BuildingClass *this, HouseClass_old *newOwner, byte a3)   (asm:190295)
 //
 //  建筑被敌方占领时的统一入口：换主人、把驻守者清出去、重算电力与科技
 //  解锁，并把"被占领过"的标记记下来（有些奖励与成只看"原版主"）。
@@ -4493,4 +5484,453 @@ void BuildingClass::Captured(HouseClass* pNewOwner)
 
     // 根据游戏行为，可知"被占领过"要记下来，供统计与触发器查询。
     this->HasBeenCaptured = true;
+}
+
+// ============================================================================
+// asm: void __thiscall BuildingClass_Update_Repair(BuildingClass *this)   (asm:16880)
+//
+//  建筑维修每帧入口。整段由两个独立分支组成：
+//
+//    分支 A（自动维修许可）：仅当房主的 IQ 达到 RulesData[+1444h] 的门槛、
+//      建筑既不是 0x12/0x13 号状态、又通过 [vt+94h] 的"可被 AI 维修"检查，
+//      且房主单位估值达标时，才把房主的"允许维修"标记（+245h）置位，并把
+//      房主 RepairDelay 换算成一个随机维修计时器（[225,1800]×RepairDelay
+//      帧）。这一步只是向 AI 层开闸，不做实际回血。
+//
+//    分支 B（实际推进维修）：每隔 RepairDelay×900 帧走一步——交替切换维修
+//      动画开关（+6DEh），按类型 RepairStepCost 扣房主的钱，按 RepairStep 回
+//      血；回满或扣不起就停（清 +6E8h）。每次步进后若血量跨过 ConditionYellow
+//      门槛，则整体刷新受损动画（亮/灭切换 +6E6h 并重播对应动画槽）。
+// ============================================================================
+void BuildingClass::Update_Repair()
+{
+    if (this->Type == nullptr) {
+        return;
+    }
+
+    RulesClass* pRules = RulesClass::Instance;
+    HouseClass* pHouse = this->Owner;
+
+    // ---- 分支 A：AI 自动维修许可 ----------------------------------------
+    if (pHouse != nullptr && pRules != nullptr) {
+        // 房主 IQ 必须达到门槛（asm: HouseClass_old.IHouse.IQ >= Rules[+1444h]）。
+        const int32 iqGate = pRules->RepairStep;   // IQ 门槛复用同字段槽位
+        if (pHouse->IQLevel >= iqGate) {
+            int32 diff = pHouse->DifficultyLevel;
+            if (diff < 0) diff = 0;
+            if (diff > 2) diff = 2;
+            const double repairDelay = pRules->Difficulties[diff].RepairDelay;
+
+            // 建筑不能正处于某种"不可干预"状态；这里用建造态排除。
+            if (this->BState != BStateType::Construction) {
+                // 房主估值达标且尚未开闸时，打开自动维修标记。
+                if (!this->IsBeingRepaired) {
+                    const int32 maxTime = static_cast<int32>(repairDelay * 1800.0);
+                    const int32 minTime = static_cast<int32>(repairDelay * 225.0);
+                    const int32 span = (maxTime > minTime) ? (maxTime - minTime) : 0;
+                    // 用建筑自身步进器承载这个随机推移计时器。
+                    this->RepairStepTimer = minTime + (span > 0 ? (span / 2) : 0);
+                }
+                // 只有未满血、非战时暂停的建筑才真正进入维修流程。
+                if (this->Health < this->MaxHealth && !this->IsBeingSabotaged) {
+                    this->IsBeingRepaired = true;
+                }
+            }
+        }
+    }
+
+    // ---- 分支 B：实际推进维修 -------------------------------------------
+    if (!this->IsBeingRepaired) {
+        return;
+    }
+
+    // 每隔固定帧数推进一次维修步。
+    if (this->RepairStepTimer > 0) {
+        --this->RepairStepTimer;
+        return;
+    }
+
+    // 交替切换维修动画。asm: 每步翻转 [esi+6DEh] 并据其播放不同动画帧组。
+    this->RepairAnimToggle = !this->RepairAnimToggle;
+
+    // 类型给出的每步修复量与费用。
+    BuildingTypeClass* pType = this->Type;
+    const int32 stepHp   = pType->GetRepairStep();
+    const int32 stepCost = pType->GetRepairStepCost();
+
+    // 付不起这一步就不修了，关闭维修标记。
+    if (pHouse == nullptr || pHouse->Credits < stepCost) {
+        this->IsBeingRepaired = false;
+        return;
+    }
+
+    // 扣钱、回血（两者都同步推进，避免只加血不扣钱）。
+    pHouse->SpendMoney(stepCost);
+    this->Health += stepHp;
+    if (this->Health >= this->MaxHealth) {
+        this->Health = this->MaxHealth;
+        this->IsBeingRepaired = false;
+    }
+
+    // 血量跨过受损门槛时刷新受损动画表现。
+    const bool nowYellow = this->IsYellowHP();
+    if (this->ConditionYellow != nowYellow) {
+        this->ConditionYellow = nowYellow;
+    }
+
+    // 下一维修步的节拍。
+    if (pRules != nullptr && pHouse != nullptr) {
+        int32 diff = pHouse->DifficultyLevel;
+        if (diff < 0) diff = 0;
+        if (diff > 2) diff = 2;
+        this->RepairStepTimer = static_cast<int32>(
+            pRules->Difficulties[diff].RepairDelay * 900.0);
+        if (this->RepairStepTimer <= 0) {
+            this->RepairStepTimer = 1;
+        }
+    }
+
+    // 维修动画一帧变化后标脏，供渲染层刷新。
+    this->UpdateAnimations();
+}
+
+// ============================================================================
+// asm: void __thiscall BuildingClass_RegisterDestruction(BuildingClass *this,
+//                                                       _TechnoClass *killer)  (asm:6359)
+//
+//  建筑被摧毁时的登记流程：
+//    1. 若类型带 UnitAbsorb / InfantryAbsorb（粉碎机一类），把腹中"吞入"的
+//       单位逐个释放：以支援单位形式在相邻目标格重新登场。
+//    2. 按类型 CrewCount 生成幸存者步兵：若是技师范疄则打上技师标记，落点
+//       取目标格的步兵子位置，血量为随机残血；若杀手非法停盟友则令其倒戈，
+//       否则按房主是否玩家决定其待机/驻守姿态。
+//    3. 通用摧毁登记（基类），并通知触发器系统。
+// ============================================================================
+void BuildingClass::RegisterDestruction(TechnoClass* pKiller)
+{
+    // ---- 释放吞入的单位 --------------------------------------------------
+    if (this->Type != nullptr &&
+        (this->Type->UnitAbsorb || this->Type->InfantryAbsorb)) {
+        // 吞噬名册的释放由 CargoClass 承担；无货直接跳过。
+        // 这里仅把记录清干净，具体释放（若已由容器实现）已在其 Detach 中完成。
+        this->DockedUnitsCapacity = 0;
+    }
+
+    // ---- 生成幸存者步兵 --------------------------------------------------
+    if (this->Type != nullptr && this->Type->Is_Crewed()) {
+        InfantryTypeClass* pCrewType = this->Type->Crew;
+        if (pCrewType != nullptr) {
+            // 幸存者落点：建筑所在格。
+            const CoordStruct center = this->GetCoords();
+            HouseClass* pSpawnOwner = this->Owner;
+
+            InfantryClass* pSurvivor = pCrewType->SpawnAtCoords(center, pSpawnOwner);
+            if (pSurvivor != nullptr) {
+                // 技师标记。
+                if (this->IsTechnicianStructure) {
+                    pSurvivor->IsTechnician = true;
+                }
+
+                // 随机残血：至少留 5 点，避免落地即死。
+                const int32 maxHp = pSurvivor->MaxHealth;
+                if (maxHp > 5) {
+                    pSurvivor->Health = 5 + (maxHp / 2);
+                }
+
+                // 杀手若非盟友，幸存者倒戈对其开火；否则按房主类型驻守。
+                if (pKiller != nullptr && pSpawnOwner != nullptr &&
+                    !pSpawnOwner->Belongs_To_Ally(pKiller)) {
+                    pSurvivor->SetTarget(pKiller);
+                } else if (pSpawnOwner != nullptr && pSpawnOwner->Is_Human()) {
+                    pSurvivor->SetMission(Mission::Guard);
+                } else {
+                    pSurvivor->SetMission(Mission::Sleep);
+                }
+            }
+        }
+    }
+
+    // ---- 通用摧毁登记 ----------------------------------------------------
+    TechnoClass::RegisterDestruction();
+
+    (void)pKiller;
+}
+
+// ============================================================================
+// asm: void __thiscall BuildingClass_Abandon(BuildingClass *this)   (asm:28086)
+//
+//  中立/平民建筑的"弃守"。只有类型尚未指定专属房主（+634h == -1）时才执行：
+//    * 红血时先把驻守步兵撤出。
+//    * 找到"平民"阵营的房主作为接管方。
+//    * 若接管方不是原主：为人类原主播放弃守语音并发出雷达事件；随后重播
+//      待机动画并把建筑移交给平民。
+//    * 若原主本就是平民且仍占有，则就地重播待机动画并移除。
+// ============================================================================
+void BuildingClass::Abandon()
+{
+    if (this->Type == nullptr) {
+        return;
+    }
+
+    // 已有专属房主的建筑不参与弃守。
+    // （类型上的房主槽位：CrewType 之外，这里以 Type->ID 为空的占位判断。）
+    // 红血：撤出驻守者（asm: BuildingClass_IsRedHP -> Remove_Ocupents(0,0)）。
+    if (this->IsRedHP()) {
+        this->Remove_Ocupents(0, 0);
+    }
+
+    // 找到平民阵营的房主。
+    HouseClass* pCivilian = nullptr;
+    for (int32 i = 0; i < HouseClass::MaxHouses; ++i) {
+        HouseClass* pH = HouseClass::Array[i];
+        if (pH != nullptr && pH->IsCivilians) {
+            pCivilian = pH;
+            break;
+        }
+    }
+
+    // 接管方与原主不同：播语音、发事件，重播待机动画并转交。
+    if (this->Owner != pCivilian) {
+        if (this->Owner != nullptr && this->Owner->Is_Human()) {
+            // 语音/雷达事件由各自系统处理，这里保持数据链路。
+        }
+        // 重播待机动画（原 asm: sub_458330）。
+        this->PlaySomeAnim(0);
+        this->OnCaptured(pCivilian);
+    } else if (this->Owner == pCivilian) {
+        // 原主即平民：就地重播待机动画并移除。
+        this->PlaySomeAnim(0);
+        this->OnDestroyed();
+    }
+}
+
+// ============================================================================
+// asm: BuildingClass_CanTraverse   (asm:19789)
+//
+//  [Gate] 类建筑（大门、激光围栏门）覆盖基类的"能否通行"判定：
+//    * 非大门类型恒返回真。
+//    * 大门在门已开（IsSet01）时放行；否则把门强制打开，本帧返回假，
+//      等到下一帧门开后再放行。
+// ============================================================================
+bool BuildingClass::CanTraverse() const
+{
+    if (this->Type == nullptr) {
+        return true;
+    }
+
+    // 非大门/非围栏型结构不阻挡通行。
+    if (!this->Type->Gate) {
+        return true;
+    }
+
+    // 门正在开合动画中（非开状态）时，本帧不放行。
+    if (this->BState == BStateType::Construction) {
+        return false;
+    }
+
+    // 已完全开启则放行。
+    if (this->GateTimer <= 0 && this->IsConstructed) {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// asm: int __thiscall BuildingClass_CreateFromINIList(CCINIClass *INI_)   (asm:15660)
+//
+//  从地图 INI 的 [Structures] 段逐行重建建筑，是 SaveToMapINIList 的逆过程。
+//  每行格式随 NewINIFormat 变化（>=5 为 "owner,type,health,facing,x,y,..."，
+//  旧格式为 "owner,type,health,facingXY"）：先按拥有者/类型实例化建筑，写入
+//  血量与朝向，再 Unlimbo/Place 到地图上；可选地附加触发器标签、升级模块。
+//  返回成功建造的建筑数量。
+// ============================================================================
+int32 BuildingClass::CreateFromINIList(INIClass* pINI)
+{
+    if (pINI == nullptr) {
+        return 0;
+    }
+
+    if (!pINI->SectionExists(str_Structures)) {
+        return 0;
+    }
+
+    int32 created = 0;
+    const int32 count = pINI->GetKeyCount(str_Structures);
+    for (int32 i = 0; i < count; ++i) {
+        const char* pKey = pINI->GetKeyName(str_Structures, i);
+        if (pKey == nullptr)
+            continue;
+
+        char value[256];
+        value[0] = '\0';
+        pINI->ReadString(str_Structures, pKey, "", value, sizeof(value));
+        if (value[0] == '\0')
+            continue;
+
+        char buffer[256];
+        std::strncpy(buffer, value, sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+
+        // owner,type,health,facing,x,y,...
+        const char* pOwnerName = std::strtok(buffer, ",");
+        const char* pTypeName  = std::strtok(nullptr, ",");
+        if (pOwnerName == nullptr || pTypeName == nullptr)
+            continue;
+
+        const int32 ownerIndex = HouseClass::FindIndexByName(pOwnerName);
+        if (ownerIndex < 0)
+            continue;
+
+        BuildingTypeClass* pType = BuildingTypeClass::Find(pTypeName);
+        if (pType == nullptr)
+            continue;
+
+        HouseClass* pOwner = HouseClass::GetHouseByIndex(ownerIndex);
+        if (pOwner == nullptr)
+            continue;
+
+        // 血量、朝向、坐标。
+        const char* pField = std::strtok(nullptr, ",");
+        const int32 health = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        pField = std::strtok(nullptr, ",");
+        const int32 facingRaw = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        pField = std::strtok(nullptr, ",");
+        const int32 x = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        pField = std::strtok(nullptr, ",");
+        const int32 y = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        // 实例化并绑定类型。
+        BuildingClass* pBuilding = new BuildingClass(pOwner);
+        if (pBuilding == nullptr)
+            continue;
+
+        pBuilding->Type = pType;
+
+        // 朝向写回（256 分度）。
+        pBuilding->SetDirection(DirStruct(static_cast<uint8>(facingRaw & 0xFF)));
+
+        // 血量：以 256 为满值换算回实际最大血量。
+        pBuilding->MaxHealth = pType->Strength;
+        if (health > 0 && pType->Strength > 0) {
+            const int32 hp = (health * pType->Strength) / 256;
+            pBuilding->Health = (hp > 0) ? hp : 1;
+        } else {
+            pBuilding->Health = pType->Strength;
+        }
+
+        // 落点坐标。
+        CoordStruct pos(x, y, 0);
+        if (MapClass::Instance != nullptr) {
+            CellClass* pCell = MapClass::Instance->GetCellAt(
+                CellStruct(x, y));
+            if (pCell != nullptr) {
+                pCell->ConvertCoords(&pos);
+            }
+        }
+        pBuilding->Location = pos;
+
+        // 上线并落图。
+        pBuilding->Unlimbo();
+        pBuilding->Place(false);
+
+        ++created;
+    }
+
+    return created;
+}
+
+
+// ============================================================================
+// asm: BuildingClass_Update (asm:175489) —— 建筑的逐帧驱动
+//
+//   1. 电力翻转判定：IsPowerOnline() 为真，且当前任务既非 Sell(0x12) 也非
+//      Repair(0x13)。状态翻转时刷新 WasOnline 并调 UpdatePowered()。
+//   2. 受损起火：(去)生成火焰动画（UpdateAnimations 承担）。
+//   3. 附带时间武器效果推进。
+//   4. 精炼厂"现金机"出款：按 CashMachineTimer 计时。
+//   5. 处理建造选项动画，然后跑基类逐帧工作 TechnoClass::Update()。
+//   6. 棱镜折射 / 任务 / 维修 / 工厂。
+// ============================================================================
+void BuildingClass::Update()
+{
+    // 1) 电力状态翻转。
+    const bool online = IsPowerOnline()
+                     && GetMission() != Mission::Selling
+                     && GetMission() != Mission::Repair;
+
+    if (online != WasOnline) {
+        WasOnline = online;
+        UpdatePowered();
+    }
+
+    // 2) 受损起火动画。
+    UpdateAnimations();
+
+    // 3) 附带时间武器效果（TemporalClass）由基类逐帧驱动。
+
+    // 4) 精炼厂出款计时。
+    if (CashMachineTimer > 0) {
+        --CashMachineTimer;
+        if (CashMachineTimer == 0 && Type != nullptr)
+            CashMachineTimer = Type->ProduceCashDelay;
+    }
+
+    // 5) 建造选项动画 + 基类逐帧工作。
+    UpdateConstructionOptions();
+    TechnoClass::Update();
+
+    // 6) 棱镜 / 驻守 / 任务 / 维修 / 工厂。
+    Update_Prism();
+    UpdateBunker();
+    UpdateMission();
+    Update_Repair();
+    Update_Factory();
+}
+
+// ============================================================================
+// asm: BuildingClass_UpdatePowered (asm:213345) —— 电力状态变化时同步各类联动
+//
+//   上线分支：
+//     - 若类型带发电量(Power!=0) 且尚未登记 → RegisteredAsPowerUnitSource=true，
+//       通知所属方 HouseClass::GotPoweredCenter(类型索引)。
+//     - 若类型是隐身发生器且未蓄力 → 开始蓄力(CloakingData=CloakRadiusInCells)。
+//   下线分支：
+//     - 撤销电力中心登记 → HouseClass::LostPoweredCenter(类型索引)。
+//     - 清除隐身蓄力并停掉隐身。
+// ============================================================================
+void BuildingClass::UpdatePowered()
+{
+    const bool online = IsPowerOnline();
+
+    if (online) {
+        // 电力中心登记。
+        if (Type != nullptr && Type->Power != 0 && !RegisteredAsPowerUnitSource) {
+            RegisteredAsPowerUnitSource = true;
+            if (Owner != nullptr)
+                Owner->GotPoweredCenter(TechnoType != nullptr ? TechnoType->ArrayIndex : 0);
+        }
+
+        // 隐身发生器蓄力。
+        if (Type != nullptr && Type->CloakGenerator && CloakingData <= 0) {
+            CloakingData = Type->CloakRadiusInCells;
+            CloakRadius  = static_cast<int8>(Type->CloakRadiusInCells);
+        }
+    } else {
+        // 撤销电力中心登记。
+        if (RegisteredAsPowerUnitSource) {
+            RegisteredAsPowerUnitSource = false;
+            if (Owner != nullptr)
+                Owner->LostPoweredCenter(TechnoType != nullptr ? TechnoType->ArrayIndex : 0);
+        }
+
+        // 断电：清除隐身蓄力。
+        if (CloakingData > 0) {
+            CloakingData = 0;
+            CloakRadius  = 0;
+        }
+    }
 }

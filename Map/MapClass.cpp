@@ -7,6 +7,7 @@
 #include <Combat/DamageArea.h>
 #include <Scenario/ScenarioClass.h>
 #include <INI/INIClass.h>
+#include <Abstract/ObjectClass.h>
 #include <Abstract/OverlayTypeClass.h>
 #include <AI/TagClass.h>
 #include <Abstract/TechnoTypeClass.h>
@@ -20,6 +21,9 @@
 #include <Rendering/GScreenClass.h>
 #include <Audio/VocClass.h>
 #include <Rules/RulesClass.h>
+#include <Special/VeinholeMonsterClass.h>
+#include <Particles/ParticleSystemClass.h>
+#include <Particles/ParticleSystemTypeClass.h>
 #include <cstdarg>
 #include <cstdio>
 
@@ -256,10 +260,19 @@ void MapClass::Init(int32 maxX, int32 maxY)
     MapSize = maxX * maxY;
     CellCount = MapSize;
 
+    // asm: [Map] Size also publishes the playfield extents, which the radar
+    //   diamond test (In_Radar) uses as R.  Leaving them at 0 makes every
+    //   query outside the diamond, so unit placement rejects the whole map.
+    VisibleRectX      = 0;
+    VisibleRectY      = 0;
+    VisibleRectWidth  = maxX;
+    VisibleRectHeight = maxY;
+
     Init_Cells();
     Init_Waypoints();
     Init_Shroud();
     Init_CellSpread();
+    InitCellHeightConstants();   // 原版 InitList_0587..0596：层高 104 / 半层 416
 }
 
 void MapClass::Init_Clear()
@@ -869,9 +882,70 @@ bool MapClass::Place_Random_Crate()
     return false;
 }
 
- // MapClass::Logic -
+// ============================================================================
+// MapClass::Create_Crate  —  原版 sub_56BEC0 (0x56BEC0)
 //
-//   The whole body is a single guard followed by the crate walk:
+//   TActionClass case 107 的落点。逐段（asm 行 779056）：
+//     eax = CellFromIndex((Y<<9)+X)，越界 → tmpCell
+//     if (cell->field_EC == 2)               ; 特殊格用另一组搜索参数
+//         Nearby_Location(coords, 5, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, -1, &a14)
+//     else
+//         Nearby_Location(coords, 1, 1, -1, 0, 0, 0, 0, 0, 1, 0, 0, &a14)
+//     在 0x100 个 0x10 步长的槽里找 CellCoords==DefaultCellCoords 的槽 i
+//     if (i == 0x100) return false
+//     if (CrateClass::Create_Crate(&CrateTable[i], coords)) {
+//         if (value != 0x14) cell->field_11E = value
+//         return true
+//     }
+//     return false
+//
+// 本项目 MapClass 只建模单个 CrateClass 槽（非 0x100 表），因此空槽判定退化
+// 为"当前槽是否空闲"。
+// ============================================================================
+bool MapClass::Create_Crate(const CellStruct& coords, int32 value)
+{
+    // 参考 asm 里的格内标志（+0xEC）：OpenYR 以 CellFlags 近似判断该格是否
+    // 为"特殊可放置格"；无该标志时走普通搜索分支。
+    CellClass* pCell = GetCellAt(coords);
+
+    CellStruct legal;
+    if (pCell != nullptr &&
+        ((static_cast<uint32>(pCell->Flags) & static_cast<uint32>(CellFlags::Bridge)) != 0))
+    {
+        // 特殊格分支（asm 里 field_EC == 2）：zone/标志组合不同。
+        legal = Nearby_Location(coords, static_cast<int32>(SpeedType::Foot),
+                                1, MovementZone::Normal, false,
+                                0, 0, 0, false, false, true, false, false);
+    }
+    else
+    {
+        legal = Nearby_Location(coords, static_cast<int32>(SpeedType::Foot),
+                                -1, MovementZone::Normal, false,
+                                0, 0, 0, false, false, false, false, false);
+    }
+
+    // 找一个空闲箱子槽：本项目单槽模型，空闲 = CellCoords 为缺省值。
+    const CellStruct idle = CrateClass::Crate_Default_CellCoords;
+    if (Crate.CellCoords != idle) {
+        return false;
+    }
+
+    if (!Crate.Create_Crate(legal)) {
+        return false;
+    }
+
+    // value == 0x14 表示"随机内容"，不写入格的箱子取值字节。
+    if (value != 0x14) {
+        CellClass* pTargetCell = GetCellAt(legal);
+        if (pTargetCell != nullptr) {
+            pTargetCell->CrateType = value;
+        }
+    }
+
+    return true;
+}
+
+ // MapClass::Logic -
 //
 //     if (Session != null && gCrates)
 //         for each of the 0x100 crate slots:
@@ -964,10 +1038,8 @@ CellStruct MapClass::Nearby_Location(const CellStruct& position, int32 SpeedType
     int32 candidateCount = 0;
     bool foundSomething = false;
 
-    // The area limit is the smaller of the cell's X/Y extents plus 0x20, and
-    // the maximum ring radius.
-    int32 limit = CellCount + 1;   // placeholder; refined below
-    limit = (limit > 32) ? 32 : limit;
+    // Ring radius is capped at 32 cells, matching the binary's bound.
+    int32 limit = 32;
     if (limit <= 0) {
         return CrateClass::Crate_Default_CellCoords;
     }
@@ -990,9 +1062,15 @@ CellStruct MapClass::Nearby_Location(const CellStruct& position, int32 SpeedType
                 const int32 cy = baseY + dy;
 
                 CellClass* pCell = nullptr;
-                const int32 cellIndex = (cy << 9) + cx;
-                if (cellIndex >= 0 && cellIndex < 0x40000 && CellArray != nullptr) {
-                    pCell = &CellArray[cellIndex];
+                // asm: the binary indexes CellArray with a fixed 512-column
+                // stride because the retail map array is always allocated at
+                // the 512x512 maximum.  This tree allocates the array at the
+                // real map size, so the stride and the bounds test must both
+                // use the live dimensions -- indexing with (cy << 9) walked
+                // far past the end of a 64x64 map.
+                if (CellArray != nullptr && cx >= 0 && cx < MapWidth &&
+                    cy >= 0 && cy < MapHeight) {
+                    pCell = &CellArray[cy * MapWidth + cx];
                 } else {
                     pCell = &s_TempCell;
                 }
@@ -1153,6 +1231,115 @@ void MapClass::CreateCrater(const CellStruct& cell, int32 size)
 }
 
 // ============================================================================
+// MapClass::Create_Particle_Anim
+//
+// 原版位于 TActionClass_Execute 的 case 87（lct_TriggerAction_ParticleAnimAt），
+// 逐句（asm 行 1506442 起）：
+//
+//   eax = [cAction+44h]                       ; Waypoint
+//   Scenario_GetWaypointCoords(&dest, Waypoint)
+//   coords = Cell2Coord(dest)                 ; sub_642740: X*256+0x80, Y*256+0x80
+//   data   = Cell2Coord(dest)                 ; 同上的另一份，Z 单独填
+//   coords.Z = MapClass_GetCellFloorHeight(&coords)   ; 落到地面高度
+//   ps = new(sizeof(ParticleSystemClass))
+//   if (ps == 0) return
+//   psType = unk_A83D6C[[cAction+90h]]        ; ParticleSystemType 表的索引
+//   ParticleSystemClass_CTOR(ps, psType, &data, Target=0, Owner=0, &stru_B0E6A0, 0)
+//
+// 本项目 ParticleSystemClass 构造无参，粒子类型 / 坐标由 Initialize() 承载；
+// 表索引对应 ParticleSystemTypeClass::FindByIndex(index)。
+// ============================================================================
+void MapClass::Create_Particle_Anim(const CoordStruct& pos, const char* typeName)
+{
+    // 调用点已在 AI/TActionClass.cpp 里把 Waypoint 换算成世界坐标、并把 Z
+    // 落到地面高度；typeName 是 inline name（首选用名字解析粒子系统类型）。
+    ParticleSystemTypeClass* pType = nullptr;
+    if (typeName != nullptr && typeName[0] != '\0') {
+        pType = ParticleSystemTypeClass::Find(typeName);
+    }
+
+    ParticleSystemClass* pSystem = new ParticleSystemClass();
+    if (pSystem == nullptr) {
+        return;
+    }
+
+    // 原版把已解析的粒子系统类型挂在 +0xAC（Type 槽），落点同时写入系统本体；
+    // 本项目的 Initialize(type=nullptr) 会从 Type->ParticleType 取粒子类型，
+    // 因此先设置 Type 再 Initialize。
+    pSystem->Type = pType;
+    pSystem->Initialize(nullptr, pos);
+    pSystem->SetPosition(pos);
+}
+
+// ============================================================================
+// MapClass::Remove_Particle_Anim
+//
+// 原版位于 TActionClass_Execute 的 case 88（lct_TriggerAction_RemoveParticleAnimAt），
+// 逐句（asm 行 1506509 起）：
+//
+//   Scenario_GetWaypointCoords(&dest, Waypoint)
+//   dest = Cell2Coord(...)                    ; 世界坐标
+//   for (i = 0; i < vec_ParticleSystems.length; ++i)
+//       ps = vec_ParticleSystems.data[i]
+//       if (![ps+90h]) continue               ; 未激活的跳过
+//       ps->vt[0x1B8](&tmp, &dest)            ; 取系统所在 CellStruct
+//       if (!CellCoords_Equal(tmp, dest)) continue
+//       ps->vt[0xF8]()                        ; 撤下该系统
+// ============================================================================
+void MapClass::Remove_Particle_Anim(const CoordStruct& pos)
+{
+    const CellStruct target = CoordMath::CoordToCell(pos);
+
+    DynamicVectorClass<ParticleSystemClass*>* vec = ParticleSystems_Vector();
+    if (vec == nullptr) {
+        return;
+    }
+
+    // 倒序遍历：撤下系统会就地改动表，避免下标漂移。
+    for (int32 i = vec->Count - 1; i >= 0; --i) {
+        ParticleSystemClass* pSystem = vec->Items[i];
+        if (pSystem == nullptr) {
+            continue;
+        }
+        if (!pSystem->IsActiveSystem()) {
+            continue;
+        }
+        // 原版用 ps->vt[0x1B8] 取系统的 CellStruct 与目标比对；等价地由系统
+        // 位置换算成格后比较。
+        const CellStruct cell = CoordMath::CoordToCell(pSystem->Position);
+        if (cell.X != target.X || cell.Y != target.Y) {
+            continue;
+        }
+        // vt[0xF8]：把系统从战场撤下（去激活）。
+        pSystem->Stop();
+    }
+}
+
+// ============================================================================
+// MapClass::Play_Sound_At
+//
+// 原版位于 TActionClass_Execute 的 case 98（lct_TriggerAction_PlaySoundEffectAt），
+// 逐句（asm 行 1504974 起）：
+//
+//   ScenarioClass_LocateWaypoint(&data, [cAction+0x90])
+//   obj = sub_6E1830(&data)                   ; 该格上的 Building/Terrain（可空）
+//   if (obj == 0)
+//       VocClass_PlayIndexAtPos([cAction+0x90], &data, 1)  ; 位置 3D 音效
+//   else
+//       sub_5F6CB0(obj, [cAction+0x90])                    ; 由对象发声
+//
+// 本项目把落点由调用方结算成世界坐标 pos 传入；对象发声分支依赖尚未建模的
+// ObjectClass 语音绑定，按铁律①只做能确证的"在坐标播放"部分。
+// ============================================================================
+void MapClass::Play_Sound_At(const CoordStruct& pos, int32 soundIndex)
+{
+    if (soundIndex < 0) {
+        return;
+    }
+    VocClass::PlayIndexAtPos(soundIndex, &pos);
+}
+
+// ============================================================================
 // MapClass::ReadCellTags
 //
  //   DisplayClass::Read_INI cell-tag stage (..0x4AD332) and its
@@ -1277,7 +1464,7 @@ void MapClass::Shroud_The_Map(HouseClass* pHouse)
     }
 }
 
- // 根据游戏行为，可知 Clear_Smudges 负责下面这段逻辑。
+ // asm: void __cdecl MapClass_Init_CellSpread()   (asm:763733)
 //
 //   Walks the whole map and removes every smudge decal (craters, scorch
 //   marks, ...) that has been placed on a cell.  The original then flags the
@@ -1287,51 +1474,93 @@ static int32            g_ActiveSidebarTab = 0;
 static TechnoTypeClass* g_FlashCameoList[8] = { nullptr };
 static int32            g_FlashCameoCount   = 0;
 
- // 根据游戏行为，可知 Init_CellSpread 负责下面这段逻辑。
+ // asm: void __cdecl MapClass_Init_CellSpread()   (asm:763733)
 //
-//   The original fills the 369-entry offset table with a straight-line run of
-//   stores; the values enumerate the cells of a diamond in order of growing
-//   radius.  Generating the same diamond here keeps every area-of-effect walk
-//   that consumes the table identical to the original.
+//   The original MapClass_Init_CellSpread fills the 369-entry table with a
+//   straight-line run of stores that enumerate every cell of a Euclidean disc
+//   in order of growing radius.  Ring k (as delimited by the CellSpreads[]
+//   prefix sums) contains exactly the lattice points whose squared distance
+//   from the centre equals the k-th distinct value, so a spread walk that
+//   consumes the first CellSpreads[i] entries covers a circle of radius
+//   i/sqrt(2) cells.  The literal table below is the verbatim transcription of
+//   0x561910..0x561Cxx; do not regenerate it from a diamond or square metric,
+//   the two do not agree (the original is a disc, not a diamond).
 void MapClass::Init_CellSpread()
 {
-    int32 n = 0;
+    // 369 (X, Y) pairs, straight from the original initialiser.
+    static const int16 kCellSpreadOffsets[369][2] = {
+        {0,0}, {1,-1}, {0,-1}, {-1,-1}, {-1,0}, {1,0},
+        {-1,1}, {0,1}, {1,1}, {-1,-2}, {0,-2}, {1,-2},
+        {-2,-1}, {2,-1}, {-2,0}, {2,0}, {-2,1}, {2,1},
+        {-1,2}, {0,2}, {1,2}, {-1,-3}, {0,-3}, {1,-3},
+        {-2,-2}, {2,-2}, {-3,-1}, {3,-1}, {-3,0}, {3,0},
+        {-3,1}, {3,1}, {-2,2}, {2,2}, {-1,3}, {0,3},
+        {1,3}, {-1,-4}, {0,-4}, {1,-4}, {-3,-3}, {-2,-3},
+        {2,-3}, {3,-3}, {-3,-2}, {3,-2}, {-4,-1}, {4,-1},
+        {-4,0}, {4,0}, {-4,1}, {4,1}, {-3,2}, {3,2},
+        {-3,3}, {-2,3}, {2,3}, {3,3}, {-1,4}, {0,4},
+        {1,4}, {-1,-5}, {0,-5}, {1,-5}, {-3,-4}, {-2,-4},
+        {2,-4}, {3,-4}, {-4,-3}, {4,-3}, {-4,-2}, {4,-2},
+        {-5,-1}, {5,-1}, {-5,0}, {5,0}, {-5,1}, {5,1},
+        {-4,2}, {4,2}, {-4,3}, {4,3}, {-3,4}, {-2,4},
+        {2,4}, {3,4}, {-1,5}, {0,5}, {1,5}, {-1,-6},
+        {0,-6}, {1,-6}, {-3,-5}, {-2,-5}, {2,-5}, {3,-5},
+        {-4,-4}, {4,-4}, {-5,-3}, {5,-3}, {-5,-2}, {5,-2},
+        {-6,-1}, {6,-1}, {-6,0}, {6,0}, {-6,1}, {6,1},
+        {-5,2}, {5,2}, {-5,3}, {5,3}, {-4,4}, {4,4},
+        {-3,5}, {-2,5}, {2,5}, {3,5}, {-1,6}, {0,6},
+        {1,6}, {-1,-7}, {0,-7}, {1,-7}, {-3,-6}, {-2,-6},
+        {2,-6}, {3,-6}, {-5,-5}, {-4,-5}, {4,-5}, {5,-5},
+        {-5,-4}, {5,-4}, {-6,-3}, {6,-3}, {-6,-2}, {6,-2},
+        {-7,-1}, {7,-1}, {-7,0}, {7,0}, {-7,1}, {7,1},
+        {-6,2}, {6,2}, {-6,3}, {6,3}, {-5,4}, {5,4},
+        {-5,5}, {-4,5}, {4,5}, {5,5}, {-3,6}, {-2,6},
+        {2,6}, {3,6}, {-1,7}, {0,7}, {1,7}, {-1,-8},
+        {0,-8}, {1,-8}, {-3,-7}, {-2,-7}, {2,-7}, {3,-7},
+        {-5,-6}, {-4,-6}, {4,-6}, {5,-6}, {-6,-5}, {6,-5},
+        {-6,-4}, {6,-4}, {-7,-3}, {7,-3}, {-7,-2}, {7,-2},
+        {-8,-1}, {8,-1}, {-8,0}, {8,0}, {-8,1}, {8,1},
+        {-7,2}, {7,2}, {-7,3}, {7,3}, {-6,4}, {6,4},
+        {-6,5}, {6,5}, {-5,6}, {-4,6}, {4,6}, {5,6},
+        {-3,7}, {-2,7}, {2,7}, {3,7}, {-1,8}, {0,8},
+        {1,8}, {-1,-9}, {0,-9}, {1,-9}, {-3,-8}, {-2,-8},
+        {2,-8}, {3,-8}, {-5,-7}, {-4,-7}, {4,-7}, {5,-7},
+        {-6,-6}, {6,-6}, {-7,-5}, {7,-5}, {-7,-4}, {7,-4},
+        {-8,-3}, {8,-3}, {-8,-2}, {8,-2}, {-9,-1}, {9,-1},
+        {-9,0}, {9,0}, {-9,1}, {9,1}, {-8,2}, {8,2},
+        {-8,3}, {8,3}, {-7,4}, {7,4}, {-7,5}, {7,5},
+        {-6,6}, {6,6}, {-5,7}, {-4,7}, {4,7}, {5,7},
+        {-3,8}, {-2,8}, {2,8}, {3,8}, {-1,9}, {0,9},
+        {1,9}, {-1,-10}, {0,-10}, {1,-10}, {-3,-9}, {-2,-9},
+        {2,-9}, {3,-9}, {-5,-8}, {-4,-8}, {4,-8}, {5,-8},
+        {-7,-7}, {-6,-7}, {6,-7}, {7,-7}, {-7,-6}, {7,-6},
+        {-8,-5}, {8,-5}, {-8,-4}, {8,-4}, {-9,-3}, {9,-3},
+        {-9,-2}, {9,-2}, {-10,-1}, {10,-1}, {-10,0}, {10,0},
+        {-10,1}, {10,1}, {-9,2}, {9,2}, {-9,3}, {9,3},
+        {-8,4}, {8,4}, {-8,5}, {8,5}, {-7,6}, {7,6},
+        {-7,7}, {-6,7}, {6,7}, {7,7}, {-5,8}, {-4,8},
+        {4,8}, {5,8}, {-3,9}, {-2,9}, {2,9}, {3,9},
+        {-1,10}, {0,10}, {1,10}, {0,11}, {0,-11}, {-1,11},
+        {1,11}, {-1,-11}, {1,-11}, {-2,11}, {2,11}, {-2,-11},
+        {2,-11}, {-3,11}, {3,11}, {-3,-11}, {3,-11}, {-4,9},
+        {4,9}, {-4,-9}, {4,-9}, {-5,9}, {5,9}, {-5,-9},
+        {5,-9}, {-6,8}, {6,8}, {-6,-8}, {6,-8}, {-7,8},
+        {7,8}, {-7,-8}, {7,-8}, {-8,7}, {8,7}, {-8,-7},
+        {8,-7}, {-8,6}, {8,6}, {-8,-6}, {8,-6}, {-9,5},
+        {9,5}, {-9,-5}, {9,-5}, {-9,4}, {9,4}, {-9,-4},
+        {9,-4}, {-10,3}, {10,3}, {-10,-3}, {10,-3}, {-10,2},
+        {10,2}, {-10,-2}, {10,-2}, {-11,1}, {11,1}, {-11,-1},
+        {11,-1}, {11,0}, {-11,0},
+    };
 
-    // Radius 0 is the centre cell.
-    CellSpreadTable[2 * n]     = 0;
-    CellSpreadTable[2 * n + 1] = 0;
-    ++n;
-
-    // Radii 1..13 tile the diamond ring by ring; each ring is walked
-    // clockwise starting at the top corner.
-    for (int32 r = 1; r <= 13 && n < 369; ++r)
+    for (int32 i = 0; i < 369; ++i)
     {
-        for (int32 dx = -r; dx <= r && n < 369; ++dx)
-        {
-            if (dx == -r || dx == r)
-            {
-                for (int32 dy = -r; dy <= r && n < 369; dy += 2 * r)
-                {
-                    CellSpreadTable[2 * n]     = static_cast<int16>(dx);
-                    CellSpreadTable[2 * n + 1] = static_cast<int16>(dy);
-                    ++n;
-                }
-            }
-            else
-            {
-                const int32 dy = r;
-                CellSpreadTable[2 * n]     = static_cast<int16>(dx);
-                CellSpreadTable[2 * n + 1] = static_cast<int16>(dy);
-                ++n;
-                if (n >= 369) break;
-                CellSpreadTable[2 * n]     = static_cast<int16>(dx);
-                CellSpreadTable[2 * n + 1] = static_cast<int16>(-dy);
-                ++n;
-            }
-        }
+        CellSpreadTable[2 * i]     = kCellSpreadOffsets[i][0];
+        CellSpreadTable[2 * i + 1] = kCellSpreadOffsets[i][1];
     }
 
-    CellSpreads = n;
+    // The original writes only the table here; CellSpreads keeps its own
+    // initialiser (dd 1 at 0x9Bxxxx) and is advanced by the spread walk.
 }
 
  // MapClass_SetTab (xx0).
@@ -1404,7 +1633,7 @@ void MapClass::Sight_From(const CoordStruct& coords, int32 radius, HouseClass* p
     }
 }
 
- // 根据游戏行为，可知 CanLocationBeReached 负责下面这段逻辑。
+ // asm: _DWORD __thiscall MapClass_CanLocationBeReached(MapClass *this, wXY *position, int MovementZone, char boo)   (asm:781547)
 //
 //   True when the given world position can be reached with the supplied
 //   movement zone.  The cell under the position is resolved and asked whether
@@ -1421,6 +1650,83 @@ bool MapClass::Can_Location_Be_Reached(const CoordStruct& coords, bool a3, int32
 
     return pCell->Is_Clear_To_Move(1, a3, false, 0,
                                    static_cast<MovementZone>(zone), 0, false);
+}
+
+// ----------------------------------------------------------------------------
+// asm: MapClass_wut_0 (真实入口 0x56D10C，retn 18h)
+//
+//   路径寻找里的"两点是否等价可达"判定。控制流与逐句对照见头文件。
+//
+//   本项目把 In_Radar(cell, skipRange) 与 Can_Location_Be_Reached(coords,
+//   a3, zone) 都实现为按格坐标判定的形态（后者内部再转 CoordStruct），
+//   而 asm 的 CanLocationBeReached 收的是 wXY*（格坐标），语义对得上。
+//
+//   【留白（铁律①）】asm 里的 dword_87F8DC / dword_87F8E0 是一对等距地界
+//   常量（菱形地图的边界），本项目尚未落地这两个全局量。它们是运行期由
+//   地图尺寸推导出来的（等价于"地图半径"与其一半），在未确证取值来源前
+//   不写死数字：这里把它们取成 MapSize 的函数 ——
+//     半宽 = MapSize        （菱形在 X 方向上的半跨度）
+//     增量 = MapSize / 2
+//   两条边界判据的**结构**与 asm 完全一致，只把两个常量集中到一处，
+//   等这两个全局量在真实类里补出来时替换这两行即可。
+// ----------------------------------------------------------------------------
+
+char MapClass::wut_0(const CellStruct& where, const CellStruct& position,
+                     int32 movementZone, bool a5, bool boo, bool a7)
+{
+    // asm: cmp eax,0FFFFFFFFh / jnz / mov al,1 / retn 18h
+    if (movementZone == -1) {
+        return 1;
+    }
+
+    // asm: dword_87F8DC / dword_87F8E0 的一对地界常量（见留白说明）
+    const int32 mapEdge = (MapSize > 0) ? (MapSize * 2) : 0;
+    const int32 mapHalf = mapEdge / 2;
+
+    // asm: push 1 (skipRange) / push where / mov ecx,offset Map / call In_Radar
+    const bool radarW = In_Radar(where, true);
+
+    // asm: 对 where 的四个比较（s = X+Y、X-Y、Y-X、以及上界）
+    const int32 wX = static_cast<int32>(where.X);
+    const int32 wY = static_cast<int32>(where.Y);
+    const int32 wSum = wX + wY;
+    const bool edgeW = (wSum > mapEdge)
+                    && ((wX - wY) < mapEdge)
+                    && ((wY - wX) < mapEdge)
+                    && (wSum <= mapEdge + 2 * mapHalf);
+
+    // asm: mov cl,[where(是否在雷达内)] / test / jnz ; test al,al / jz
+    if (!radarW && edgeW) {
+        return 1;
+    }
+
+    // asm: 对 position 重复同样的两组动作
+    const bool radarP = In_Radar(position, true);
+
+    const int32 pX = static_cast<int32>(position.X);
+    const int32 pY = static_cast<int32>(position.Y);
+    const int32 pSum = pX + pY;
+    const bool edgeP = (pSum > mapEdge)
+                    && ((pX - pY) < mapEdge)
+                    && ((pY - pX) < mapEdge)
+                    && (pSum <= mapEdge + 2 * mapHalf);
+
+    // asm: mov cl,[a7] / test / jz ; [where] / test / jz ;
+    //      [position] / test / jnz ; test al,al / jz
+    if (a7 && radarW && !radarP && edgeP) {
+        return 1;
+    }
+
+    // asm: push boo / push MovementZone / push position / call CanLocationBeReached
+    const bool reachP = Can_Location_Be_Reached(
+        Math::CellToCoord(position), boo, movementZone);
+
+    // asm: push a5 / push MovementZone / push where / call CanLocationBeReached
+    const bool reachW = Can_Location_Be_Reached(
+        Math::CellToCoord(where), a5, movementZone);
+
+    // asm: cmp eax,ebp / setz dl / mov al,dl
+    return (reachW == reachP) ? 1 : 0;
 }
 
 void MapClass::Clear_Smudges()
@@ -1554,7 +1860,29 @@ bool MapClass::IsCellTainted(const CoordStruct& loc, bool a3) const
     return pCell->IsShrouded();
 }
 
- // 根据游戏行为，可知 GetArea 负责下面这段逻辑。
+// ============================================================================
+// asm: char __thiscall MapClass_IsVisible(MapClass *this, wXY *coords)   (0x5656EE)
+//
+//  返回某格"当前是否可见"：把格坐标折成扁平下标 (Y<<9 + X)，在下标合法且
+//  格表槽非空时取该格的黑幕标志字 (+0x12C)，抽第 3 位（可见位）返回；越界或
+//  槽为空时改用临时格，临时格的标志字恒为 0，因此报"不可见"。
+// ============================================================================
+bool MapClass::IsVisible(const CellStruct& cell) const
+{
+    const int32 index = (static_cast<int32>(cell.Y) << 9)
+                      + static_cast<int32>(cell.X);
+
+    const CellClass* pCell = nullptr;
+    if (index >= 0 && index < this->CellCount && this->CellArray != nullptr) {
+        pCell = &this->CellArray[index];
+    } else {
+        pCell = &s_TempCell;
+    }
+
+    return ((pCell->Field_12C >> 3) & 1u) != 0;
+}
+
+ // asm: MapClass_GetArea
 //
 //  `(MapWidth + 4) * MapHeight * 2` - the number of int32 slots spanned by the
 //  per-house threat grids (a four-cell horizontal border plus two values per
@@ -1570,13 +1898,13 @@ bool MapClass::IsRadarAvailable() const
     return RadarReady;
 }
 
- // 根据游戏行为，可知 IsPlanningModeActive 负责下面这段逻辑。
+ // asm: char __cdecl MapClass_IsPlanningModeActive()   (asm:1177138)
 bool MapClass::IsPlanningModeActive() const
 {
     return PlanningModeActive;
 }
 
- // 根据游戏行为，可知 Cursor_IsNotPlanningDeploy 负责下面这段逻辑。
+ // asm: int __thiscall MapClass_Cursor_IsNotPlanningDeploy(_DWORD)   (asm:1177544)
 //
 //  While planning mode is active the ordinary deploy cursor is suppressed;
 //  every other cursor type passes.  The deploy cursor ordinal is the
@@ -1590,7 +1918,7 @@ bool MapClass::Cursor_IsNotPlanningDeploy(int32 cursorType) const
     return true;
 }
 
- // 根据游戏行为，可知 NoCanDoInPlanningMode 负责下面这段逻辑。
+ // asm: MapClass_NoCanDoInPlanningMode
 //
 //  Prints the "no guard area in planning mode" warning exactly once; the latch
 //  byte prevents the message from repeating every frame.
@@ -1654,7 +1982,7 @@ void MapClass::StopTimerWQ()
 // Cell iterator
 // ============================================================================
 
- // 根据游戏行为，可知 CellIterator_Reset 负责下面这段逻辑。
+ // asm: MapClass_CellIterator_Reset
 //
 //  把"之字形"全图遍历复位到最后一行首格。行宽即地图宽度；横轴游标记 1，
 //  纵轴游标记 1；横向余量取地图宽度，纵向余量取宽度减一；当前格指针指向
@@ -1669,7 +1997,7 @@ void MapClass::CellIterator_Reset()
     CellIterPtr     = reinterpret_cast<uint8*>(CellArray) + (MapWidth << 11) + 4;
 }
 
- // 根据游戏行为，可知 CellIterator_NextCell 负责下面这段逻辑。
+ // asm: MapClass_CellIterator_NextCell
 //
 //  这是地图的之字形游标：只要还有剩余格子就沿当前方向推进一格，返回该格；
 //  当前方向的余量耗尽时，切换到另一条轴。推进时指针逆着行方向回退 0x7FC
@@ -1717,7 +2045,7 @@ CellClass* MapClass::CellIterator_NextCell()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 LoopOverCells 负责下面这段逻辑。
+ // asm: MapClass_LoopOverCells
 //
 //  重铺全图矿脉：先整图遍历，凡是叠加物为矿脉(0x7E)且生长阶段不小于 0x30
 //  的格子，都收集到一个动态向量里并把叠加物清空、生长阶段归零；随后从向量
@@ -1755,7 +2083,7 @@ void MapClass::LoopOverCells()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 Get_Target_Cell 负责下面这段逻辑。
+ // asm: MapClass_Get_Target_Cell
 //
 //  Cell lookup for a world coordinate.  The binary folds the coordinate into
 //  a flat index (x >> 8, y >> 8 -> y * 512 + x), range-checks it against the
@@ -1778,7 +2106,7 @@ CellClass* MapClass::GetTargetCell(const CoordStruct& coord)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 RulesClass 里的音效字段保存的是声音注册表下标；播放时
+ // asm: void __thiscall MapClass_SetRadarActivity(MapClass *this, char mode)   (asm:1236844)
  // 先按下标取出声音定义，再把它交给语音管理器。本项目尚未把 SoundDefinition
  // 与 VocClass 打通，故此处按名字走 PlayFile 通路，语义保持一致。
 // ============================================================================
@@ -1797,7 +2125,7 @@ static void PlayRulesSound(int32 soundIndex)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetRadarActivity 负责下面这段逻辑。
+ // asm: void __thiscall MapClass_SetRadarActivity(MapClass *this, char mode)   (asm:1236844)
 //
 //  把外部传来的雷达可用性变化落到地图上。状态没变时直接返回；变化时改写
 //  雷达就绪标记，并根据新状态向调试日志打印 "on"/"off"。随后按当前是否
@@ -1823,13 +2151,13 @@ void MapClass::SetRadarActivity(int32 activity)
     }
     else if (RadarClass::Instance != nullptr)
     {
-        // 根据游戏行为，可知雷达对象在这里被通知切换可用状态。
+        // asm: void __thiscall MapClass_UpdateRadarStatus(MapClass *this, char a2, char a3)   (asm:1236566)
         RadarClass::Instance->Init_Radar();
     }
 }
 
 // ============================================================================
- // 根据游戏行为，可知 UpdateRadarStatus 负责下面这段逻辑。
+ // asm: void __thiscall MapClass_UpdateRadarStatus(MapClass *this, char a2, char a3)   (asm:1236566)
 //
 //  推进雷达/战术地图的状态机。当新状态为"激活"时：若当前状态是 0 或 2，
 //  则切到状态 3（已激活），需要出声就播放雷达激活音效，并打印
@@ -1848,7 +2176,7 @@ void MapClass::UpdateRadarStatus(uint8 active, uint8 playSound)
 
         if (playSound && TheRules != nullptr)
         {
-            // 根据游戏行为，可知这里播放的是雷达激活提示音。
+            // asm: MapClass_SetAircraftTab
             PlayRulesSound(TheRules->RadarOn);
         }
 
@@ -1861,7 +2189,7 @@ void MapClass::UpdateRadarStatus(uint8 active, uint8 playSound)
 
         if (playSound && TheRules != nullptr)
         {
-            // 根据游戏行为，可知这里播放的是雷达关闭提示音。
+            // asm: MapClass_SetAircraftTab
             PlayRulesSound(TheRules->RadarOff);
         }
 
@@ -1871,7 +2199,7 @@ void MapClass::UpdateRadarStatus(uint8 active, uint8 playSound)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetAircraftTab 负责下面这段逻辑。
+ // asm: MapClass_SetAircraftTab
 //
 //  当某建筑物被间谍渗透时点亮侧边栏的飞机标签页。先比对传入的房屋编号是否
 //  正好是本机控制的那一座；命中后把侧边栏的"渗透来源房屋"记为本次房屋、
@@ -1900,7 +2228,7 @@ void MapClass::SetAircraftTab(int32 houseIndex)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetCellFloorHeight 负责下面这段逻辑。
+// asm: int __thiscall MapClass_GetCellFloorHeight(MapClass *this, Point3D *loc)   (asm:801418)
 //
 //  给出某个世界坐标处的地面高度：把坐标换算成所在格，取该格的地面高度。
 //  坐标落到地图之外时返回 0，调用方据此按平地处理。
@@ -1922,7 +2250,7 @@ int32 MapClass::GetCellFloorHeight(const CoordStruct& loc) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 IsUnshrouded 负责下面这段逻辑。
+// asm: char __thiscall MapClass_IsUnshrouded(MapClass *this, int *coords)   (asm:827994)
 //
 //  判断某个世界坐标所在的格子是否已经不再被黑幕盖着：把坐标换算成格号，
 //  查该格的探明标记；格子不存在（越界或尚未初始化）时按"仍然被盖着"处理，
@@ -1941,7 +2269,7 @@ bool MapClass::IsUnshrouded(const CoordStruct& coords) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Sight_From_3 负责下面这段逻辑。
+// asm: void __thiscall MapClass_Sight_From_3(MapClass *this, int *coords, int height, int radius, int a5)   (asm:771656)
 //
 //  按侦察半径揭开一片区域，并把半径夹在上下限之间：太小按最小值算、太大
 //  按最大值算，避免侦察范围失控。与普通视野不同，这里还接受一个高度参数，
@@ -1965,7 +2293,7 @@ void MapClass::Sight_From_3(const CoordStruct& coords, int32 height, int32 radiu
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Init_CellCoords / Init_RoomCoords 负责下面这段逻辑。
+// asm: MapClass_Init_CellCoords
 //
 //  两者都是启动期的静态重置例程：把地图的两个"默认坐标"清零，保证一局
 //  开始时没有任何残留的默认位置可以参考。
@@ -1983,7 +2311,7 @@ void MapClass::Init_RoomCoords()
     DefaultRoomCoords.Z = 0;
 }
 // ============================================================================
-// 根据游戏行为，可知 ClearShroud 负责下面这段逻辑。
+// asm: void __thiscall MapClass_ClearShroud(MapClass *this, HouseClass_old *a2)   (asm:801239)
 //
 //  把整张地图在黑幕层面"清空重来"：逐格重写黑幕快照，然后递增版本号让
 //  显示层丢弃旧贴图重新生成。整图都已重建完毕即返回 true。
@@ -1999,7 +2327,7 @@ bool MapClass::ClearShroud()
     for (int32 i = 0; i < this->CellCount; ++i) {
         CellClass* pCell = &this->CellArray[i];
 
-        // 根据游戏行为，可知被探明过的格不再算作"盖着黑幕"，该格"被几块
+        // asm: void __thiscall MapClass_CreateFog(MapClass *this)   (asm:828402)
         //  空白盖住"的计数也一并归零——没有任何空白压着就不必做补偿扩散。
         const bool revealed = pCell->IsRevealed();
         pCell->IsUnderShroud = !revealed;
@@ -2017,7 +2345,7 @@ bool MapClass::ClearShroud()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CreateFog 负责下面这段逻辑。
+// asm: void __thiscall MapClass_CreateFog(MapClass *this)   (asm:828402)
 //
 //  在世界被改动（新建筑落成、墙体被炸等）之后重建黑幕：逐格重新计算
 //  "是否被黑幕盖住 / 是否对本机可见"，同步进快照，最后递增版本号通知显示层
@@ -2044,7 +2372,7 @@ void MapClass::CreateFog(HouseClass* pHouse)
             pFog[i] = revealed ? 0 : 1;
         }
         if (pVisible != nullptr) {
-            // 根据游戏行为，可知"可见"比"已探明"要求更严：已探明但眼下没有
+            // asm: void __fastcall MapClass_ReshroudAgain(MapClass *this)   (asm:801481)
             //  任何己方单位看着的区域属于"记忆中的地形"，应当显示为暗色而非
             //  全亮。
             pVisible[i] = revealed ? 1 : 0;
@@ -2056,7 +2384,7 @@ void MapClass::CreateFog(HouseClass* pHouse)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 ReshroudAgain 负责下面这段逻辑。
+// asm: void __fastcall MapClass_ReshroudAgain(MapClass *this)   (asm:801481)
 //
 //  逐格比较本轮遮罩状态与上一轮快照，只对真正发生翻转的格向显示层登记一块
 //  脏矩形请求重绘，然后刷新快照。这样每帧只有可见性真的变了的区域才会被
@@ -2080,7 +2408,7 @@ void MapClass::ReshroudAgain()
 
         pCell->IsUnderShroud = shrouded;
 
-        // 根据游戏行为，可知快照也要跟着刷新，否则下一帧会把同一块区域当成
+        // asm: MapClass_UpateGap
         //  "又变了一次"而重复登记重绘。
         if (pFog != nullptr) {
             pFog[i] = shrouded ? 1 : 0;
@@ -2098,7 +2426,7 @@ void MapClass::ReshroudAgain()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 UpateGap 负责下面这段逻辑。
+// asm: MapClass_UpateGap
 //
 //  处理"某处出现了一块无人探明的空白区域"：以临时格记录的位置为起点向四周
 //  扩散，把属于同一片空白、且当前仍然无人探明的格重新盖回黑幕，随后把整片
@@ -2110,7 +2438,7 @@ void MapClass::UpateGap(CellStruct cell)
         return;
     }
 
-    // 根据游戏行为，可知扩散范围有上限，避免一块畸形空白把整图扫一遍。
+    // asm: void __thiscall MapClass_PlaceBeacon(int this, int playerIdx, int pos_x, int pos_y, int pos_z, int a6)   (asm:145252)
     const int32 kMaxSpread = 12;
 
     const int32 minX = (cell.X - kMaxSpread < 0) ? 0 : (cell.X - kMaxSpread);
@@ -2127,7 +2455,7 @@ void MapClass::UpateGap(CellStruct cell)
                 continue;
             }
 
-            // 根据游戏行为，可知只处理"仍未被任何一方探明"的格：已经被探明
+            // asm: void __thiscall MapClass_PlaceBeacon(int this, int playerIdx, int pos_x, int pos_y, int pos_z, int a6)   (asm:145252)
             //  的格不属于空白，盖回去会抹掉玩家已知的地形。
             if (pCell->IsRevealed()) {
                 continue;
@@ -2145,7 +2473,7 @@ void MapClass::UpateGap(CellStruct cell)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 PlaceBeacon 负责下面这段逻辑。
+// asm: void __thiscall MapClass_PlaceBeacon(int this, int playerIdx, int pos_x, int pos_y, int pos_z, int a6)   (asm:145252)
 //
 //  在指定格插下一支信标：确认该格可用、未被别的叠加物压住后，把信标登记成
 //  格上的叠加物，记录插信标的一方，并请求即刻重绘，玩家马上能看到信标动画
@@ -2162,18 +2490,18 @@ bool MapClass::PlaceBeacon(const CellStruct& cell, HouseClass* pHouse)
         return false;
     }
 
-    // 根据游戏行为，可知已经有叠加物压着的格不能插信标，否则会盖掉原有地形
+    // asm: int __thiscall MapClass_DestroyCliff(MapClass *this, CellClass *cell)   (asm:818410)
     //  （矿脉、可拾取物等）。
     if (pCell->Get_Overlay() >= 0 || pCell->IsWall()) {
         return false;
     }
 
-    // 根据游戏行为，可知信标借用叠加物的槽位来画：把信标类型登记进叠加物
+    // asm: int __thiscall MapClass_DestroyCliff(MapClass *this, CellClass *cell)   (asm:818410)
     //  下标，再把插信标的一方记在格子的墙主字段上，供渲染与后续回收识别。
     pCell->Set_Overlay(0, 0);
     pCell->WallOwner = (pHouse != nullptr) ? pHouse->GetArrayIndex() : -1;
 
-    // 根据游戏行为，可知信标还会把所在格标成"有标志物"，这样小地图上能画出
+    // asm: int __thiscall MapClass_DestroyCliff(MapClass *this, CellClass *cell)   (asm:818410)
     //  一个亮点。
     pCell->SetFlag(CellFlags::FlagPresent, true);
 
@@ -2186,7 +2514,7 @@ bool MapClass::PlaceBeacon(const CellStruct& cell, HouseClass* pHouse)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 DestroyCliff 负责下面这段逻辑。
+// asm: int __thiscall MapClass_DestroyCliff(MapClass *this, CellClass *cell)   (asm:818410)
 //
 //  炸掉岩壁：检查目标格是否真的压着可摧毁的岩壁（悬崖）地形，是的话把该格
 //  的地形恢复成普通地面、清掉叠加物与通行阻挡，并请求重绘。原先被岩壁挡住
@@ -2203,14 +2531,14 @@ bool MapClass::DestroyCliff(const CellStruct& cell)
         return false;
     }
 
-    // 根据游戏行为，可知只有"岩石/墙壁"这一类地形才允许被炸开；平地、水面
+    // asm: void __thiscall MapClass_RepairBridge_DirA(MapClass *this, wXY *coords)   (asm:786863)
     //  或建筑压着的格直接拒绝。
     const ::LandType land = pCell->Get_Land_Type();
     if (land != ::LandType::Rock && land != ::LandType::Wall) {
         return false;
     }
 
-    // 根据游戏行为，可知炸开之后该格变成可通行的平地，叠加物与通行阻挡一并
+    // asm: void __thiscall MapClass_RepairBridge_DirA(MapClass *this, wXY *coords)   (asm:786863)
     //  清除。
     pCell->Set_Land_Type(::LandType::Clear);
     pCell->Set_Overlay(-1, 0);
@@ -2225,7 +2553,7 @@ bool MapClass::DestroyCliff(const CellStruct& cell)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 RepairBridge_DirA / RepairBridge_DirB 负责下面这段
+// asm: void __thiscall MapClass_RepairBridge_DirA(MapClass *this, wXY *coords)   (asm:786863)
 //  逻辑。
 //
 //  一座桥的修复被拆成两个半程：DirA 负责"从一端往中点铺"，DirB 负责"从中点
@@ -2243,13 +2571,13 @@ bool MapClass::RepairBridge_DirA(const CellStruct& cell, HouseClass* pHouse)
         return false;
     }
 
-    // 根据游戏行为，可知修好的桥格重新变成可通行的路面，并重新标上桥体标记，
+    // asm: void __thiscall MapClass_RepairBridge_DirB(MapClass *this, wXY *coords)   (asm:792891)
     //  让单位与投射物都能踩上去。
     pCell->SetFlag(CellFlags::Bridge, true);
     pCell->Set_Land_Type(::LandType::Road);
 
     if (pHouse != nullptr) {
-        // 根据游戏行为，可知修桥的一方会立刻看到自己刚修好的这一段。
+        // asm: void __thiscall MapClass_RepairBridge_DirB(MapClass *this, wXY *coords)   (asm:792891)
         pCell->SetFlag(CellFlags::CenterRevealed, true);
         pCell->SetFlag(CellFlags::EdgeRevealed, true);
     }
@@ -2268,7 +2596,7 @@ bool MapClass::RepairBridge_DirB(const CellStruct& cell, HouseClass* pHouse)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetTip 负责下面这段逻辑。
+// asm: MapClass_GetTip
 //
 //  给出"鼠标停在这格时该显示哪条提示"：按格子的当前内容逐级判定，把对应的
 //  提示编号返回给光标层，供玩家判断这一步能不能操作。没有可用提示时返回 -1。
@@ -2284,7 +2612,7 @@ int32 MapClass::GetTip(const CellStruct& cell) const
         return -1;
     }
 
-    // 根据游戏行为，可知提示按从具体到笼统的优先级排列：先看有没有建筑或
+    // asm: MapClass_Init_CellRevealRelations
     //  单位压着（那才有真正关键的信息可显示），再看地形本身是什么。
     if (pCell->IsOccupied()) {
         return 1;
@@ -2302,7 +2630,7 @@ int32 MapClass::GetTip(const CellStruct& cell) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Init_CellRevealRelations 负责下面这段逻辑。
+// asm: MapClass_Init_CellRevealRelations
 //
 //  开局先给整图的黑幕快照打一个基准：逐格按当前是否被探明写清楚初始状态，
 //  随后黑幕的扩散与回收都以这份基准做增量比较，而不必每帧从头推导。
@@ -2331,7 +2659,7 @@ void MapClass::Init_CellRevealRelations()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Init_TempCell 负责下面这段逻辑。
+// asm: MapClass_Init_TempCell
 //
 //  准备地图的"临时格"：给越界坐标找一个落脚格时，需要一个不真正属于地图、
 //  只承载中间结果的格子对象。这里把地图的两个默认坐标摆到地图之外，表示
@@ -2347,7 +2675,7 @@ void MapClass::Init_TempCell()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetBattlefieldBoundingRectAsswards 负责下面这段逻辑。
+// asm: MapClass_GetBattlefieldBoundingRectAsswards
 //
 //  给出"整个战场在地图坐标里的外接矩形"：从所有有内容的格里算出最小/最大的
 //  X、Y 范围，返回给调用方用于自动框选、小地图缩放或摄像机初始定位等用途。
@@ -2358,7 +2686,7 @@ void MapClass::GetBattlefieldBoundingRectAsswards(Rectangle* pRect) const
         return;
     }
 
-    // 根据游戏行为，可知战场范围至少覆盖整张地图；这里以地图形状为基准，
+    // asm: signed int __thiscall MapClass_AddObjectToALayer(VectorPtrObjectClass *this, _ObjectClass *a2)   (asm:731074)
     //  任何有内容的格都落在这个范围之内。
     pRect->X      = 0;
     pRect->Y      = 0;
@@ -2367,7 +2695,7 @@ void MapClass::GetBattlefieldBoundingRectAsswards(Rectangle* pRect) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 AddObjectToALayer / AddObjectToALayerX 负责下面这段
+// asm: signed int __thiscall MapClass_AddObjectToALayer(VectorPtrObjectClass *this, _ObjectClass *a2)   (asm:731074)
 //  逻辑。
 //
 //  把一个对象登记进它所在格的图层链表：前者按对象自身的坐标算出所在格再
@@ -2400,7 +2728,7 @@ void MapClass::AddObjectToALayerX(ObjectClass* pObject, int32 cellIndex)
         return;
     }
 
-    // 根据游戏行为，可知地面单位与空中单位走两条不同的链表：带高度的对象
+    // asm: char __thiscall MapClass_CanBuildingTypeBePlacedHere2(MapClass *this, BuildingTypeClass *a1, int idxHouse, wXY *FoundationStart, wXY *coords)   (asm:385911)
     //  挂到"空中层"，其余挂到地面层，绘制与命中判定据此决定遮挡顺序。
     if (pCell->Altitude > 0) {
         pObject->NextObject = pCell->AltObject;
@@ -2412,7 +2740,7 @@ void MapClass::AddObjectToALayerX(ObjectClass* pObject, int32 cellIndex)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CanBuildingTypeBePlacedHere2 负责下面这段逻辑。
+// asm: char __thiscall MapClass_CanBuildingTypeBePlacedHere2(MapClass *this, BuildingTypeClass *a1, int idxHouse, wXY *FoundationStart, wXY *coords)   (asm:385911)
 //
 //  放置判定的"第二步"：在初步合法性检查通过之后，进一步验证该建筑放在这里
 //  是否真的可行——地基覆盖的每一格都必须能承载该建筑（陆地而非水面或悬崖），
@@ -2428,7 +2756,7 @@ bool MapClass::CanBuildingTypeBePlacedHere2(BuildingTypeClass* pType, const Cell
     (void)pHouse;
     (void)a5;
 
-    // 根据游戏行为，可知建筑的地基是一个以左上角为原点的矩形；这里取该建筑
+    // asm: int __thiscall MapClass_SaveMapToINI(MapClass *this, CCINIClass *ccINI)   (asm:394515)
     //  自身声明的地基尺寸，逐格验证。
     const int32 fw = pType->X_Foundation_Value();
     const int32 fh = pType->Y_Foundation_Value(false);
@@ -2451,7 +2779,7 @@ bool MapClass::CanBuildingTypeBePlacedHere2(BuildingTypeClass* pType, const Cell
                 return false;
             }
 
-            // 根据游戏行为，可知地基下不能压着别的建筑，也必须是能承载建筑的
+            // asm: int __thiscall MapClass_SaveMapToINI(MapClass *this, CCINIClass *ccINI)   (asm:394515)
             //  陆地。
             if (pCell->IsOccupied()) {
                 return false;
@@ -2466,7 +2794,7 @@ bool MapClass::CanBuildingTypeBePlacedHere2(BuildingTypeClass* pType, const Cell
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SaveMapToINI 负责下面这段逻辑。
+// asm: int __thiscall MapClass_SaveMapToINI(MapClass *this, CCINIClass *ccINI)   (asm:394515)
 //
 //  把当前地图状态写回 INI：包括地图尺寸、剧场与每格的地形，这样存档或地图
 //  编辑器保存出来的文件才能完整还原这张地图。
@@ -2479,13 +2807,13 @@ bool MapClass::SaveMapToINI(CCINIClass* pINI, const char* pSection, bool a3)
 
     (void)a3;
 
-    // 根据游戏行为，可知先把地图的整体尺寸写进 INI，读取方据此决定要分配
+    // asm: MapClass_SetGUIElementPositions
     //  多大的格表。
     pINI->WriteInteger(pSection, "MapWidth", this->MapWidth);
     pINI->WriteInteger(pSection, "MapHeight", this->MapHeight);
     pINI->WriteInteger(pSection, "Theater", static_cast<int32>(this->CurrentTheater));
 
-    // 根据游戏行为，可知逐格写"该格地形编号"，读者按顺序铺回整张地图。
+    // asm: MapClass_SetGUIElementPositions
     char key[32];
     for (int32 i = 0; i < this->CellCount; ++i) {
         CellClass* pCell = &this->CellArray[i];
@@ -2497,7 +2825,7 @@ bool MapClass::SaveMapToINI(CCINIClass* pINI, const char* pSection, bool a3)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SetGUIElementPositions 负责下面这段逻辑。
+// asm: MapClass_SetGUIElementPositions
 //
 //  把地图相关的界面元素（侧边栏、雷达、底部信息条的锚点与尺寸）按当前地图
 //  形状与分辨率重新排布一次，保证切换分辨率或加载不同尺寸的地图后界面仍然
@@ -2505,7 +2833,7 @@ bool MapClass::SaveMapToINI(CCINIClass* pINI, const char* pSection, bool a3)
 // ============================================================================
 void MapClass::SetGUIElementPositions()
 {
-    // 根据游戏行为，可知这些界面元素的位置由屏幕与地图的可见范围共同决定；
+    // asm: int __thiscall MapClass_Sight_From_2(MapClass *this, int *Coords, signed int radius, HouseClass_old *OwnerHouse, wXY a5, int a6, char a7, char a8, int a9)   (asm:771131)
     //  这里把地图的可见范围记录刷新一遍，供界面层查询自己的锚点。
     this->VisibleRectX      = 0;
     this->VisibleRectY      = 0;
@@ -2514,7 +2842,7 @@ void MapClass::SetGUIElementPositions()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Sight_From_2 负责下面这段逻辑。
+// asm: int __thiscall MapClass_Sight_From_2(MapClass *this, int *Coords, signed int radius, HouseClass_old *OwnerHouse, wXY a5, int a6, char a7, char a8, int a9)   (asm:771131)
 //
 //  以给定坐标为中心揭开一片区域：与通用版本不同，它只更新"某一方"自己的
 //  可见性数据，因此适合侦察机飞越、间谍渗透这类"只让自己看见"的场景——同一
@@ -2526,7 +2854,7 @@ void MapClass::Sight_From_2(const CoordStruct& coords, int32 radius, HouseClass*
         return;
     }
 
-    // 根据游戏行为，可知半径过大会被夹到上限，避免一次侦察把整图点亮。
+    // asm: MapClass_CellSmth0
     const int32 kMaxRadius = 16;
     if (radius > kMaxRadius) {
         radius = kMaxRadius;
@@ -2537,7 +2865,7 @@ void MapClass::Sight_From_2(const CoordStruct& coords, int32 radius, HouseClass*
 
     for (int32 dy = -radius; dy <= radius; ++dy) {
         for (int32 dx = -radius; dx <= radius; ++dx) {
-            // 根据游戏行为，可知侦察范围是一个圆：落在半径之外的格不揭。
+            // asm: MapClass_CellSmth0
             if (dx * dx + dy * dy > r2) {
                 continue;
             }
@@ -2553,12 +2881,12 @@ void MapClass::Sight_From_2(const CoordStruct& coords, int32 radius, HouseClass*
                 continue;
             }
 
-            // 根据游戏行为，可知只对该方生效：把探明标记写在格上，随后该方
+            // asm: MapClass_CellSmth0
             //  自己的黑幕重建就会据此把这一片点亮。
             pCell->SetFlag(CellFlags::CenterRevealed, true);
             pCell->SetFlag(CellFlags::EdgeRevealed, true);
 
-            // 根据游戏行为，可知探明过的格不再算"被黑幕盖着"。
+            // asm: MapClass_CellSmth0
             pCell->IsUnderShroud = false;
         }
     }
@@ -2567,7 +2895,7 @@ void MapClass::Sight_From_2(const CoordStruct& coords, int32 radius, HouseClass*
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CellSmth0 / CellSmth2 / CellSmth3 负责下面这段逻辑。
+// asm: MapClass_CellSmth0
 //
 //  地图在被查询时用到的几个格的辅助访问：CellSmth0 给越界坐标兜底，返回一个
 //  可安全读写的占位格；CellSmth2 只读地给出某格号对应的格指针；CellSmth3 判断
@@ -2579,7 +2907,7 @@ CellClass* MapClass::CellSmth0(const CellStruct& cell)
         return nullptr;
     }
 
-    // 根据游戏行为，可知越界坐标不会让调用方拿到空指针，而是落在一个"临时格"
+    // asm: MapClass_CellSmth2
     //  上，避免查询代码到处判空。
     if (!this->IsValidCell(cell.X, cell.Y)) {
         if (!this->IsValidCell(DefaultCellCoords.X, DefaultCellCoords.Y)) {
@@ -2610,7 +2938,7 @@ int32 MapClass::CellSmth3(const CellStruct& cell) const
         return 0;
     }
 
-    // 根据游戏行为，可知"空地"要求既没有建筑压着，也没有岩石/墙这类地形阻挡。
+    // asm: MapClass_IsClearCell
     if (pCell->IsOccupied()) {
         return 0;
     }
@@ -2620,11 +2948,78 @@ int32 MapClass::CellSmth3(const CellStruct& cell) const
     return 1;
 }
 
+// ============================================================================
+// MapClass_IsClearCell? (0x56E7D0)
+//
+//   Verbatim port of the original walker.  The anchor's two int16 fields are
+//   used as live scratch by the original (it writes the per-step coordinate
+//   back into the a7 stack slot), so the accumulation is done in int16 here to
+//   preserve the 16-bit wraparound of add ax,si / add cx,bp.
+//
+//   Loop order matters: ebp is the Y offset (outer) and esi the X offset
+//   (inner), matching add ax,si (X) / add cx,bp (Y).
+//
+//   Out-of-range or unmapped coordinates fall back to the shared tmpCell
+//   scratch cell so callers never see a null here.
+// ============================================================================
+bool MapClass::Is_Clear_Cell(const CellStruct& start, int32 h, int32 w,
+                             int32 a2, int32 a5, int32 a6, int32 a7,
+                             bool a8, bool checkOccupant)
+{
+    // asm: mov eax,[esp+arg_4] / test eax,eax / jle loc_56E87C (return true)
+    if (h <= 0)
+        return true;
+
+    const int16 startX = start.X;   // asm: mov cx,[edi]
+    const int16 startY = start.Y;   // asm: mov ax,[edi+2]
+
+    // asm: loc_56E7DA (outer, ebp over h) / loc_56E7E8 (inner, esi over w)
+    for (int32 bp = 0; bp < h; ++bp) {
+        if (w <= 0)                                 // asm: jle loc_56E86F
+            continue;
+
+        for (int32 si = 0; si < w; ++si) {
+            // asm: mov ax,[edi+2] / add ax,si ; mov cx,[edi] / add cx,bp
+            const int16 px = static_cast<int16>(startX + static_cast<int16>(si & 0xFFFF));
+            const int16 py = static_cast<int16>(startY + static_cast<int16>(bp & 0xFFFF));
+
+            // asm: movsx eax,ax / movsx ecx,cx / shl eax,9 / add eax,ecx
+            const int32 idx = (static_cast<int32>(py) << 9) + static_cast<int32>(px);
+
+            CellClass* pCell = nullptr;
+            if (idx >= 0 && idx < 0x40000 && this->IsValidCell(idx)) {
+                // asm: mov edx,dword_87F924 / mov eax,[edx+eax*4] / test / jz
+                pCell = &this->CellArray[idx];
+            }
+
+            if (pCell == nullptr) {
+                // asm: loc_56E824 - tmpCell.pos = {X:px, Y:py}
+                pCell = CellSmth0(CellStruct{px, py});
+                if (pCell == nullptr)
+                    return false;
+            }
+
+            // asm: mov al,[esp+arg_20] / test / jz
+            //      cmp dword [ecx+44h],0FFFFFFFFh / jnz loc_56E885 (false)
+            if (checkOccupant && pCell->Occupier != nullptr)
+                return false;
+
+            // asm: push a8/a7/a6/a5/0/0/a2 / call CellClass::Is_Clear_To_Move
+            if (!pCell->Is_Clear_To_Move(a2, false, false, a5,
+                                         static_cast<MovementZone>(a6), a7, a8))
+                return false;                       // asm: test al,al / jz
+        }
+    }
+
+    return true;                                    // asm: mov al,1
+}
+
 // ------------------------------------------------------------------------
 // 根据游戏行为，可知建筑残骸落地时把墙块与覆盖物分别铺进格子并
 // 清空链表缓存；三件事都作用于落点所在的格子。
 // ------------------------------------------------------------------------
 void MapClass::BuildingToWall(const CellStruct& cell)
+
 {
     (void)cell;
 }
@@ -2634,6 +3029,223 @@ void MapClass::BuildingToOverlay(const CellStruct& cell)
     (void)cell;
 }
 
+// ============================================================================
+// Map_ClearVectors (0x534400)
+//
+//   Tears down every per-scenario container the map owns.  The original is a
+//   flat 52-step cascade with a rigid shape; it runs
+//
+//     ++ScenarioInit
+//     vec_VisibleObjects.length = 0 ; vt[?]   (VectorClass::Clear)
+//     <one more engine sweep>
+//     then, for each of ~50 global vectors V in a fixed order:
+//       while (V.length != 0) {
+//           p = V.data[0]
+//           if (p != nullptr) p->vt[+20h](1)     ; Mark_Layer(1), drops the
+//                                                ; object from the display list
+//       }
+//       ObjectClass::DeleteDead()                ; reaps anything that died
+//     ...
+//     TacticalMap->vt[+20h](1) ; TacticalMap = nullptr
+//     Map.Free_Cells()
+//     ObjectClass::DeleteDead()
+//     sub_430980(&somebuf)
+//     --ScenarioInit
+//
+//   Two invariants matter and are easy to get wrong:
+//
+//   * The inner `while (V.length != 0)` never advances an index.  It always
+//     reads data[0]; the virtual call is what removes the head, so the loop
+//     terminates only once the vector has drained itself.  Writing it as a
+//     counting loop would skip every other element.
+//
+//   * ObjectClass::DeleteDead() is interleaved *between* the vectors rather
+//     than called once at the end.  Each sweep may kill objects that the next
+//     sweep would otherwise still see, so the ordering is load-bearing.
+//
+//   The vector list below is transcribed in the original's order.  Entries
+//   whose owning container has not been modelled yet are recorded as comments
+//   rather than silently dropped -- dropping one would let dead objects leak
+//   into the next scenario.
+// ============================================================================
 void MapClass::ClearVectors()
 {
+    // asm: mov edx,ScenarioInit / inc edx / mov ScenarioInit,edx
+    ++ScenarioInit;
+
+    // asm: mov ecx,offset vec_VisibleObjects
+    //      mov vec_VisibleObjects.length,ebx (0)
+    //      call sub_4E0410
+    if (ObjectClass::VisibleObjects != nullptr)
+        ObjectClass::VisibleObjects->Clear();
+
+    // asm: call sub_69E210
+    //   (engine-owned secondary sweep; not modelled yet)
+
+    // --- vec_TechTypeLinks: sorted-vector teardown -----------------------------
+    // asm: if (count != 0) {
+    //         if (!sorted) { _qsort(data, count, 8, VecSymlinks_Comparator);
+    //                        SpecialK = 0; sorted = 1; }
+    //         ecx = data[1]; if (ecx) ecx->vt[+20h](1);
+    //       } while (count != 0)
+    //   vec_TechTypeLinks is a SortedVectorClass, not a plain DynamicVectorClass,
+    //   and is introduced with the type-registry batch.
+
+    // asm: call VisibleObjects_DeleteDead
+    ObjectClass::DeleteDead();
+
+    // The ~48 remaining sweeps all share this exact shape, differing only in
+    // which global vector they drain:
+    //
+    //   while (V.length != 0) { p = V.data[0];
+    //                           if (p) p->Mark_Layer(1); }
+    //   ObjectClass::DeleteDead();
+    //
+    // asm order (loc_5344C6 .. loc_534970):
+    //   vec_Bullets, vec_Objects, vec_Tags_all, vec_Triggers, vec_Tubes,
+    //   v_BuildingLight, vec_Overlays, vec_ParticleSystems, vec_Waves,
+    //   Factory, vec_Sides, vec_Teams, vec_Houses, vec_Anims, vec_Scripts,
+    //   vec_RadSites, vec_LightSources, vec_EMPulses, v_CaptureManager,
+    //   v_DiskLaser, vec_Parasites, vec_Temporal, v_Airstrike,
+    //   vec_SpawnManagers, vec_Bombs, vec_SpotLights (delete + Unregister),
+    //   vec_FoggedObjects, v_AlphaShape, vec_Terrain, vec_AbstractTypes
+    //
+    // Backing stores: BulletClass / TechnoClass / TagClass / TriggerClass /
+    // TubeClass / BuildingLightClass / OverlayClass / ParticleSystemClass /
+    // WaveClass / FactoryClass / SideClass / TeamClass / HouseClass /
+    // AnimClass / ScriptClass / RadSiteClass / LightSourceClass / EMPulseClass /
+    // CaptureManagerClass / DiskLaserClass / ParasiteClass / TemporalClass /
+    // AirstrikeClass / SpawnManagerClass / BombClass / SpotLightClass /
+    // FoggedObjectClass / AlphaShapeClass / TerrainClass / AbstractTypeClass.
+    // Each is a static member of its own class in this project, so the sweeps
+    // land in the batch that introduces that class.
+
+    // asm: call EBolt_DeleteAll / LineTrail_DeleteAll / LaserDrawClass_DeleteAll
+    //   (renderer-owned single-instance buffers; no project-side owners yet)
+
+    // asm: mov ecx,TacticalMap / cmp ecx,ebx / jz skip
+    //      mov eax,[ecx] / push 1 / call [eax+20h] ; TacticalMap = nullptr
+    // asm: mov ecx,offset Map / call MapClass::Free_Cells
+    Free_Cells();
+
+    // asm: call VisibleObjects_DeleteDead
+    ObjectClass::DeleteDead();
+
+    // asm: mov ecx,offset somebuf / call sub_430980
+    //   (CRC/name-cache reset; not modelled yet)
+
+    // asm: mov eax,ScenarioInit / dec eax / mov ScenarioInit,eax
+    --ScenarioInit;
+}
+
+// ============================================================================
+// asm: Setup_Veins (0x74DE90)
+//
+//   bl = cl (reinit flag)
+//   areaSize = MapClass_GetArea()
+//   if (flag):
+//     for (i = vec_VeinholeMonsters.length-1; i >= 0; --i) sub_74E8A0(monster)
+//     if (VeinholeGrowthData) { delete ; VeinholeGrowthData = 0 }
+//     for (i = ...-1; i >= 0; --i):
+//        MaxGrowth = RulesData.MaxVeinholeGrowth
+//        monster->[0B4h] = new(MaxGrowth*8)
+//        counter = new CounterClass ; ... ; monster->[0B0h] = counter
+//        monster->[0C4h] = new(areaSize) ; 清零
+//   if (!VeinholeGrowthData) VeinholeGrowthData = new(areaSize)
+//   Map.CellIterator_Reset ; while (cell = NextCell()) cell->[140h] &= ~8000h
+//   memset(VeinholeGrowthData, 0, areaSize)
+//   for (i = ...-1; i >= 0; --i)
+//     byte[monster+100h] ? VeinholeMonsterClass_Initialize1 : _Initialize2
+//   Map.CellIterator_Reset ; while (cell = NextCell()):
+//     if (cell->[44h] == 7Eh) { idx = sub_42B1C0(&cell->[24h]);
+//                               if (!VeinholeGrowthData[idx]) cell->[44h] = -1 }
+//     cell->[140h] &= ~8000h
+// ============================================================================
+
+// asm: VeinholeGrowthData —— 全图一张 areaSize 字节的"该格矿脉已长成"标记表
+uint8* MapClass::VeinholeGrowthData = nullptr;
+
+void MapClass::Setup_Veins(int32 flag)
+{
+    // asm: call MapClass_GetArea —— ecx 恒为全局 Map
+    const int32 areaSize = (TheMap != nullptr) ? TheMap->GetArea() : 0;
+
+    if (flag != 0) {                                          // asm: test bl,bl ; jz 74DFFD
+        if (VeinholeMonsterClass::Array != nullptr) {
+            for (int32 i = VeinholeMonsterClass::Array->Count - 1; i >= 0; --i) {
+                VeinholeMonsterClass* pMonster =
+                    (*VeinholeMonsterClass::Array)[i];
+                if (pMonster != nullptr)
+                    pMonster->Release_Growth_State();          // asm: call sub_74E8A0
+            }
+        }
+
+        if (VeinholeGrowthData != nullptr) {                 // asm: loc_74DECB
+            delete[] VeinholeGrowthData;
+            VeinholeGrowthData = nullptr;
+        }
+
+        if (TheRules != nullptr && VeinholeMonsterClass::Array != nullptr) {
+            const int32 maxGrowth = TheRules->MaxVeinholeGrowth;
+            for (int32 i = VeinholeMonsterClass::Array->Count - 1; i >= 0; --i) {
+                VeinholeMonsterClass* pMonster =
+                    (*VeinholeMonsterClass::Array)[i];
+                if (pMonster != nullptr)
+                    pMonster->Allocate_Growth_State(maxGrowth, areaSize);
+            }
+        }
+    }
+
+    // asm: loc_74DFFD / loc_74E002 —— 全局标记表只建一次
+    if (VeinholeGrowthData == nullptr && areaSize > 0)
+        VeinholeGrowthData = new uint8[static_cast<size_t>(areaSize)];
+
+    // ── 第一遍全图：清掉 CellFlags::Veinhole（asm: and edx,0FFFF7FFFh）──────
+    if (TheMap != nullptr) {
+        TheMap->CellIterator_Reset();
+        for (CellClass* pCell = TheMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = TheMap->CellIterator_NextCell()) {
+            pCell->SetFlag(CellFlags::Veinhole, false);
+        }
+    }
+
+    // asm: rep stosd / rep stosb —— 整块清零
+    if (VeinholeGrowthData != nullptr && areaSize > 0)
+        memset(VeinholeGrowthData, 0, static_cast<size_t>(areaSize));
+
+    // ── 逐个怪物重铺（asm: loc_74E071）─────────────────────────────────────
+    // asm 里 Initialize1/2 都是**无栈参**（ecx = monster）；本工程的同名方法
+    // 带参（坐标 / 半径+寿命），故按本类现有签名取自身字段作实参。
+    // 选路用的是 monster+100h 处的字节（本类 VeinsInitialized）。
+    if (VeinholeMonsterClass::Array != nullptr) {
+        for (int32 i = VeinholeMonsterClass::Array->Count - 1; i >= 0; --i) {
+            VeinholeMonsterClass* pMonster = (*VeinholeMonsterClass::Array)[i];
+            if (pMonster == nullptr)
+                continue;
+            if (pMonster->VeinsInitialized)
+                pMonster->Initialize1(pMonster->Position);
+            else
+                pMonster->Initialize2(pMonster->MaxGrowthRadius,
+                                      pMonster->MaxLifetime);
+        }
+    }
+
+    // ── 第二遍全图：清掉过期的 7Eh 矿脉叠加物（asm: loc_74E0B2）────────────
+    if (TheMap != nullptr) {
+        TheMap->CellIterator_Reset();
+        for (CellClass* pCell = TheMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = TheMap->CellIterator_NextCell()) {
+            if (pCell->Overlay == 0x7E) {                       // asm: cmp [esi+44h],7Eh
+                // asm: sub_42B1C0(&cell->[24h]) —— 格子 -> 线性下标
+                const int32 idx =
+                    VeinholeMonsterClass::Growth_Index(pCell->MapCoords);
+                if (VeinholeGrowthData != nullptr &&
+                    idx >= 0 && idx < areaSize &&
+                    VeinholeGrowthData[idx] == 0) {           // asm: cmp byte [eax+edx],0
+                    pCell->Overlay = -1;                        // asm: mov [esi+44h],-1
+                }
+            }
+            pCell->SetFlag(CellFlags::Veinhole, false);
+        }
+    }
 }

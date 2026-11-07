@@ -203,6 +203,8 @@ public:
     bool DesyncDetected;
 
     int32 MaxAheadFrames;
+    // 每帧向对端发送同步帧的间隔（原版全局 FrameSendRate，同步日志头部打印）
+    int32 FrameSendRate;
     int32 FrameBufferSize;
     int32 ReceivedFrameCount;
     int32 SentFrameCount;

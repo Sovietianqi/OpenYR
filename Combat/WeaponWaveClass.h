@@ -10,6 +10,7 @@ class TechnoClass;
 class WeaponTypeClass;
 class HouseClass;
 class WarheadTypeClass;
+class WaveClass;   // Special/WaveClass.h —— 真正的波束对象
 
 // ============================================================================
 // BeamSegment - 一条已提交给渲染层的波束段
@@ -79,6 +80,15 @@ public:
     int32            Width;
     int32            DamageDealt;
     bool             IsDead;
+
+    // ------------------------------------------------------------------------
+    // Wave —— 本层承载的真波对象（asm: WaveClass）。
+    //
+    // 第 6 轮起，本类是 `WaveClass` 的兼容适配层：构造时按武器标志建出一条
+    // 真 WaveClass 并挂到 Owner->FiringWave 上，后续寿命推进 / 区域伤害 /
+    // 绘制风格全部转发给它。为空表示当前无绑定波（例如池已满或武器不带波）。
+    // ------------------------------------------------------------------------
+    WaveClass*       Wave;
 
 protected:
     void SubmitSegment(int32 colorIndex, int32 width, int32 phase);

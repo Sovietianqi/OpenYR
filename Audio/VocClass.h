@@ -87,6 +87,12 @@ struct SoundDefinition {
     uint8             pad8C[0xA8];               // +8C .. +133
     int32             SampleCount;               // +134
     int32             SampleIndex[MAX_SAMPLES_PER_SOUND]; // +0B4
+    int32             Attack;                    // +138
+    int32             Decay;                     // +13C
+
+    // asm: Sound_Effect 里的 "mov edi,[ecx]" —— 音效定义自带的静态坐标
+    // （环境音）。全零表示该声没有固定声源，不做距离衰减。
+    CoordStruct       SelfPosition;
 
     SoundDefinition();
     ~SoundDefinition();
@@ -119,6 +125,146 @@ struct VocChannel {
     int32 Pan;
     int32 Frequency;
     bool IsActive;
+};
+
+// ---------------------------------------------------------------------------
+// 声音对象的链表节点。原版把每个 VocClass 挂进一条 intrusive 环形链表：
+// 节点 +0x00 = 前驱(NearLink)，+0x04 = 后继(FarLink)，首节点即表头哨兵。
+// asm: VocCtrl_Add / sub_407440 / VocClass_RemoveFromList / VocClass_GetPrevious
+// 都只操作这两个指针，故这里只需一个两指针的基类即可复刻其语义。
+// ---------------------------------------------------------------------------
+struct VocClassHeader {
+    VocClassHeader* NearLink;   // +0x00
+    VocClassHeader* FarLink;    // +0x04
+
+    VocClassHeader() : NearLink(this), FarLink(this) {}
+};
+
+// ---------------------------------------------------------------------------
+// asm: AudioMiniBuffer (0x3C 字节) —— 一条"正在播放的静态音效"记录。
+//
+// 原版把每条实例挂进 AudioBufferNewest 这条环形双向链表（VocCtrl_Add 插入
+// 到表头之后），节点偏移已由 asm 证实：
+//   +0x00 NearLink      前驱                (VocClass_GetPrevious 读 [ecx])
+//   +0x04 FarLink       后继
+//   +0x0C Handle        StrX 句柄槽         (PlayIndexAtPos: StrX_Init(esi+0Ch))
+//   +0x14 Owner         关联的 VocClass*    (SaveData: mov ecx,[edi+14h])
+//   +0x18 Voice         引擎 voice 句柄     (SaveData: mov ecx,[edi+24h] 前的 [edi+20h])
+//   +0x20 Position      dwXYZ (3×int32)     (SaveData 原样写 12 字节)
+//   +0x2C Argument      PlayIndexAtPos 的第 3 参
+//   +0x30 Countdown     剩余帧数
+// ---------------------------------------------------------------------------
+struct VocInstance {
+    VocClassHeader Link;       // +0x00 / +0x04
+    int32          Pad08;      // +0x08
+    void*          Handle;     // +0x0C
+    SoundDefinition* Owner;    // +0x14
+    void*          Voice;      // +0x18
+    CoordStruct    Position;   // +0x20
+    int32          Argument;   // +0x2C
+    int32          Countdown;  // +0x30
+
+    VocInstance() : Pad08(0), Handle(nullptr), Owner(nullptr), Voice(nullptr),
+                    Position(0, 0, 0), Argument(0), Countdown(0) {}
+};
+
+// ---------------------------------------------------------------------------
+// asm: StrX_406130 / StrX_406170 / StrX_4060F0 的最小语义替身。
+//
+// 原版把"某个对象当前挂着的音效"放在一个 StrX 槽里，提供三个操作：取句柄、
+// 取该句柄绑定的坐标、把句柄写回。对象/渲染层在本工程中尚未建模，故以纯
+// 虚接口固化这三条语义，由持有音效的对象按需实现（例如 AnimClass 的 Report
+// 音效槽）。
+// ---------------------------------------------------------------------------
+class VocSoundAnchor {
+public:
+    virtual ~VocSoundAnchor() {}
+    virtual void* Get_Current_Sound() const = 0;              // asm: StrX_406130
+    virtual const CoordStruct* Get_Current_Sound_Coords() const = 0; // StrX_406170
+    virtual void  Set_Current_Sound(void* pSound) = 0;        // asm: StrX_4060F0
+};
+
+// ---------------------------------------------------------------------------
+// asm: 音效归属对象 —— StrX 槽指向的播放实例（节点）的持有者。
+//
+// 节点（slot +0x00）只被这些析构函数按偏移读写；节点自己的 +0xB0 回指本
+// 对象，本对象的 +0xC0 又回指节点（双向绑定）。asm 里 sub_4026A0 / 4026B0 /
+// 4025B0 / 4026F0 的 `this` 就是它（IDA 注释误标成 VocClass*）：
+//   +0x90/0x98/0x9C/0xB4/0xB8/0xBC/0xC0  int32 —— 摘链时一并清零
+//   +0xA4  int32  状态位（bit0 | bit2 = "样本已被换掉"）
+//   +0xD4  void*  声卡设备对象（虚表 +0x10 / +0x28 / +0x2C 三个槽）
+//   +0x168 int32  设备计数器
+// ---------------------------------------------------------------------------
+class StrXOwner {
+public:
+    // asm: sub_4026A0 —— 设备 vt+0x28
+    void Guard_Detach();
+    // asm: sub_4026B0 —— 设备 vt+0x2C
+    void Guard_Attach();
+    // asm: sub_4025B0 —— 停声：vt+28、按位 vt+0x10、vt+2C、回调 [+0BCh]、清 +168
+    void Stop_Voice();
+    // asm: sub_4026F0 —— 清 bit4 后再 vt+28 / vt+2C
+    void Release_Voice();
+
+    // asm: sub_401F90 —— voice 条目引用计数递减（下限 0），返回递减后的值
+    static int32 Voice_Dec_Ref(void* pVoice);
+
+    int32 field_90;   // +0x90
+    int32 field_98;   // +0x98
+    int32 field_9C;   // +0x9C
+    int32 flags_A4;   // +0xA4
+    int32 field_B4;   // +0xB4
+    int32 field_B8;   // +0xB8
+    int32 field_BC;   // +0xBC
+    int32 field_C0;   // +0xC0  当前节点（与 slot->Node 同值）
+    void* Device;     // +0xD4
+    int32 field_168;  // +0x168
+};
+
+// ---------------------------------------------------------------------------
+// asm: someStructX (sizeof = 0x14) —— "某个对象当前挂着的音效"句柄槽。
+//   AnimClass 里是 someStruct1/2、strX，TechnoClass 里是 StrX_3..6。
+//   +0x00 Node     播放实例节点
+//   +0x04 Field04  与 [node+138h] 比对
+//   +0x08 Field08  与 [node+24h] 比对；每条出口都清 0
+//   +0x0C Marker   asm: offset VocGlobalA.SoundCount+3D8h —— 归属标记（常数）
+//   +0x10 Field10  本组函数不触碰
+// ---------------------------------------------------------------------------
+class StrXSlot {
+public:
+    // asm: StrX_Init
+    void StrX_Init();
+    // asm: StrX_DTOR_0 (0x405C40) —— 全量拆除，并在每条出口清 +0x0C
+    void StrX_DTOR_0();
+    // asm: StrX_DTOR_1 (0x405D40) —— 全量拆除
+    void StrX_DTOR_1();
+    // asm: StrX_DTOR_3 (0x4060D9) —— 只做"摘挂"守卫，不拆 voice 表
+    void StrX_DTOR_3();
+
+    // asm: VocGlobalA.field_140+3D8h —— 非 0 才允许拆除
+    static int32 GlobalReady;
+    // asm: offset VocGlobalA.SoundCount+3D8h —— 写进 Marker 的归属常数
+    static int32 MarkerToken;
+
+    void* Node;      // +0x00
+    int32 Field04;   // +0x04
+    int32 Field08;   // +0x08
+    int32 Marker;    // +0x0C
+    int32 Field10;   // +0x10
+
+private:
+    // DTOR_0 / DTOR_1 的公共体；clearFieldC 决定是否多清 +0x0C
+    void Voice_Teardown(bool clearFieldC);
+};
+
+// ---------------------------------------------------------------------------
+// asm: IStream::Write(vt+0x10) 的最小替身。SaveData 只用到"写一段字节"，
+// COM 流在本工程未建模，故以纯虚接口固定同样的字节序列。
+// ---------------------------------------------------------------------------
+class VocSaveStream {
+public:
+    virtual ~VocSaveStream() {}
+    virtual bool Write(const void* pData, int32 length) = 0;
 };
 
 class VocClass {
@@ -173,12 +319,85 @@ public:
     // 根据游戏行为，可知通道回退查找与按位播放是声音面的两个
     // 底层入口：回退沿最近使用顺序取上一个，按位播放把索引绑定
     // 到世界坐标。
-    static int32 GetPreviousFromHead();
-    static int32 GetPrevious();
     static const char* FindNameByIndex(int32 index);
-    static void SaveData();
-    static void UpdateAtLocation(int32 index, void* pAnchor);
-    static bool PlayIndexAtPos(int32 index, const struct CoordStruct* pPos);
+    static bool SaveData(VocSaveStream* pStream);
+    static void UpdateAtLocation(const CoordStruct* pPos, VocSoundAnchor* pAnchor);
+    static VocInstance* PlayIndexAtPos(int32 index, const CoordStruct* pPos,
+                                       int32 argument = 0);
+
+    // -------------------------------------------------------------------
+    // AudioBufferNewest —— 静态音效实例链表（asm 全局 dword_B1D3A8/AC 为
+    // 当前条数与历史峰值）。这些入口只操作链表本身，不触碰声卡后端。
+    //   GetPreviousFromHead : asm 518  （表头 -> 最旧一条）
+    //   GetPrevious         : asm 551  （节点 -> 其前驱，遇到表头哨兵返回 0）
+    // -------------------------------------------------------------------
+    static VocInstance* AllocInstance();                 // 池取节点
+    static void         FreeInstance(VocInstance* pInst);
+    static void         AddInstanceToNewest(VocInstance* pInst);  // VocCtrl_Add
+    static VocInstance* GetPreviousFromHead();           // GetPreviousFromHead
+    static VocInstance* GetPrevious(VocInstance* pInst); // GetPrevious
+    static void         RemoveInstanceFromList(VocInstance* pInst); // RemoveFromList
+    static void         ResetInstances();                // DeleteAll 的链表段
+    static int32        GetInstanceCount();              // dword_B1D3A8
+    static int32        GetInstancePeak();               // dword_B1D3AC
+
+    // asm: sub_750AC0 —— 距离衰减。返回 0..1 的音量系数并把声像写入
+    // *pPan（0..0x4000，0x2000 为正中）。源坐标为世界坐标，像素投影
+    // 在本工程尚未建模，故以世界 XY 距离等价折算（见 .cpp 注释）。
+    static float ComputeAttenuation(const CoordStruct& listener, int32 range,
+                                    const CoordStruct& source, int32* pPan);
+
+    // asm: VocClass_FindIndex —— 在 VocClass 数组里按名字大小写不敏感地
+    // 查下标，未命中返回 -1。语义与 FindIndexOfName 完全等价，直接转调。
+    static int32 FindIndex(const char* pName);
+
+    // -------------------------------------------------------------------
+    // asm: VocClass_RemoveFromList (__fastcall, VocClass *this)
+    //   把 this 从它所在的环形链表里摘掉，并把自己恢复成自环（空节点）。
+    // asm: VocClass_GetPrevious / GetPreviousFromHead
+    //   __fastcall(VocClassHeader *this) -> VocClass*，返回 NearLink，
+    //   但当 this 为空、NearLink 为空或该节点就是表头（自环）时返回 nullptr。
+    // asm: VocClass_SaveData (IStream *this)
+    //   复刻：先写入音频缓冲长度(4B)，再遍历链表写出每个声音的名字下标
+    //   (4B) 与 [ +0x20, +0x24, +0x28 ](共 16B)。每段写失败即以该
+    //   HRESULT 提前返回。
+    // -------------------------------------------------------------------
+    void RemoveFromList();
+    VocClassHeader* GetPreviousFromList();
+    VocClassHeader* GetPreviousFromHeadEntry();
+
+    // -------------------------------------------------------------------
+    // asm: Sound_Effect (0x7509D0)   (retn 4)
+    //
+    //   Sound_Effect proc near        ; dump 无 `; void ...` 签名注释行
+    //   按函数体推断：__fastcall(ecx=voiceIdx, edx=a1, 栈 a2=pWhat) -> void*
+    //   调用者极多（20+ 处，如 AircraftClass_Mi_SpyPlaneApproach）。
+    //
+    //   mov al,byte_8464AC / test al,al / jnz loc_7509F2 ; 关闭时直接返回 0
+    //   test ecx,ecx / jl loc_750A0F
+    //   cmp ecx,VocClass.length / jge loc_750A0F         ; 索引越界保护
+    //   mov eax,VocClass.data / mov ecx,[eax+ecx*4] / mov edi,[ecx]
+    //                                                    ; edi = 该声的坐标槽
+    //   若 pWhat: pHandle = StrX_406130(pWhat)
+    //             if (StrX_406310(pHandle) == coords) {
+    //                 StrX_4052F0(pHandle) ; pHandle = 0     ; 同位置去重
+    //             }
+    //   若 coords != 0:
+    //     volume = sub_750AC0(a1, &pWhat, coords)        ; 距离衰减（ST0）
+    //     if (volume <= 0.0f):                           ; 听不见
+    //        if (pHandle) StrX_4052F0(pHandle) ; pHandle = 0
+    //     else:  ... 按 volume*16384 播放并绑定 StrX 句柄 ...
+    //   return pHandle
+    //
+    // 铁律①：sub_750AC0(衰减) / StrX_406130 / StrX_406310 / StrX_4052F0 /
+    //        StrX_405190 / StrX_4061D0 / StrX_406270 / StrX_4060F0 与全局
+    //        byte_8464AC 均尚未落地，此处只固化已确证的入口语义、越界保护、
+    //        去重判定与衰减门槛，不臆造实现。
+    // -------------------------------------------------------------------
+    static bool  Get_Sound_Effect_Enabled();         // asm: byte_8464AC
+    static void  Set_Sound_Effect_Enabled(bool on);
+    static void* Sound_Effect(int32 index, const CoordStruct* pPos,
+                              VocSoundAnchor* pAnchor);
 
     // -------------------------------------------------------------------
     // Sound definition list
@@ -190,6 +409,18 @@ public:
     // -------------------------------------------------------------------
     static void CreateFromINIList(class CCINIClass* pINI);
     static void DeleteAll();
+
+    // -------------------------------------------------------------------
+    // asm: init_vec_Voc (0x750340) —— 全局 vec_Voc（DynamicVectorClass<
+    //   VocClass*>）的静态铺底
+    //   data=0 / count=0 / IsInitialized=1 / IsAllocated=0 /
+    //   vtable=DynamicVectorClass<VocClass*>::vftable / incrementAmount=0Ah /
+    //   length=0，随后 _atexit(loc_750340) 注册析构：析构把 vtable 回落成
+    //   VectorClass<VocClass*>，IsAllocated 为真时 delete data，再清
+    //   IsAllocated / count。
+    //   本工程以函数内静态对象表达同一语义（同 MixFileClass::sctor2 的手法）。
+    // -------------------------------------------------------------------
+    static DynamicVectorClass<VocClass*>& Vec_Voc();
     static SoundDefinition* FindSound(const char* pName);
     static SoundDefinition* GetSound(int32 nIndex);
     static int32 GetSoundDefinitionCount();

@@ -36,6 +36,20 @@ public:
     bool ProcessWarpOut();
     bool ProcessWarpTransition();
     bool ProcessWarpIn();
+    // asm: Process 开头的"外部传送相位同步"段（7192E0..719351）：当载体的
+    //   IsWarpingOut（+0x74）或外部相位槽（+0x280）在动时，把本机相位与之同步
+    //   并当帧不推进。返回 true 表示已被外部相位接管。
+    bool HandleOuterWarp();
+    // asm: Process 的"被抹除"分支（loc_7197CC）：置载体的抹除旗标并起蓄能计时。
+    void BeginCharge();
+    // asm: Process 里把相位点所在格是否为桥面写入载体的标记。
+    bool TargetCellOnBridge() const;
+    // asm: Process 的 719803..719BE2 相位分派与起始段。
+    bool ProcessPhase();
+    void BeginWarpOut();
+    bool FinishWarp();
+    void PlayChronoOutSound();
+    void PlayChronoInSound();
     bool IsValidDestination() const;
     bool IsValidDestinationForCoord(CoordStruct coord) const;
     void RevertTeleport();
@@ -69,7 +83,11 @@ public:
     bool HasArrived;
     AnimTypeClass* WarpOutAnim;
     AnimTypeClass* WarpInAnim;
+    // asm: TeleportLocomotionClass +0x24 —— 朝往点（HeadTo）。目的地复用基类 Dest。
+    CoordStruct HeadTo;
     CoordStruct TargetCell;
     int32 WarpPhase;
     int32 WarpDelay;
+    // asm: 相位点所在格是否为桥面（写回载体的 +0x8C 标记）。
+    bool TargetOnBridge;
 };

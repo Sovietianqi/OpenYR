@@ -2,6 +2,8 @@
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
+#include <FileFormats/SHP.h>
+#include <Game/Externs.h>
 #include <INI/INIClass.h>
 #include <IO/CRC.h>
 #include <Rules/RulesClass.h>
@@ -113,30 +115,80 @@ int32 TerrainTypeClass::GetCount()
     return Array->Count;
 }
 
+// asm: TerrainTypeClass_FindOrAllocate 的 ID 查询面（大小写不敏感）。
+TerrainTypeClass* TerrainTypeClass::FindByName(const char* pID)
+{
+    return Find(pID);
+}
+
+// asm: TerrainTypeClass_CreateFromINIList (asm:218)
+//   遍历全部地形类型；对剧场类型（[+22Ch] != 0）按
+//   "<ID>.<theater ext>" 解析 SHP 到 ImageSHP（+0xA4）。非剧场类型跳过。
+void TerrainTypeClass::CreateFromINIList(int32 idxTheater)
+{
+    if (Array == nullptr)
+        return;
+
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        TerrainTypeClass* pType = Array->Items[i];
+        if (pType == nullptr)
+            continue;
+
+        // asm: cmp [esi+22Ch],bl / jz loc_71DD63
+        if (!pType->IsTheater)
+            continue;
+
+        // asm: __makepath(ID, ".", theaterData.ext) —— 由 ID 与剧场扩展名拼名。
+        const char* pBase = (pType->Image[0] != '\0') ? pType->Image : pType->ID;
+        char base[0x100];
+        char full[0x100];
+        snprintf(base, sizeof(base), "%s.SHP", pBase);
+        pType->TheaterSpecificID(base, idxTheater, full);
+
+        // asm: CCFileClass + Read_File 解出 SHP；文件后端未接通，保持 null。
+        pType->ImageSHP = nullptr;
+    }
+}
+
 // ============================================================================
 // Constructor
+//
+// asm: TerrainTypeClass_CTOR (asm:30, retn 4)
+//   [294h]=-1 ; [298h]=0 ; [29Ch..29Eh]=0 ; [2A8h]=7 ; [2ACh]=7 ; [2A0h]=0
+//   [2A4h]=0 ; [2B0h..2B4h]=0 ; [2B8h]=0
+//   Create_ID ; 字标志位：[230h]=0 [234h]=1 [22Fh]=1 [231h]=0 [232h]=1
+//   注册进 vec_TerrainTypes -> [294h]=ordinal
+//   [0A0h]=-1 ; [9Ch]=6 (格子地形=Tiberium? Land 值)
 // ============================================================================
 
 TerrainTypeClass::TerrainTypeClass(const char* pID) noexcept
     : ObjectTypeClass(pID)
 {
-    IsMarble            = false;
-    IsRocks             = false;
-    IsTree              = false;
+    IsMarble            = false;   // asm: [29Ch] = 0
+    IsRocks             = false;   // asm: [29Dh] = 0
+    IsTree              = false;   // asm: [29Eh] = 0
     IsTiberium          = false;
-    SpawnsTiberium      = false;
-    IsFlammable         = false;
+    SpawnsTiberium      = false;   // asm: [2B1h] = 0
+    IsFlammable         = false;   // asm: [2B2h] = 0
     IsCrushable         = false;
     IsVein              = false;
     IsFog               = false;
-    IsAnimated          = false;
+    IsAnimated          = false;   // asm: [2B3h] = 0
     SpawnsTiberiumType  = 0;
     SpawnsTiberiumRadius = 0;
     SpawnsTiberiumChance = 0;
-    Damage              = 0;
-    ArmorIndex          = 0;
-    FrameCount          = 0;
-    FireAnim            = -1;
+    Damage              = 0;       // asm: [2A0h] = 0
+    ArmorIndex          = 0;       // asm: [2A4h] = 0
+    FrameCount          = 0;       // asm: [2B8h] = 0
+    TreeStrength        = -1;      // asm: [0A0h] = -1
+    TemperateOccupationBits = 7;   // asm: [2A8h] = 7
+    SnowOccupationBits      = 7;   // asm: [2ACh] = 7
+    IsVeinhole          = false;   // asm: [2B4h] = 0
+    WaterBound          = false;   // asm: [2B0h] = 0
+
+    // 注：asm 另有 [9Ch]=6 的字格地形写入，OpenYR 的 ObjectTypeClass 未抽出
+    // 该字段（语义为"地形对象落格时的默认地形"），此处不臆造字段。
 
     std::memset(ArtName, 0, sizeof(ArtName));
 }
@@ -162,109 +214,32 @@ HRESULT TerrainTypeClass::GetClassID(CLSID* pClassID)
     return S_OK;
 }
 
+// asm: TerrainTypeClass_Load (asm:577, retn 8)
+//   ObjectTypeClass_Load ; 失败返回
+//   重打虚表 + ObjectTypeClass_Load3DArt + Load_Theater_Art
+//   [2B8h] = &theatreData[Land] 序表项（无自有字段序列化）
 HRESULT TerrainTypeClass::Load(IStream* pStm)
 {
     if (pStm == nullptr)
         return E_POINTER;
 
     HRESULT hr = ObjectTypeClass::Load(pStm);
-    if (hr < 0) return hr;
+    if (hr < 0)
+        return hr;                            // asm: jl loc_71E235
 
-    ULONG read = 0;
+    ObjectTypeClass::Load3DArt(0);            // asm: ObjectTypeClass_Load3DArt
+    ObjectTypeClass::Load_Theater_Art(0);     // asm: ObjectTypeClass_Load_Theater_Art
 
-    // Read bool flags as a bitmask
-    uint32 flags = 0;
-    hr = pStm->Read(&flags, sizeof(flags), &read);
-    if (hr < 0 || read != sizeof(flags)) return E_FAIL;
-    IsMarble       = (flags & 0x0001) != 0;
-    IsRocks        = (flags & 0x0002) != 0;
-    IsTree         = (flags & 0x0004) != 0;
-    IsTiberium     = (flags & 0x0008) != 0;
-    SpawnsTiberium = (flags & 0x0010) != 0;
-    IsFlammable    = (flags & 0x0020) != 0;
-    IsCrushable    = (flags & 0x0040) != 0;
-    IsVein         = (flags & 0x0080) != 0;
-    IsFog          = (flags & 0x0100) != 0;
-    IsAnimated     = (flags & 0x0200) != 0;
-
-    hr = pStm->Read(&SpawnsTiberiumType, sizeof(SpawnsTiberiumType), &read);
-    if (hr < 0 || read != sizeof(SpawnsTiberiumType)) return E_FAIL;
-
-    hr = pStm->Read(&SpawnsTiberiumRadius, sizeof(SpawnsTiberiumRadius), &read);
-    if (hr < 0 || read != sizeof(SpawnsTiberiumRadius)) return E_FAIL;
-
-    hr = pStm->Read(&SpawnsTiberiumChance, sizeof(SpawnsTiberiumChance), &read);
-    if (hr < 0 || read != sizeof(SpawnsTiberiumChance)) return E_FAIL;
-
-    hr = pStm->Read(&Damage, sizeof(Damage), &read);
-    if (hr < 0 || read != sizeof(Damage)) return E_FAIL;
-
-    hr = pStm->Read(&ArmorIndex, sizeof(ArmorIndex), &read);
-    if (hr < 0 || read != sizeof(ArmorIndex)) return E_FAIL;
-
-    hr = pStm->Read(&FrameCount, sizeof(FrameCount), &read);
-    if (hr < 0 || read != sizeof(FrameCount)) return E_FAIL;
-
-    hr = pStm->Read(&FireAnim, sizeof(FireAnim), &read);
-    if (hr < 0 || read != sizeof(FireAnim)) return E_FAIL;
-
-    hr = pStm->Read(ArtName, sizeof(ArtName), &read);
-    if (hr < 0 || read != sizeof(ArtName)) return E_FAIL;
-    ArtName[sizeof(ArtName) - 1] = '\0';
-
-    return S_OK;
+    return S_OK;                              // asm: xor eax,eax
 }
 
+// asm: TerrainTypeClass_Save (asm:637, retn 0Ch) —— 纯转发 ObjectTypeClass_Save。
 HRESULT TerrainTypeClass::Save(IStream* pStm, BOOL fClearDirty)
 {
     if (pStm == nullptr)
         return E_POINTER;
 
-    HRESULT hr = ObjectTypeClass::Save(pStm, fClearDirty);
-    if (hr < 0) return hr;
-
-    ULONG written = 0;
-
-    // Write bool flags as a bitmask
-    uint32 flags = 0;
-    if (IsMarble)       flags |= 0x0001;
-    if (IsRocks)        flags |= 0x0002;
-    if (IsTree)         flags |= 0x0004;
-    if (IsTiberium)     flags |= 0x0008;
-    if (SpawnsTiberium) flags |= 0x0010;
-    if (IsFlammable)    flags |= 0x0020;
-    if (IsCrushable)    flags |= 0x0040;
-    if (IsVein)         flags |= 0x0080;
-    if (IsFog)          flags |= 0x0100;
-    if (IsAnimated)     flags |= 0x0200;
-    hr = pStm->Write(&flags, sizeof(flags), &written);
-    if (hr < 0 || written != sizeof(flags)) return E_FAIL;
-
-    hr = pStm->Write(&SpawnsTiberiumType, sizeof(SpawnsTiberiumType), &written);
-    if (hr < 0 || written != sizeof(SpawnsTiberiumType)) return E_FAIL;
-
-    hr = pStm->Write(&SpawnsTiberiumRadius, sizeof(SpawnsTiberiumRadius), &written);
-    if (hr < 0 || written != sizeof(SpawnsTiberiumRadius)) return E_FAIL;
-
-    hr = pStm->Write(&SpawnsTiberiumChance, sizeof(SpawnsTiberiumChance), &written);
-    if (hr < 0 || written != sizeof(SpawnsTiberiumChance)) return E_FAIL;
-
-    hr = pStm->Write(&Damage, sizeof(Damage), &written);
-    if (hr < 0 || written != sizeof(Damage)) return E_FAIL;
-
-    hr = pStm->Write(&ArmorIndex, sizeof(ArmorIndex), &written);
-    if (hr < 0 || written != sizeof(ArmorIndex)) return E_FAIL;
-
-    hr = pStm->Write(&FrameCount, sizeof(FrameCount), &written);
-    if (hr < 0 || written != sizeof(FrameCount)) return E_FAIL;
-
-    hr = pStm->Write(&FireAnim, sizeof(FireAnim), &written);
-    if (hr < 0 || written != sizeof(FireAnim)) return E_FAIL;
-
-    hr = pStm->Write(ArtName, sizeof(ArtName), &written);
-    if (hr < 0 || written != sizeof(ArtName)) return E_FAIL;
-
-    return S_OK;
+    return ObjectTypeClass::Save(pStm, fClearDirty);
 }
 
 // ============================================================================
@@ -274,6 +249,39 @@ HRESULT TerrainTypeClass::Save(IStream* pStm, BOOL fClearDirty)
 AbstractType TerrainTypeClass::WhatAmI() const
 {
     return AbstractType::TerrainType;
+}
+
+// asm: 类型派生标识（供 TerrainClass::ComputeCRC 等按类型取 ID 使用）。
+int32 TerrainTypeClass::GetAbstractDerivationID() const
+{
+    return static_cast<int32>(AbstractType::TerrainType);   // asm: 25h
+}
+
+// asm: TerrainTypeClass_GetArrayIndex (asm:847) -- "mov eax,[ecx+294h] ; retn"
+//   本实现在无缓存序号字段时按注册表就地求值（等价语义）。
+int32 TerrainTypeClass::GetArrayIndex() const
+{
+    if (Array == nullptr)
+        return -1;
+
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        if (Array->Items[i] == this)
+            return i;
+    }
+    return -1;
+}
+
+// asm: 类型层 INI 读取别名（转发 LoadFromINI）。
+bool TerrainTypeClass::Read_INI(CCINIClass* pINI)
+{
+    return LoadFromINI(pINI);
+}
+
+// asm: 类型层 SHP 访问面 —— 返回缓存的 SHP 句柄（ObjectTypeClass::GetImage）。
+SHPStruct* TerrainTypeClass::GetImageData() const
+{
+    return GetImage();
 }
 
 int32 TerrainTypeClass::Size() const
@@ -304,122 +312,106 @@ bool TerrainTypeClass::Spawns_Tiberium() const
 // LoadFromINI
 // ============================================================================
 
+// asm: TerrainTypeClass_LoadFromINI (asm:313, retn 4)
+//   Reset(INI) ; ObjectTypeClass_LoadFromINI ; test al,al / jz -> false
+//   if (TreeStrength[0A0h] == -1) TreeStrength = Rules->[1144h]
+//   键序（逐字）：IsVeinhole, WaterBound, SpawnsTiberium, IsFlammable,
+//   Foundation(art INI), 然后 RadColor(来自 SHP 帧色) / RadarColor /
+//   IsAnimated / AnimationRate / AnimationProbability /
+//   TemperateOccupationBits / SnowOccupationBits
 bool TerrainTypeClass::LoadFromINI(CCINIClass* pINI)
 {
     if (pINI == nullptr)
         return false;
 
-    // Chain the parent first so common fields are read.
-    ObjectTypeClass::LoadFromINI(pINI);
+    // asm: ObjectTypeClass_LoadFromINI ; test al,al / jz loc_71E0B4 -> false
+    if (!ObjectTypeClass::LoadFromINI(pINI))
+        return false;
 
     const char* section = this->ID;
     if (section == nullptr || section[0] == '\0')
         return false;
 
-    // ------------------------------------------------------------------
-    // Classification flags
-    // ------------------------------------------------------------------
-    IsRocks        = pINI->ReadBool(section, "Rocks",       IsRocks);
-    IsTiberium     = pINI->ReadBool(section, "Tiberium",    IsTiberium);
-    IsCrushable    = pINI->ReadBool(section, "Crushable",   IsCrushable);
-    SpawnsTiberium = pINI->ReadBool(section, "SpawnsTiberium", SpawnsTiberium);
-
-    // ------------------------------------------------------------------
-    // Combat properties
-    // ------------------------------------------------------------------
-    Damage     = pINI->ReadInteger(section, "Damage", Damage);
-    ArmorIndex = pINI->ReadInteger(section, "Armor",  ArmorIndex);
-
-    // ------------------------------------------------------------------
-    // Tiberium spawning parameters
-    // ------------------------------------------------------------------
-
-    // ------------------------------------------------------------------
-    // Animation properties
-    // ------------------------------------------------------------------
-
-    // ------------------------------------------------------------------
-    // Radar colour - three raw bytes.
-    // ------------------------------------------------------------------
-    pINI->Get3Bytes(section, "RadarColor", RadarColor);
-
-    // ------------------------------------------------------------------
-    // Art reference - falls back to the type ID when no Image is given.
-    // ------------------------------------------------------------------
-    char artBuf[64];
-    pINI->ReadString(section, "Image", "", artBuf, sizeof(artBuf));
-    if (artBuf[0] != '\0')
+    // asm: cmp dword ptr [esi+0A0h],0FFFFFFFFh / jnz loc_71DEE2
+    //     —— 类型未显式给出时回落到 Rules+1144h（[General] TreeStrength）。
+    //     原版 RulesClass 构造把该槽预置 0x19，故缺省（未读到键）时仍取 0x19。
+    if (TreeStrength == -1)
     {
-        int32 j = 0;
-        while (artBuf[j] != '\0' && j < static_cast<int32>(sizeof(ArtName) - 1))
-        {
-            ArtName[j] = artBuf[j];
-            ++j;
-        }
-        ArtName[j] = '\0';
-    }
-    else if (ID[0] != '\0')
-    {
-        int32 j = 0;
-        while (ID[j] != '\0' && j < static_cast<int32>(sizeof(ArtName) - 1))
-        {
-            ArtName[j] = ID[j];
-            ++j;
-        }
-        ArtName[j] = '\0';
+        const int32 rulesTreeStrength = (TheRules != nullptr) ? TheRules->TreeStrength : 0;
+        TreeStrength = (rulesTreeStrength > 0) ? rulesTreeStrength : 0x19;
     }
 
-
-    // generated-ini-reads
-    // ------------------------------------------------------------------
-    // Full key set - every field keeps its current value when the key
-    // is absent, so partially specified sections stay valid.
-    // ------------------------------------------------------------------
-    CCINIClass* pArt = &CCINIClass::INI_Art;
-    if (pArt == nullptr)
-        pArt = pINI;
-
-    IsVeinhole = pINI->ReadBool(section, "IsVeinhole", IsVeinhole);
-    WaterBound = pINI->ReadBool(section, "WaterBound", WaterBound);
+    // asm: 键序 IsVeinhole / WaterBound / SpawnsTiberium / IsFlammable。
+    IsVeinhole     = pINI->ReadBool(section, "IsVeinhole", IsVeinhole);
+    if (IsVeinhole)
+    {
+        HasRadialIndicator = false;   // asm: mov [HasRadialIndicator],0
+        IsFlammable        = true;    // asm: byte ptr [esi+231h],1
+    }
+    WaterBound     = pINI->ReadBool(section, "WaterBound", WaterBound);
     SpawnsTiberium = pINI->ReadBool(section, "SpawnsTiberium", SpawnsTiberium);
-    IsFlammable = pINI->ReadBool(section, "IsFlammable", IsFlammable);
-    FoundationValue = pINI->GetFoundation(section, "Foundation", FoundationValue);
+    IsFlammable    = pINI->ReadBool(section, "IsFlammable", IsFlammable);
+
+    // asm: Foundation 来自 art INI（section = Image 名）。
+    const char* artSection = (Image[0] != '\0') ? Image : section;
+    FoundationValue = CCINIClass::INI_Art.GetFoundation(artSection, "Foundation", FoundationValue);
+
+    // asm: 非剧场 -> "<Image>.SHP" -> Finder -> ImageSHP（文件后端未接通）。
+    if (!IsTheater)
+    {
+        char base[0x100];
+        char full[0x100];
+        snprintf(base, sizeof(base), "%s.SHP", artSection);
+        TheaterSpecificID(base, 0, full);
+        ImageSHP = nullptr;
+    }
+
+    // asm: 若 SHP 有效，用帧色回填 RadarColor。
+    if (ImageSHP != nullptr)
+    {
+        ColorStruct frameColor = ImageSHP->GetColor(0);
+        RadarColor[0] = frameColor.R;
+        RadarColor[1] = frameColor.G;
+        RadarColor[2] = frameColor.B;
+    }
+
+    // asm: 显式 RadarColor 覆盖。
     pINI->Get3Bytes(section, "RadarColor", RadarColor);
-    IsAnimated = pINI->ReadBool(section, "IsAnimated", IsAnimated);
-    AnimationRate = pINI->ReadInteger(section, "AnimationRate", AnimationRate);
+
+    // asm: IsAnimated / AnimationRate / AnimationProbability /
+    //      TemperateOccupationBits / SnowOccupationBits。
+    IsAnimated     = pINI->ReadBool(section, "IsAnimated", IsAnimated);
+    AnimationRate  = pINI->ReadInteger(section, "AnimationRate", AnimationRate);
     AnimationProbability = pINI->ReadFixed(section, "AnimationProbability", AnimationProbability);
     TemperateOccupationBits = pINI->ReadInteger(section, "TemperateOccupationBits", TemperateOccupationBits);
     SnowOccupationBits = pINI->ReadInteger(section, "SnowOccupationBits", SnowOccupationBits);
 
-        return true;
+    return true;
 }
 
 // ============================================================================
 // CRC
 // ============================================================================
 
+// asm: TerrainTypeClass_GetCRC (asm:506)
+//   AbstractTypeClass_GetCRC(buf)
+//   CRC_DWORD(HeapID[294h]) ; CRC_bool(WaterBound[2B0h]) ; CRC_bool(SpawnsTiberium[2B1h])
+//   CRC_bool(IsFlammable[2B2h]) ; CRC_DWORD(Foundation[298h])
+//   CRC_bool(IsAnimated[2B3h]) ; CRC_DWORD(AnimationRate[2A0h])
+//   CRC_float(AnimationProbability[2A4h])
 void TerrainTypeClass::ComputeCRC(CRCEngine& crc) const
 {
     ObjectTypeClass::ComputeCRC(crc);
 
-    crc.AddData(&IsMarble,             sizeof(IsMarble));
-    crc.AddData(&IsRocks,              sizeof(IsRocks));
-    crc.AddData(&IsTree,               sizeof(IsTree));
-    crc.AddData(&IsTiberium,           sizeof(IsTiberium));
-    crc.AddData(&SpawnsTiberium,       sizeof(SpawnsTiberium));
-    crc.AddData(&IsFlammable,          sizeof(IsFlammable));
-    crc.AddData(&IsCrushable,          sizeof(IsCrushable));
-    crc.AddData(&IsVein,               sizeof(IsVein));
-    crc.AddData(&IsFog,                sizeof(IsFog));
-    crc.AddData(&IsAnimated,           sizeof(IsAnimated));
-    crc.AddData(&SpawnsTiberiumType,   sizeof(SpawnsTiberiumType));
-    crc.AddData(&SpawnsTiberiumRadius, sizeof(SpawnsTiberiumRadius));
-    crc.AddData(&SpawnsTiberiumChance, sizeof(SpawnsTiberiumChance));
-    crc.AddData(&Damage,               sizeof(Damage));
-    crc.AddData(&ArmorIndex,           sizeof(ArmorIndex));
-    crc.AddData(&FrameCount,           sizeof(FrameCount));
-    crc.AddData(&FireAnim,             sizeof(FireAnim));
-    crc.AddData(ArtName,               static_cast<int32>(sizeof(ArtName)));
+    const int32 heapId = GetArrayIndex();            // asm: [294h]
+    crc.AddData(&heapId,             sizeof(heapId));
+    crc.AddData(&WaterBound,         sizeof(WaterBound));
+    crc.AddData(&SpawnsTiberium,     sizeof(SpawnsTiberium));
+    crc.AddData(&IsFlammable,        sizeof(IsFlammable));
+    crc.AddData(&FoundationValue,    sizeof(FoundationValue));
+    crc.AddData(&IsAnimated,         sizeof(IsAnimated));
+    crc.AddData(&AnimationRate,      sizeof(AnimationRate));
+    crc.AddData(&AnimationProbability, sizeof(AnimationProbability));
 }
 
 int32 TerrainTypeClass::GetCRC() const

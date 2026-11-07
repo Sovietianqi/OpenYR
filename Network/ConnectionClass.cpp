@@ -10,7 +10,7 @@
 // ============================================================
 
 ConnectionClass::ConnectionClass()
-    : Socket(0), Address(0), Port(0), Connected(false), Timeout(5000), LastActivity(0)
+    : Socket(0), Address(0), Port(0), Connected(false), PeerName{}, Timeout(5000), LastActivity(0)
     , SequenceNumber(0), AckNumber(0), RemoteSequence(0)
     , Latency(0), LatencyAverage(0), LatencyDeviation(0)
     , PacketLoss(0.0f), PacketsSent(0), PacketsReceived(0), PacketsLost(0)
@@ -28,6 +28,7 @@ ConnectionClass::ConnectionClass()
         PendingAcks[i].Length = 0;
         PendingAcks[i].Sent = false;
         PendingAcks[i].SendTime = 0;
+        PendingAcks[i].FirstSendTime = 0;
         PendingAcks[i].Retransmits = 0;
     }
 }
@@ -135,6 +136,7 @@ int32 ConnectionClass::BuildReliablePacket(const uint8* data, int32 len, uint8* 
             PendingAcks[slot].Length = len;
             PendingAcks[slot].Sent = false;
             PendingAcks[slot].SendTime = 0;
+            PendingAcks[slot].FirstSendTime = 0;
             PendingAcks[slot].Retransmits = 0;
             PendingAcks[slot].Acked = false;
         }
@@ -352,6 +354,245 @@ uint32 ConnectionClass::CalculateCRC(const uint8* data, int32 len) {
 }
 
 // ============================================================
+// ConnectionClass - service queues
+//
+// 原版把收发两端都放在 CommBufferClass（[this+4]）里：该结构 +0x28 是
+// "待确认发送队列"的条数、+0x38 是"已收待交付队列"的条数，服务函数
+// 按条目上的 flag 字节决定走哪一趟。本工程用 PendingAcks[] 表达发送
+// 队列，条目字段与 asm 的对应关系：
+//   asm [entry+0x00] bit1   -> Sent      （已发出/已处理）
+//   asm [entry+0x04]        -> SendTime  （首次发送时刻）
+//   asm [entry+0x08]        -> SendTime  （最近一次发送时刻）
+//   asm [entry+0x0C]        -> Retransmits（重发次数）
+//   asm [entry+0x14]        -> Data/Sequence（内层包）
+//   asm [this+0x2C]         -> MaxRetransmits
+//   asm [this+0x30]         -> Timeout（生命期上限）
+// ============================================================
+
+// ----------------------------------------------------------------------------
+// asm: ConnectionClass_ServiceSendQueue 第一趟 (asm:639..678)
+//   for (i = 0; i < queue.count; ++i) {
+//       e = queue[i];
+//       if (!(e->flags & 2)) continue;              ; 只看已发出条目
+//       if (e->packet->code == 0) {                 ; NOACK 包
+//           elapsed = now - e->firstSend;           ; 64 位 tick 差值
+//           sub_48BA10(queue, elapsed);             ; 往返时延统计
+//       }
+//       sub_48B570(queue, 0,0,0, i, 0,0);           ; 结算并移除
+//       --i;                                        ; 索引回退
+//   }
+// ----------------------------------------------------------------------------
+int32 ConnectionClass::RetireAcknowledged()
+{
+    int32 retired = 0;
+    const int32 now = static_cast<int32>(SystemTimer::GetTime());
+
+    for (int32 i = 0; i < MAX_PENDING_ACKS; ++i)
+    {
+        PendingAck& ack = PendingAcks[i];
+        if (!ack.Sent || !ack.Acked)          // asm: test byte ptr [ebx],2 / jz
+            continue;
+
+        // asm: e->packet->code == 0 -> sub_48BA10(往返时延)
+        if (ack.SendTime != 0)
+        {
+            int32 rtt = now - ack.SendTime;
+            if (rtt >= 0)
+            {
+                if (LatencyAverage == 0)
+                    LatencyAverage = rtt;
+                else
+                    LatencyAverage = (LatencyAverage * 7 + rtt) / 8;  // 指数平滑
+                Latency = rtt;
+            }
+        }
+
+        if (ack.Data != nullptr)
+            std::free(ack.Data);              // asm: sub_48B570 释放条目负载
+        ack.Data        = nullptr;
+        ack.Length      = 0;
+        ack.Sent        = false;
+        ack.Acked       = false;
+        ack.Retransmits = 0;
+        ack.SendTime    = 0;
+
+        ++retired;
+    }
+
+    return retired;
+}
+
+// ----------------------------------------------------------------------------
+// asm: ConnectionClass_ServiceSendQueue (asm:621)
+//
+// 第二趟（asm:679..791）：
+//   for (i = 0; i < count; ++i) {
+//       e = queue[i];
+//       if (e->flags & 2) continue;                  ; 已处理
+//       elapsed = now - e->lastSend;
+//       if (elapsed <= this->[0x28]) continue;        ; 未到重发间隔
+//       vtable+0x24(this, e->seq, e->data, e->len, e->code, isServer, e->id);
+//       e->lastSend = now;
+//       if (e->retries == 0) {
+//           e->firstSend = now;
+//           if (e->packet->code == 1) e->flags |= 2;  ; ACK 包只需一次
+//       } else {
+//           ++this->[0x08];                           ; 重发计数
+//       }
+//       ++e->retries;
+//       if (this->[0x2C] != -1 && e->retries > this->[0x2C]) e->flags |= 4, bad = 1;
+//       if (this->[0x30] != -1 && e->lastSend - e->firstSend > this->[0x30])
+//                                                            e->flags |= 4, bad = 1;
+//   }
+//   if (bad) { WWDebugString("bad connection"); return 0; }
+//   return 1;
+// ----------------------------------------------------------------------------
+bool ConnectionClass::Service_Send_Queue()
+{
+    const int32 now = static_cast<int32>(SystemTimer::GetTime());
+
+    // 第一趟：结算已确认条目（RetireAcknowledged）
+    RetireAcknowledged();
+
+    bool bad = false;
+
+    for (int32 i = 0; i < MAX_PENDING_ACKS; ++i)
+    {
+        PendingAck& ack = PendingAcks[i];
+        if (!ack.Sent || ack.Acked || ack.Data == nullptr)  // asm: test [esi],2
+            continue;
+
+        // asm: mov ecx,[esi+8] / mov eax,[edi+28h] / sub edx,ecx / cmp edx,eax
+        const int32 elapsed = now - ack.SendTime;
+        if (elapsed <= RetransmitTimeout)                    // asm: jbe
+            continue;
+
+        // asm: 以 vtable+0x24 重发整包（头 8 字节 + 负载）
+        {
+            uint8 buffer[1500];
+            const int32 total = ack.Length + 8;
+            if (total > static_cast<int32>(sizeof(buffer)))
+                continue;
+
+            BuildRetransmitPacket(ack.Sequence, ack.Data, ack.Length,
+                                  buffer, static_cast<int32>(sizeof(buffer)));
+            SendPacket(buffer, total);                       // asm: call [eax+24h]
+            ++PacketsSent;
+            TotalBytesSent += total;
+        }
+
+        ack.SendTime = now;                                  // asm: mov [esi+8],ebp
+
+        if (ack.Retransmits == 0)                            // asm: mov eax,[esi+0Ch] / jnz
+        {
+            ack.FirstSendTime = now;                         // asm: mov [esi+4],ebp
+        }
+        else
+        {
+            ++PacketsLost;                                   // asm: inc dword ptr [edi+8]
+        }
+
+        ++ack.Retransmits;                                   // asm: inc [esi+0Ch]
+
+        // asm: cmp eax,[edi+2Ch] ; jbe ; flags |= 4 ; bad = 1
+        if (MaxRetransmits >= 0 && ack.Retransmits > MaxRetransmits)
+            bad = true;
+
+        // asm: [edi+30h] 生命期上限（最近发送 - 首次发送 > 上限）
+        if (Timeout >= 0 && (ack.SendTime - ack.FirstSendTime) > Timeout)
+            bad = true;
+    }
+
+    if (bad)
+    {
+        // asm: WWDebugString("ConnectionClass::Service_Send_Queue bad connection")
+        State = ConnectionState::Error;
+        Connected = false;
+        return false;                                        // asm: xor eax,eax
+    }
+
+    return true;                                             // asm: mov eax,1
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_48C3B0 —— 两个服务口的包装
+//   call [eax+1Ch]  ; 发送服务
+//   if (!eax) return 0
+//   call [eax+20h]  ; 接收服务
+//   if (!eax) return 0
+//   return 1
+//
+// 接收侧在本工程没有独立的收包缓冲（ConnectionClass 的子类直接从
+// socket 读），故这里做两件可确证的事：结算已确认条目、刷新丢包率，
+// 并在连接失效时返回 0 让调用链中断。
+// ----------------------------------------------------------------------------
+bool ConnectionClass::Service_Receive_Queue()
+{
+    if (State == ConnectionState::Disconnected)          // asm: 第一个服务口失败
+        return false;
+
+    RetireAcknowledged();
+
+    // asm: ReceivePacket 里 (sentCount - acked) / sent 的百分比统计
+    if (PacketsSent > 0)
+    {
+        int32 lost = PacketsSent - PacketsReceived;
+        if (lost < 0) lost = 0;
+        PacketLoss = static_cast<float>(lost) / static_cast<float>(PacketsSent);
+    }
+
+    return State != ConnectionState::Error;              // asm: 第二个服务口
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_48BF10 —— 连接复位
+//   [ecx+34h..40h] = 0 ; [ecx+08h..18h] = 0 ;
+//   [ecx+44h] = [ecx+48h] = -1 ; CommBuffer->Reset()
+// 本工程用对应的统计字段表达，并清空待确认队列。
+// ----------------------------------------------------------------------------
+void ConnectionClass::Reset_Connection()
+{
+    PacketLoss        = 0.0f;      // asm: [ecx+34h..40h] 计数区
+    PacketsSent       = 0;
+    PacketsReceived   = 0;
+    PacketsLost       = 0;
+    RetransmitCount   = 0;
+
+    TotalBytesSent     = 0;        // asm: [ecx+08h..18h]
+    TotalBytesReceived = 0;
+    Latency            = 0;
+    LatencyAverage     = 0;
+    LatencyDeviation   = 0;
+
+    AckNumber      = 0xFFFFFFFF;   // asm: [ecx+44h] = -1
+    RemoteSequence = 0xFFFFFFFF;   // asm: [ecx+48h] = -1
+
+    for (int32 i = 0; i < MAX_PENDING_ACKS; ++i)
+    {
+        if (PendingAcks[i].Data != nullptr)
+            std::free(PendingAcks[i].Data);
+        PendingAcks[i].Data        = nullptr;
+        PendingAcks[i].Length      = 0;
+        PendingAcks[i].Sent        = false;
+        PendingAcks[i].Acked       = false;
+        PendingAcks[i].SendTime    = 0;
+        PendingAcks[i].Retransmits = 0;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_48C630 —— if (code < 0 || code >= 3) return 0; return table[code];
+// 表项在 .rdata 里依次是 "ADATA" 家族的三个字符串。
+// ----------------------------------------------------------------------------
+const char* ConnectionClass::GetPacketKindName(int32 code)
+{
+    static const char* const Names[3] = { "ADATA", "ADATA2", "ADATA3" };
+    if (code < 0 || code >= 3)          // asm: test ecx,ecx / jl ; cmp ecx,3 / jge
+        return nullptr;
+    return Names[code];                 // asm: mov eax,off_81D27C[ecx*4]
+}
+
+// ============================================================
 // WinsockInterfaceClass
 // ============================================================
 
@@ -499,7 +740,8 @@ uint32 WinsockInterfaceClass::AddressToString(uint32 address, char* buffer, int3
 // ============================================================
 
 IPXConnectionClass::IPXConnectionClass()
-    : ConnectionClass(), IPXNetwork(0), IPXNode(0), IPXSocket(0) {
+    : ConnectionClass(), IPXNetwork(0), IPXNode(0), IPXSocket(0),
+      Listening(true), PendingReceive(0) {
 }
 
 IPXConnectionClass::~IPXConnectionClass() {
@@ -840,7 +1082,7 @@ ConnectionClass* ConnectionManager::FindConnectionByAddress(uint32 address) cons
     return nullptr;
 }
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知缓冲档位作用于主套接字（传入无效句柄时回退
+// asm: WinsockInterfaceClass_SetBufferOptions
 // 到内部主句柄），SO_RCVBUF 设置失败时记录错误码。
 // ------------------------------------------------------------------------
 bool WinsockInterfaceClass::SetBufferOptions(int32 socket)
@@ -858,7 +1100,7 @@ bool WinsockInterfaceClass::SetBufferOptions(int32 socket)
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知关闭动作对主、广播两条通道分别处理，关闭后
+// asm: WinsockInterfaceClass_CloseSockets
 // 立即复位为无效句柄哨兵。
 // ------------------------------------------------------------------------
 void WinsockInterfaceClass::CloseSockets()
@@ -871,7 +1113,7 @@ void WinsockInterfaceClass::CloseSockets()
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知 Winsock 实现的套接字初始化是空桩：不分配
+// asm: WinsockInterfaceClass_InitSocket
 // 任何通道，直接报告失败。
 // ------------------------------------------------------------------------
 bool WinsockInterfaceClass::InitSocket(int32 a2)

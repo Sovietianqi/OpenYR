@@ -14,6 +14,134 @@ class IStream;
 class TechnoTypeClass;
 class BuildingTypeClass;
 class CCINIClass;
+class TechnoClass;
+class WarheadTypeClass;
+class HouseClass;
+class ObjectClass;
+
+template <typename T>
+class DynamicVectorClass;
+
+// ============================================================================
+// 存档载入子对象（asm: LoadGame_slave3 / 0x5BE490，见 Game/LoadGame.cpp）
+//
+// 原版 Map 对象里这些子对象直接躺在 +0x014…+0x11BC 区间，靠"整块对象镜像"
+// （+0x000 起 0x556C 字节）一次性恢复，随后按固定顺序重建。本工程 MapClass
+// 按字段布局，因此把它们收进 MapLoadState，由 LoadGame_slave3 逐字段维护。
+// ============================================================================
+
+// 原版 VectorClass / DynamicVectorClass 的落位（32 位下 0x18 字节）：
+//   +0x00 vftable  +0x04 Items  +0x08 Capacity  +0x0C IsAlloc
+//   +0x0D GrowFlag +0x0E 对齐   +0x10 Count     +0x14 GrowStep
+template <typename T>
+struct MapLoadVector
+{
+    void* Vft       = nullptr;
+    T*    Items     = nullptr;
+    int32 Capacity  = 0;
+    uint8 IsAlloc   = 1;
+    uint8 GrowFlag  = 0;
+    int16 Reserved  = 0;
+    int32 Count     = 0;
+    int32 GrowStep  = 0;
+
+    // asm loc_5BE447 / loc_5BE569 的 CTOR 形态：只把计数归零。
+    void Clear() { Count = 0; }
+
+    // 按 asm loc_5BE3E5 起的门限追加：Count < Capacity 直接追加；否则只有
+    // (GrowFlag 已置位 或 容量为 0) 且 GrowStep > 0 时才扩容，扩容失败或门限
+    // 不满足时该条目被静默丢弃（原版就是这样丢的）。
+    bool Append(const T& value)
+    {
+        if (Count >= Capacity && !Grow(GrowStep))
+            return false;
+        Items[Count++] = value;
+        return true;
+    }
+
+    // GrowStep 由存档镜像/重建步骤给出时按 GrowStep 扩容；未给出（<=0）时
+    // 退回本工程 DynamicVectorClass 的增长策略（0 → 8，之后翻倍）。
+    bool Grow(int32 step)
+    {
+        if (!(GrowFlag != 0 || Capacity == 0))
+            return false;
+        const int32 newCapacity =
+            (step > 0) ? Capacity + step : (Capacity == 0 ? 8 : Capacity * 2);
+        if (newCapacity <= Capacity)
+            return false;
+        T* const newItems = new T[newCapacity];
+        if (newItems == nullptr)
+            return false;
+        for (int32 i = 0; i < Count; ++i)
+            newItems[i] = Items[i];
+        delete[] Items;
+        Items = newItems;
+        Capacity = newCapacity;
+        return true;
+    }
+};
+
+// 0x1804 字节哈希块里的桶（原版 VectorClass<HashObject<uint,uint>>）。
+struct MapLoadHashEntry
+{
+    uint32 Key;
+    int32  Value;
+};
+
+// 0x1804 字节哈希块里的桶（原版
+// VectorClass<HashObject<uint,SubzoneConnectionStruct>>）。
+struct MapLoadSubzoneEntry
+{
+    uint32 Key;
+    int32  Zone;
+    int32  Subzone;
+};
+
+// 原版哈希包（Map 对象 +0x014 / +0x080 / +0x084 / +0x088，共 0x10 字节）：
+//   +0x00 数据块  +0x04 哈希函数(sub_56CB80)  +0x08 容量(0x100)  +0x0C 步长(0x14)
+struct MapLoadHashTable
+{
+    void*  Data      = nullptr;
+    uint32 (*HashFn)(const uint32* pKey) = nullptr;
+    int32  Capacity  = 0;
+    int32  GrowStep  = 0;
+};
+
+// asm 15416 起逐条读出的 16 字节记录（4 个 word + 标志字节 + 索引）。
+struct MapLoadCellRecord
+{
+    uint16 Field00 = 0;
+    uint16 Field02 = 0;
+    uint16 Field04 = 0;
+    uint16 Field06 = 0;
+    uint8  Field08 = 0;
+    uint8  Reserved[3] = {0, 0, 0};   // 原版这三字节取自栈上残留，此处保持 0
+    int32  Field0C = 0;
+};
+
+// ----------------------------------------------------------------------------
+// MapLoadState —— 上面那些子对象在本工程里的具名落位。
+// 注释里的偏移是原版 Map 对象内的偏移，仅供与 asm 对照；本工程按名取用。
+// ----------------------------------------------------------------------------
+struct MapLoadState
+{
+    MapLoadHashTable                 TileHash;          // asm +0x014
+    void*                            LineBuffers[13] = {nullptr};  // asm +0x018..+0x04B
+    int32                            LineBufferWords = 0;         // asm +0x04C
+    MapLoadVector<MapLoadCellRecord> CellRecords;       // asm +0x050
+    void*                            MinimapFlags   = nullptr;    // asm +0x068
+    int32                            MinimapCells   = 0;          // asm +0x06C
+    void*                            MinimapColors  = nullptr;    // asm +0x070
+    MapLoadHashTable                 ZoneHash[3];       // asm +0x080 / +0x084 / +0x088
+    MapLoadVector<uint32>            RadarCellList[3];  // asm +0x08C / +0x0A4 / +0x0BC
+    MapLoadVector<int32>             DwordsD4;          // asm +0x0D4
+    MapLoadVector<int32>             Dwords115C;        // asm +0x115C
+    void*                            Swizzle11A0 = nullptr;       // asm +0x11A0
+    void*                            Swizzle11A4 = nullptr;       // asm +0x11A4
+    void*                            Swizzle11A8 = nullptr;       // asm +0x11A8
+    bool                             LoadComplete = false;        // asm +0x11BC
+    Rectangle                        RadarRect;                   // asm +0x0EC
+};
 
 // ============================================================================
 // MapClass - The game map manager, singleton
@@ -64,6 +192,41 @@ public:
  // MapClass_CanLocationBeReached.  True when the given world
     // position can be reached with the supplied movement zone.
     bool Can_Location_Be_Reached(const CoordStruct& coords, bool a3, int32 zone);
+
+    // ------------------------------------------------------------------------
+    // asm: MapClass_wut_0 (真实入口 0x56D10C，retn 18h)
+    //
+    //   ; char __thiscall MapClass_wut_0(MapClass *this, wXY *where,
+    //                                    wXY *position, int MovementZone,
+    //                                    char a5, char boo, char a7)
+    //
+    //   原版符号名就是 MapClass_wut_0（未命名槽），用途是路径寻找里的
+    //   "两点是否等价可达"判定：先排除地形边缘、再看两侧的行走区域是否
+    //   给出同一个可达结论，从而判断单位能否从 where 走到 position。
+    //
+    //   逐句（asm 行 781344-781520）：
+    //     if (MovementZone == -1)  return 1
+    //     radarW = In_Radar(where, 1)                ; skipRange = 1
+    //     edgeW  = (where.X + where.Y >  dword_87F8DC)
+    //           && (where.X - where.Y <  dword_87F8DC)
+    //           && (where.Y - where.X <  dword_87F8DC)
+    //           && (where.X + where.Y <= dword_87F8DC + 2*dword_87F8E0)
+    //     if (!radarW && edgeW)  return 1
+    //     radarP = In_Radar(position, 1)
+    //     edgeP  = 同上的 edgeW，只是换成 position 的两个分量
+    //     if (a7 && radarW && !radarP && edgeP)  return 1
+    //     reachP = CanLocationBeReached(position, MovementZone, boo)
+    //     reachW = CanLocationBeReached(where,    MovementZone, a5)
+    //     return reachW == reachP
+    //
+    //   注 1：dword_87F8DC / dword_87F8E0 是一对等距地界常量（地图的
+    //         菱形边界），本项目尚未落地；见 .cpp 里的留白说明。
+    //   注 2：AsmComplex6 批注把参数写成 (void* pMap, void* pWhere,
+    //         void* pPosition, int32 mz, int32 a5, int32 boo, int32 a7)
+    //         并把 In_Radar 的参数顺序也抄串了；以 asm 原文为准。
+    // ------------------------------------------------------------------------
+    char wut_0(const CellStruct& where, const CellStruct& position,
+               int32 movementZone, bool a5, bool boo, bool a7);
 
  // MapClass_FlashCameo (xx0).  Lights up the sidebar cameo for
     // `pType` so the player notices a newly available build option.
@@ -121,6 +284,81 @@ public:
     // ------------------------------------------------------------------------
     int32 GetCellFloorHeight(const CoordStruct& loc) const;
 
+    // ========================================================================
+    // 原版层高常量（dword_89E870 / dword_89E864）
+    //   由 MapClass_Init_CellSpread 链按原版公式算出：104 / 416。
+    //   供 Damage_At_Cell 的高度门限使用。
+    // ========================================================================
+    static int32 CellHeightLeptons;   // dword_89E870
+    static int32 HalfCellHeight;      // dword_89E864
+
+    // 原版 InitList_0587..0596 链的等价实现：算出一层高度与半层偏置。
+    static void InitCellHeightConstants();
+
+    // ========================================================================
+    // Damage_At_Cell  —  原版 Damage_At_Cell_Update_489280 (0x489280)
+    //
+    //   这是"在某点引爆"的统一入口：以世界坐标 loc 为中心，按弹头
+    //   CellSpread 逐环收集受影响对象、结算伤害，并处理油桶连锁、
+    //   钢/木桥破坏、震屏与粒子。控制流与算术均按原版 1:1 搬运。
+    //
+    //   参数：
+    //     loc          引爆点世界坐标
+    //     damage       基础伤害
+    //     pSender      伤害来源单位（可为 null，例如地图脚本引爆）
+    //     pWarhead     弹头类型（null 时立即返回 1）
+    //     a5           是否扣减 tiberium
+    //     pOwnerHouse  归属方，用于粒子生成
+    //
+    //   返回：1 = 空转/未造成伤害；2 = noShake 短路；0 = 造成了伤害。
+    // ========================================================================
+    int32 Damage_At_Cell(const CoordStruct& loc, int32 damage,
+                         TechnoClass* pSender, WarheadTypeClass* pWarhead,
+                         bool a5, HouseClass* pOwnerHouse);
+
+    // 原版 GlobalUnitsForSomething：范围收集用的全局对象暂存区。
+    static DynamicVectorClass<ObjectClass*> GlobalUnitsForSomething;
+    static int32 CountNearbyUnits(CellClass* pCell, int32 spread);
+
+    // ========================================================================
+    // asm: gfv_FlushAll (0x4128F0)
+    //
+    //   清空 400 个 0x18 字节槽的 GlobalUnitsForSomething 表，以及叠在表尾
+    //   的 TechnoClass* 向量（dword_889E08 块）。asm 逐段：
+    //
+    //     push ebx/ebp/esi/edi
+    //     mov esi,offset GlobalUnitsForSomething / mov ebp,190h / xor ebx,ebx
+    //   loc_412900:                            ; 活跃期：400 槽
+    //     mov eax,[esi] / mov edi,[esi+8] / mov ecx,esi
+    //     call dword ptr [eax+0Ch]             ; 虚表 +0x0C（清空）
+    //     mov edx,[esi] / push ebx / push edi / mov ecx,esi
+    //     call dword ptr [edx+8]               ; 虚表 +0x08（释放 data）
+    //     add esi,18h / dec ebp / jnz loc_412900
+    //     ; -- TechnoClass* 向量（dword_889E08 块）--
+    //     eax = dword_889E08 / esi = dword_889E10 / ecx = &dword_889E08
+    //     call [eax+0Ch] / edx = dword_889E08 / push ebx / push esi
+    //     ecx = &dword_889E08 / call [edx+8]
+    //     eax = dword_889E0C / ebp = VectorClass<TechnoClass*>::vftable
+    //     cmp eax,ebx / mov dword_889E08,ebp / jz loc_412967
+    //     cmp byte_889E15,bl / jz loc_412967
+    //     push eax / call delete / add esp,4 / mov dword_889E0C,ebx
+    //   loc_412967:
+    //     mov byte_889E15,bl / mov dword_889E10,ebx
+    //     mov esi,offset dword_889E0C / mov edi,190h
+    //   loc_41297D:                            ; 清扫期：399 -> 0
+    //     mov eax,[esi-18h] / sub esi,18h / cmp eax,ebx
+    //     mov [esi-4],ebp / jz loc_41299A
+    //     cmp [esi+9],bl / jz loc_41299A
+    //     push eax / call delete / mov [esi],ebx
+    //   loc_41299A:
+    //     dec edi / mov [esi+9],bl / mov [esi+4],ebx / jnz loc_41297D
+    //
+    //   OpenYR 侧 GlobalUnitsForSomething 是 DynamicVectorClass<ObjectClass*>，
+    //   本方法只做"清空 + 复位标志"这一步（原版的逐槽虚调用是 COM 宿主层的
+    //   释放协议，本项目的容器不携带该协议）。铁律①：只做能确证的部分。
+    // ========================================================================
+    static void Flush_Global_Units();
+
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 IsUnshrouded 负责判断某个世界坐标所在的格子是否
     //  已经不再被黑幕盖着（即已经被任何一方探明）：换算成格号后查该格的
@@ -174,6 +412,25 @@ public:
     void ApplyDamageArea(const DamageArea& area);
     void CreateCrater(const CellStruct& cell, int32 size);
 
+    // ========================================================================
+    // 三个由 TActionClass 触发的"在地图坐标处播放效果"入口。
+    //
+    // 原版把这三件事写在 TActionClass_Execute 的 case 87 / 88 / 98 里内联，
+    // 并没有独立的 MapClass 成员函数；OpenYR 把它们收拢到地图对象上以复用
+    // （见 AI/TActionClass.cpp 的调用点）。
+    //
+    //   Create_Particle_Anim(pos, typeName): 以 pos 为落点，按名字解析出的
+    //     ParticleSystemType 新建一个粒子系统（原版 new ParticleSystemClass +
+    //     ParticleSystemClass_CTOR(psType, loc, ...)）。
+    //   Remove_Particle_Anim(pos): 遍历存活粒子系统表，把落点与 pos 相同的
+    //     系统全部撤下（原版遍历 vec_ParticleSystems 后调用虚表 +0xF8）。
+    //   Play_Sound_At(pos, index): 在 world 坐标 pos 处播放索引为 index 的
+    //     3D 音效（原版 VocClass_PlayIndexAtPos(index, &pos, 1)）。
+    // ========================================================================
+    void Create_Particle_Anim(const CoordStruct& pos, const char* typeName);
+    void Remove_Particle_Anim(const CoordStruct& pos);
+    void Play_Sound_At(const CoordStruct& pos, int32 soundIndex);
+
     // Base zone
     bool Base_Is_Area_Occupied(int32 cellIndex, int32 radius) const;
 
@@ -197,6 +454,28 @@ public:
 
     // Crate
     void Update_Crate_Respawn();
+
+    // ========================================================================
+    // MapClass::Create_Crate  —  原版 sub_56BEC0 (0x56BEC0)
+    //
+    //   TActionClass case 107 (lct_TriggerAction_CreateCrate) 的落点：在给定
+    //   格生成一只补给箱。与 CrateClass::Create_Crate（真正放置叠加物的那个
+    //   成员函数）是两层不同的调用——本方法负责选格、挑空槽位并转发。
+    //   逐句（asm 行 779056）：
+    //     cell = CellFromIndex((Y<<9)+X)，越界则用 tmpCell
+    //     if (cell[+0xEC] == 2)  Nearby_Location(..., a14)   ; 特殊格的搜索参数
+    //     else                   Nearby_Location(coords, Foot, zone=-1, ...)
+    //     在 0x100 个 0x10 步长的空槽里找 CellCoords==DefaultCellCoords 的槽
+    //     if (槽满) return false
+    //     if (CrateClass::Create_Crate(slot, coords)) {
+    //         if (value != 0x14) cell[+0x11E] = value          ; 记录箱内容值
+    //         return true
+    //     }
+    //     return false
+    //
+    //   value 为箱子内容取值（P3_Value），0x14 = 随机缺省，记录时跳过。
+    // ========================================================================
+    bool Create_Crate(const CellStruct& coords, int32 value);
 
  // Remove_Crate - MapClass::Remove_Crate.  Finds the crate
     // occupying a cell and harvests it.  With a live session the crate table
@@ -326,6 +605,11 @@ public:
  // MapClass_IsCellTainted (xx): true when the cell the coordinate
     // falls in carries the "tainted" (revealed-by-something) marker.
     bool IsCellTainted(const CoordStruct& loc, bool a3) const;
+ // MapClass_IsVisible (0x5656EE, retn 8): reads the cell-visible bit — bit 3
+    // of the shroud flag word (+0x12C) — of the cell the coordinate addresses.
+    // Out-of-range coordinates resolve to the scratch cell, which reports not
+    // visible.
+    bool IsVisible(const CellStruct& cell) const;
  // MapClass_GetArea: (MapWidth + 4) * MapHeight * 2 - the
     // size of the per-cell threat grids, in int32 slots.
     int32 GetArea() const;
@@ -360,6 +644,27 @@ public:
     // 命中者重新执行 SetupVeins 让矿脉恢复成完整形态。
     // ========================================================================
     void LoopOverCells();
+
+    // ========================================================================
+    // asm: Setup_Veins (0x74DE90) —— 矿脉（Veinhole）生长账簿的建/拆总入口，
+    // 由 INIClass_ReadScenario 末尾调用（ecx 为全局 Map，故本函数是 static）。
+    //
+    //   flag != 0：先对每个矿脉怪物调 sub_74E8A0（拆账簿）、释放全局
+    //     VeinholeGrowthData、再对每个怪物按 RulesData.MaxVeinholeGrowth
+    //     重建三块账簿；
+    //   随后：VeinholeGrowthData 为空则 new(areaSize)；
+    //     第一遍全图遍历清掉 CellFlags::Veinhole（bit 8000h）；
+    //     把 VeinholeGrowthData 整块清零；
+    //     逐个怪物按 byte[+100h] 选路调 Initialize1 / Initialize2；
+    //     第二遍全图遍历：Overlay 仍是 0x7E 且该格的生长标记为 0 的，
+    //     把 Overlay 改回 -1，并同样清掉 Veinhole 位。
+    // ========================================================================
+    static void Setup_Veins(int32 flag);
+
+    // asm: VeinholeGrowthData —— 全图一张 areaSize 字节的"该格矿脉已长成"
+    //   标记表（全局量，0x74DE90 段与 Remove_Matching 共用）。下标用
+    //   VeinholeMonsterClass::Growth_Index（asm sub_42B1C0）换算。
+    static uint8* VeinholeGrowthData;
 
     // ========================================================================
  // Follow-camera state
@@ -506,6 +811,23 @@ public:
     CellClass* CellSmth0(const CellStruct& cell);
     CellClass* CellSmth2(const CellStruct& cell) const;
     int32      CellSmth3(const CellStruct& cell) const;
+
+    // ========================================================================
+    // MapClass_IsClearCell? (0x56E7D0)
+    //
+    //   Walks an h x w block of cells anchored at pStart and reports whether
+    //   every one of them is passable.  The anchor is a pair of int16 map
+    //   coordinates (not a CellStruct pointer): pStart is dereferenced as
+    //   [X, Y] and each step adds the loop counters with 16-bit wraparound,
+    //   exactly as the original does.  Out-of-range or unmapped coordinates
+    //   fall back to the shared tmpCell scratch cell.
+    //
+    //   checkOccupant mirrors arg_20: when set, a cell whose occupant slot
+    //   (+0x44) is not -1 aborts the walk.
+    // ========================================================================
+    bool Is_Clear_Cell(const CellStruct& start, int32 h, int32 w,
+                       int32 a2, int32 a5, int32 a6, int32 a7,
+                       bool a8, bool checkOccupant);
 
     // Members
     int32       MapWidth;
@@ -773,6 +1095,10 @@ public:
     // Padding to match original binary layout
     // The original MapClass has a large gap of unknown members
     uint8       _unused_padding[0x456C - 0x21A0];
+
+    // 存档载入期重建的地图子对象（asm: LoadGame_slave3）。
+    // 维护入口：Game/LoadGame.cpp 的 LoadGame_slave3_5BE490。
+    MapLoadState LoadState;
 };
 // The single global map instance, mirroring `Map` in the original binary.
 extern MapClass* TheMap;

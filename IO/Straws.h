@@ -270,6 +270,10 @@ public:
         , MaxBlockSize(0)
         , BlockType(0)
         , BlockLength(0)
+        , Key(0)
+        , KeysSet(false)
+        , RestartState13C(0)
+        , RestartState140(0)
     {
         Buffer = static_cast<uint8*>(YRMemory::Allocate(PK_MAX_BLOCK_SIZE));
         if (Buffer)
@@ -289,6 +293,27 @@ public:
 
     virtual int32 Get(void* pBuffer, int32 length) override;
 
+    // ------------------------------------------------------------------------
+    // asm: PKStraw_SetKey (0x633110)
+    //
+    //   eax = [esp+key] / xor edx,edx / cmp eax,edx
+    //   mov [ecx+PKStraw.Key], eax
+    //   jz reset                    ; zero key leaves the flag untouched
+    //   mov byte ptr [ecx+0Ch], 1   ; KeysSet = true
+    // reset:
+    //   mov [ecx+13Ch], edx         ; block restart state = 0
+    //   mov [ecx+140h], edx         ; block restart state = 0
+    //   retn 4
+    // ------------------------------------------------------------------------
+    void SetKey(int32 key)
+    {
+        Key = key;                       // asm: mov [ecx+PKStraw.Key],eax
+        if (key != 0)
+            KeysSet = true;              // asm: mov byte ptr [ecx+0Ch],1
+        RestartState13C = 0;             // asm: mov [ecx+13Ch],edx
+        RestartState140 = 0;             // asm: mov [ecx+140h],edx
+    }
+
     // PKWare constants
     static constexpr int32 PK_MAX_BLOCK_SIZE = 8192;
     static constexpr int32 PK_WINDOW_SIZE = 4096;
@@ -300,6 +325,12 @@ public:
     int32 MaxBlockSize;
     int32 BlockType;
     int32 BlockLength;
+
+    // ---- original-layout extras (PKStraw_SetKey write targets) ----
+    int32 Key;              // asm: PKStraw.Key
+    bool  KeysSet;          // asm: byte [ecx+0Ch]
+    int32 RestartState13C;  // asm: dword [ecx+13Ch]
+    int32 RestartState140;  // asm: dword [ecx+140h]
 
 private:
     DISABLE_COPY_AND_MOVE(PKStraw)

@@ -1,15 +1,46 @@
 #include "FileFormats/VXL.h"
+#include "IO/MixFileClass.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 // ============================================================================
-// VXLClass implementation
+// VXLClass —— 严格按 gamemd.exe 的 VoxLib_CTOR（0x755DB0）解析
+//
+// 载入顺序（asm 原样）：
+//   1. ReadFile(32)                     -> 文件头
+//   2. new(SectionCount * 12)           -> section 表（只保留 first/last/flags）
+//   3. ReadFile(SectionCount * 28)      -> section 头，逐条抽取三个字段
+//   4. ReadFile(BlobSize)               -> 体素载荷
+//   5. ReadFile(RecordCount * 92)       -> record 表
+//
+// 本实现不再拷贝/改写 record，而是在访问时把文件里的 uint32 偏移加上
+// blob 基址，等价于 asm 里「载入时把 offset 改写成指针」的结果，但不需要
+// 164 字节的运行时展开缓冲。
 // ============================================================================
 
+namespace
+{
+    constexpr uint32 kVoxelEmpty = 0xFFFFFFFFu;
+
+    inline uint32 ReadU32(const BYTE* p)
+    {
+        uint32 v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+
+    inline float ReadF32(const BYTE* p)
+    {
+        float v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    }
+}
+
 // ----------------------------------------------------------------------------
-// VXLClass::VXLClass - Default constructor
+// 构造 / 析构
 // ----------------------------------------------------------------------------
 VXLClass::VXLClass()
     : m_pRawData(nullptr)
@@ -17,471 +48,403 @@ VXLClass::VXLClass()
     , m_bOwnsData(false)
     , m_pHeader(nullptr)
     , m_pSections(nullptr)
+    , m_pRecords(nullptr)
+    , m_pBlob(nullptr)
     , m_SectionCount(0)
-    , m_pHVAData(nullptr)
-    , m_HVASize(0)
+    , m_RecordCount(0)
+    , m_BlobSize(0)
+    , m_LastError("not loaded")
 {
 }
 
-// ----------------------------------------------------------------------------
-// VXLClass::VXLClass(const char*) - Constructor with filename
-// ----------------------------------------------------------------------------
 VXLClass::VXLClass(const char* pFilename)
-    : m_pRawData(nullptr)
-    , m_RawDataSize(0)
-    , m_bOwnsData(false)
-    , m_pHeader(nullptr)
-    , m_pSections(nullptr)
-    , m_SectionCount(0)
-    , m_pHVAData(nullptr)
-    , m_HVASize(0)
+    : VXLClass()
 {
-    if (pFilename)
+    if (pFilename != nullptr)
         LoadFromFile(pFilename);
 }
 
-// ----------------------------------------------------------------------------
-// VXLClass::~VXLClass - Destructor
-// ----------------------------------------------------------------------------
 VXLClass::~VXLClass()
 {
-    if (m_bOwnsData)
-    {
-        if (m_pSections)
-        {
-            std::free(m_pSections);
-            m_pSections = nullptr;
-        }
-        if (m_pRawData)
-        {
-            std::free(m_pRawData);
-            m_pRawData = nullptr;
-        }
-    }
-    m_pHeader = nullptr;
-    m_pHVAData = nullptr;
-    m_SectionCount = 0;
-    m_HVASize = 0;
+    Reset();
+}
+
+void VXLClass::Reset()
+{
+    if (m_bOwnsData && m_pRawData != nullptr)
+        std::free(m_pRawData);
+
+    m_pRawData = nullptr;
+    m_RawDataSize = 0;
     m_bOwnsData = false;
+    m_pHeader = nullptr;
+    m_pSections = nullptr;
+    m_pRecords = nullptr;
+    m_pBlob = nullptr;
+    m_SectionCount = 0;
+    m_RecordCount = 0;
+    m_BlobSize = 0;
 }
 
 // ----------------------------------------------------------------------------
-// VXLClass::LoadFromFile - Parse a VXL voxel model file
-//
-// VXL format:
-//   VXLHeader (20 bytes):
-//     char Signature[4]   - "Voxel Section"
-//     uint32 SectionCount - number of sections
-//     uint32 BodySize     - size of body section data
-//     uint32 HVAStart     - offset to embedded HVA (0 if none)
-//     uint32 HVASize      - size of embedded HVA data
-//
-//   For each section:
-//     VXLSectionHeader (28 bytes):
-//       char Name[16]         - section name
-//       uint32 SpanStart      - start offset in span array
-//       uint32 SpanEnd        - end offset in span array
-//       uint32 SpanDataOffset - offset to span data in file
-//       uint32 SectionSize    - total size of section data
-//
-//   For each section, span data consists of:
-//     For each z-layer (0 to dimZ-1):
-//       For each y-row (0 to dimY-1):
-//         Span header: uint32 byteCount, uint32 spanCount
-//         For each span: uint32 start, uint32 end, uint8 color
+// LoadFromFile
 // ----------------------------------------------------------------------------
 bool VXLClass::LoadFromFile(const char* pFilename)
 {
-    // Clean up existing data
-    if (m_bOwnsData)
+    Reset();
+    m_LastError = "not loaded";
+
+    if (pFilename == nullptr || pFilename[0] == '\0')
     {
-        if (m_pSections)
+        m_LastError = "empty filename";
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 先查 MIX：零售版的 .vxl 全在 ra2md.mix / expandmd*.mix 里，
+    // 直接用 fopen 永远找不到模型。
+    // ------------------------------------------------------------------
+    {
+        int32 mixSize = 0;
+        void* pMixData = MixFileClass::RetrieveSized(pFilename, &mixSize);
+        if (pMixData != nullptr && mixSize > static_cast<int32>(sizeof(VXLFileHeader)))
         {
-            std::free(m_pSections);
-            m_pSections = nullptr;
+            m_pRawData = static_cast<BYTE*>(std::malloc(static_cast<size_t>(mixSize)));
+            if (m_pRawData != nullptr)
+            {
+                std::memcpy(m_pRawData, pMixData, static_cast<size_t>(mixSize));
+                m_RawDataSize = mixSize;
+                m_bOwnsData = true;
+            }
+            YRMemory::Deallocate(pMixData);
         }
-        if (m_pRawData)
+    }
+
+    // ------------------------------------------------------------------
+    // 散装文件兜底
+    // ------------------------------------------------------------------
+    if (m_pRawData == nullptr)
+    {
+        std::FILE* pFile = std::fopen(pFilename, "rb");
+        if (pFile == nullptr)
+        {
+            m_LastError = "file not found";
+            return false;
+        }
+
+        std::fseek(pFile, 0, SEEK_END);
+        const long fileSize = std::ftell(pFile);
+        std::fseek(pFile, 0, SEEK_SET);
+
+        if (fileSize < static_cast<long>(sizeof(VXLFileHeader)))
+        {
+            std::fclose(pFile);
+            m_LastError = "file too small";
+            return false;
+        }
+
+        m_RawDataSize = static_cast<int32>(fileSize);
+        m_pRawData = static_cast<BYTE*>(std::malloc(static_cast<size_t>(m_RawDataSize)));
+        if (m_pRawData == nullptr)
+        {
+            std::fclose(pFile);
+            m_LastError = "out of memory";
+            return false;
+        }
+
+        const size_t read = std::fread(m_pRawData, 1, static_cast<size_t>(m_RawDataSize), pFile);
+        std::fclose(pFile);
+
+        if (read != static_cast<size_t>(m_RawDataSize))
         {
             std::free(m_pRawData);
             m_pRawData = nullptr;
+            m_RawDataSize = 0;
+            m_LastError = "short read";
+            return false;
         }
+
+        m_bOwnsData = true;
     }
-    m_pHeader = nullptr;
-    m_pHVAData = nullptr;
-    m_SectionCount = 0;
-    m_HVASize = 0;
-    m_bOwnsData = false;
 
-    // Open the file
-    std::FILE* pFile = std::fopen(pFilename, "rb");
-    if (!pFile)
-        return false;
+    return Parse();
+}
 
-    // Get file size
-    std::fseek(pFile, 0, SEEK_END);
-    long fileSize = std::ftell(pFile);
-    std::fseek(pFile, 0, SEEK_SET);
-
-    if (fileSize < static_cast<long>(sizeof(VXLHeader)))
+// ----------------------------------------------------------------------------
+// Parse - 按 asm 顺序切分四段
+// ----------------------------------------------------------------------------
+bool VXLClass::Parse()
+{
+    if (m_RawDataSize < static_cast<int32>(sizeof(VXLFileHeader)))
     {
-        std::fclose(pFile);
+        m_LastError = "file too small";
+        Reset();
         return false;
     }
 
-    // Read the entire file
-    m_RawDataSize = static_cast<int32>(fileSize);
-    m_pRawData = static_cast<BYTE*>(std::malloc(static_cast<size_t>(m_RawDataSize)));
-    if (!m_pRawData)
+    const BYTE* pBase = m_pRawData;
+    const BYTE* pEnd  = pBase + m_RawDataSize;
+
+    // ---- 1) 文件头 ----
+    m_pHeader = reinterpret_cast<const VXLFileHeader*>(pBase);
+
+    // asm 的校验是 ReadFile 返回值 == 32；这里额外核对签名的前 4 字节，
+    // 与原版 ASCIIZ 字符串 "Voxel Section" 一致。
+    if (std::memcmp(m_pHeader->FileType, "Voxel Section", 4) != 0)
     {
-        std::fclose(pFile);
+        m_LastError = "bad signature";
+        Reset();
         return false;
     }
 
-    size_t bytesRead = std::fread(m_pRawData, 1, static_cast<size_t>(m_RawDataSize), pFile);
-    std::fclose(pFile);
+    const uint32 sectionCount = m_pHeader->SectionCount;
+    const uint32 recordCount  = m_pHeader->RecordCount;
+    const uint32 blobSize     = m_pHeader->BlobSize;
 
-    if (bytesRead != static_cast<size_t>(m_RawDataSize))
+    if (sectionCount == 0 || sectionCount > static_cast<uint32>(MaxSections))
     {
-        std::free(m_pRawData);
-        m_pRawData = nullptr;
-        m_RawDataSize = 0;
+        m_LastError = "bad section count";
+        Reset();
+        return false;
+    }
+    if (recordCount == 0 || recordCount > static_cast<uint32>(MaxRecords))
+    {
+        m_LastError = "bad record count";
+        Reset();
         return false;
     }
 
-    m_bOwnsData = true;
-
-    // Parse the VXL header
-    m_pHeader = reinterpret_cast<VXLHeader*>(m_pRawData);
-
-    // Validate signature
-    if (std::memcmp(m_pHeader->Signature, "Voxel Section", 4) != 0)
+    // ---- 2) section 头 ----
+    const size_t sectionsOffset = sizeof(VXLFileHeader);
+    const size_t sectionsBytes  = static_cast<size_t>(sectionCount) * sizeof(VXLSectionEntry);
+    if (sectionsOffset + sectionsBytes > static_cast<size_t>(m_RawDataSize))
     {
-        std::free(m_pRawData);
-        m_pRawData = nullptr;
-        m_RawDataSize = 0;
-        m_bOwnsData = false;
-        m_pHeader = nullptr;
+        m_LastError = "section table out of range";
+        Reset();
         return false;
     }
 
-    m_SectionCount = static_cast<int32>(m_pHeader->SectionCount);
+    m_pSections = reinterpret_cast<const VXLSectionEntry*>(pBase + sectionsOffset);
 
-    if (m_SectionCount <= 0 || m_SectionCount > MaxSections)
+    // ---- 3) blob ----
+    const size_t blobOffset = sectionsOffset + sectionsBytes;
+    if (blobOffset + static_cast<size_t>(blobSize) > static_cast<size_t>(m_RawDataSize))
     {
-        std::free(m_pRawData);
-        m_pRawData = nullptr;
-        m_RawDataSize = 0;
-        m_bOwnsData = false;
-        m_pHeader = nullptr;
-        m_SectionCount = 0;
+        m_LastError = "blob out of range";
+        Reset();
+        return false;
+    }
+    m_pBlob = pBase + blobOffset;
+
+    // ---- 4) record 表 ----
+    const size_t recordsOffset = blobOffset + static_cast<size_t>(blobSize);
+    const size_t recordsBytes  = static_cast<size_t>(recordCount) * sizeof(VXLRecordRaw);
+    if (recordsOffset + recordsBytes > static_cast<size_t>(m_RawDataSize))
+    {
+        m_LastError = "record table out of range";
+        Reset();
         return false;
     }
 
-    // Parse section headers (they follow the VXLHeader)
-    m_pSections = reinterpret_cast<VXLSectionHeader*>(
-        m_pRawData + sizeof(VXLHeader));
+    m_pRecords = reinterpret_cast<const VXLRecordRaw*>(pBase + recordsOffset);
 
-    // Validate that section headers are within the file
-    size_t sectionsEnd = sizeof(VXLHeader) +
-        static_cast<size_t>(m_SectionCount) * sizeof(VXLSectionHeader);
-    if (sectionsEnd > static_cast<size_t>(m_RawDataSize))
+    // 每条 section 的 FirstRecord/LastRecord 必须落在 record 表内；
+    // 越界的 section 在 GetRecord 里会被拒绝，但这里先做一次整体体检。
+    for (uint32 i = 0; i < sectionCount; ++i)
     {
-        std::free(m_pRawData);
-        m_pRawData = nullptr;
-        m_RawDataSize = 0;
-        m_bOwnsData = false;
-        m_pHeader = nullptr;
-        m_pSections = nullptr;
-        m_SectionCount = 0;
-        return false;
-    }
-
-    // Extract embedded HVA data if present
-    if (m_pHeader->HVAStart != 0 && m_pHeader->HVASize > 0)
-    {
-        uint32 hvaStart = m_pHeader->HVAStart;
-        uint32 hvaSize = m_pHeader->HVASize;
-
-        if (hvaStart + hvaSize <= static_cast<uint32>(m_RawDataSize))
+        const VXLSectionEntry& s = m_pSections[i];
+        if (s.FirstRecord > s.LastRecord || s.LastRecord >= recordCount)
         {
-            m_HVASize = static_cast<int32>(hvaSize);
-            m_pHVAData = m_pRawData + hvaStart;
+            m_LastError = "bad section record range";
+            Reset();
+            return false;
         }
     }
+
+    m_SectionCount = static_cast<int32>(sectionCount);
+    m_RecordCount  = static_cast<int32>(recordCount);
+    m_BlobSize     = static_cast<int32>(blobSize);
+    m_LastError    = "";
+
+    (void)pEnd;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// section 查询
+// ----------------------------------------------------------------------------
+const char* VXLClass::GetSectionName(int32 sectionIndex) const
+{
+    if (!HasSection(sectionIndex))
+        return nullptr;
+    return m_pSections[sectionIndex].Name;
+}
+
+bool VXLClass::HasSection(int32 sectionIndex) const
+{
+    return m_pSections != nullptr && sectionIndex >= 0 && sectionIndex < m_SectionCount;
+}
+
+int32 VXLClass::GetFrameCount(int32 sectionIndex) const
+{
+    if (!HasSection(sectionIndex))
+        return 0;
+
+    // asm: VoxLib_Process 直接用 FirstRecord + frame 索引 record，
+    // frame 的合法范围就是 [0, LastRecord - FirstRecord]。
+    const VXLSectionEntry& s = m_pSections[sectionIndex];
+    return static_cast<int32>(s.LastRecord - s.FirstRecord) + 1;
+}
+
+// ----------------------------------------------------------------------------
+// GetRecord - 等价于 VoxLib_Process(section, frame) 的展开
+// ----------------------------------------------------------------------------
+bool VXLClass::GetRecord(int32 sectionIndex, int32 frame, VXLRecordView& out) const
+{
+    if (!HasSection(sectionIndex))
+        return false;
+
+    const VXLSectionEntry& s = m_pSections[sectionIndex];
+    const int32 frameCount = static_cast<int32>(s.LastRecord - s.FirstRecord) + 1;
+
+    if (frameCount <= 0)
+        return false;
+
+    // 越界按帧数取模（HVA 帧与 VXL 帧数理论上一致，但缺失 HVA 时会传 0）
+    if (frame < 0)
+        frame = 0;
+    if (frame >= frameCount)
+        frame %= frameCount;
+
+    const uint32 recordIndex = s.FirstRecord + static_cast<uint32>(frame);
+    if (recordIndex >= static_cast<uint32>(m_RecordCount))
+        return false;
+
+    const VXLRecordRaw& r = m_pRecords[recordIndex];
+
+    // ---- 体素数据 ----
+    // off0 是数据起点；off1 若大于 off0 则视为终点，否则用 Size 推导长度。
+    const uint32 off0 = r.Offset0;
+    const uint32 off1 = r.Offset1;
+
+    if (off0 >= static_cast<uint32>(m_BlobSize))
+        return false;
+
+    int32 sizeX = static_cast<int32>(r.SizeX);
+    int32 sizeY = static_cast<int32>(r.SizeY);
+    int32 sizeZ = static_cast<int32>(r.SizeZ);
+
+    if (sizeX <= 0) sizeX = 1;
+    if (sizeY <= 0) sizeY = 1;
+    if (sizeZ <= 0) sizeZ = 1;
+
+    const int64 bySize = static_cast<int64>(sizeX) * sizeY * sizeZ;
+    int64 count = 0;
+
+    if (off1 > off0)
+    {
+        const uint32 spanBytes = off1 - off0;
+        count = static_cast<int64>(spanBytes / sizeof(uint32));
+    }
+
+    // off1 不可信或与 Size 不一致时，以 Size 为准（Size 是 record 自带的权威字段）
+    if (count <= 0 || count > bySize)
+        count = bySize;
+
+    const int64 maxWords = static_cast<int64>((m_BlobSize - static_cast<int32>(off0)) / 4);
+    if (count > maxWords)
+        count = maxWords;
+
+    if (count <= 0)
+        return false;
+
+    out.Voxels      = m_pBlob + off0;
+    out.VoxelCount  = static_cast<int32>(count);
+    out.SizeX       = sizeX;
+    out.SizeY       = sizeY;
+    out.SizeZ       = sizeZ;
+    out.NormalMode  = static_cast<int32>(r.NormalMode);
+
+    // ---- AABB：Corner0 / Corner1 逐分量取小/取大 ----
+    for (int32 i = 0; i < 3; ++i)
+    {
+        const float a = r.Corner0[i];
+        const float b = r.Corner1[i];
+        out.Min[i] = (a < b) ? a : b;
+        out.Max[i] = (a < b) ? b : a;
+    }
+
+    std::memcpy(out.Transform, r.Transform, sizeof(out.Transform));
 
     return true;
 }
 
 // ----------------------------------------------------------------------------
-// VXLClass::GetSectionName - Get the name of a section
+// GetVoxelRaw - 原生 (x,y,z) 索引，x 变化最快
 // ----------------------------------------------------------------------------
-const char* VXLClass::GetSectionName(int32 sectionIndex) const
+uint32 VXLClass::GetVoxelRaw(int32 sectionIndex, int32 frame,
+                             int32 x, int32 y, int32 z) const
 {
-    if (!m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
-        return nullptr;
+    VXLRecordView rec;
+    if (!GetRecord(sectionIndex, frame, rec))
+        return kVoxelEmpty;
 
-    return m_pSections[sectionIndex].Name;
+    if (x < 0 || y < 0 || z < 0 ||
+        x >= rec.SizeX || y >= rec.SizeY || z >= rec.SizeZ)
+        return kVoxelEmpty;
+
+    const int64 index = static_cast<int64>(x)
+                      + static_cast<int64>(y) * rec.SizeX
+                      + static_cast<int64>(z) * rec.SizeX * rec.SizeY;
+
+    if (index >= rec.VoxelCount)
+        return kVoxelEmpty;
+
+    return ReadU32(rec.Voxels + index * 4);
 }
 
 // ----------------------------------------------------------------------------
-// VXLClass::GetSpanCount - Get the number of spans for a section
-// ----------------------------------------------------------------------------
-int32 VXLClass::GetSpanCount(int32 sectionIndex) const
-{
-    if (!m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
-        return 0;
-
-    const VXLSectionHeader& section = m_pSections[sectionIndex];
-    return static_cast<int32>(section.SpanEnd - section.SpanStart);
-}
-
-// ----------------------------------------------------------------------------
-// VXLClass::GetSpanData - Get raw span data pointer for a section
-// ----------------------------------------------------------------------------
-const BYTE* VXLClass::GetSpanData(int32 sectionIndex) const
-{
-    if (!m_pRawData || !m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
-        return nullptr;
-
-    const VXLSectionHeader& section = m_pSections[sectionIndex];
-    uint32 offset = section.SpanDataOffset;
-
-    if (offset >= static_cast<uint32>(m_RawDataSize))
-        return nullptr;
-
-    return m_pRawData + offset;
-}
-
-// ----------------------------------------------------------------------------
-// VXLClass::GetSpanStartOffset - Get the start index in the span array
-// ----------------------------------------------------------------------------
-int32 VXLClass::GetSpanStartOffset(int32 sectionIndex) const
-{
-    if (!m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
-        return 0;
-
-    return static_cast<int32>(m_pSections[sectionIndex].SpanStart);
-}
-
-// ----------------------------------------------------------------------------
-// VXLClass::GetSpanEndOffset - Get the end index in the span array
-// ----------------------------------------------------------------------------
-int32 VXLClass::GetSpanEndOffset(int32 sectionIndex) const
-{
-    if (!m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
-        return 0;
-
-    return static_cast<int32>(m_pSections[sectionIndex].SpanEnd);
-}
-
-// ----------------------------------------------------------------------------
-// VXLClass::GetVoxel - Get voxel color at a specific 3D position
-//
-// VXL uses span-based run-length encoding:
-// For each (z, y) pair, there is a list of spans.
-// Each span defines a contiguous range of x positions with a single color.
-// To find the voxel at (x, y, z):
-//   1. Navigate to the span data for layer z, row y
-//   2. Search through spans for one that contains x
-//   3. Return the span's color, or 0 if not found
+// GetVoxel - 兼容旧接口：调色板索引，0 = 空
 // ----------------------------------------------------------------------------
 BYTE VXLClass::GetVoxel(int32 sectionIndex, int32 x, int32 y, int32 z) const
 {
-    if (!m_pRawData || !m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
+    const uint32 v = GetVoxelRaw(sectionIndex, 0, x, y, z);
+    if (v == kVoxelEmpty)
         return 0;
-
-    if (x < 0 || x >= VoxelSize || y < 0 || y >= VoxelSize || z < 0 || z >= VoxelSizeZ)
-        return 0;
-
-    const VXLSectionHeader& section = m_pSections[sectionIndex];
-    const BYTE* pSpanData = m_pRawData + section.SpanDataOffset;
-
-    if (section.SpanDataOffset >= static_cast<uint32>(m_RawDataSize))
-        return 0;
-
-    // The span data is organized as:
-    // For each z layer:
-    //   For each y row:
-    //     uint32 byteCount (total bytes in this row including header)
-    //     uint32 spanCount (number of spans in this row)
-    //     (spanCount) spans, each: uint32 start, uint32 end, uint8 color
-    //     Padding to align
-
-    const BYTE* pData = pSpanData;
-    const BYTE* pDataEnd = m_pRawData + m_RawDataSize;
-
-    // Navigate to the correct z-layer and y-row
-    int32 currentZ = 0;
-    int32 currentY = 0;
-
-    while (pData < pDataEnd && currentZ <= z)
-    {
-        // Read the row header
-        if (pData + 8 > pDataEnd)
-            return 0;
-
-        uint32 byteCount = *reinterpret_cast<const uint32*>(pData);
-        pData += 4;
-        uint32 spanCount = *reinterpret_cast<const uint32*>(pData);
-        pData += 4;
-
-        if (byteCount == 0 || spanCount == 0)
-        {
-            // Empty row, move to next
-            currentY++;
-            if (currentY >= VoxelSize)
-            {
-                currentY = 0;
-                currentZ++;
-            }
-            continue;
-        }
-
-        if (byteCount < 8)
-            return 0;
-
-        if (pData + byteCount - 8 > pDataEnd)
-            return 0;
-
-        if (currentZ == z && currentY == y)
-        {
-            // Found the correct row, search spans
-            const BYTE* pSpanStart = pData;
-            const BYTE* pSpanEnd = pData + byteCount - 8;
-
-            for (uint32 s = 0; s < spanCount && pSpanStart + 8 <= pSpanEnd; ++s)
-            {
-                uint32 spanStart = *reinterpret_cast<const uint32*>(pSpanStart);
-                pSpanStart += 4;
-                uint32 spanEnd = *reinterpret_cast<const uint32*>(pSpanStart);
-                pSpanStart += 4;
-                uint8 color = *pSpanStart;
-                pSpanStart += 1;
-
-                if (static_cast<int32>(spanStart) <= x && static_cast<int32>(spanEnd) >= x)
-                {
-                    return color;
-                }
-            }
-            return 0;
-        }
-
-        // Move to next row
-        pData += byteCount - 8;
-        currentY++;
-        if (currentY >= VoxelSize)
-        {
-            currentY = 0;
-            currentZ++;
-        }
-    }
-
-    return 0;
+    return static_cast<BYTE>(v & 0xFF);
 }
 
 // ----------------------------------------------------------------------------
-// VXLClass::HasSection - Check if a section exists
-// ----------------------------------------------------------------------------
-bool VXLClass::HasSection(int32 sectionIndex) const
-{
-    return (sectionIndex >= 0 && sectionIndex < m_SectionCount);
-}
-
-// ----------------------------------------------------------------------------
-// VXLClass::GetBounds - Compute the bounding box of a section
-//
-// Iterates through all spans to find min/max x, y, z coordinates.
-// A span defines a run of filled voxels in x, at a given (y, z) position.
+// GetBounds - 兼容旧接口：frame 0 的体素索引范围
 // ----------------------------------------------------------------------------
 void VXLClass::GetBounds(int32 sectionIndex, int32& minX, int32& maxX,
                          int32& minY, int32& maxY, int32& minZ, int32& maxZ) const
 {
-    minX = VoxelSize;
-    maxX = 0;
-    minY = VoxelSize;
-    maxY = 0;
-    minZ = VoxelSizeZ;
-    maxZ = 0;
+    minX = maxX = minY = maxY = minZ = maxZ = 0;
 
-    if (!m_pRawData || !m_pSections || sectionIndex < 0 || sectionIndex >= m_SectionCount)
+    VXLRecordView rec;
+    if (!GetRecord(sectionIndex, 0, rec))
         return;
 
-    const VXLSectionHeader& section = m_pSections[sectionIndex];
-    const BYTE* pSpanData = m_pRawData + section.SpanDataOffset;
+    minX = 0; maxX = rec.SizeX - 1;
+    minY = 0; maxY = rec.SizeY - 1;
+    minZ = 0; maxZ = rec.SizeZ - 1;
+}
 
-    if (section.SpanDataOffset >= static_cast<uint32>(m_RawDataSize))
-        return;
+// ----------------------------------------------------------------------------
+// GetWorldBounds - record 的模型空间 AABB
+// ----------------------------------------------------------------------------
+bool VXLClass::GetWorldBounds(int32 sectionIndex, int32 frame,
+                              float outMin[3], float outMax[3]) const
+{
+    VXLRecordView rec;
+    if (!GetRecord(sectionIndex, frame, rec))
+        return false;
 
-    const BYTE* pData = pSpanData;
-    const BYTE* pDataEnd = m_pRawData + m_RawDataSize;
-
-    int32 currentZ = 0;
-    int32 currentY = 0;
-
-    while (pData < pDataEnd)
+    for (int32 i = 0; i < 3; ++i)
     {
-        if (pData + 8 > pDataEnd)
-            break;
-
-        uint32 byteCount = *reinterpret_cast<const uint32*>(pData);
-        pData += 4;
-        uint32 spanCount = *reinterpret_cast<const uint32*>(pData);
-        pData += 4;
-
-        if (byteCount == 0 || spanCount == 0)
-        {
-            currentY++;
-            if (currentY >= VoxelSize)
-            {
-                currentY = 0;
-                currentZ++;
-            }
-            if (currentZ >= VoxelSizeZ)
-                break;
-            continue;
-        }
-
-        if (byteCount < 8 || pData + byteCount - 8 > pDataEnd)
-            break;
-
-        const BYTE* pSpanStart = pData;
-        const BYTE* pRowEnd = pData + byteCount - 8;
-
-        for (uint32 s = 0; s < spanCount && pSpanStart + 8 <= pRowEnd; ++s)
-        {
-            uint32 spanStart = *reinterpret_cast<const uint32*>(pSpanStart);
-            pSpanStart += 4;
-            uint32 spanEnd = *reinterpret_cast<const uint32*>(pSpanStart);
-            pSpanStart += 4;
-            pSpanStart += 1; // Skip color byte
-
-            int32 sx = static_cast<int32>(spanStart);
-            int32 ex = static_cast<int32>(spanEnd);
-
-            if (sx < minX) minX = sx;
-            if (ex > maxX) maxX = ex;
-            if (currentY < minY) minY = currentY;
-            if (currentY > maxY) maxY = currentY;
-            if (currentZ < minZ) minZ = currentZ;
-            if (currentZ > maxZ) maxZ = currentZ;
-        }
-
-        pData += byteCount - 8;
-        currentY++;
-        if (currentY >= VoxelSize)
-        {
-            currentY = 0;
-            currentZ++;
-        }
-        if (currentZ >= VoxelSizeZ)
-            break;
+        outMin[i] = rec.Min[i];
+        outMax[i] = rec.Max[i];
     }
-
-    // If no spans were found, reset bounds
-    if (minX > maxX)
-    {
-        minX = 0; maxX = 0;
-        minY = 0; maxY = 0;
-        minZ = 0; maxZ = 0;
-    }
+    return true;
 }

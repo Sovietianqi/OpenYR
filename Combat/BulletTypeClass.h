@@ -2,6 +2,10 @@
 
 #include "../Abstract/ObjectTypeClass.h"
 
+class BulletClass;
+class HouseClass;
+struct CoordStruct;
+
 class CCINIClass;
 class CRCEngine;
 
@@ -32,8 +36,38 @@ public:
 
     virtual AbstractType WhatAmI() const override;
     virtual int32 Size() const override;
+    virtual AbstractType GetAbstractDerivationID() const;
+
+    // asm: BulletTypeClass_PointerGotInvalid (0x46C8xx) retn 8 -> 2 args.
+    //   Clears the cached Trailer anim pointer (+0x2D8) when it is the victim.
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
 
     virtual bool LoadFromINI(CCINIClass* pINI) override;
+
+    // ------------------------------------------------------------------------
+    // asm: BulletType_CreateBullet (0x46B060)
+    //
+    //   BulletClass *__fastcall BulletType_CreateBullet(
+    //       BulletTypeClass *pType, CoordStruct *pPos, HouseClass *pOwner,
+    //       int32 a4, int32 a8, int32 warhead, int32 speed,
+    //       bool bright, int32 a7)
+    //
+    //   建一颗子弹实例并完成初始化。asm 逐段：
+    //     CoCreateInstance(CLSID_BulletClass, 0, 7, IID_Invalid1, &bullet)
+    //     test eax,eax / jge ok / return 0
+    //     BulletClass_Initialize(bullet, type, pos, owner, damage, WH,
+    //                            speed, bright, a7)
+    //     mov eax,esi / retn 14h
+    //
+    //   原版走 COM 激活；本项目直接堆分配 BulletClass 并由构造函数完成
+    //   类型挂接（等价于原版的 Initialize 前半段）。
+    // ------------------------------------------------------------------------
+    static BulletClass* Create_Bullet(BulletTypeClass* pType,
+                                      const CoordStruct* pPos,
+                                      HouseClass* pOwner,
+                                      int32 a4, int32 a8,
+                                      int32 warhead, int32 speed,
+                                      bool bright, int32 a7);
     virtual bool SaveToINI(CCINIClass* pINI);
     virtual void ComputeCRC(CRCEngine& crc) const override;
     int32 GetCRC() const;
@@ -97,13 +131,15 @@ public:
     bool         Bouncy;
     bool         Airburst;
     int32        Cluster;
-    char        Image[0x20];
+    // NOTE: the "Image" key is stored in the inherited ObjectTypeClass::Image
+    //   (+0x1F8 in the binary), not a separate field -- the asm writes it there
+    //   and the base art loader resolves ImageSHP from it.
     AnimTypeClass* Trailer;
     int32        SpawnDelay;
- // BulletTypeClass_SetSpawnDelay (xxx).
-    //   BulletClass_InitScalable re-stamps the delay for scalable projectiles
-    //   after scaling it by the firing object's range.
-    void SetSpawnDelay(int32 delay) { SpawnDelay = delay; }
+    // asm: BulletTypeClass_SetSpawnDelay (0x46C8xx) -- writes the *scaled*
+    //   spawn delay (+0x2E8) used by BulletClass_Update's trailer timer.
+    void SetSpawnDelay(int32 delay) { ScaledSpawnDelay = delay; }
+    int32 GetSpawnDelay() const { return SpawnDelay; }
     bool         Rotates;
     bool         Flat;
     WeaponTypeClass* AirburstWeapon;
@@ -116,4 +152,9 @@ public:
     int32        AnimHigh;
     int32        AnimRate;
     bool         AnimPalette;
+    // asm: BulletTypeClass+0x2DC -- trajectory selector consumed by
+    // WeaponTypeClass_CalculateSpeed (non-zero disables auto speed calc).
+    int32        TrajectoryKind;
+    // asm: BulletTypeClass+0x295 -- requests half-gravity ballistics.
+    bool         HalfGravity;
 };

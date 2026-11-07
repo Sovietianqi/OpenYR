@@ -3,6 +3,8 @@
 #include <Abstract/FootClass.h>
 #include <Math/Timer.h>
 
+class INIClass;
+
 // ============================================================================
 // InfantryClass - base for all infantry units
 // Inherits FootClass
@@ -90,6 +92,11 @@ public:
     virtual AbstractClass* GetTarget() const;
     virtual void ClearTarget();
     virtual bool HasTarget() const;
+    // asm: InfantryClass_Update (gamemd:623746 .. 624348) —— vt+0x5C 覆写。
+    //   前置段：隧道步进 / 传送中清目标 / 任务队列门；随后 call
+    //   FootClass::AI（asm 624000）；最后跑步兵专属的
+    //   Firing_AI / Doing_AI / Movement_AI（624322/624329/624336）。
+    virtual void Update() override;
     virtual void SetMission(Mission mission);
     virtual Mission GetMission() const;
     virtual bool DoAction(Action action, AbstractClass* pTarget, CellStruct* pCell);
@@ -109,6 +116,39 @@ public:
     virtual void MissionPatrol();
     virtual void MissionAreaGuard();
     virtual void MissionParaDrop();
+
+    // ========================================================================
+    // 开火入口 / 任务处理器覆写（asm: InfantryClass_Fire 6196 / _Attack 7019 /
+    //   _Guard 7266 / _Hunt 7165 / _Move 7330 / _Unload 7405）
+    //
+    //  步兵的任务跳表与载具完全不同：展开/收起姿态会改变任务的走向，
+    //  工程师/C4 兵种会把 Attack 改写成占领/爆破。这些覆写把 asm 的分支
+    //  按原样落到本项目的姿态字段上。
+    // ========================================================================
+    virtual BulletClass* Fire(AbstractClass* pTarget, int32 nWeaponIndex) override;
+    virtual int32 Mission_Attack() override;
+    virtual int32 Mission_Move() override;
+    virtual int32 Mission_Guard() override;
+    virtual int32 Mission_Hunt() override;
+    virtual int32 Mission_Return() override;
+    virtual int32 Mission_Enter() override;
+    virtual int32 Mission_Unload() override;
+    virtual int32 Mission_Capture() override;
+
+    // ------------------------------------------------------------------------
+    // asm: char __thiscall InfantryClass_GuardBuildingCheck
+    //  警戒/区域警戒时检查脚下建筑：可驻守的民房/可穿越的闸门会让步兵
+    //  贴上去（asm 624010 段的 Cell_Building + CanBeOccupied 分支）。
+    // ------------------------------------------------------------------------
+    bool TryEnterBuilding();
+
+    // ------------------------------------------------------------------------
+    // asm: InfantryClass_Update 的 624240..624322 段
+    //  姿态收尾：清掉已播完的"忙"序列标记、推进趴下计时器、按类型决定
+    //  是回到站姿还是保持伏地。InfantryClass::Update 在 FootClass::Update
+    //  之后调用它。
+    // ------------------------------------------------------------------------
+    void Update_Posture();
     virtual void UpdateMission();
     virtual void AI_Update();
     virtual void Combat_AI();
@@ -128,6 +168,19 @@ public:
     virtual void Draw(Point2D& point, RectangleStruct& rect);
     virtual void DrawSHP(Point2D& point, RectangleStruct& rect, int32 brightness, int32 tint);
     virtual void DrawShadow(Point2D& point);
+
+    // ------------------------------------------------------------------------
+    // asm: int __thiscall sub_518D80(InfantryClass *this)   —— 步兵 SHP 帧号
+    //
+    //   帧号 = 序列.StartFrame
+    //        + (AnimationFrame % max(序列.FrameCount, 1))
+    //        + 方向序号 * 序列.FramesPerDirection      （仅当 FramesPerDirection > 0）
+    //
+    //   方向序号不是直接拿 8 方向枚举，而是把 16 位朝向切成 32 个扇区后查
+    //   原版 .data:dword_7EAEFC（32 项 → 0..7）。该表把"顺时针增大的朝向"
+    //   翻成"逆时针增大的 SHP 帧序"：0 = NW … 7 = N。
+    // ------------------------------------------------------------------------
+    int32 Get_Frame() const;
     virtual int32 GetZBias() const;
     virtual bool IsVisibleTo(HouseClass* pHouse) const;
     virtual void RevealTo(HouseClass* pHouse);
@@ -288,8 +341,10 @@ public:
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 UpdateDeployment 负责推进"展开/坐下"这类变形动画：
     //  只在当前动作序列属于变形序列时才推进；序列播完就把状态定形。
+    //  asm 返回 -1 表示"未在展开动画中"，其余返回动画剩余帧数，
+    //  Guard/AreaGuard 据此决定是否跳过基类处理。
     // ------------------------------------------------------------------------
-    void UpdateDeployment();
+    int32 UpdateDeployment();
 
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 UpdateInTunnel 负责推进单位在隧道中的移动：沿
@@ -297,6 +352,113 @@ public:
     //  单位保持间距。
     // ------------------------------------------------------------------------
     void UpdateInTunnel(int32 a1);
+
+    // ========================================================================
+    // 类型 / 反射信息（asm: InfantryClass_GetType / _GetImage / _GetUIName /
+    //  _GetAbstractDerivationID / _GetSize / _GetCRC）
+    //
+    //  GetType 直接返回步兵类型；GetImage 是 FootClass::GetImage 的转发；
+    //  GetUIName 在"技工"标记置位时返回 TXT_TECHNICIAN，否则按敌我关系返回
+    //  伪装名或自身类型名；GetAbstractDerivationID 返回 AbstractType::Infantry；
+    //  Size 返回原版 InfantryClass 结构体字节数 0x6F0；ComputeCRC 把步兵特有的
+    //  序列与状态字节并入校验。
+    // ========================================================================
+    virtual TechnoTypeClass* GetType() const override;
+    virtual SHPStruct* GetImage() const override;
+    virtual const wchar_t* GetUIName() const override;
+    virtual AbstractType GetAbstractDerivationID() const;
+    virtual void ComputeCRC(CRCEngine& crc) const override;
+
+    // ========================================================================
+    // 速度 / 活动状态（asm: InfantryClass_GetCurrentSpeed /
+    //  _GetObjectActivityState）
+    //
+    //  GetCurrentSpeed 在基类速度之上按"爬行/趴下"状态打折；
+    //  GetObjectActivityState 对处于特殊序列（死亡/游泳/飞翔）的步兵统一
+    //  报告活动状态 6，其余情况汇报"能否开火/能否接近"。
+    // ========================================================================
+    virtual int32 GetCurrentSpeed() const;
+    int32 GetObjectActivityState(AbstractClass* pTarget, int32 idxWeapon,
+                                 int32 ignoreCloseEnough);
+    // ========================================================================
+    // 开火位置（asm: InfantryClass_GetFLH）
+    //
+    //  步兵搭乘载具且属于该载具乘客时，改由载具的 FLH 提供炮口位置；
+    //  其余情况沿用基类的炮口位置计算。
+    // ========================================================================
+    CoordStruct GetFLH(int32 idxWeapon, bool muzzle);
+
+    // ========================================================================
+    // 伪装查询（asm: InfantryClass_GetDisguise / _GetDisguiseHouse /
+    //  _IsDisguisedAs）
+    //
+    //  GetDisguise / GetDisguiseHouse 在目标方与己方同盟且查询方要求"看真身"
+    //  时返回己方信息，否则返回对方的伪装身份；IsDisguisedAs 判断目标对象是否
+    //  与本步兵的伪装身份一致。
+    // ========================================================================
+    virtual int32 GetDisguise(int32 a2) const;
+    virtual HouseClass* GetDisguiseHouse(int32 a2) const;
+    virtual bool IsDisguisedAs(int32 a2) const override;
+
+    // ========================================================================
+    // 空闲动作（asm: InfantryClass_IdleAction / _PlayIdleAnim /
+    //  _Is_Ready_To_Random_Animate）
+    //
+    //  IdleAction 在空闲计时到达后按规则频率重置计时器，并处理 Fraidycat
+    //  的自动散开与"牛"类步兵的特殊空闲；PlayIdleAnim 轮流播放两套空闲
+    //  动画；Is_Ready_To_Random_Animate 汇总各"正在忙"标记决定能否随机动画。
+    // ========================================================================
+    virtual bool IdleAction() override;
+    virtual void PlayIdleAnim(int32 a2) override;
+    virtual bool Is_Ready_To_Random_Animate() const;
+
+    // ========================================================================
+    // 光标 / 点击（asm: InfantryClass_ClickedMission /
+    //  _GetCursorOverCell / _PointerGotInvalid）
+    //
+    //  ClickedMission 把被点击对象映射为步兵可执行的任务码；
+    //  GetCursorOverCell 只对己方玩家给出单元格光标；
+    //  PointerGotInvalid 在类型指针失效时把自身类型清空。
+    // ========================================================================
+    virtual bool ClickedMission(int32 act, ObjectClass* pTarget, int32 a4) const;
+    virtual int32 GetCursorOverCell(const CellStruct& cell, bool a3, bool a4) const;
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
+
+    // ========================================================================
+    // 放置 / 移动（asm: InfantryClass_Put / _MoveTo）
+    //
+    //  Put 把步兵放到地图上的指定坐标（贴合地面高度并登记所在格）；
+    //  MoveTo 朝目标坐标规划一条步兵可走的路径。
+    // ========================================================================
+    virtual bool Put(const CoordStruct& coords, int32 a2) override;
+    bool MoveTo(const CoordStruct& where);
+
+    // ========================================================================
+    // 卸载 / 区域防守（asm: InfantryClass_Unload / _AreaGuard）
+    //
+    //  Unload 推进步兵的"收起"-"展开"状态机：简单部署单位按当前序列在
+    //  展开/收起之间切换；AreaGuard 先推进部署动画，未定形时继续，否则退回
+    //  基类的区域防守。
+    // ========================================================================
+    void Unload();
+    void AreaGuard();
+
+    // ========================================================================
+    // 场景 INI 读写（asm: InfantryClass_CreateFromINIList /
+    //  _SaveToMapINIList）
+    // ========================================================================
+    static void CreateFromINIList(INIClass* pINI);
+    static void SaveToMapINIList(INIClass* pINI);
+
+    // ========================================================================
+    // 初始化（asm: InfantryClass_Init）
+    //
+    //  在构造末尾调用：把本单位登记进所属房屋的追踪表；按房屋的"老兵/精英"
+    //  规则以及类型自身的老兵标记决定是否直接以老兵身份出场；把类型的初始
+    //  朝向同步到自身的两套朝向字段。
+    // ========================================================================
+    void Init();
+
     virtual bool IsTechno() const;
     virtual bool IsInfantry() const;
     virtual bool IsUnit() const;
@@ -321,6 +483,10 @@ public:
     InfantryTypeClass* Type;
     Sequence CurrentSequence;
     Sequence UnkSequence;
+    // asm +0F8h：当前序列内的动画帧号。InfantryClass_DoAction 在切序列时
+    //   置为 [0, 序列.FrameCount) 的随机值（randomStartFrame）或 0。
+    //   sub_518D80 用它配合 FrameCount 取模得到循环帧。
+    int32 AnimationFrame;
     bool IsCrawlingNow;
     bool IsProneNow;
     bool IsDeployedNow;
@@ -338,6 +504,9 @@ public:
     bool IsABombNow;
     bool IsC4Now;
     bool IsTerrorDrone;
+    // 技工标记（+0x6D9）：步兵被改造为技工（如从被拆解的建筑中出来）时置位，
+    // GetUIName 据此返回 TXT_TECHNICIAN。
+    bool IsTechnician;
     BYTE align_7F0[4];
     bool IsCivilian;
     bool IsBrute;
@@ -391,8 +560,8 @@ public:
     // intentionally reuse the timers inherited from TechnoClass rather than
     // duplicating them here.
     // ========================================================================
-    Mission        CurrentMission;     // active mission (backed by Get/SetMission)
-    Mission        QueuedMission;      // mission to run once the current ends
+    // ★ 任务状态不再在本类另存一份：CurrentMission / QueuedMission 已由
+    //   MissionClass（继承链上）持有，本类只做副作用（序列/姿态/停火）。
     AbstractClass* TargetObj;          // current target (backed by Get/SetTarget)
     CoordStruct    DestinationCoord;   // current movement destination
     bool           IsSleepingNow;      // true while the Sleep mission is active
@@ -406,4 +575,7 @@ public:
     void Save(class SaveGameClass& saver) const;
     void Load(class LoadGameClass& loader);
     TechnoClass*   MindControlVictim;  // techno this infantry is controlling
+
+    // 最近一次本体绘制的屏幕包围盒（SHP 帧 dst），供血条/选中框定位。
+    RectangleStruct LastRenderRect;
 };

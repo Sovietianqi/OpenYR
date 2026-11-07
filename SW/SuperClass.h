@@ -58,6 +58,31 @@ public:
     // active.  PsyDom_IsActive returns `Status != 0`.
     static int32 PsyDom_Status;
 
+    // ── 存档里随场景一起走的特效全局（asm: LoadGame_slave1 / sub_539AE0 /
+    //    ExtraData0_Save / Scenario_ResetAllSuperWeapons 四处同一组）─────────
+    //   位置在原版的 .data 段，与 LightningStorm_Active / PsyDom_Status 相邻。
+    static int32      LightningStorm_StartTime;          // asm: LightningStorm_StartTime
+    static int32      LightningStorm_Duration;           // asm: LightningStorm_Duration
+    static int32      LightningStorm_LightningDeferment; // asm: LightningStorm_LightningDeferment
+    static uint8      LightningStorm_TimeToEnd;          // asm: LightningStorm_TimeToEnd（1 字节）
+    static int32      LightningStorm_Status;             // asm: LightningStorm_Status
+    static CellStruct LightningStorm_CellCoords;         // asm: LightningStorm_CellCoords
+    static HouseClass* LightningStorm_Owner;             // asm: LightningStorm_Owner（要 Swizzle）
+    static AnimClass* PsyDom_Anim;                       // asm: PsyDom_Anim（要 Swizzle）
+    static CellStruct PsyDom_CellCoords;                 // asm: PsyDom_CellCoords
+    static HouseClass* PsyDom_Owner;                     // asm: PsyDom_Owner（要 Swizzle）
+    // asm: dword_827FC8 / dword_827FCC —— 只出现在"重置 / 存档 / 读档"三条路径
+    //   上，游戏逻辑不读，原版没有名字，这里按相邻块位置命名。
+    static int32      LightningStorm_Field8;
+    static int32      LightningStorm_FieldC;
+
+    // asm: vec_Anims_const1 / vec_Anims_const2 / vec_Anims_const —— 闪电风暴与
+    //   心灵控制器特效动画的三张登记表。读档时各自按 count + 指针数组整表
+    //   回填再逐项 Swizzle（见 Game/LoadGame.cpp 的 sub_539AE0）。
+    static DynamicVectorClass<AnimClass*>* vec_Anims_const1;
+    static DynamicVectorClass<AnimClass*>* vec_Anims_const2;
+    static DynamicVectorClass<AnimClass*>* vec_Anims_const;
+
  // byte __cdecl LightningStorm_IsActive()
     static bool LightningStorm_IsActive() { return LightningStorm_Active; }
 
@@ -79,8 +104,43 @@ public:
     virtual AbstractType WhatAmI() const override;
     virtual int32 Size() const override;
 
+    // asm: SuperClass_GetCRC (vtable) - chains AbstractClass_GetCRC then feeds
+    // the tagged fields (existence / readiness / charge state).
+    virtual void ComputeCRC(CRCEngine& crc) const;
+
     virtual void Update() override;
-    virtual void PointerExpired(AbstractClass* pAbstract, bool removed) override;
+    virtual void PointerGotInvalid(AbstractClass* pAbstract, bool removed) override;
+
+    // asm: char __thiscall SuperClass::AI(SuperClass *this, byte isPlayer)
+    //  The per-frame charge/readiness pass driven by HouseClass_Update.  Returns
+    //  true when the weapon fired this frame (used by the caller for the
+    //  player-owned announce fan-out).
+    bool AI(bool isPlayer);
+    // asm: int __thiscall SuperClass::Anim_Stage(SuperClass *this)
+    //  Charge tier (0..0x35) used by the sidebar cameo animation.
+    int32 Anim_Stage() const;
+
+    // asm: int __thiscall SuperClass_GetRechargeTime(SuperClass *this)
+    //  The scripted override (CustomChargeTime) when set, else the type's
+    //  nominal RechargeTime.
+    int32 GetRechargeTime() const;
+    // asm: byte __thiscall SuperClass_IsPowered(SuperClass *this)
+    bool GetIsPowered() const;
+
+    // asm: void __thiscall SuperClass::Enable(SuperClass *, int, int, int)
+    void Enable(int32 quantity, int32 arg4, int32 arg8);
+    // asm: char __thiscall SuperClass::Remove(SuperClass *this)
+    bool Remove();
+
+    // asm: SuperClass.field_6D (+0x6D) - the "exists / donated" byte Enable()
+    // sets.  AI(), Anim_Stage(), SetSWCharge() and Suspend() all bail out when
+    // it is clear.
+    bool Donated() const { return IsDonated_; }
+    // asm: SuperClass.SpecialSoundDuration (+0x50) - countdown for the type's
+    // SpecialSound; -1 means idle.  SpecialSoundCoords (+0x54) is the point the
+    // sound plays at.
+    int32 SpecialSoundDuration = -1;
+    CoordStruct SpecialSoundCoords;
 
     // Recharge management
     void UpdateRecharge();
@@ -196,6 +256,13 @@ public:
     static SuperClass* FindByOwner(HouseClass* pOwner, SuperWeaponType swType);
     static int32 GetReadyCount(HouseClass* pOwner);
 
+    // asm: int __stdcall LightningStorm_Strike(int coords) (0x53A0E0)
+    //  Fires one lightning bolt at the cell.  LightningStorm_Start is the
+    //  higher-level entry the trigger action uses to open a storm at a cell.
+    static void LightningStorm_Start(const CellStruct& cell);
+    // asm: HouseClass_IonCannonFire (0x509B3E) / trigger action 93.
+    static void Ion_Cannon_Strike(const CellStruct& cell);
+
 protected:
     explicit SuperClass(noinit_t) noexcept : AbstractClass(noinit) {}
 
@@ -211,7 +278,14 @@ public:
     // RechargeTime"; SetSWRecharge stores an explicit frame count here and
     // ResetSWRecharge restores the -1 sentinel.
     int32 CustomChargeTime;
+    // asm +0x78: frame at which the weapon last became ready; the sidebar
+    // flash window is [HasReadyFrame, HasReadyFrame + FlashSidebarTabFrames).
+    int32 HasReadyFrame = -1;
+    // asm +0x2C-slot cache: last Anim_Stage value seen by AI, used to detect a
+    // charge-tier change frame-over-frame.
+    int32 ReadinessFrame = -1;
     bool IsGranted;
+    bool IsDonated_;
     bool IsAnimationPlaying;
     bool IsAlreadyActivated;
     bool IsSuspended;

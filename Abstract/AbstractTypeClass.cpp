@@ -6,6 +6,7 @@
 #include <IO/CRC.h>
 #include <Rules/RulesClass.h>
 #include <Houses/HouseClass.h>
+#include <Game/EngineGlobals.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -200,22 +201,47 @@ void AbstractTypeClass::Delete_All()
 AbstractTypeClass::AbstractTypeClass(const char* pID) noexcept
     : AbstractClass(noinit)
 {
-    int32 i = 0;
+    // asm: AbstractTypeClass_CTOR (asm:21)
+    //   if (pID == 0) sprintf(buf, "%08X", this);   // 地址派生的临时 ID
+    //   else          strncpy(ID, pID, 0x18);
+    //   strncpy(Name, ID, 0x30);                    // 显示名默认等于 ID
+    //   UINamePtr = wNull;                          // CSF 解析前的空宽串
+    //   vec_AbstractTypes.Add(this);                // 注册到全局类型表
+    //
+    // 注册动作由 Find_Or_Allocate 负责（见下），此处不再重复 Add，避免
+    // 与调用路径重复入表。
     if (pID != nullptr)
     {
+        int32 i = 0;
         while (pID[i] != '\0' && i < 23)
         {
             ID[i] = pID[i];
             ++i;
         }
+        ID[i] = '\0';
     }
-    ID[i] = '\0';
+    else
+    {
+        // "%08X" 形式：无名字时用对象地址生成一个稳定的十六进制 ID。
+        snprintf(ID, sizeof(ID), "%08X",
+                 static_cast<unsigned>(reinterpret_cast<uintptr_t>(this)));
+    }
 
     zero_3C = 0;
 
     UINameLabel[0] = '\0';
     UIName[0] = L'\0';
-    Name[0] = '\0';
+
+    // 显示名从小写 ID 拷贝而来，LoadFromINI 读到 "Name" 键时再覆盖。
+    {
+        int32 j = 0;
+        while (ID[j] != '\0' && j < static_cast<int32>(sizeof(Name) - 1))
+        {
+            Name[j] = ID[j];
+            ++j;
+        }
+        Name[j] = '\0';
+    }
 
     ArrayIndex = -1;
     TechLevel = -1;
@@ -364,21 +390,44 @@ int32 AbstractTypeClass::Size() const
 // ============================================================================
 // ComputeCRC
 //
-//  Feeds the common type-class fields into the CRC stream.  Concrete
-//  subclasses chain this before adding their own state.
+//  asm: AbstractTypeClass_GetCRC (asm:545)
+//      push buf ; call AbstractClass_GetCRC          ; 基类先入摘要
+//      lea  eax,[esi+24h] ; CRC_string               ; +0x24 = ID
+//      lea  ecx,[esi+64h] ; CRC_string               ; +0x64 = 宽显示名
+//      add  esi,3Dh       ; CRC_string               ; +0x3D = 显示名(Name)
+//
+//  The original folds exactly three *strings* through CRC_string (an
+//  NUL-terminated, character-wise hash) after the base class has contributed
+//  its own four bytes.  The reconstructed build hashes the same three textual
+//  identity fields in the identical order.
 // ============================================================================
 void AbstractTypeClass::ComputeCRC(CRCEngine& crc) const
 {
     Compute_CRC_Abstract(crc);
 
-    crc.AddData(ID,           static_cast<int32>(sizeof(ID)));
-    crc.AddData(&zero_3C,     sizeof(zero_3C));
-    crc.AddData(UINameLabel,  static_cast<int32>(sizeof(UINameLabel)));
-    crc.AddData(UIName,       static_cast<int32>(sizeof(UIName)));
-    crc.AddData(Name,         static_cast<int32>(sizeof(Name)));
-    crc.AddData(&ArrayIndex,  sizeof(ArrayIndex));
-    crc.AddData(&TechLevel,   sizeof(TechLevel));
-    crc.AddData(&Cost,        sizeof(Cost));
+    crc.AddData(ID,          static_cast<int32>(std::strlen(ID)));
+    crc.AddData(UINameLabel, static_cast<int32>(std::strlen(UINameLabel)));
+    crc.AddData(Name,        static_cast<int32>(std::strlen(Name)));
+}
+
+// ============================================================================
+// HasThisID
+//
+//  asm: AbstractTypeClass_HasThisID (asm:300 / 320)
+//      mov  eax,[esp+4]      ; pID
+//      add  ecx,24h          ; &ID
+//      call __strcmpi
+//      neg  eax / sbb eax,eax / inc eax   ; == 0 -> 1, else 0
+//
+//  Case-insensitive identity test against the type's ID.  Derived classes
+//  (TechnoTypeClass and friends) publish a virtual overload; this base one is
+//  the concrete helper the array-walking code uses.
+// ============================================================================
+bool AbstractTypeClass::HasThisID(const char* pID) const
+{
+    if (pID == nullptr)
+        return false;
+    return _strcmpi(this->ID, pID) == 0;
 }
 
 // ============================================================================
@@ -467,6 +516,29 @@ bool AbstractTypeClass::LoadFromINI(CCINIClass* pINI)
         UINameLabel[j] = '\0';
     }
 
+    // asm: after the "UIName" tag is stored, the original calls Get_String on
+    // it and hangs the resolved wide string off +0x60, falling back to the
+    // global empty string (wNull) when the label resolves to nothing.  The
+    // reconstructed build widens the resolved ASCII text into UIName.
+    if (UINameLabel[0] != '\0')
+    {
+        const char* pResolved = EngineGlobals::Get_String(UINameLabel);
+        if (pResolved != nullptr)
+        {
+            int32 k = 0;
+            while (pResolved[k] != '\0' && k < static_cast<int32>(sizeof(UIName) / sizeof(UIName[0])) - 1)
+            {
+                UIName[k] = static_cast<wchar_t>(static_cast<unsigned char>(pResolved[k]));
+                ++k;
+            }
+            UIName[k] = L'\0';
+        }
+    }
+    else
+    {
+        UIName[0] = L'\0';
+    }
+
     // ------------------------------------------------------------------
     // Display name - human-readable fallback when UIName is empty.
     // ------------------------------------------------------------------
@@ -515,10 +587,14 @@ bool AbstractTypeClass::SaveToINI(CCINIClass* pINI)
     if (section == nullptr || section[0] == '\0')
         return false;
 
+    // asm: AbstractTypeClass_SaveIntoINI (asm:483)
+    //   mangleStuff_(sectionName)                    ; 规范节名
+    //   WriteString(section, "Name",   Name)         ; 总是写出显示名
+    //   if (UINameLabel[0]) WriteString(section,"UIName", &UINameLabel)
+    const char* name = (Name[0] != '\0') ? Name : ID;
+    pINI->WriteString(section, "Name", name);
     if (UINameLabel[0] != '\0')
         pINI->WriteString(section, "UIName", UINameLabel);
-    if (Name[0] != '\0')
-        pINI->WriteString(section, "Name", Name);
 
     pINI->WriteInteger(section, "TechLevel", TechLevel);
     pINI->WriteInteger(section, "Cost", Cost);

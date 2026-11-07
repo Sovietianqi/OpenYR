@@ -3,6 +3,7 @@
 #include "AbstractClass.h"
 #include "AbstractTypeClass.h"
 #include "ObjectTypeClass.h"
+#include <Game/LogicClass.h>
 
 class AnimClass;
 class FootClass;
@@ -16,23 +17,75 @@ class TagClass;
 //  The common base of everything that lives on the map: it owns a world
 //  position, an owner house, the cell-occupancy list link (+0x30) and the
 //  attached-animation slot (+0x88).
+//
+//  ★ 继承链对齐：原版是 ObjectClass → AbstractClass，而逐帧驱动槽 0x5C
+//    （Update）由 AbstractClass 提供，凡进入 vec_Logics 的实体都实现它。
+//    OpenYR 把这个“可被 vec_Logics 驱动”的能力显式建模成 LogicClass
+//    （无数据成员的纯接口），ObjectClass 以它为基类——布局、虚表槽位与
+//    “直接继承 AbstractClass”完全一致，同时让
+//    DynamicVectorClass<LogicClass*> 能直接存放 ObjectClass*。
 // ============================================================================
-class ObjectClass : public AbstractClass {
+class ObjectClass : public LogicClass {
 public:
     static const AbstractType AbsID = AbstractType::Object;
 
     static DynamicVectorClass<ObjectClass*>* Array;
 
+    // asm: vec_VisibleObjects -- the global vector of objects the tactical
+    // pass currently keeps on screen.  DeleteDead() sweeps it.
+    static DynamicVectorClass<ObjectClass*>* VisibleObjects;
+
+    // ========================================================================
+    // VisibleObjects_DeleteDead (0x725C50)
+    //
+    //   Walks vec_VisibleObjects and removes every entry whose virtual
+    //   IsDead() (vt+0x44) reports true, then runs the per-object cleanup:
+    //   the vt+0x08 gate, the RTTI check against the four concrete Techno
+    //   subclasses (setting +0x90 InLimbo when it matches), and the vt+0x20
+    //   mark-dirty call.
+    //
+    //   The removal loop reproduces the original's FindIndex-based purge: it
+    //   keeps calling FindIndex on the same element so duplicates are dropped
+    //   too, and the outer index is deliberately not advanced after a removal
+    //   because the shift leaves the next element in place.
+    // ========================================================================
+    static void DeleteDead();
+
+    // asm: VisibleObjects_DeleteDead (proc@1644735) —— 原名入口，Main_Loop@756905
+    //   每帧调用。实现与 DeleteDead() 共用同一张表与同一套摘除规则。
+    static void VisibleObjects_DeleteDead();
+
+    // ========================================================================
+    // vec_Logics 登记 / 注销（asm: ObjectClass::Unlimbo L1049805 /
+    //   ObjectClass_DTOR L1047348 / ObjectClass_Remove0 L1049520）
+    //
+    //   Register_Logic 幂等：重复登记会被忽略（否则同一对象每帧被驱动两次）。
+    //   注销按指针查找，找不到即静默返回。
+    // ========================================================================
+    void Register_Logic();
+    void Unregister_Logic();
+    bool Is_Logic_Registered() const;
+
     ObjectClass() noexcept
-        : AbstractClass()
+        : LogicClass()
+        , Location()
+        , CachedLocation()
+        , Owner(nullptr)
+        , IsSelected(false)
+        , IsInLimbo(false)
         , Marked(false)
         , InOpenTopped(false)
         , PassengerBlocked(false)
-        , NextObject(nullptr)
-        , AttachedAnim(nullptr)
         , Tag(nullptr)
+        , NextObject(nullptr)
+        , field_14(0)
+        , field_6C(0)
+        , field_74(1)
+        , Selected(0)
+        , Alive(0)
+        , AttachedAnim(nullptr)
     {}
-    virtual ~ObjectClass() {}
+    virtual ~ObjectClass();
 
     virtual AbstractType WhatAmI() const override { return AbstractType::Object; }
     virtual int32 Size() const override { return sizeof(ObjectClass); }
@@ -72,6 +125,15 @@ public:
     virtual bool Unlimbo();
 
     // ------------------------------------------------------------------------
+    // asm: vt_TechnoClass.r.m.o.Put（ObjectClass 虚槽，子类各自覆写）
+    //
+    //   Put 把对象直接落到给定 lepton 坐标：对象先被置于 limbo，再以新坐标
+    //   Unlimbo 回地图。返回是否落位成功。原版 UnitClass / InfantryClass /
+    //   AircraftClass 都覆写这一槽（步兵与飞行器的覆写见各自 .cpp）。
+    // ------------------------------------------------------------------------
+    virtual bool Put(const CoordStruct& coords, int32 a2);
+
+    // ------------------------------------------------------------------------
     // 根据游戏行为，可知 Remove0 负责把一个对象从战场上彻底摘掉：
     //  只有在战场已经开打、并且这个对象不是在敞篷运输车里的时候才做——
     //  否则它只是被运载的货物，摘除由载具那边统一处理。摘除的动作包括：
@@ -81,7 +143,18 @@ public:
     bool Remove0();
 
     // ========================================================================
-    // Coordinate accessors
+    // ObjectClass_Update  (asm:1047494 / ObjectClass_Update proc)
+    //
+    //   对象层的逐帧主体，由 MissionClass_Update 的第一条调用
+    //   （asm `MissionClass_Update +0: call ObjectClass_Update`）驱动。
+    //   它做的是"不依赖 techno 语义"的那部分：环境音、离场摘除与
+    //   高度/伞降收尾。TechnoClass 覆写了本槽，故本实现只在显式
+    //   `ObjectClass::Update()` 时生效（例如 Anim/Bullet 一类直系对象）。
+    // ========================================================================
+    virtual void Update() override;
+
+    // ========================================================================
+    // ObjectClass coordinate-forwarding getters
     // ========================================================================
     CoordStruct Get_Coord() const;
     void Set_Coord(const CoordStruct& coord);
@@ -115,7 +188,11 @@ public:
     //      the object's health fraction is below the rules-level threshold
     //      held just past GUIMoveOutSound; otherwise 1.
     //  Every other command is unhandled and returns 0.
-    int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4);
+    // asm: vtable slot vt_TechnoClass.r.m.o.Techno_ReceivedRadioCommand — a real
+    // virtual in the original, so RadioClass / UnitClass / AircraftClass all
+    // override the same slot.  OpenYR kept it non-virtual while the radio chain
+    // was flat; it is virtual now that RadioClass exists as a base class.
+    virtual int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4);
 
     // ========================================================================
     // Map presence / validity
@@ -226,6 +303,76 @@ public:
     bool CompareYSortValues(ObjectClass* pOther) const;
 
     // ========================================================================
+    // ObjectClass_GetImage / GetUIName / HasThisID / GetFactoryType
+    //
+    //  Thin forwarders onto the attached ObjectTypeClass.  The original
+    //  reaches the type through the virtual GetType slot (+0x88) and then
+    //  dispatches onto the matching type-level accessor:
+    //
+    //    GetImage    -> GetType()->GetImage()          (SHP drawn for this obj)
+    //    GetUIName   -> the base returns the literal "No name"
+    //    HasThisID   -> GetType()->HasThisID(id)       (ID/name match test)
+    //    GetFactoryType -> the object's own type is asked which abstract
+    //                      factory it belongs to; at object level this simply
+    //                      yields the object's abstract kind.
+    // ========================================================================
+    virtual SHPStruct* GetImage() const;
+    virtual const wchar_t* GetUIName() const;
+    virtual bool HasThisID(const char* pID) const;
+    virtual AbstractType GetFactoryType() const;
+
+    // ========================================================================
+    // ObjectClass_GetWeaponRange: base objects carry no weapon, so the
+    //  default answers 0 (`xor eax,eax / retn 4`).  Armed subclasses override.
+    // ========================================================================
+    virtual int32 GetWeaponRange(int32 weaponIndex) const;
+
+    // ========================================================================
+    // ObjectClass_Get_Height? -- despite the IDA label this is not a height;
+    //  the body loads the second argument's coords, the object's coords, and
+    //  returns the facing/angle (radians) between them:
+    //
+    //    atan2(px - qx, py - qy) - pi/2
+    //
+    //  The caller supplies the reference object as the second argument and
+    //  receives the angle (scaled by the game's direction constant) through
+    //  the first argument's dwXY buffer.
+    // ========================================================================
+    virtual void GetFacingTowards(CoordStruct* pOut, const ObjectClass* pRef) const;
+
+    // ========================================================================
+    // Facing/angle helper used by GetFacingTowards: atan2 of the two deltas
+    //  minus pi/2, scaled to the game's 0x100-direction convention.
+    // ========================================================================
+    static int32 FacingFromDeltas(int32 dx, int32 dy);
+
+    // ========================================================================
+    // ObjectClass_SetPosition: caches the object's draw position.  The
+    //  original writes the three coordinate dwords through a cached slot
+    //  (+0x9C) rather than through Location, so the renderer can keep the
+    //  last projected origin separate from the logical position.
+    // ========================================================================
+    void SetPosition(const CoordStruct& coords);
+
+    // ========================================================================
+    // Neutral object-layer stubs.  Each is a literal transcription of the
+    //  base slot the original installs at this level (`retn 0Ch`, `xor al,al`,
+    //  ...); concrete subclasses replace them when the behaviour matters.
+    //
+    //    IronCurtain      : assign an iron-curtain timer (no-op at base)
+    //    Scatter          : reflex-scatter the object (no-op at base)
+    //    IsCellOccupied   : does the object occupy the given cell? base = 0
+    //    MouseOverObject  : hit-test against the cursor (base returns 0)
+    //    MouseOverCell    : cell hit-test (base returns 0)
+    // ========================================================================
+    virtual void IronCurtain(ObjectClass* pSource, int32 a3, int32 a4) const;
+    virtual void Scatter(int32 a2, int32 a3, int32 a4) const;
+    virtual bool IsCellOccupied(const CellStruct& cell, int32 a3, int32 a4,
+                                int32 a5, int32 a6) const;
+    virtual int32 MouseOverObject(int32 a2, int32 a3) const;
+    virtual int32 MouseOverCell(int32 a2, int32 a3, int32 a4) const;
+
+    // ========================================================================
     // Vtable-slot stubs (asm bodies are bare `retn` / `retn 4` / `xor eax,eax`)
     //
     //  Every one of these is a real object-layer slot the original leaves
@@ -288,10 +435,17 @@ public:
     void SetLocation(const CoordStruct& loc) { Location = loc; }
 
 protected:
-    explicit ObjectClass(noinit_t) noexcept : AbstractClass(noinit) {}
+    explicit ObjectClass(noinit_t) noexcept : LogicClass() {}
 
 public:
     CoordStruct Location;
+
+    // -- Cached draw position (+0x9C) -----------------------------------------
+    // ObjectClass_SetPosition writes here rather than into Location: the
+    // renderer keeps the last projected origin separate from the logical
+    // position.  Defaults to the origin.
+    CoordStruct CachedLocation;
+
     HouseClass* Owner;
     bool IsSelected;
     bool IsInLimbo;
@@ -328,6 +482,21 @@ public:
     // walk it, stopping at the first entry whose WhatAmI() matches the
     // requested abstract type.
     ObjectClass*    NextObject;
+
+    // -- Damage_At_Cell support fields ------------------------------------
+    // 原版 ObjectClass（sizeof=0xA4）字段布局（偏移取自 IDA 结构定义）：
+    //   +0x14  可被震屏标志字节（Damage_At_Cell 读 bit0）
+    //   +0x6C  扫描/绘制标志字节（>0 表示参与结算）
+    //   +0x74  战术层注册标记（byte）
+    //   +0x81  Selected 选中标志
+    //   +0x88  Alive 存活标志
+    // 注：原版 Health(+0x64)/BackupHealth(+0x68) 在本项目中由
+    // TechnoClass 同名字段承载（见 TechnoClass.h），此处不重复声明以免遮蔽。
+    uint8           field_14;              // +0x14  震屏相关标志位
+    uint8           field_6C;              // +0x6C  扫描/绘制标志字节
+    uint8           field_74;              // +0x74  战术层注册标记
+    uint8           Selected;              // +0x81  选中标志
+    uint8           Alive;                 // +0x88  存活标志
 
     // -- Attached animation (+0x88) -------------------------------------------
     // The single animation the engine hangs off the object (damage smoke,

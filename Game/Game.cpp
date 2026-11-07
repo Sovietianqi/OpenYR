@@ -12,6 +12,7 @@
 #include "IO/CCFileClass.h"
 #include "IO/MixFileClass.h"
 #include "INI/INIClass.h"
+#include "FileFormats/SHP.h"
 
 // ── Platform Detection ────────────────────────────────────────────────────
 #if !defined(PLATFORM_WINDOWS) && !defined(PLATFORM_LINUX)
@@ -1707,4 +1708,131 @@ void Game::UnloadStartingSpotsAndWinsock()
 void Game::ProcessCampaignOptions()
 {
     // 根据游戏行为，可知战役选项在进场景前结算到会话状态。
+}
+
+// ============================================================================
+// asm: Game_UnloadDLGSHPs (0x72B130)
+//
+//   void __cdecl Game_UnloadDLGSHPs(void)
+//
+//   顺序卸载五个对话框 SHP，每个走同一段逻辑：
+//     cmp Loaded,bl / jz done                ; 未加载 -> 跳过
+//     cmp pSHP,ebx / jz clear_only           ; 指针空 -> 只清标志
+//     mov ecx,pSHP / call SHPStruct_Unload   ; 释放帧数据
+//     push pSHP / call delete                ; 释放对象
+//   clear_only:
+//     mov Loaded,bl / mov pSHP,ebx
+// ============================================================================
+Game::DialogSHPGlobal Game::PUDLGBGN = { nullptr, 0 };
+Game::DialogSHPGlobal Game::PUDLGBGA = { nullptr, 0 };
+Game::DialogSHPGlobal Game::PUDLGBGS = { nullptr, 0 };
+Game::DialogSHPGlobal Game::PUDLGBGY = { nullptr, 0 };
+Game::DialogSHPGlobal Game::MNBTTN   = { nullptr, 0 };
+
+// 单个 SHP 槽的卸载（asm 里五处内联展开，这里提成局部函数保持语义）
+static void UnloadOneDialogSHP(Game::DialogSHPGlobal& g)
+{
+    // asm: cmp Loaded,bl / jz done
+    if (g.Loaded == 0)
+        return;
+
+    // asm: cmp pSHP,ebx / jz clear_only
+    if (g.pSHP == nullptr)
+    {
+        g.Loaded = 0;                       // asm: mov Loaded,bl
+        return;
+    }
+
+    // asm: mov ecx,pSHP / call SHPStruct_Unload
+    //   SHPStruct_Unload（asm:1374254）释放引用型帧数据：先递归卸载引用，
+    //   再摘链（list_SHPFiles_First）、free 帧块。语义见 FileFormats/SHP.cpp。
+    static_cast<SHPStruct*>(g.pSHP)->Unload();
+
+    // asm: push pSHP / call delete
+    //   delete 走项目堆分配器。
+    YRMemory::Deallocate(g.pSHP);
+
+    // asm: mov Loaded,bl / mov pSHP,ebx
+    g.Loaded = 0;
+    g.pSHP   = nullptr;
+}
+
+void Game::UnloadDLGSHPs()
+{
+    UnloadOneDialogSHP(PUDLGBGN);           // asm: 第一块
+    UnloadOneDialogSHP(PUDLGBGA);           // asm: loc_72B15D..
+    UnloadOneDialogSHP(PUDLGBGS);
+    UnloadOneDialogSHP(PUDLGBGY);
+    UnloadOneDialogSHP(MNBTTN);
+}
+
+// ============================================================================
+// asm: Game_AddMPHouses_obsolete (0x6468D0 区域)
+//
+//   void __cdecl Game_AddMPHouses_obsolete(void *hWnd)
+//
+//   for i in 0..7:
+//     push offset "<Player @ X>" / push 0 / push 143h / push hWnd
+//     call SendMessageA                          -> item
+//     push (117Bh + i) / push item / push 151h / push hWnd
+//     call SendMessageA
+//
+//   标记为 obsolete 是因为原版已改用新的玩家注册流程；本函数保留以维持
+//   消息序列的等价。hWnd 由调用方给出。
+// ============================================================================
+void Game::AddMPHouses_Obsolete(void* hWnd)
+{
+    static const char* pNames[8] = {
+        "<Player @ A>", "<Player @ B>", "<Player @ C>", "<Player @ D>",
+        "<Player @ E>", "<Player @ F>", "<Player @ G>", "<Player @ H>",
+    };
+    static const int32 lpData[8] = {
+        0x117B, 0x117C, 0x117D, 0x117E, 0x117F, 0x1180, 0x1181, 0x1182,
+    };
+
+    if (hWnd == nullptr)
+        return;
+
+    for (int32 i = 0; i < 8; ++i)
+    {
+        // asm: push offset aPlayer@X / push 0 / push 143h / push hWnd
+        //      call SendMessageA
+        //   原版消息常量 0x143 = 注册玩家名，0x151 = 设置玩家槽位数据。
+        //   跨平台构建下统一走 Game 的消息辅助入口。
+        const int32 item = SendWindowMessage(hWnd, 0x143, 0,
+                                             pNames[i]);
+
+        // asm: push 117Bh+i / push eax / push 151h / push hWnd
+        //      call SendMessageA
+        SendWindowMessage(hWnd, 0x151, item,
+                          reinterpret_cast<const char*>(
+                              static_cast<intptr_t>(lpData[i])));
+    }
+}
+
+// ============================================================================
+// Game::SendWindowMessage —— asm `call SendMessageA` 的统一入口
+//
+//   原版在 AddMPHouses_obsolete 等处直接调 Win32 SendMessageA。
+//   跨平台构建下，Windows 平台转发真实 API，其他平台返回 0。
+//   保持参数顺序与 Win32 一致：hwnd, msg, wParam, lParam。
+// ============================================================================
+#if defined(PLATFORM_WINDOWS)
+extern "C" __declspec(dllimport) intptr_t __stdcall SendMessageA(
+    void* hWnd, uint32 Msg, uintptr_t wParam, intptr_t lParam);
+#endif
+
+int32 Game::SendWindowMessage(void* hWnd, int32 msg, int32 wParam, const void* lParam)
+{
+#if defined(PLATFORM_WINDOWS)
+    return static_cast<int32>(SendMessageA(
+        hWnd,
+        static_cast<uint32>(msg),
+        static_cast<uintptr_t>(wParam),
+        reinterpret_cast<intptr_t>(lParam)));
+#else
+    // 非 Windows 平台没有窗口系统，消息不投递。
+    (void)hWnd; (void)msg; (void)wParam; (void)lParam;
+    return 0;
+#endif
 }

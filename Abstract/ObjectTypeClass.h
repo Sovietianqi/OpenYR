@@ -35,6 +35,12 @@ public:
     static void Delete_Array();
     static void Delete_All();
 
+    // asm: ObjectTypeClass_One_Time (asm:740) --- called once from
+    // Init_BulkData.  Lazily loads the four shared sidebar/pip sprites
+    // (PIPBRD.SHP / PIPS.SHP / PIPS2.SHP / TALKBUBL.SHP) into engine globals,
+    // each guarded by a "already resident" check so a second call is a no-op.
+    static void One_Time();
+
     // ------------------------------------------------------------------
     // Construction / destruction
     // ------------------------------------------------------------------
@@ -92,6 +98,11 @@ public:
  // ObjectTypeClass_GetImage (xxx): the loaded SHP the type draws
     //   itself with, cached at +0x10 by Resolve_SHP_References.
     virtual SHPStruct* GetImage() const;
+    // GetImageData (alias): the same cached ImageSHP handle, exposed under the
+    // name the art subsystem uses when it wants the raw shape.  Kept non-virtual
+    // so it does not add a vtable slot; every derived type resolves through
+    // Resolve_SHP_References which fills ImageSHP.
+    SHPStruct* GetImageData() const { return ImageSHP; }
  // ObjectTypeClass_GetPipMax (xxx): base answers 0 - only the
     //   types that actually render pips (buildings, harvesters) override it.
     virtual int32 GetPipMax() const;
@@ -100,9 +111,14 @@ public:
     virtual int32 GetActualCost(HouseClass* pOwner) const;
  // ObjectTypeClass_GetBuildSpeed (xxx): base build-speed factor.
     int32 GetBuildSpeed() const;
- // ObjectTypeClass_GetCameo (xxx): the sidebar cameo index; base
-    //   has no cameo of its own.
-    virtual int32 GetCameo() const;
+ // ObjectTypeClass_GetCameo (asm: xor eax, eax ; retn): the sidebar cameo
+    //   SHP drawn for this type.  The base has no cameo art, so it returns
+    //   null; TechnoTypeClass overrides it with the cached CameoShape.
+    virtual SHPStruct* GetCameo() const;
+ // ObjectTypeClass_GetOwners (asm: or eax, 0FFFFFFFFh ; retn): the owner
+    //   bitmask for this type.  The base owns nothing (-1); TechnoTypeClass
+    //   overrides it with its parsed Owners field.
+    virtual int32 GetOwners() const;
  // ObjectTypeClass_Generic (xxx): stamps the 'G' marker byte that
     //   the sidebar uses to flag a generic (non-faction) cameo.
     void Generic();

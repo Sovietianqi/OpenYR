@@ -69,7 +69,7 @@ public:
     virtual ~AbstractClass() {}
 
     virtual void Init() {}
-    virtual void PointerExpired(AbstractClass* pAbstract, bool removed) {}
+    virtual void PointerGotInvalid(AbstractClass* pAbstract, bool removed) {}
     virtual AbstractType WhatAmI() const = 0;
     virtual int32 Size() const = 0;
     virtual void ComputeCRC(CRCEngine& crc) const {}

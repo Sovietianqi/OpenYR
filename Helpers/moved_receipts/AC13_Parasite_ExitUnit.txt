@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex13.cpp
+start=1018
+end=1356
+symbol=Parasite_ExitUnit
+target=Combat/ParasiteClass.cpp

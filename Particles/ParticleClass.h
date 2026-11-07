@@ -6,6 +6,7 @@
 #include "../Core/Memory.h"
 #include "../Containers/DynamicVectorClass.h"
 #include "../Math/CoordStruct.h"
+#include "../Math/Rectangle.h"
 #include "ParticleTypeClass.h"
 
 // ============================================================================
@@ -40,9 +41,70 @@ public:
     virtual void Update() override;
     virtual CoordStruct* GetCoords(CoordStruct* pCrd) const override;
 
+    // ------------------------------------------------------------------------
+    // asm: ParticleClass_Update_All 之外，粒子的每帧主体推进由 AI 承载；
+    //   Update() 转译 AI()。同时 PointerGotInvalid 清除指向失效对象的引用槽。
+    // ------------------------------------------------------------------------
+    int32 AI();
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
+
+    // ------------------------------------------------------------------------
+    // asm: ParticleClass_GetAbstractDerivationID (0x62DA6E): mov eax,16h
+    //   返回 AbstractType::Particle 的编号 0x16(22)，供存档 Swizzle 阶段
+    //   判别具体派生类型。基类 AbstractClass 无此虚接口，故与 BulletClass
+    //   一样以新增虚函数形式提供。
+    // ------------------------------------------------------------------------
+    virtual AbstractType GetAbstractDerivationID() const;
+
+    // ------------------------------------------------------------------------
+    // asm: ParticleClass_GetType (0x62DAA6):
+    //        mov eax,[ecx+ParticleClass.ParticleType] / retn
+    //   直接返回粒子类型指针。ParticleTypeClass 并非 ObjectTypeClass 的派生，
+    //   无法协变覆盖基类 ObjectClass::GetType 的 ObjectTypeClass* 版本，
+    //   故按本项目图层 Mark_Layer 的消歧惯例改名为 GetParticleType，
+    //   语义与 asm 完全一致。
+    // ------------------------------------------------------------------------
+    ParticleTypeClass* GetParticleType() const { return Type; }
+
+    // ------------------------------------------------------------------------
+    // 图层三件套
+    // ------------------------------------------------------------------------
+    // asm: ParticleClass_GetLayer (0x62DA8A): mov eax,2  -> Layer::Ground
+    virtual Layer GetLayer() const;
+    // asm: ParticleClass_SetLayer (0x62DB64):
+    //   push idxLayer / call ObjectClass::Mark / test al,al / setnz al / retn 4
+    //   转发到基类 Mark_Layer 并把结果规格化为 0/1。
+    virtual bool Mark_Layer(int32 idxLayer) override;
+
+    // asm: ParticleClass_InWhichLayer (0x62DB8B): mov eax,Air(3)
+    //   粒子一律画在 Air 层。
+    virtual Layer InWhichLayer() const;
+
+    // ------------------------------------------------------------------------
+    // asm: ParticleClass_Update_All (0x62CE40) -- 顶层 per-frame 推进
+    //   按 Type->BehavesLike 分派到对应 Update_*，随后 dec RemainingEC，
+    //   归零则置 TimeToDie(Dead)。
+    // ------------------------------------------------------------------------
+    void Update_All();
+
+    // ------------------------------------------------------------------------
+    // 默认坐标（静态），供构造期回填 xyz_5 等未知向量槽。
+    // asm: ParticleClass_Init_DefaultCellCoords (0x62D9E0)
+    //      ParticleClass_Init_DefaultRoomCoords (0x62D9F0)
+    // ------------------------------------------------------------------------
+    static CellStruct DefaultCellCoords;
+    static CoordStruct DefaultRoomCoords;
+    static void Init_DefaultCellCoords();
+    static void Init_DefaultRoomCoords();
+
     // Particle-specific
     void Fire();
+    // asm: ParticleClass_Draw(0x62CEF0) 的两种入口：
+    //   * Draw() 自行把世界坐标换算到战术面并绘制（供 DrawAllParticles 使用）；
+    //   * Draw(pos, clip) 由战术层在 Draw_Transient_Objects 中按已有屏幕坐标调用，
+    //     与 AnimClass::Draw 同形，避免重复换算。
     void Draw();
+    void Draw(Point2D* pPos, const Rectangle* pClip);
     void FadeOut();
     bool IsDead() const { return Dead; }
     int32 GetAge() const { return Age; }

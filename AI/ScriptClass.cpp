@@ -582,7 +582,7 @@ void ScriptClass::SetActive(bool active) {
     IsScriptActive = active;
 }
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知脚本执行面的行游标三步推进：回卷置为队首之外
+// asm: void __thiscall ScriptClass_ResetCurrentLine(AIScriptClass *this)   (asm:1348173)
 // 的哨位、读取当前行号、步进后报告是否仍有可用行。
 // ------------------------------------------------------------------------
 void ScriptClass::ResetCurrentLine()
@@ -598,4 +598,20 @@ int32 ScriptClass::GetCurrentLine() const
 void ScriptClass::StepToNextLine()
 {
     ++CurrentLine;
+}
+
+// ------------------------------------------------------------------------
+// asm: AIScriptClass_NotLastAction (0x5CA2A0)
+//   eax = [ecx+24h] / ecx = [ecx+2Ch]
+//   cmp ecx, [eax+0A0h] / sbb eax,eax / neg eax
+//
+// sbb/neg 组合是 **无符号** 比较：CurrentLine < (uint)cntActions 时返回 1。
+// 脚本类型为空时原版会解引用空指针，这里返回 0（与"没有下一行"同义）。
+// ------------------------------------------------------------------------
+bool ScriptClass::Not_Last_Action() const
+{
+    if (ScriptType == nullptr)
+        return false;
+    return static_cast<uint32>(CurrentLine) <
+           static_cast<uint32>(ScriptType->ActionsCount);   // asm: cmp/sbb/neg
 }

@@ -30,6 +30,21 @@ WarheadTypeClass* WarheadTypeClass::FindOrAllocate(const char* pID) {
     return newItem;
 }
 
+WarheadTypeClass* WarheadTypeClass::FindByName(const char* pName) {
+    // asm: WarheadTypeClass_FindByName (0x75E4A0) --- __fastcall, ecx = name.
+    //   for (i = 0; i < vec_WarheadTypes.length; ++i)
+    //       if (!strcmpi(name, vec[i] + a.nameINI /* = ID @ +0x24 */)) return vec[i];
+    //   return 0;
+    // The comparison target is the ini section name (the ID field), not the
+    // display Name; the two lookups therefore agree on their key.
+    if (!Array || !pName) return nullptr;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        WarheadTypeClass* item = Array->GetItem(i);
+        if (item && !_strcmpi(item->ID, pName)) return item;
+    }
+    return nullptr;
+}
+
 // WarheadTypeClass::NotifyAll - the tail of RulesClass_Addition_SpecialWeapons.
 // Every registered warhead type is given the rules pointer through its
 // vtable +0x64 entry; the hook is a no-op on a type that has no data to
@@ -54,7 +69,9 @@ WarheadTypeClass::WarheadTypeClass(const char* pID) noexcept
       SplashList(nullptr), IsAttachedParticle(false),
       Temporal(false), Parasite(false), Bright(false),
       PenetratesBunker(false), AnimListCount(0), DebrisCount(0),
-      DebrisMaximumsCount(0), DebrisTypes(nullptr), DebrisMaximums(nullptr) {
+      DebrisMaximumsCount(0), DebrisTypes(nullptr), DebrisMaximums(nullptr),
+      DetachSplashDword(0), DetachedSplash(nullptr),
+      DebrisMaximumsCapacity(0), DebrisMaximumsCap2(0) {
     for (int32 i = 0; i < 11; ++i) {
         Verses[i] = 1.0f;
     }
@@ -372,17 +389,106 @@ AbstractType WarheadTypeClass::WhatAmI() const {
     return AbstractType::WarheadType;
 }
 
+// asm: WarheadTypeClass_GetAbstractDerivationID (0x75E4E8) - returns 0x32,
+// which is AbstractType::WarheadType.
+AbstractType WarheadTypeClass::GetAbstractDerivationID() const {
+    return AbstractType::WarheadType;
+}
+
 int32 WarheadTypeClass::Size() const {
     return sizeof(WarheadTypeClass);
 }
 
-bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
+// asm: WarheadTypeClass_GetCRC (0x75DEB0)
+//
+// Chains the base CRC then folds in the warhead's identity in the same order
+// the original does: a run of boolean flags (+0x144..+0x153), the combat-light
+// doubles, the cached splash anim DWORD, the DebrisMaximums mirror counts, the
+// Locomotor CLSID (16 raw bytes), the eleven Verses doubles, the InfDeath and
+// ArrayIndex DWORDs.
+int32 WarheadTypeClass::GetCRC() const {
+    CRCEngine crc;
+    ComputeCRC(crc);
+
+    auto crcBool = [&crc](bool v) { uint8 b = v ? 1 : 0; crc.AddData(&b, sizeof(b)); };
+
+    crcBool(IsWallDestroyer);
+    crcBool(IsWoodDestroyer);
+    crcBool(IsWallAbsoluteDestroyer);
+    crcBool(IsTiberiumDestroyer);
+    crcBool(IsOreDestroyer);
+    crcBool(IsSparky);
+    crcBool(IsFire);
+    crcBool(IsSmoke);
+    crcBool(IsGas);
+    crcBool(IsLocomotor);
+    crcBool(IsSonic);
+    crcBool(IsRadiation);
+    crcBool(IsPsychic);
+    crcBool(IsMechanical);
+    crcBool(Bullets);
+    crcBool(IsAttachedParticle);
+
+    // asm: CRC_double(CellInset) then CRC_DWORD(+0x100) then CRC_double(CombatLightSize)
+    crc.AddData(&CellInset, sizeof(CellInset));
+    crc.AddData(&DetachSplashDword, sizeof(DetachSplashDword));
+    crc.AddData(&CombatLightSize, sizeof(CombatLightSize));
+
+    // asm: +0x17B bool, +0x17C/0x180/0x184/0x188 DWORDs
+    crcBool(Parasite);
+    crc.AddData(&DelayKillFrames, sizeof(DelayKillFrames));
+    crc.AddData(&DelayKillAtMax, sizeof(DelayKillAtMax));
+
+    // asm: CRC_Calculate(src=+0x15C, len=0x10) - the Locomotor CLSID.
+    crc.AddData(Locomotor, 0x10);
+
+    // asm: eleven CRC_double over the Verses array.
+    for (int32 i = 0; i < 11; ++i) {
+        double v = static_cast<double>(Verses[i]);
+        crc.AddData(&v, sizeof(v));
+    }
+
+    // asm: CRC_DWORD(+0x114 = AnimListCount), CRC_DWORD(+0x120 = DebrisCount)
+    crc.AddData(&AnimListCount, sizeof(AnimListCount));
+    crc.AddData(&DebrisCount, sizeof(DebrisCount));
+
+    return static_cast<int32>(crc.GetCRC());
+}
+
+// asm: WarheadTypeClass_PointerGotInvalid (0x75E440)
+//   arg0 = expired abstract pointer.
+//   - if it equals the cached splash anim (+0x140) clear that cache;
+//   - remove the same entry from the per-instance splash anim list (+0x104).
+void WarheadTypeClass::PointerGotInvalid(AbstractClass* pAbstract, bool /*removed*/) {
+    if (pAbstract == nullptr) return;
+
+    if (static_cast<AbstractClass*>(DetachedSplash) == pAbstract) {
+        DetachedSplash = nullptr;
+    }
+
+    for (int32 i = 0; i < AnimListCount; ++i) {
+        if (static_cast<AbstractClass*>(AnimList[i]) == pAbstract) {
+            for (int32 j = i; j + 1 < AnimListCount; ++j) {
+                AnimList[j] = AnimList[j + 1];
+            }
+            --AnimListCount;
+            AnimList[AnimListCount] = nullptr;
+            return;
+        }
+    }
+}
+
+// asm: WarheadTypeClass_LoadFromINI (0x75CF00)
+//
+// Reads the warhead's own [<ID>] section. On return:
+//   - false if the section is absent (asm `return` path zeroes AL);
+//   - VersesMediumWoodZero is updated from Verses[Medium]==0 && Verses[Wood]==0.
+bool WarheadTypeClass::LoadFromINI(CCINIClass* pINI) {
     if (!pINI) return false;
 
     char sectionName[64];
     snprintf(sectionName, sizeof(sectionName), "%s", this->ID);
     if (!pINI->SectionExists(sectionName)) return false;
-
 
     IsWallDestroyer = pINI->ReadInteger(sectionName, "Wall", 0) > 0;
     IsWoodDestroyer = pINI->ReadInteger(sectionName, "Wood", 0) > 0;
@@ -392,8 +498,8 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
     IsFire = pINI->ReadBool(sectionName, "Fire", IsFire);
     IsSmoke = pINI->ReadBool(sectionName, "Smoke", IsSmoke);
     IsGas = pINI->ReadBool(sectionName, "Gas", IsGas);
-    IsLocomotor = pINI->ReadBool(sectionName, "Locomotor", IsLocomotor);
-    IsSonic = pINI->ReadBool(sectionName, "IsSonic", IsSonic);
+    IsLocomotor = pINI->ReadBool(sectionName, "IsLocomotor", IsLocomotor);
+    IsSonic = pINI->ReadBool(sectionName, "Sonic", IsSonic);
     IsRadiation = pINI->ReadInteger(sectionName, "Radiation", 0) > 0;
     IsPsychic = pINI->ReadInteger(sectionName, "PsychicDamage", 0) > 0;
     Bullets = pINI->ReadBool(sectionName, "Bullets", Bullets);
@@ -505,7 +611,9 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
     Parasite = pINI->ReadBool(section, "Parasite", Parasite);
     Temporal = pINI->ReadBool(section, "Temporal", Temporal);
     IsLocomotor = pINI->ReadBool(section, "IsLocomotor", IsLocomotor);
-    pINI->ReadString(section, "Locomotor", Locomotor, Locomotor, sizeof(Locomotor));
+    // asm: INIClass_ReadCLSID(section, "Locomotor", &CLSID) - the field holds
+    // the 16-byte locomotion class id, kept with its current value when absent.
+    pINI->ReadCLSID(section, "Locomotor", reinterpret_cast<GUID*>(Locomotor));
     Airstrike = pINI->ReadBool(section, "Airstrike", Airstrike);
     Psychedelic = pINI->ReadBool(section, "Psychedelic", Psychedelic);
     BombDisarm = pINI->ReadBool(section, "BombDisarm", BombDisarm);
@@ -549,6 +657,12 @@ bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
     pINI->GetVectorIntegers(section, "DebrisMaximums", DebrisMaximums, DebrisMaximumsCount);
 
         return true;
+}
+
+// Compatibility alias: callers (e.g. RulesClass::Read_Warheads) still invoke
+// the list-loader name; it is the same section parser as LoadFromINI.
+bool WarheadTypeClass::LoadFromINIList(CCINIClass* pINI) {
+    return LoadFromINI(pINI);
 }
 
 bool WarheadTypeClass::SaveToINIList(CCINIClass* pINI) {

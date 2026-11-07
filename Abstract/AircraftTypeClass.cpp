@@ -781,7 +781,7 @@ AircraftTypeClass* AircraftTypeClass::FindOrAllocate(const char* pID)
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知旋翼图材是两张全局共享的 SHP：左旋翼与右旋翼，
+// asm: void __cdecl AircraftTypeClass_LoadRotorArt()   (asm:104344)
 // 批量数据初始化时从混合文件一次性登记；找不到就用空句柄占位。
 // ------------------------------------------------------------------------
 void AircraftTypeClass::LoadRotorArt()

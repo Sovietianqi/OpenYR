@@ -45,11 +45,14 @@ struct DifficultyStruct {
     bool    ContentScan;
     BYTE    unused_4B[5];
 
+    // 缺省值取自 asm RulesClass_Addition_Difficulty 的三个 GetFixed / GetBool
+    // 立即数：战力/速度/装甲/射速/造价/建造时间为 1.0，RepairDelay 0.02，
+    // BuildDelay 0.03，DestroyWalls 缺省为真。
     DifficultyStruct()
         : Firepower(1.0), GroundSpeed(1.0), AirSpeed(1.0)
         , Armor(1.0), ROF(1.0), Cost(1.0), BuildTime(1.0)
-        , RepairDelay(1.0), BuildDelay(1.0)
-        , BuildSlowdown(false), DestroyWalls(false), ContentScan(false)
+        , RepairDelay(0.02), BuildDelay(0.03)
+        , BuildSlowdown(false), DestroyWalls(true), ContentScan(false)
     {
         for (int32 i = 0; i < 5; ++i) unused_4B[i] = 0;
     }
@@ -116,18 +119,19 @@ public:
     //   says whether the terrain may carry a structure.
     // ========================================================================
     struct LandTypeCharacteristics {
-        float Hover;        // +0x00
-        float Foot;         // +0x04
-        float Track;        // +0x08
-        float Wheel;        // +0x0C
-        float Float;        // +0x10
-        float Amphibious;   // +0x14
-        float FloatBeach;   // +0x18
-        bool  Buildable;    // +0x1C
+        float Foot;         // +0x00
+        float Track;        // +0x04
+        float Wheel;        // +0x08
+        float Hover;        // +0x0C
+        float Winged;       // +0x10  hard-coded 1.0 (air ignores land type)
+        float Float;        // +0x14
+        float Amphibious;   // +0x18
+        float FloatBeach;   // +0x1C
+        bool  Buildable;    // +0x20
         uint8 _pad[3];
     };
-    static_assert(sizeof(LandTypeCharacteristics) == 0x20,
-                  "LandTypeCharacteristics must match the binary's 0x20 stride");
+    static_assert(sizeof(LandTypeCharacteristics) == 0x24,
+                  "LandTypeCharacteristics must match the binary's 0x24 stride");
 
     // Number of rows, one per LandType.
     static constexpr int32 LAND_TYPE_COUNT = 12;
@@ -150,6 +154,13 @@ public:
     // ========================================================================
     void Init(CCINIClass* pINI);
     void Read_File(CCINIClass* pINI);
+
+    // asm: RulesData_LoadTypeData (0x679A00 区, __stdcall(INI), retn 4)
+    //   对全部类型向量逐项调 vt+64h（LoadFromINI）——住户、超级武器、动画
+    //   （改读 ART.INI）、建筑、飞机、载具、步兵、武器、弹丸、战斗部，随后
+    //   逐武器 CalculateSpeed、逐建筑走 nullsub、地形/烟雾/覆盖物/等距瓦片/
+    //   粒子、体素动画，最后按 0x20 步长扫 MissionControls 表。
+    void LoadTypeData(CCINIClass* pINI);
 
     // ========================================================================
     // Section readers
@@ -179,6 +190,11 @@ public:
     void Read_Animations(CCINIClass* pINI);
     void Read_VoxelAnims(CCINIClass* pINI);
     void Read_Warheads(CCINIClass* pINI);
+    // [Projectiles] / [WeaponTypes]：弹丸表与武器表的名字登记段。两者与其它
+    // 类型列表段同构（逐键取名字 -> FindOrAllocate -> LoadFromINI）。武器
+    // LoadFromINI 用 Projectile/Warhead 反查，故弹丸与弹头必须先建表。
+    void Read_Projectiles(CCINIClass* pINI);
+    void Read_WeaponTypes(CCINIClass* pINI);
     void Read_Particles(CCINIClass* pINI);
     void Read_ParticleSystems(CCINIClass* pINI);
     void Read_AI(CCINIClass* pINI);
@@ -187,8 +203,7 @@ public:
     void Read_IQ(CCINIClass* pINI);
     void Read_JumpjetControls(CCINIClass* pINI);
     void Read_Movies(CCINIClass* pINI);
-    void Read_AdvancedCommandBar(CCINIClass* pINI);
-    void Read_HarvesterRules(CCINIClass* pINI);
+    void Read_AdvancedCommandBar(CCINIClass* pINI, bool isMP = false);
     void Read_Tiberiums(CCINIClass* pINI);
     void Read_TileTypes(CCINIClass* pINI);
     void Read_MissionControl(CCINIClass* pINI);
@@ -242,7 +257,7 @@ public:
     void Addition_LandCharacteristics(CCINIClass* pINI);
     void Addition_IQ(CCINIClass* pINI);
     void Addition_Movies(CCINIClass* pINI);
-    void Addition_AdvancedCommandBar(CCINIClass* pINI);
+    void Addition_AdvancedCommandBar(CCINIClass* pINI, bool isMP = false);
     void LoadDifficulties_unused(CCINIClass* pINI);
 
     // ========================================================================
@@ -325,6 +340,33 @@ public:
     DynamicVectorClass<AnimTypeClass*> DeadBodies;
     DynamicVectorClass<AnimTypeClass*> MetallicDebris;
     DynamicVectorClass<AnimTypeClass*> BridgeExplosions;
+
+    // ========================================================================
+    // Bridge / terrain tile indices
+    //
+    //   原版 RulesClass 在 +0x155C / +0x1740 处存放"压毁随机上限"（用于
+    //   Damage_At_Cell 的钢桥/木桥破坏判定），并持有桥面与木桥的 tile
+    //   起始索引，供 (tile - Set + 1) 落在 Middle 区间内时判定为桥体。
+    //   这些值由 [General] 段的 BridgeSet / WoodBridgeSet 等键读入。
+    // ========================================================================
+    int32       field_155C;        // +0x155C  钢桥压毁随机上限（Random2 上限）
+    int32       field_1740;        // +0x1740  木桥压毁随机上限
+    int32       BridgeSet;         // 钢桥 tile 起始索引
+    int32       WoodBridgeSet;     // 木桥 tile 起始索引
+    int32       BridgeMiddle1;     // 钢桥中段 tile 起始
+    int32       BridgeMiddle2;     // 钢桥中段 tile 起始（第二组）
+    WarheadTypeClass* field_FA8;   // +0x0FA8  油桶连锁引爆使用的弹头
+    int32       field_C;           // +0x000C  油桶连锁引爆使用的伤害值
+    WarheadTypeClass* CrushWarhead2; // +0x0FF0  第二压毁弹头（isCrushWH2）
+
+    // ------------------------------------------------------------------------
+    // +0x0B40 / +0x0B4C —— 单位类型免疫列表
+    //   Damage_At_Cell 在 what==1(Unit) 且 Scenario 标志 0x800 置位时，
+    //   遍历该列表：命中则跳过该单位（原版 asm 比较的是 4 字节类型指针）。
+    //   +0x0B40 为列表数据指针，+0x0B4C 为元素个数。
+    // ------------------------------------------------------------------------
+    TechnoTypeClass** ImmuneUnitTypes = nullptr;   // +0x0B40
+    int32             ImmuneUnitTypeCount = 0;     // +0x0B4C
 
     // ========================================================================
     // Properties - Sounds
@@ -459,6 +501,10 @@ public:
     // ========================================================================
     // Properties - JumpJet
     // ========================================================================
+    // GateUp/GateDown 在 asm 里是**声音索引**，且来自 [AudioVisual]（
+    // asm:1273880 / 1273907，GetString + VocClass_FindIndexOfName），不是
+    // [JumpjetControls] 的整数键；下面的 TurnRate..WobbleDeviation 才是
+    // RulesData_LoadJumpjetControls 读的 7 个键。
     int32       GateUp;
     int32       GateDown;
     int32       TurnRate;
@@ -590,6 +636,9 @@ public:
     int32       StopSound;
     int32       GuardSound;
     int32       ScatterSound;
+    // 注: [AudioVisual] 里**没有** DeploySound 键（asm 核实：该键只出现在
+    //   TechnoTypeClass_LoadFromINI，读的是每个单位自己的段）。保留字段是为了
+    //   维持 RulesClass 的字段布局与 asm 偏移一致，但规则段永远不会写它。
     int32       DeploySound;
     int32       StormSound;
     DynamicVectorClass<int32> LightningSounds;
@@ -782,7 +831,9 @@ public:
     DynamicVectorClass<int32> AICaptureLowPower;
     DynamicVectorClass<int32> AICaptureLowMoney;
     int32       AICaptureLowMoneyMark;
-    int32       AICaptureWoundedMark;
+    // asm: Addition_General 从 [General] 用 INIClass_GetFixed 读入并 fstp 到
+    // 4 字节槽（RulesClass+0x0EC0），因此这里是 float 而非 int。
+    float       AICaptureWoundedMark;
     DynamicVectorClass<int32> AISuperDefenseProbability;
     int32       AISuperDefenseFrames;
     float       AISuperDefenseDistance;
@@ -812,7 +863,9 @@ public:
     float       OccupyDamageMultiplier;
     float       OccupyROFMultiplier;
     int32       OccupyWeaponRange;
-    int32       BunkerDamageMultiplier;
+    // asm: Addition_CombatDamage 从 [CombatDamage] 用 INIClass_GetFixed 读入并
+    // fstp 到 4 字节槽（RulesClass+0x0F4C），故为 float。
+    float       BunkerDamageMultiplier;
     float       BunkerROFMultiplier;
     int32       BunkerWeaponRangeBonus;
     float       OpenToppedDamageMultiplier;
@@ -1304,6 +1357,15 @@ public:
 
     // --- Read_AdvancedCommandBar ---
     char                     NoneValue2[0x20];
+
+    // asm: RulesClass_Addition_AdvancedCommandBar 把 [AdvancedCommandBar] /
+    // [MultiplayerAdvancedCommandBar] 的 ButtonList（逗号分隔的按钮名）在命令栏
+    // 按钮表里解析成槽位。原版写进 UI 全局命令栏对象；重建侧命令栏尚未落地，
+    // 这里保留解析出的按钮名与此处的原始串，供后续消费。最多 0x19（25）个槽。
+    static constexpr int32 ADVANCED_COMMAND_BAR_MAX = 0x19;
+    char                     AdvancedCommandBarButtons[ADVANCED_COMMAND_BAR_MAX][0x20];
+    int32                    AdvancedCommandBarButtonCount;
+    bool                     AdvancedCommandBarIsMP;
 
     // --- Read_Difficulty ---
     double                   FirePower;

@@ -2,6 +2,7 @@
 #include "../Abstract/TechnoTypeClass.h"
 #include "../INI/INIClass.h"
 #include "../IO/CRC.h"
+#include "../Game/Externs.h"
 
 #include <cstring>
 #include <cstdio>
@@ -14,15 +15,13 @@
 // entry pairs a TechnoTypeClass pointer with a desired count (and optional
 // min/max bounds for team-recruitment flexibility). The original game reads
 // task forces from the [TaskForces] INI block: every numbered entry in a
-// task-force section is a "unitType,count" pair.
+// task-force section is a "count,unitTypeID" pair.
 //
-// This file implements:
-//   * Static registry (Array) management and name-based lookup
-//   * Construction / destruction with full member initialisation
-//   * Binary stream persistence (Load / Save) of the member list
-//   * INI parsing that resolves unit-type names to TechnoTypeClass pointers
-//   * CRC computation for multiplayer sync verification
-//   * Member management: add / remove / query / validate
+// asm 权威布局（原版）：
+//   +0x98 Group(整型, 构造 -1) / +0x9C cntObjects / +0xA0 isGlobal /
+//   +0xA4.. 内联 6 项成员数组，每项 8 字节 {int cnt; TechnoTypeClass*}。
+// OpenYR 用 DynamicVectorClass 承载成员表，字段名与顺序不必逐字节对应，
+// 只要语义一致。
 // ============================================================================
 
 DynamicVectorClass<TaskForceClass*>* TaskForceClass::Array = nullptr;
@@ -71,7 +70,7 @@ int32 TaskForceClass::GetCount() {
 // ============================================================================
 
 TaskForceClass::TaskForceClass(const char* pID) noexcept
-    : AbstractTypeClass(pID), Grouping(-1) {
+    : AbstractTypeClass(pID), Grouping(-1), IsGlobal(0) {
 }
 
 TaskForceClass::~TaskForceClass() {
@@ -94,9 +93,9 @@ HRESULT TaskForceClass::GetClassID(CLSID* pClassID) {
 // ----------------------------------------------------------------------------
 // Load - read the task force's persistent state from a binary stream.
 //
-// The on-disk layout is: ID[24] | Grouping | MemberCount | for each member a
-// 24-byte type-name string plus Count, MinCount, MaxCount. Type pointers are
-// re-resolved by name after the type registries have been loaded.
+// asm: TaskForceClass_Load (0x6E86A0) retn 8 —— 链 AbstractClass::Load 之后
+// 重新盖章本类 vtable，再对 6 项成员槽逐个调用 SwizzleManager 还原指针。
+// OpenYR 无原版 Swizzle 机制，改按名称重新绑定 TechnoTypeClass*。
 // ----------------------------------------------------------------------------
 HRESULT TaskForceClass::Load(IStream* pStm) {
     if (!pStm) return E_POINTER;
@@ -104,18 +103,22 @@ HRESULT TaskForceClass::Load(IStream* pStm) {
     ULONG read = 0;
     HRESULT hr = S_OK;
 
-    // Read ID
+    // 读 ID
     char idBuf[0x18];
     hr = pStm->Read(idBuf, sizeof(idBuf), &read);
     if (hr < 0 || read != sizeof(idBuf)) return E_FAIL;
     std::memcpy(ID, idBuf, sizeof(ID));
     ID[sizeof(ID) - 1] = '\0';
 
-    // Read Grouping
+    // 读 Group
     hr = pStm->Read(&Grouping, sizeof(Grouping), &read);
     if (hr < 0 || read != sizeof(Grouping)) return E_FAIL;
 
-    // Read member count
+    // 读 isGlobal
+    hr = pStm->Read(&IsGlobal, sizeof(IsGlobal), &read);
+    if (hr < 0 || read != sizeof(IsGlobal)) return E_FAIL;
+
+    // 读成员条目数
     int32 memCount = 0;
     hr = pStm->Read(&memCount, sizeof(memCount), &read);
     if (hr < 0 || read != sizeof(memCount)) return E_FAIL;
@@ -142,8 +145,7 @@ HRESULT TaskForceClass::Load(IStream* pStm) {
         member.MinCount = minCount;
         member.MaxCount = maxCount;
         if (typeName[0]) {
-            member.Type = static_cast<TechnoTypeClass*>(
-                TechnoTypeClass::Find(typeName));
+            member.Type = TechnoTypeClass::Find(typeName);
         }
         Members.Add(member);
     }
@@ -153,6 +155,9 @@ HRESULT TaskForceClass::Load(IStream* pStm) {
 
 // ----------------------------------------------------------------------------
 // Save - write the task force's persistent state to a binary stream.
+//
+// asm: TaskForceClass_Save (0x6E8870) retn 0Ch —— 仅链 AbstractClass::Save，
+// 返回其 HRESULT（<0 保留，否则归零）。
 // ----------------------------------------------------------------------------
 HRESULT TaskForceClass::Save(IStream* pStm, BOOL fClearDirty) {
     if (!pStm) return E_POINTER;
@@ -165,6 +170,9 @@ HRESULT TaskForceClass::Save(IStream* pStm, BOOL fClearDirty) {
 
     hr = pStm->Write(&Grouping, sizeof(Grouping), &written);
     if (hr < 0 || written != sizeof(Grouping)) return E_FAIL;
+
+    hr = pStm->Write(&IsGlobal, sizeof(IsGlobal), &written);
+    if (hr < 0 || written != sizeof(IsGlobal)) return E_FAIL;
 
     int32 memCount = Members.Count;
     hr = pStm->Write(&memCount, sizeof(memCount), &written);
@@ -211,104 +219,126 @@ int32 TaskForceClass::Size() const {
     return sizeof(TaskForceClass);
 }
 
+// asm: TaskForceClass_GetAbstractDerivationID (0x6E87D4) —— 返回常量 0x21 = 33
+AbstractType TaskForceClass::GetAbstractDerivationID() const {
+    return AbstractType::TaskForce;
+}
+
+// ----------------------------------------------------------------------------
+// GetTechLevel - asm: TaskForceClass_GetTechLevel (0x6E87E0)
+// 遍历成员，取各成员类型 Prerequisite[0] 的最大值；若某成员的前提列表首项为
+// -1（"需全部前提"）且会话正在运行，则记为 0x0B。任何成员按 -1 记 0x0B。
+// ----------------------------------------------------------------------------
+int32 TaskForceClass::GetTechLevel() const {
+    int32 techLevel = 0;
+    const int32 count = Members.Count;
+    if (count <= 0) return techLevel;
+
+    for (int32 i = 0; i < count; ++i) {
+        const TechnoTypeClass* pType = Members.Items[i].Type;
+        if (pType == nullptr) continue;
+
+        int32 prereq = 0;
+        if (pType->Prerequisite.Count > 0) {
+            prereq = pType->Prerequisite[0];
+        }
+
+        if (prereq > techLevel) {
+            techLevel = prereq;
+        } else if (prereq == -1 && TheSession != nullptr) {
+            techLevel = 0x0B;
+        }
+    }
+    return techLevel;
+}
+
 // ============================================================================
 // INI loading
 //
-// The original game stores task forces in [TaskForces] as a list of IDs.
-// Each ID has its own section containing numbered entries "N=type,count"
-// plus an optional "Group" key.
+// asm: TaskForceClass_LoadFromINI (0x6E84F0) retn 4
+//   链 AbstractTypeClass::LoadFromINI；随后清空成员表，对 key=0..5 依次
+//   GetString(本段, "N")，非空则 LoadObjects 解析 "数量,单位ID"；仅当解析出的
+//   类型非空才把该成员计入 cntObjects。最后读 [Group] 整型（默认沿用旧值）。
 // ============================================================================
 
 bool TaskForceClass::LoadFromINI(CCINIClass* pINI) {
     if (!pINI) return false;
 
-    char sectionName[64];
-    snprintf(sectionName, sizeof(sectionName), "%s", this->ID);
-    if (!pINI->SectionExists(sectionName)) return false;
+    const char* sectionName = this->ID;
 
-    // Read the grouping (formation tightness) if present.
-    Grouping = pINI->ReadInteger(sectionName, "Group", Grouping);
-
-    // Read the "Name" display label.
-    char nameBuf[0x31];
-    pINI->ReadString(sectionName, "Name", "", nameBuf, sizeof(nameBuf));
-    if (nameBuf[0]) {
-        int32 i = 0;
-        while (nameBuf[i] && i < static_cast<int32>(sizeof(Name)) - 1) {
-            Name[i] = nameBuf[i];
-            ++i;
-        }
-        Name[i] = '\0';
+    // asm: 先走基类解析（Name/UIName/Cost/TechLevel），失败则整体失败。
+    if (!AbstractTypeClass::LoadFromINI(pINI)) {
+        return false;
     }
 
-    // Parse every numbered member entry. The INI format is:
-    //   0=GI,2
-    //   1=Engineer,1
-    // The value is "unitTypeID,count". We also support an extended
-    // "unitTypeID,count,minCount,maxCount" form for editor compatibility.
     Members.Clear();
-    for (int32 i = 0; i < 50; ++i) {
-        char keyName[32];
-        snprintf(keyName, sizeof(keyName), "%d", i);
 
-        char entryStr[128];
-        pINI->ReadString(sectionName, keyName, "", entryStr, sizeof(entryStr));
-        if (!entryStr[0]) break;
+    // asm: 硬编码 6 项上限。
+    for (int32 i = 0; i < 6; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
 
-        // Tokenise the value by commas.
-        char typeBuf[0x18];
-        int32 count = 0, minCount = 0, maxCount = 0;
-        int32 fieldIndex = 0;
-
-        char* token = entryStr;
-        char* comma = strchr(entryStr, ',');
-        while (token) {
-            if (comma) *comma = '\0';
-            if (fieldIndex == 0) {
-                int32 k = 0;
-                while (token[k] && k < static_cast<int32>(sizeof(typeBuf)) - 1) {
-                    typeBuf[k] = token[k];
-                    ++k;
-                }
-                typeBuf[k] = '\0';
-            } else if (fieldIndex == 1) {
-                count = atoi(token);
-            } else if (fieldIndex == 2) {
-                minCount = atoi(token);
-            } else if (fieldIndex == 3) {
-                maxCount = atoi(token);
-            }
-            ++fieldIndex;
-            if (comma) {
-                token = comma + 1;
-                comma = strchr(token, ',');
-            } else {
-                token = nullptr;
-            }
+        char value[0x80];
+        value[0] = '\0';
+        if (pINI->ReadString(sectionName, key, "", value, sizeof(value)) <= 0) {
+            continue;
         }
-
-        if (fieldIndex < 2) count = 1;  // default count if only type given
 
         TaskForceMember member;
-        member.Count = count;
-        member.MinCount = minCount;
-        member.MaxCount = (maxCount > 0) ? maxCount : count;
-        member.Type = nullptr;
-        if (typeBuf[0] && _strcmpi(typeBuf, "<none>") != 0) {
-            member.Type = static_cast<TechnoTypeClass*>(
-                TechnoTypeClass::Find(typeBuf));
+        LoadObjects(&member, value);
+        if (member.Type != nullptr) {
+            Members.Add(member);
         }
-        Members.Add(member);
     }
 
+    // asm: GetInteger(section, "Group", fallback = 旧 Grouping)。
+    Grouping = pINI->ReadInteger(sectionName, "Group", Grouping);
+
+    (void)sectionName;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// SaveToINI - asm: TaskForceClass_SaveToINI (0x6E852F) retn 4
+//   链 AbstractTypeClass::SaveToINI；对 key=0..5：若 i < cntObjects 则把
+//   第 i 个成员格式化 "数量,单位ID" 写回，否则写空串清除陈旧键；最后写
+//   [Group] 整型（十六进制无）。
+// ----------------------------------------------------------------------------
+bool TaskForceClass::SaveToINI(CCINIClass* pINI) {
+    if (pINI == nullptr) return false;
+
+    if (!AbstractTypeClass::SaveToINI(pINI)) {
+        return false;
+    }
+
+    const int32 count = Members.Count;
+
+    for (int32 i = 0; i < 6; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "%d", i);
+
+        if (i < count) {
+            const TaskForceMember& m = Members.Items[i];
+            char value[0x80];
+            const char* pName = (m.Type != nullptr) ? m.Type->ID : "";
+            snprintf(value, sizeof(value), "%d,%s", m.Count, pName);
+            pINI->WriteString(this->ID, key, value);
+        } else {
+            // mangleStuff_：清除越界的陈旧编号键。
+            pINI->WriteString(this->ID, key, "");
+        }
+    }
+
+    pINI->WriteInteger(this->ID, "Group", Grouping, false);
     return true;
 }
 
 // ============================================================================
 // CRC computation
 //
-// Feeds the task force's ID, grouping and member list into the CRC engine so
-// the multiplayer sync check can detect team-composition divergence.
+// asm: TaskForceClass_GetCRC (0x6E87FC) retn 4
+//   链 AbstractTypeClass::GetCRC(buf)，随后把本对象 Group(+0x98) 与成员数
+//   (+0x9C) 各喂入一个 DWORD。
 // ============================================================================
 
 int32 TaskForceClass::GetCRC() const {
@@ -453,13 +483,42 @@ bool TaskForceClass::Is_Valid() const {
 }
 
 // ----------------------------------------------------------------------------
+// LoadObjects - asm: TaskForceClass_LoadObjects (0x6E7E90) retn 4
+//   __thiscall (TaskForceMember* pOut, const char* str)。把 "数量,单位ID"
+//   经 sscanf("%d,%s") 拆开：数量入 pOut->Count，ID 依次在步兵/载具/飞机
+//   三张类型表中解析，命中即写 pOut->Type（未命中保持空）。
+// ----------------------------------------------------------------------------
+void TaskForceClass::LoadObjects(TaskForceMember* pOut, const char* str) {
+    if (pOut == nullptr) return;
+    pOut->Count = 0;
+    pOut->MinCount = 0;
+    pOut->MaxCount = 0;
+    pOut->Type = nullptr;
+    if (str == nullptr) return;
+
+    int32 count = 0;
+    char objID[0x40];
+    objID[0] = '\0';
+    if (sscanf(str, "%d,%63s", &count, objID) != 2) {
+        return;
+    }
+
+    pOut->Count = count;
+    if (objID[0] && _strcmpi(objID, "<none>") != 0 && _strcmpi(objID, "none") != 0) {
+        pOut->Type = TechnoTypeClass::Find(objID);
+    }
+    pOut->MinCount = count;
+    pOut->MaxCount = count;
+}
+
+// ----------------------------------------------------------------------------
 // CreateFromINIList - TaskForceClass_CreateFromINIList (asm 0x6E822B)
 //
-//   Walks the [TaskForces] section.  Each key's value names the task force to
-//   create; the sentinels "<none>" and "none" are skipped, and a name that is
-//   already registered is reused rather than duplicated.
+//   __fastcall (CCINIClass* this, int global)。遍历 [TaskForces] 段：每个键
+//   的值即要创建的特遣队名；"<none>"/"none" 跳过，已登记的名称复用而非重建；
+//   新建时把 global 写入该对象的 isGlobal。
 // ----------------------------------------------------------------------------
-void TaskForceClass::CreateFromINIList(CCINIClass* pINI)
+void TaskForceClass::CreateFromINIList(CCINIClass* pINI, int32 global)
 {
     if (pINI == nullptr) {
         return;
@@ -487,14 +546,57 @@ void TaskForceClass::CreateFromINIList(CCINIClass* pINI)
 
         TaskForceClass* pItem = FindOrAllocate(name);
         if (pItem != nullptr) {
+            pItem->IsGlobal = global;
             pItem->LoadFromINI(pINI);
         }
     }
 }
 
+// ----------------------------------------------------------------------------
+// SaveListToINI - asm: TaskForceClass_SaveListToINI (0x6E833F) retn 0
+//   __fastcall (CCINIClass* this, int global)。先遍历 [TaskForces] 现有键做
+//   一次规范化（mangleStuff_：写空串清除），再对 isGlobal==global 的对象
+//   按序号 0.. 写回其名称并调用各自的 SaveToINI。
+// ----------------------------------------------------------------------------
+void TaskForceClass::SaveListToINI(CCINIClass* pINI, int32 global)
+{
+    if (pINI == nullptr) {
+        return;
+    }
+
+    static const char* const SECTION = "TaskForces";
+
+    // 规范化：把现有编号键全部清空，随后按归属逐个重写。
+    int32 existing = pINI->GetKeyCount(SECTION);
+    for (int32 i = 0; i < existing; ++i) {
+        const char* pKeyName = pINI->GetKeyName(SECTION, i);
+        if (pKeyName != nullptr) {
+            pINI->WriteString(SECTION, pKeyName, "");
+        }
+    }
+
+    if (!Array) {
+        return;
+    }
+
+    int32 idx = 0;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        TaskForceClass* pTF = Array->GetItem(i);
+        if (pTF == nullptr || pTF->IsGlobal != global) {
+            continue;
+        }
+
+        char key[16];
+        snprintf(key, sizeof(key), "%d", idx);
+        ++idx;
+        pINI->WriteString(SECTION, key, pTF->ID);
+        pTF->SaveToINI(pINI);
+    }
+}
+
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知特遣支队的成员盘点是逐项累加各条目的数量字段；
-// 过时查找面则按标识符做大小写不敏感的线性比对。
+// asm: int __thiscall TaskForceClass_CountObjects(AITaskTypeClass *this)
+// 逐项累加成员数量。
 // ------------------------------------------------------------------------
 int32 TaskForceClass::CountObjects() const
 {
@@ -520,58 +622,4 @@ TaskForceClass* TaskForceClass::Find_obsolete(const char* pID)
         }
     }
     return nullptr;
-}
-
-// ------------------------------------------------------------------------
-// 根据游戏行为，可知成员清单以"数量,类型"成对读取，遇到空段或
-// 截断的键即停止；类型表驱动逐项展开。
-// ------------------------------------------------------------------------
-void TaskForceClass::LoadObjects(CCINIClass* pINI, const char* pSection)
-{
-    if (pINI == nullptr || pSection == nullptr) {
-        return;
-    }
-
-    Members.Clear();
-    for (int32 i = 0; i < 128; ++i) {
-        char value[256];
-        char key[16];
-        snprintf(key, sizeof(key), "%d", i);
-        if (pINI->ReadString(pSection, key, "", value, sizeof(value)) <= 0) {
-            break;
-        }
-
-        int32 count = 0;
-        char typeName[64];
-        typeName[0] = '\0';
-        if (sscanf(value, "%d,%63s", &count, typeName) != 2) {
-            break;
-        }
-
-        TaskForceMember member;
-        member.Count = count;
-        member.MinCount = count;
-        member.MaxCount = count;
-        member.Type = TechnoTypeClass::Find(typeName);
-        Members.AddItem(member);
-    }
-}
-
-bool TaskForceClass::SaveListToINI(CCINIClass* pINI, const char* pSection)
-{
-    if (pINI == nullptr || pSection == nullptr) {
-        return false;
-    }
-
-    const int32 count = Members.GetCount();
-    for (int32 i = 0; i < count; ++i) {
-        char key[16];
-        char value[128];
-        snprintf(key, sizeof(key), "%d", i);
-        const TaskForceMember& member = Members[i];
-        const char* pName = (member.Type != nullptr) ? member.Type->ID : "";
-        snprintf(value, sizeof(value), "%d,%s", member.Count, pName);
-        pINI->WriteString(pSection, key, value);
-    }
-    return count > 0;
 }

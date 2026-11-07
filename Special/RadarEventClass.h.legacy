@@ -1,0 +1,90 @@
+#pragma once
+
+#include "../Core/Definitions.h"
+#include "../Core/Macros.h"
+#include "../Core/Memory.h"
+
+// ============================================================================
+// RadarEventClass —— 雷达警报事件
+//
+// asm 权威布局（RadarEventClass, sizeof=0x3F, mappedto_1960）：
+//   +0x00  int32      Type
+//   +0x04  int32      field_4
+//   +0x08  int32      field_8
+//   +0x0C  int32      field_C
+//   +0x10  float/int32 Pi_slash_four    π/4，用于角度→扇区换算
+//   +0x14  int32      RotationSpeed
+//   +0x18  int32      field_18
+//   +0x1C  int32      ColorSpeed
+//   +0x20  wXY        Position           struct { int16 X; int16 Y; }
+//   +0x24  int32      field_24
+//   +0x28  int32      field_28
+//   +0x2C  int32      field_2C
+//   +0x30  int32      field_30
+//   +0x34  int32      field_34
+//   +0x38  int32      field_38
+//   +0x3C  uint8      field_3C
+//   +0x3D  uint8      field_3D
+//   +0x3E  uint8      field_3E
+//
+// 容器 DV_RadarEventClass（sizeof=0x18, mappedto_5728）即
+// DynamicVectorClass<RadarEventClass*>，全局实例为 vec_RadarEvents。
+// ============================================================================
+
+struct RadarEventPosition   // asm: wXY
+{
+    int16 X;                // +0x00
+    int16 Y;                // +0x02
+};
+
+class RadarEventClass
+{
+public:
+    int32    Type;              // +0x00
+    int32    field_4;           // +0x04
+    int32    field_8;           // +0x08
+    int32    field_C;           // +0x0C
+    int32    Pi_slash_four;     // +0x10  π/4
+    int32    RotationSpeed;     // +0x14
+    int32    field_18;          // +0x18
+    int32    ColorSpeed;        // +0x1C
+    RadarEventPosition Position;// +0x20
+    int32    field_24;          // +0x24
+    int32    field_28;          // +0x28
+    int32    field_2C;          // +0x2C
+    int32    field_30;          // +0x30
+    int32    field_34;          // +0x34
+    int32    field_38;          // +0x38
+    uint8    field_3C;          // +0x3C
+    uint8    field_3D;          // +0x3D
+    uint8    field_3E;          // +0x3E
+
+    // 全局事件表（asm: vec_RadarEvents，DV_RadarEventClass）。
+    static DynamicVectorClass<RadarEventClass*>* Array;
+
+    // ========================================================================
+    // asm: RadarEventClass_ClearVector (0x660B00)
+    //
+    // 从尾到头遍历事件表，逐个调用虚表 +0x10（FindIndex）定位自身下标，
+    // 命中则先压缩数组再 delete 该对象。asm 逐段：
+    //
+    //   push ecx / mov eax,vec_RadarEvents.Count / lea edi,[eax-1]
+    //   test edi,edi / jl done
+    // loc_660B0F:
+    //   mov esi,[ecx+edi*4] / test esi,esi / jz next
+    //   lea edx,[esp+var_4] / push edx / mov ecx,offset vec_RadarEvents
+    //   mov [esp+var_4],esi / call [eax+10h]        ; 虚表 FindIndex(&item)
+    //   cmp eax,0FFFFFFFFh / jz delete
+    //   mov ecx,Count / cmp eax,ecx / jge delete
+    //   dec ecx / cmp eax,ecx / mov Count,ecx / jge delete
+    // loc_660B4C:                                    ; 压缩
+    //   mov ecx,data / inc eax / mov edx,[ecx+eax*4] / mov [ecx+eax*4-4],edx
+    //   mov ecx,Count / cmp eax,ecx / jl loc_660B4C
+    // loc_660B64:
+    //   push esi / call delete
+    // loc_660B6D:
+    //   dec edi / jns loc_660B0F
+    // done:
+    // ========================================================================
+    static void Clear_Vector();
+};

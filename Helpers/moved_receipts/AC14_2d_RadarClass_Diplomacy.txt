@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex14.cpp
+start=1373
+end=1791
+symbol=RadarClass_Diplomacy_DialogFunc
+target=Rendering/RadarClass.cpp

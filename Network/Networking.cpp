@@ -26,6 +26,7 @@ NetworkingClass::NetworkingClass()
     , LobbyFrame(0), SyncFrame(0), SyncInterval(60)
     , CRCErrors(0), MaxCRCErrors(10), DesyncDetected(false)
     , ChatMessageCount(0), MaxAheadFrames(10)
+    , FrameSendRate(6)
     , FrameBufferSize(30), ReceivedFrameCount(0)
     , SentFrameCount(0), AckedFrameCount(0)
 {

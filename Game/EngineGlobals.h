@@ -20,7 +20,9 @@ public:
     static void* Get_Grey_Remap_Ptr(int32 houseIndex);
     static void* Starting_Locations();
     static const char* Get_String(const char* pKey);
-    static void* Mono_ScreenPtr_5BC450();
+    // asm: Get_Mono_ScreenPtr_5BC450 (0x5BC450) —— fastcall，ecx = 索引，
+    // 返回 dword_ABF168[ecx]（5 项单色调试屏全局表）。
+    static void* Mono_ScreenPtr_5BC450(int32 index);
     static bool Audio_Thread_State();
     static void* House_PCX_Icon(int32 houseIndex);
 

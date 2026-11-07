@@ -388,6 +388,72 @@ int32 PaletteClass::Get_Closest_Color(const RGBClass& color) const
 // Utility
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// asm: Palette_FillBuffer (0x4BBAC0)
+//
+//   ; void __fastcall Palette_FillBuffer(WORD *a1, int len, Palette *source)
+//   ecx = a1（目标 16bpp 缓冲）; edx = len（调色板组数）;
+//   stack arg = source（8bit RGB 三元组流），retn 4。
+//
+//   逐句对照（asm 行 421874-422006）：
+//     cmp esi,1 / jl 结束              —— len < 1 直接返回
+//     lea eax,[esi-1] / test / jl 结束 —— len == 1 也直接返回（见下注）
+//     外层 g 由 var_C(=0) 每轮 += 0x20000、var_8(=len-1) 每轮 -- 计数
+//     内层 i: 0..0x100，ebx（目标游标）每轮 +2
+//       ecx = (i * 0x100 + g*?) 的字节偏移，取 3 个字节 R/G/B
+//       R = [p] << 0 ；G = [p+1] ；B = [p+2]
+//       各 imul f / sar 16 / 上限 0xFF
+//       再按 col_* 移位打包进 WORD
+//
+//   注：asm 的进入判据 `cmp esi,1 / jl` 与 `lea eax,[esi-1] / test eax,eax
+//       / jl` 两条合起来是 len <= 1 时直接返回 —— 也就是说 len == 1
+//       时**不写任何像素**（asm 在那种情况下走 loc_4BBC1B 直接 retn），
+//       而不是"用 0x10000 因子填一遍"。loc_4BBB47 里的
+//       `mov eax, 10000h` 只在 len > 1 的循环体内、被外层计数逻辑
+//       用到时才可达；这里照 asm 的门槛保留 len <= 1 直接返回。
+// ----------------------------------------------------------------------------
+void PaletteClass::FillBuffer(uint16* pDest, int32 count, const uint8* pSource)
+{
+    // asm: cmp esi,1 / jl loc_4BBC1B  —— 只挡 <= 0；
+    //   len == 1 是“单组、不缩放”的合法情况（原版注释：因子取 0x10000）。
+    //   旧实现把 len == 1 一并 return，等于把整张表留成黑色，
+    //   于是所有 ConvertClass(…, 1, …) 建出来的调色板全黑。
+    if (pDest == nullptr || pSource == nullptr || count <= 0) {
+        return;
+    }
+
+    const int32 groups = (count > 1) ? count : 1;
+    int32 factorAccum = 0;          // asm: var_C，16.16 域内的增量累加器
+
+    for (int32 g = 0; g < groups; ++g) {
+        // asm: cmp esi,1 / jle -> 0x10000 ；否则 eax=var_C / idiv (esi-1)
+        const int32 factor = (count > 1)
+                                 ? (factorAccum / (count - 1))
+                                 : 0x10000;
+
+        for (int32 i = 0; i < PALETTE_SIZE; ++i) {
+            const uint8* p = pSource + (g * PALETTE_SIZE + i) * 3;
+
+            // asm: mov dl,[ecx] / imul esi,eax / sar esi,10h（见下注2）
+            //      cmp esi,0FFh / jl / mov esi,0FFh
+            int32 r = (static_cast<int32>(p[0]) * factor) >> 16;
+            int32 gg = (static_cast<int32>(p[1]) * factor) >> 16;
+            int32 b = (static_cast<int32>(p[2]) * factor) >> 16;
+            if (r > 0xFF) r = 0xFF;
+            if (gg > 0xFF) gg = 0xFF;
+            if (b > 0xFF) b = 0xFF;
+
+            // asm: 按 col_R_SHR_3/SHL_11、col_G_SHR_2/SHL_5、
+            //      col_B_SHR_3/SHL_0 移位后 or 起来
+            pDest[g * PALETTE_SIZE + i] = static_cast<uint16>(
+                ((r >> 3) << 11) | ((gg >> 2) << 5) | ((b >> 3) << 0));
+        }
+
+        // asm: mov ecx,var_C / add ecx,20000h ; mov eax,var_8 / dec eax
+        factorAccum += 0x20000;
+    }
+}
+
 void PaletteClass::Clear()
 {
     for (int32 i = 0; i < PALETTE_SIZE; ++i) {
@@ -444,4 +510,35 @@ bool PaletteClass::Is_Black() const
         }
     }
     return true;
+}
+
+// ============================================================================
+// Palette_FillWith  (asm: Palette_FillWith, 0x626000)
+//
+//   edx = this+2 ; esi = 0x100 ; bl = 0
+// clear_loop:                       ; zero 256 RGB triplets
+//   [edx-2] = bl ; [edx-1] = bl ; [edx] = bl ; edx += 3
+//   esi-- / jnz
+//   edi = fill                       ; the source RGB triplet
+// fill_loop:                        ; copy 256 triplets (2+1 byte moves)
+//   [edx] = word [edi] ; [edx+2] = byte [edi+2]
+// ============================================================================
+void PaletteClass::FillWith(const RGBClass& fill)
+{
+    // asm clear loop: 256 entries zeroed (values overwritten below, kept for
+    // exactness with the original's two-phase structure).
+    for (int32 i = 0; i < 256; ++i) {
+        RGBClass& entry = Get_Color(i);
+        entry.Red   = 0;
+        entry.Green = 0;
+        entry.Blue  = 0;
+    }
+
+    // asm fill loop: one triplet replicated 256 times.
+    for (int32 i = 0; i < 256; ++i) {
+        RGBClass& entry = Get_Color(i);
+        entry.Red   = fill.Red;
+        entry.Green = fill.Green;
+        entry.Blue  = fill.Blue;
+    }
 }

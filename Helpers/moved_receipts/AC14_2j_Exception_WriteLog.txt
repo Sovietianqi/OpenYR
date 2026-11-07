@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex14.cpp
+start=4536
+end=5104
+symbol=Exception_WriteLog
+target=Core/ExceptionHandler.cpp

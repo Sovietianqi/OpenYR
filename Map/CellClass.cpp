@@ -1,4 +1,5 @@
 #include "CellClass.h"
+#include <cstdio>
 #include <vector>
 #include <queue>
 #include <utility>
@@ -9,9 +10,11 @@
 #include "../Abstract/TerrainClass.h"
 #include "../Abstract/OverlayClass.h"
 #include "../Abstract/OverlayTypeClass.h"
+#include "../FileFormats/SHP.h"
 #include "../Rules/RulesClass.h"
 #include "../Game/Externs.h"
 #include "../Objects/IsometricTileGlobals.h"
+#include "../Objects/IsometricTile.h"
 #include "../Special/TiberiumClass.h"
 #include "../Abstract/SmudgeClass.h"
 #include "../Houses/HouseClass.h"
@@ -24,11 +27,22 @@
 #include "../COM/IUnknown.h"
 
 #include <cstring>
+#include <cmath>
+#include "../Abstract/TechnoClass.h"
+#include "../Abstract/AircraftClass.h"
 
 // 根据游戏行为，可知 HasAbility 在本项目里接收的是 VeteranAbilities /
 // EliteAbilities 数组下标（0..3），而不是原版的位掩码。VEIN_PROOF 在原版
 // 位图里占第 3 位，故此处用下标 3 表达"脚下免疫矿脉"这一能力。
 static const int32 ABILITY_VEIN_PROOF_INDEX = 3;
+
+// asm's "IsTechno" test (ObjectClass flag at +0x14 bit 0) selects the four
+// techno abstract kinds; terrain / smudge / etc. are not technos.
+inline bool IsTechnoObject(const ObjectClass* pObj) {
+    const AbstractType what = pObj->WhatAmI();
+    return what == AbstractType::Infantry || what == AbstractType::Unit
+        || what == AbstractType::Aircraft || what == AbstractType::Building;
+}
 
 // ============================================================================
 // File-local helpers
@@ -104,9 +118,11 @@ void CellClass::Init() {
     TiberiumValue = 0;
     WallOwner = -1;
     CrateType = 0;
+    ContentCount = 0;
     IsUnderShroud = false;
     GapsCoveringCell = 0;
     Field_12C = 0;
+    LastRadarEventTime = 0;
     unknown_38 = 0;
     unknown_3C = 0;
     unknown_40 = 0;
@@ -329,6 +345,204 @@ CoordStruct CellClass::Get_CellCoords() const {
     return coord;
 }
 
+// ============================================================================
+// asm: CellClass_Update_Cell?? (真实入口 0x47FDFB，retn 4)
+//
+//   算出这一格叠加物图标在屏幕上的锚点，写进 pOut，并把 pOut 返回。
+//   逐句对照见头文件注释；这里只补两处实现细节：
+//
+//   * 格心 lepton 的构造形如
+//       ((c * 256) + 0x80 + (sign ? 0xFF : 0)) >> 8 << 8
+//     前两项把格坐标放大到 lepton 域并加半格，第三项是 C 除法向零取整的
+//     补偿（负数时补 0xFF），最后 >>8<<8 把低 8 位抹平到 256 的整数倍。
+//   * 宽高深三个量取自 SHP 头的 Frames/Height/Width 字段（asm 里的
+//     [shape+6] / [shape+2] / [shape+4]），half 计算用向零取整的 /2。
+//
+//   sub_480110 与 sub_69E7E0 尚未移植（见头文件注 3）：前者保守返回零偏移，
+//   后者保守返回全零顶点，调用点均已按 asm 形态保留。
+// ============================================================================
+
+namespace {
+
+// asm 里的向零取整折半：cdq / sub eax,edx / sar eax,1
+inline int32 CellUpdateRoundTowardZeroHalf(int32 v)
+{
+    return (v + (v < 0 ? 1 : 0)) >> 1;
+}
+
+// asm 的格心 lepton 构造：
+//   shl eax,8 / add eax,80h / cdq / and edx,0FFh / add eax,edx / sar 8 / shl 8
+inline int32 CellUpdateCenterLepton(int16 cellCoord)
+{
+    int32 lep = (static_cast<int32>(cellCoord) << 8) + 0x80;
+    lep += (lep < 0) ? 0xFF : 0;
+    return (lep >> 8) << 8;
+}
+
+} // namespace
+
+// ============================================================================
+// CellClass::Get_Overlay_Draw_Offset —— asm sub_480110 + sub_5FDCC0
+// ============================================================================
+Point2D CellClass::Get_Overlay_Draw_Offset() const
+{
+    // ---- ① sub_5FDCC0：覆盖物类型自带的纵向偏移 ------------------------
+    int32 dy = 0;
+
+    OverlayTypeClass* pType = nullptr;
+    if (OverlayTypeClass::Array != nullptr && Overlay >= 0
+        && Overlay < OverlayTypeClass::Array->Count)
+    {
+        pType = OverlayTypeClass::Array->GetItem(Overlay);
+    }
+
+    if (pType != nullptr)
+    {
+        // asm: mov bl,[esi+2A9h] / test / jnz -> ecx = -0Ch
+        //      mov bl,[esi+2A8h] / test / jnz -> ecx = -0Ch
+        //      cmp dword ptr [esi+294h], 7Eh / jz -> ecx = -0Ch
+        if (pType->IsTiberium || pType->Wall || pType->HeapID == 0x7E)
+            dy = -0x0C;
+
+        // asm: cmp dword ptr [esi+298h], 9 / jnz / dec ecx
+        if (static_cast<int32>(pType->LandValue) == 9)
+            --dy;
+    }
+
+    // asm: cmp edx, 7Eh / jnz / dec ecx   （edx = 覆盖物索引）
+    if (Overlay == 0x7E)
+        --dy;
+
+    // ---- ② sub_480110：桥面 / 填充物 ------------------------------------
+    // asm: mov al,[esi+CellClass.flags] / test al,80h
+    if ((Field_140 & 0x80u) != 0u)
+    {
+        // asm: sub ecx,10h
+        dy -= 0x10;
+
+        // asm: mov al,[esi+CellClass.Powerup] / cmp al,9 / jb ; cmp al,11h / ja
+        //   +0x11E 这个字节在本工程里叫 OverlayFrame（同一格字节，
+        //   Update_Cell 里也按它取生长阶段）。
+        const int32 powerup = static_cast<int32>(OverlayFrame);
+        if (powerup >= 9 && powerup <= 0x11)
+            dy -= 0x0F;
+    }
+    else
+    {
+        // asm: cmp dword ptr [esi+44h], 0EFFh / jnz / sub ecx,0Fh
+        if (Overlay == 0xEF)
+            dy -= 0x0F;
+    }
+
+    // ---- ③ 高度：每层 15 像素，越高屏幕 Y 越小 ---------------------------
+    // asm: movsx eax,byte ptr [esi+11Bh] / lea eax,[eax+eax*2] /
+    //      lea eax,[eax+eax*4]  =>  Level * 15
+    //      mov esi, rect_mouseclass_vp.L / sub esi, eax / add ecx, esi
+    //   rect_mouseclass_vp.L 是全屏战术视口左上角（0），见
+    //  OverlayTypeClass::Draw 的同款处理。
+    dy -= static_cast<int32>(static_cast<int8>(LandByte)) * 15;
+
+    // ---- 尾项的取舍 ------------------------------------------------------
+    // asm 最后还有 `add ecx,0Fh`（Y）与 `add edx,1Eh`（X）。这两个常数
+    // 恰好就是 OverlayTypeClass::Draw 内部加的 (0x1E, 0x0F)，因此这里
+    // 不再重复 —— 返回的是"叠加在格心之前的净偏移"。
+    return Point2D(0, dy);
+}
+
+CoordStruct* CellClass::Update_Cell(CoordStruct* pOut)
+{
+    if (pOut == nullptr) {
+        return nullptr;
+    }
+
+    // asm: mov eax,[edi+44h] / cmp eax,-1 / jz -> 写零返回
+    if (Overlay == -1) {
+        *pOut = CoordStruct(0, 0, 0);
+        return pOut;
+    }
+
+    // asm: mov ecx,OverlayTypeClass / mov esi,[ecx+eax*4]
+    //      mov ecx,esi / mov edx,[esi] / call dword ptr [edx+9Ch]
+    OverlayTypeClass* pType = (OverlayTypeClass::Array != nullptr &&
+                               Overlay < OverlayTypeClass::Array->Count)
+                                  ? (*OverlayTypeClass::Array)[Overlay]
+                                  : nullptr;
+
+    SHPStruct* pShape = (pType != nullptr) ? pType->GetImage() : nullptr;
+
+    // asm: mov ebx,eax / test ebx,ebx / jz -> 写零返回
+    if (pShape == nullptr) {
+        *pOut = CoordStruct(0, 0, 0);
+        return pOut;
+    }
+
+    // asm: mov al,[edi+11Eh] / mov [esp+this.X],al
+    //      mov al,[esi+OverlayTypeClass.Crate] / test / jz / mov [..],0
+    int32 level = static_cast<int32>(OverlayFrame);
+    if (pType->Crate) {
+        level = 0;
+    }
+
+    // asm: Coord_Move 前的两串移位 —— 取本格格心的 lepton 坐标
+    const CoordStruct slotCoord(
+        CellUpdateCenterLepton(MapCoords.X),
+        CellUpdateCenterLepton(MapCoords.Y),
+        0);
+
+    // asm: Tactical::Coord_To_Pixel(TacticalMap, &slotCoord, &pix)
+    Point2D pix(0, 0);
+    if (TacticalClass::Instance != nullptr) {
+        pix = TacticalClass::Instance->To_Pixel(slotCoord);
+    }
+
+    // asm: mov ecx,edi / lea ecx,[esp+this] / push ecx / call sub_480110
+    //      sub_480110 返回 (0x1E, off)；调用方随后的 `pix.x += x - 0x1E`
+    //      把 X 的 0x1E 抵掉，净 X 偏移恒为 0；Y 上的 0x0F 尾项由
+    //      OverlayTypeClass::Draw 负责，这里只取净偏移。
+    const Point2D frameOffset = Get_Overlay_Draw_Offset();
+
+    // asm: pix.x += slotCoord.x - 0x1E ; pix.y += slotCoord.y
+    int32 px = pix.X + frameOffset.X - 0x1E;
+    int32 py = pix.Y + frameOffset.Y;
+
+    // asm: mov al,[edi+140h] / test al,80h / jz
+    //      mov al,[edi+11Eh] / cmp al,9 / jb ; cmp al,11h / ja
+    //      sub ecx,0Fh / add esi,7
+    if ((static_cast<uint32>(Flags) & 0x80u) != 0u && level >= 9 && level <= 0x11) {
+        px -= 0x0F;
+        py += 7;
+    }
+
+    // asm: w = [ebx+6] ; h = [ebx+2] ; dpt = [ebx+4]
+    const int32 shapeFrames = static_cast<int32>(pShape->Frames);
+    const int32 shapeHeight = static_cast<int32>(pShape->Height);
+    const int32 shapeWidth  = static_cast<int32>(pShape->Width);
+
+    // asm: cdq / sub eax,edx / sar ebp,1 / add ebp,ecx   —— half = w/2 + level
+    const int32 half = CellUpdateRoundTowardZeroHalf(shapeFrames) + level;
+
+    // asm: pix.x -= h/2 ; pix.y -= dpt/2
+    px -= CellUpdateRoundTowardZeroHalf(shapeHeight);
+    py -= CellUpdateRoundTowardZeroHalf(shapeWidth);
+
+    // asm: sub_69E7E0(shape, &tmp, half) —— SHP 帧顶点查询
+    //         asm: push ebp / lea edx,[esp+28h] / push edx /
+    //              mov ecx,ebx / call sub_69E7E0
+    //       输出四个 int32 = 帧记录里的 (x, y, w, h)；这里只取前两个当偏移。
+    //       帧号越界 / 形状未加载时，原版落到 someOtherRect
+    //       （InitList_2617 里四个字段全初始化为 0），GetFrameBounds 同样
+    //       返回全零矩形，语义一致。
+    Rectangle frameBounds(0, 0, 0, 0);
+    pShape->GetFrameBounds(frameBounds, half);
+
+    // asm: add ecx,edi / add edx,esi —— 顶点各自叠加像素偏移
+    pOut->X = frameBounds.X + px;
+    pOut->Y = frameBounds.Y + py;
+    pOut->Z = 0;
+
+    return pOut;
+}
+
 CoordStruct CellClass::Get_Cell_Position() const {
     return Get_CellCoords();
 }
@@ -495,6 +709,190 @@ int32 CellClass::Get_Z_Height() const {
     return Altitude * LevelHeight;
 }
 
+// ----------------------------------------------------------------------------
+// asm: int __thiscall CellClass_GetHeight(CellClass *this)
+//
+//    mov eax,[ecx+CellClass.flags]     ; flag word at +0x140
+//    movsx ecx,[ecx+CellClass.Level]   ; signed byte at +0x11B
+//    shr eax,7
+//    and eax,1                         ; CellFlags::BridgeOwner (0x80)
+//    lea eax,[ecx+eax*4]               ; level + (bridge ? 4 : 0)
+//    retn
+// ----------------------------------------------------------------------------
+int32 CellClass::Get_Height() const
+{
+    const int32 level = static_cast<int32>(static_cast<int8>(Level));
+    const int32 bridgeBias =
+        ((static_cast<uint32>(Flags) & static_cast<uint32>(CellFlags::BridgeOwner)) != 0u)
+            ? 4 : 0;
+    return level + bridgeBias;
+}
+
+// ----------------------------------------------------------------------------
+// asm: dwXYZ *__thiscall CellClass_GetCoords(CellClass *this, dwXYZ *out)
+//
+//    movsx esi,word ptr [ecx+24h]      ; X
+//    movsx edi,word ptr [ecx+26h]      ; Y
+//    shl esi,8 / shl edi,8
+//    add esi,80h / add edi,80h         ; cell centre in leptons
+//    call CellClass_GetFloorHeight     ; Z (ramp-interpolated ground height)
+//    out = { esi, edi, floorHeight }
+// ----------------------------------------------------------------------------
+CoordStruct* CellClass::GetCoords(CoordStruct* pOut) const
+{
+    if (pOut == nullptr)
+        return nullptr;
+
+    const int32 x = (static_cast<int32>(MapCoords.X) << 8) + 0x80;
+    const int32 y = (static_cast<int32>(MapCoords.Y) << 8) + 0x80;
+
+    pOut->X = x;
+    pOut->Y = y;
+    pOut->Z = GetFloorHeight(CoordStruct(x, y, 0));
+
+    return pOut;
+}
+
+// ----------------------------------------------------------------------------
+// asm: byte __thiscall CellClass_IsHidden(CellClass *this)   (asm:309932)
+//
+//   While the game runs it walks the ground content chain; the first building
+//   (WhatAmI == 6) short-circuits to the "building present" branch, which
+//   answers false only when the content count is exactly one.  With no
+//   building the answer is whether the content counter at +0x100 is non-zero.
+// ----------------------------------------------------------------------------
+bool CellClass::IsHidden() const
+{
+    if (GameActive)
+    {
+        ObjectClass* pObj = FirstObject;
+        while (pObj != nullptr)
+        {
+            if (pObj->WhatAmI() == AbstractType::Building)
+            {
+                // A building occupies the cell: hidden only when it is not the
+                // sole content (the count of one is the building itself).
+                return ContentCount != 0 && ContentCount != 1;
+            }
+            pObj = pObj->NextObject;
+        }
+    }
+
+    return ContentCount != 0;
+}
+
+// ----------------------------------------------------------------------------
+// asm: void *__thiscall CellClass_GetRadSite(CellClass *this)
+//      mov eax,[ecx+CellClass.RadSite] / retn
+// ----------------------------------------------------------------------------
+void* CellClass::Get_Rad_Site() const
+{
+    return RadSite;
+}
+
+// ----------------------------------------------------------------------------
+// asm: wchar_t *__thiscall CellClass_GetUIName(CellClass *this)
+//
+//    idx = Is_Overlay_Idx_Tiberium(this->Overlay)
+//    if (idx == -1) return null
+//    return vec_Tiberiums[idx]->UIName           (the pointer at +0x60)
+// ----------------------------------------------------------------------------
+const wchar_t* CellClass::GetUIName() const
+{
+    const int32 typeIndex = Is_Overlay_Idx_Tiberium(Overlay);
+    if (typeIndex == -1)
+        return nullptr;
+
+    TiberiumClass* pType = TiberiumClass::FindByIndex(typeIndex);
+    if (pType == nullptr)
+        return nullptr;
+
+    return pType->UIName;
+}
+
+// ----------------------------------------------------------------------------
+// asm: CellClass_GetAbstractDerivationID  (mov eax,0Bh ; retn)
+// ----------------------------------------------------------------------------
+int32 CellClass::Get_AbstractDerivationID() const
+{
+    return static_cast<int32>(AbstractType::Cell);
+}
+
+// ----------------------------------------------------------------------------
+// asm: CellClass_GetSize  (mov eax,148h ; retn)
+// ----------------------------------------------------------------------------
+int32 CellClass::Get_Size() const
+{
+    return 0x148;
+}
+
+// ----------------------------------------------------------------------------
+// asm: char __fastcall CellClass_486FF0(CellClass *this)   (asm:308079)
+//
+//    if (!Map.IsCellTainted(this, true)) return true;
+//    if (TileType in [0, vec_IsometricTileTypes.length)) {
+//        tile = vec_IsometricTileTypes[TileType];
+//        if (tile->AllowBurrowing /* +0x305 */) { /* fall through */ }
+//        else return false;
+//    }
+//    if ([this+0x11C] != 0) return false;      // SlopeIndex / overlay frame
+//    if ([this+0x140] & 0x500) return false;   // FlagToShroud | HasTiberium
+//    if (GameActive) {
+//        walk ground chain: if any WhatAmI()==6 (Building) -> return false
+//        walk ground chain: if any WhatAmI()==0x24 (Terrain) -> return false
+//    }
+//    return true;
+//
+//   Note: the branch is inverted in the binary (a tainted cell still passes
+//   when the tile forbids burrowing, because the tile check only rejects when
+//   the tile is present AND AllowBurrowing is clear).  Reproduced verbatim
+//   above; the project resolves the tile through TileTypeClass_Array.
+// ----------------------------------------------------------------------------
+bool CellClass::Is_Clear_For_Subterranean() const
+{
+    // asm: push 1 / push this / mov ecx,offset Map / call MapClass_IsCellTainted
+    if (MapClass::Instance != nullptr)
+    {
+        if (!MapClass::Instance->IsCellTainted(Get_CellCoords(), true))
+            return true;
+    }
+    else
+    {
+        return true;
+    }
+
+    if (TileType >= 0 && TileTypeClass_Array != nullptr && TileType < TileTypeClass_Array->Count)
+    {
+        const IsometricTileType* pTile = (*TileTypeClass_Array)[TileType];
+        if (pTile != nullptr && !pTile->AllowBurrowing)
+            return false;
+    }
+
+    // asm: mov al,[edi+11Ch] / test al,al / jnz loc_4870A1 (reject)
+    if (Slope != 0)
+        return false;
+
+    // asm: mov eax,[edi+140h] / test ah,5 / jnz loc_4870A1 (reject)
+    if ((Field_140 & 0x0500u) != 0u)
+        return false;
+
+    if (GameActive)
+    {
+        for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+        {
+            if (pObj->WhatAmI() == AbstractType::Building)
+                return false;
+        }
+        for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+        {
+            if (pObj->WhatAmI() == AbstractType::Terrain)
+                return false;
+        }
+    }
+
+    return true;
+}
+
 // ============================================================================
 // Occupier management
 // ============================================================================
@@ -514,6 +912,7 @@ void CellClass::Add_Occupier(ObjectClass* pObj) {
     if (pObj->NextObject == nullptr && FirstObject != pObj) {
         pObj->NextObject = FirstObject;
         FirstObject = pObj;
+        ++ContentCount;
     }
 
     Occupier = pObj;
@@ -527,11 +926,13 @@ void CellClass::Remove_Occupier(ObjectClass* pObj) {
     if (FirstObject == pObj) {
         FirstObject = pObj->NextObject;
         pObj->NextObject = nullptr;
+        if (ContentCount > 0) --ContentCount;
     } else {
         for (ObjectClass* pPrev = FirstObject; pPrev; pPrev = pPrev->NextObject) {
             if (pPrev->NextObject == pObj) {
                 pPrev->NextObject = pObj->NextObject;
                 pObj->NextObject = nullptr;
+                if (ContentCount > 0) --ContentCount;
                 break;
             }
         }
@@ -540,6 +941,60 @@ void CellClass::Remove_Occupier(ObjectClass* pObj) {
     if (Occupier == pObj) {
         Occupier = nullptr;
         SetAltFlag(AltCellFlags::ContainsBuilding, false);
+    }
+}
+
+// ============================================================================
+// asm: void __thiscall CellClass::Occupy_Down(CellClass *this,
+//      ObjectClass *Content, char bridge)   (asm:3559, retn 8)
+//
+//   Threads Content onto the ground (+0xE4) or altitude (+0xE8) chain.  A
+//   building is appended to the tail so loose units stay visible in front of
+//   it; everything else is prepended.  When the cell is not shrouded the
+//   object is finally told where it now sits (vt+0xF0 SetLocation); infantry
+//   are exempted from that relocation.
+// ============================================================================
+void CellClass::Occupy_Down(ObjectClass* pContent, bool bridge)
+{
+    if (pContent == nullptr)
+        return;
+
+    ObjectClass*& pHead = bridge ? AltObject : FirstObject;
+
+    if (pContent->WhatAmI() == AbstractType::Building)
+    {
+        if (pHead != nullptr)
+        {
+            ObjectClass* pTail = pHead;
+            while (pTail->NextObject != nullptr)
+                pTail = pTail->NextObject;
+            pTail->NextObject = pContent;
+        }
+        else
+        {
+            pHead = pContent;
+        }
+        pContent->NextObject = nullptr;
+    }
+    else
+    {
+        if (pHead != pContent && (pHead == nullptr || pHead->NextObject != pContent))
+        {
+            pContent->NextObject = pHead;
+            pHead = pContent;
+        }
+    }
+
+    // asm loc_47E9C8: only when the cell is revealed to the local player is
+    // the object relocated, and infantry (WhatAmI 0xF) are left where they are.
+    if (!IsUnderShroud && pContent->WhatAmI() != AbstractType::Infantry)
+    {
+        CoordStruct place(
+            (static_cast<int32>(MapCoords.X) << 8) + 0x80,
+            (static_cast<int32>(MapCoords.Y) << 8) + 0x80,
+            0);
+        place.Z = GetFloorHeight(place);
+        pContent->SetLocation(place);
     }
 }
 
@@ -560,6 +1015,11 @@ bool CellClass::Has_Building() const {
 bool CellClass::Has_Infantry() const {
     if (!Occupier) return false;
     return Occupier->WhatAmI() == AbstractType::Infantry;
+}
+
+BuildingClass* CellClass::Get_Building() const {
+    // asm: CellClass::Cell_Building - the canonical ground-chain building walk.
+    return Cell_Building();
 }
 
 // ============================================================================
@@ -608,6 +1068,94 @@ bool CellClass::Can_Build_On() const {
 
 bool CellClass::Is_Buildable() const {
     return Can_Build_On();
+}
+
+// ============================================================================
+// asm: char __thiscall CellClass::Is_Clear_To_Build(CellClass *this, int a2,
+//      BuildingTypeClass *a3, HouseClass *a4)   (asm:1990, retn 0Ch)
+//
+//   The authoritative structure-placement test.  The ScenarioInit and
+//   Debug_Map/taint gates of the binary are folded here; the gameplay decision
+//   is the building-class branch, the occupancy / terrain rejection, the
+//   own-wall pass and the final land/speed cost test.
+// ============================================================================
+bool CellClass::Is_Clear_To_Build(int32 a2, BuildingTypeClass* a3, HouseClass* a4) const
+{
+    // asm: cmp ScenarioInit,0 / jnz -> return true   (editor load: always ok)
+
+    // asm loc_47C6DD / loc_47C76B / loc_47C7C8: dispatch on the building class.
+    const bool regularBuilding =
+        (a3 != nullptr) && !a3->LaserFence && !a3->LaserFencePost
+        && !a3->Gate && a3->TileToUse == nullptr;
+
+    if (regularBuilding)
+    {
+        // A loose aircraft, any techno or a terrain object blocks the cell.
+        if (GameActive)
+        {
+            for (ObjectClass* pObj = FirstObject; pObj; pObj = pObj->NextObject)
+                if (pObj->WhatAmI() == AbstractType::Aircraft)
+                    return false;
+
+            if (Cell_Techno(nullptr, false, nullptr) != nullptr)
+                return false;
+            if (Cell_Abstract(static_cast<int32>(AbstractType::Terrain), false) != nullptr)
+                return false;
+        }
+        // asm: test [this+124h],3Fh / jz continue -> occupied ground bits reject.
+        if ((Get_Movement_Field() & 0x3F) != 0)
+            return false;
+    }
+    else if (GameActive && FirstObject != nullptr)
+    {
+        // asm loc_47C676 / loc_47C6CD / loc_47C7AC: any building blocks; the
+        // plain laser fence additionally rejects an occupying terrain object.
+        for (ObjectClass* pObj = FirstObject; pObj; pObj = pObj->NextObject)
+            if (pObj->WhatAmI() == AbstractType::Building)
+                return false;
+
+        if (a3 != nullptr && a3->LaserFence)
+        {
+            for (ObjectClass* pObj = FirstObject; pObj; pObj = pObj->NextObject)
+                if (pObj->WhatAmI() == AbstractType::Terrain)
+                    return false;
+        }
+    }
+
+    // asm loc_47C76B: a ToTile building needs the tile to permit it.
+    if (a3 != nullptr && a3->TileToUse != nullptr && !a3->TileToUse->AllowBurrowing)
+        return false;
+
+    // asm loc_47C88D..loc_47C94F: an overlay whose wall-owner is the requesting
+    // house never blocks that house (loc_47C8F9 / loc_47C945 -> return true).
+    if (Overlay != -1 && a4 != nullptr)
+    {
+        HouseClass* pWallOwner = HouseClass::GetHouseByIndex(Field_50);
+        if (pWallOwner != nullptr && pWallOwner == a4)
+            return true;
+    }
+
+    // asm loc_47CA4D: an explicit speed class is accepted when its land cost
+    // is non-zero.
+    if (a2 != -1)
+        return Get_Movement_Cost(a2) != 0;
+
+    // asm loc_47C9CD fall-through: reject on the wall/slope flag bits, else
+    // consult the LAND's "may carry a structure" flag.
+    if ((Field_140 & 0x0100u) != 0u)
+        return false;
+    if ((Field_140 & 0x0400u) != 0u)
+        return false;
+    if (Slope != 0)
+        return false;
+
+    if (TheRules != nullptr)
+    {
+        const int32 landIndex = static_cast<int32>(Land);
+        if (landIndex >= 0 && landIndex < RulesClass::LAND_TYPE_COUNT)
+            return TheRules->LandCharacteristics[landIndex].Buildable;
+    }
+    return true;
 }
 
 bool CellClass::Is_Concrete() const {
@@ -755,7 +1303,7 @@ void CellClass::Unshroud() {
     SetFlag(CellFlags::Fogged, false);
 }
 
- // 根据游戏行为，可知 Setup 负责下面这段逻辑。
+ // asm: void __thiscall CellClass_Setup(CellClass *this, wXY coords)   (asm:289530)
 //
 //   Re-derives this cell's shroud/fog state against the map's current view
 //   rectangle.  A negative `flag` means "re-shroud if the cell has fallen
@@ -991,10 +1539,10 @@ int32 CellClass::Get_Movement_Cost(int32 SpeedType) const
     const RulesClass::LandTypeCharacteristics& row =
         TheRules->LandCharacteristics[landIndex];
 
-    // The seven named floats are immediately followed by the Buildable flag,
-    // so walking the struct as a float array reproduces the binary's flat
-    // indexing exactly.
-    const float* values = &row.Hover;
+    // asm: LandCharacteristics.Foot[land*9 + speed] -- the row base is the
+    // Foot field itself and the stride is nine floats (0x24 bytes), so the
+    // flat walk has to start at +0x00, not at the Hover field at +0x0C.
+    const float* values = &row.Foot;
     return static_cast<int32>(values[SpeedType]);
 }
 
@@ -1017,106 +1565,104 @@ int32 CellClass::Get_Movement_Cost(int32 SpeedType) const
 bool CellClass::Is_Clear_To_Move(int32 SpeedType, bool a3, bool a4, int32 a5,
                                  MovementZone zone, int32 a7, bool boo) const
 {
-    // Aircraft never need a ground path.
+    // asm: cmp eax,4 / jz -> return true   (winged movers ignore the ground)
     if (SpeedType == 4) {
         return true;
     }
 
-    // Zone check (the binary compares against MapClass_CanLocationBeReached,
-    // whose result is the cell's zone index).
+    // asm: if (a5 != -1) { reach = CanLocationBeReached(cell, zone, boo);
+    //                       if (a5 != reach) return false; }
+    // The reconstruction compares the cell's cached zone index, which is the
+    // value the map's own reachability query returns (avoids the recursive
+    // dependency Is_Clear_To_Move <-> Can_Location_Be_Reached).
     if (a5 != -1) {
         if (ZoneIndex != a5) {
             return false;
         }
     }
 
-    // Expected land byte, with the bridge adjustment.
-    const bool onBridge = IsBridge();
+    // asm: signed byte at +0x11B (the coarse "land level" byte)
+    const int32 landByte = static_cast<int32>(static_cast<int8>(LandByte));
+    const bool  onBridgeFlag = (Field_140 & 0x0100u) != 0u;
+
+    // asm: a7 (expected land byte) test, with the +4 bridge allowance.
     if (a7 != -1) {
-        const int32 landByte = Get_Land_Byte();
         if (a7 != landByte) {
-            if (!(onBridge && a7 == landByte + 4)) {
+            if (!onBridgeFlag)
                 return false;
-            }
+            if (a7 != landByte + 4)
+                return false;
+        } else {
+            if (onBridgeFlag && !boo)
+                return false;
         }
-    } else if (onBridge && !boo) {
-        // A bridge cell that the caller did not mark as a bridge-layer mover.
-        // (The binary checks this against the *requested* land; with a7 == -1
-        // it only rejects when the mover is not bridge-aware.)
     }
 
-    // Movement field: pick the bridge or the ground variant, then apply the
-    // caller's masks and require the result to be empty.
-    uint8 movement = 0;
-    const bool wantBridgeVariant = (a7 == -1) ||
-                                   (onBridge && a7 != Get_Land_Byte());
-    if (onBridge && wantBridgeVariant) {
+    // asm: pick the bridge movement field when (a7 == -1 || a7 == land+4) and
+    // the bridge flag is set; otherwise the ground field.  `cl` records the
+    // bridge variant for the final cost test.
+    bool  usedBridgeField = false;
+    uint32 movement;
+    if ((a7 == -1 || a7 == landByte + 4) && onBridgeFlag) {
         movement = Get_Movement_Field_Bridge();
+        usedBridgeField = true;
     } else {
         movement = Get_Movement_Field();
     }
 
-    uint32 bits = movement;
-    if (a3) {
-        bits &= 0xE0u;      // keep only the high three bits
-    }
-    if (a4) {
-        bits &= 0x5Fu;      // drop the "crushable" bit
-    }
-    if (bits != 0) {
+    if (a3) movement &= 0xE0u;
+    if (a4) movement &= 0x5Fu;
+    if (movement != 0) {
         return false;
     }
 
-    // A crushable overlay narrows the set of zones that may enter.
-    //
-    // The binary loads the overlay type and bails straight to the cost test
-    // when either the overlay or its Crushable byte is absent.  Otherwise it
-    // dispatches on the movement zone:
-    //
-    //   Destroyer / AmphibiousDestroyer / InfantryDestroyer  -> allowed
-    //   Crusher / AmphibiousCrusher                          -> allowed only
-    //                                                           when the
-    //                                                           overlay is not
-    //                                                           Crushable
-    //   CrusherAll                                           -> allowed
-    //   anything else                                        -> rejected
-    bool overlayCleared = false;
+    // asm: idx = [this+0ECh]  (the land row); overlay dispatch may zero it.
+    int32 landIndex = static_cast<int32>(Land);
 
     if (Overlay != -1) {
-        OverlayTypeClass* pOverlayType = OverlayTypeClass::FindByIndex(Overlay);
-        if (pOverlayType != nullptr && pOverlayType->Crushable) {
-            const bool destroyerZone =
-                zone == MovementZone::Destroyer ||               // 2
-                zone == MovementZone::AmphibiousDestroyer ||     // 3
-                zone == MovementZone::InfantryDestroyer;         // 8
-
-            const bool crusherZone =
-                zone == MovementZone::Crusher ||                 // 1
-                zone == MovementZone::AmphibiousCrusher;         // 4
-
-            if (destroyerZone || zone == MovementZone::CrusherAll) {
-                overlayCleared = true;
-            } else if (crusherZone) {
-                // A crusher may only flatten a non-crushable wall.
-                if (!pOverlayType->Crushable) {
-                    overlayCleared = true;
+        const OverlayTypeClass* pOverlay = OverlayTypeClass::FindByIndex(Overlay);
+        if (pOverlay != nullptr && pOverlay->Wall) {
+            if (zone == MovementZone::Destroyer ||          // 2
+                zone == MovementZone::AmphibiousDestroyer || // 3
+                zone == MovementZone::InfantryDestroyer)     // 8
+            {
+                landIndex = 0;
+            } else if (zone == MovementZone::Crusher ||        // 1
+                       zone == MovementZone::AmphibiousCrusher) // 4
+            {
+                if (pOverlay->Crushable) {
+                    landIndex = 0;
+                } else if (zone == MovementZone::CrusherAll) { // 0xC
+                    landIndex = 0;
                 } else {
                     return false;
                 }
+            } else if (zone == MovementZone::CrusherAll) {     // 0xC
+                landIndex = 0;
             } else {
                 return false;
             }
         }
     }
 
-    // Land / speed movement cost.  Zero means the mover cannot traverse this
-    // land type at all; the overlay note above is the only way past it.
-    const int32 cost = Get_Movement_Cost(SpeedType);
-    if (cost == 0 && !overlayCleared) {
-        return false;
+    // asm: cost = LandCharacteristics.Foot[landIndex*9 + SpeedType]
+    //      if (cost != 0.0) return true;
+    //      if (bridge variant) return true;
+    //      return false;
+    float cost = 0.0f;
+    if (TheRules != nullptr &&
+        landIndex >= 0 && landIndex < RulesClass::LAND_TYPE_COUNT &&
+        SpeedType >= 0 && SpeedType < 9)
+    {
+        const float* values = &TheRules->LandCharacteristics[landIndex].Foot;
+        cost = values[SpeedType];
     }
 
-    return true;
+    if (cost != 0.0f)
+        return true;
+    if (usedBridgeField)
+        return true;
+    return false;
 }
 
 // ============================================================================
@@ -1441,6 +1987,72 @@ int32 CellClass::Tiberium_In_Cell() const
     return pType->Value * (static_cast<int32>(OverlayFrame) + 1);
 }
 
+// ----------------------------------------------------------------------------
+// CellClass::Reduce_Tiberium
+//
+//   原版被 Damage_At_Cell 调用：按 amount 扣减格子上 tiberium 的生长阶段。
+//   生长阶段存放在 OverlayFrame（0..12），归零时移除 tiberium overlay，
+//   把 land type 恢复为 Clear，并按 Set_Tiberium 的对称逻辑清掉
+//   TiberiumValue 与 OverlayData 中的类型字节。
+// ----------------------------------------------------------------------------
+void CellClass::Reduce_Tiberium(int32 amount)
+{
+    if (amount <= 0) return;
+    if (!Contains_Tiberium() && Is_Overlay_Idx_Tiberium(Overlay) == -1) return;
+
+    int32 stage = static_cast<int32>(OverlayFrame) - amount;
+    if (stage < 0) stage = 0;
+
+    if (stage == 0) {
+        // 矿已耗尽：清除 overlay 与相关标记
+        Overlay = -1;
+        OverlayFrame = 0;
+        OverlayData = 0;
+        TiberiumValue = 0;
+        if (Land == ::LandType::Tiberium) {
+            Land = ::LandType::Clear;
+        }
+    } else {
+        OverlayFrame = static_cast<uint8>(stage);
+        TiberiumValue = stage;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CellClass::Reduce_Wall
+//
+//   原版被 Damage_At_Cell 调用：
+//     amount < 0  —— 绝对摧毁（WallAbsoluteDestroyer），直接清墙；
+//     amount >= 0 —— 按 amount 扣减墙耐久；扣完清除墙 overlay，把格子
+//                   的 land type 恢复为 Clear 并清空墙主标记。
+// ----------------------------------------------------------------------------
+void CellClass::Reduce_Wall(int32 amount)
+{
+    if (amount < 0) {
+        // 绝对摧毁
+        Overlay = -1;
+        OverlayData = 0;
+        if (Land == ::LandType::Wall) {
+            Land = ::LandType::Clear;
+        }
+        return;
+    }
+
+    if (amount == 0) return;
+
+    // 墙耐久存放在 OverlayData（低字节为阶段）；扣到 0 即摧毁
+    int32 hp = static_cast<int32>(OverlayData & 0xFF) - amount;
+    if (hp <= 0) {
+        Overlay = -1;
+        OverlayData = 0;
+        if (Land == ::LandType::Wall) {
+            Land = ::LandType::Clear;
+        }
+    } else {
+        OverlayData = (OverlayData & ~0xFF) | (hp & 0xFF);
+    }
+}
+
 bool CellClass::Contains_Tiberium() const
 {
     return Land == ::LandType::Tiberium;
@@ -1516,7 +2128,7 @@ bool CellClass::DisguiseSensors_HasHouse(int32 idxHouse) const
 // CellClass - tunnel / coordinate / identity / flag batch
 // ============================================================================
 
- // 根据游戏行为，可知 GetTunnel 负责下面这段逻辑。
+ // asm: CellClass_GetTunnel
 //
 //  Validates the 16-bit tube index at +0x118 against the tunnel table length
 //  and returns the cell the table holds; a negative index or an out-of-range
@@ -1535,7 +2147,7 @@ CellClass* CellClass::Get_Tunnel() const
     return vec_Tubes->Items[TubeIndex];
 }
 
- // 根据游戏行为，可知 SetMapCoords 负责下面这段逻辑。
+ // asm: void __thiscall CellClass_SetMapCoords(CellClass *cell, wXY *coords)   (asm:304107)
 //
 //  The original copies the four packed bytes of the MapCellExClass X/Y pair
 //  straight into +0x24; storing the CellStruct produces the identical bytes.
@@ -1551,7 +2163,7 @@ int32 CellClass::Get_AbstractID() const
     return static_cast<int32>(AbstractType::Cell);
 }
 
- // 根据游戏行为，可知 FlagPickedUp 负责下面这段逻辑。
+ // asm: char __fastcall CellClass_FlagPickedUp(CellClass *this)   (asm:300382)
 //
 //  Clears the "flag is planted" bit (0x10) from the flag word at +0x140 and
 //  resets the attached-object index at +0x50 to -1.  Returns true only when
@@ -1566,7 +2178,7 @@ bool CellClass::Flag_Picked_Up()
     return true;
 }
 
- // 根据游戏行为，可知 Smth0 负责下面这段逻辑。
+ // asm: void __fastcall CellClass_Smth0(CellClass *this)   (asm:308911)
 //
 //  Decrements the gap counter at +0x130, but a count of exactly 1 first
 //  collapses to 0 so that the subsequent decrement wraps it to -1; the net
@@ -1642,7 +2254,98 @@ ObjectClass* CellClass::GetInfantry(bool alt) const {
     return nullptr;
 }
 
- // 根据游戏行为，可知 CanAddTiberium 负责下面这段逻辑。
+// ============================================================================
+// asm: ObjectClass *__thiscall CellClass::Cell_Abstract(CellClass *this,
+//      eAbstractIDs objId, char a3)   (asm:1740)
+//
+//   Walks the chain selected by `a3` (false = ground +0xE4, true = altitude
+//   +0xE8) and returns the first entry whose WhatAmI() equals objId.  Game
+//   not running yields null immediately.
+// ============================================================================
+ObjectClass* CellClass::Cell_Abstract(int32 objId, bool alt) const {
+    if (!GameActive)
+        return nullptr;
+
+    ObjectClass* pObj = alt ? AltObject : FirstObject;
+    while (pObj) {
+        if (static_cast<int32>(pObj->WhatAmI()) == objId)
+            return pObj;
+        pObj = pObj->NextObject;
+    }
+    return nullptr;
+}
+
+// ============================================================================
+// asm: BuildingClass *__thiscall CellClass::Cell_Building(CellClass *this)
+//      (asm:1802)
+//
+//   The first building on the ground chain.  This is the canonical building
+//   lookup; Get_Building forwards to it.
+// ============================================================================
+BuildingClass* CellClass::Cell_Building() const {
+    if (!GameActive)
+        return nullptr;
+
+    for (ObjectClass* pObj = FirstObject; pObj; pObj = pObj->NextObject) {
+        if (pObj->WhatAmI() == AbstractType::Building)
+            return static_cast<BuildingClass*>(pObj);
+    }
+    return nullptr;
+}
+
+// ============================================================================
+// asm: _ObjectClass *__thiscall CellClass::Cell_Techno(CellClass *this,
+//      dwXYZ *arg0, char arg4, ObjectClass *arg8)   (asm:1609)
+//
+//   Picks the occupancy chain with arg4, then returns whichever techno on it
+//   lies nearest to the coordinate pair at arg0.  The distance is computed in
+//   the low byte of each world axis offset (per the binary: objCoord & 0xFF
+//   minus the target's pre-scaled value), square-rooted and floored; the
+//   smallest distance wins.  arg8, when non-null, is skipped.
+// ============================================================================
+ObjectClass* CellClass::Cell_Techno(CellStruct* pCoords, bool alt, ObjectClass* pSkip) const {
+    // asm: lea edi,[eax*8] / sub edi,eax  (target X * 7)
+    int32 targetX = 0;
+    int32 targetY = 0;
+    if (pCoords != nullptr) {
+        targetX = static_cast<int32>(pCoords->X) * 7;
+        targetY = static_cast<int32>(pCoords->Y) * 7;
+    }
+
+    ObjectClass* pObj = alt ? AltObject : FirstObject;
+    if (pObj == nullptr)
+        return nullptr;
+
+    ObjectClass* pBest = nullptr;
+    int32        bestDist = 0;
+
+    for (; pObj; pObj = pObj->NextObject) {
+        // asm: mov al,[esi+14h] / and al,1  - skip non-techno objects.
+        const AbstractType what = pObj->WhatAmI();
+        const bool isTechno = (what == AbstractType::Infantry || what == AbstractType::Unit
+                            || what == AbstractType::Aircraft || what == AbstractType::Building);
+        if (!isTechno)
+            continue;
+        if (pObj == pSkip)
+            continue;
+
+        CoordStruct crd(0, 0, 0);
+        pObj->GetCoords(&crd);
+
+        const int32 dx = (crd.X & 0xFF) - targetX;
+        const int32 dy = (crd.Y & 0xFF) - targetY;
+        const int32 dist = static_cast<int32>(
+            std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+
+        if (pBest == nullptr || dist < bestDist) {
+            pBest = pObj;
+            bestDist = dist;
+        }
+    }
+    return pBest;
+}
+
+ // asm: char __thiscall CellClass_CanAddTiberium(CellClass *this, int a2)   (asm:301096)
 //
 //  A cell may receive new tiberium only when it is inside the radar range,
 //  its flag word does not already carry the growth-suppressing bits 0x500,
@@ -1669,7 +2372,7 @@ bool CellClass::CanAddTiberium() const {
 }
 
 // ============================================================================
- // 根据游戏行为，可知 ScatterContent 负责下面这段逻辑。
+ // asm: CellClass_ScatterContent
 //
 //  Shoves any object parked on this cell (and, for the ground layer, its
 //  immediate neighbourhood) toward an adjacent free cell.  Used when a
@@ -1682,28 +2385,40 @@ bool CellClass::CanAddTiberium() const {
 // ============================================================================
 void CellClass::Scatter_Content(int32 a2, int32 a3, bool bIgnoreInfantry)
 {
-    (void)a2;
-    (void)a3;
+    ObjectClass* pList = FirstObject; // the project's callers use the ground chain
 
-    ObjectClass* pObj = Get_Occupier();
-    if (pObj == nullptr)
-        return;
-    if (bIgnoreInfantry && pObj->WhatAmI() == AbstractType::Infantry)
-        return;
+    // asm: any elite techno on the chain forces every occupant to scatter.
+    bool bForceScatter = false;
+    if (!bIgnoreInfantry && pList != nullptr) {
+        for (ObjectClass* pObj = pList; pObj != nullptr; pObj = pObj->NextObject) {
+            if (!IsTechnoObject(pObj))
+                continue;
+            if (static_cast<TechnoClass*>(pObj)->GetVeterancy() >= 2) {
+                bForceScatter = true;
+                break;
+            }
+        }
+    }
 
-    // Find a neighbouring cell without an occupant and hand the object off.
-    for (int32 i = 0; i < 8; ++i) {
-        CellClass* pAdj = AdjacentCells[i];
-        if (pAdj == nullptr)
+    // asm: snapshot every techno on the chain first (the scatter can mutate it).
+    std::vector<ObjectClass*> technos;
+    for (ObjectClass* pObj = pList; pObj != nullptr; pObj = pObj->NextObject) {
+        if (IsTechnoObject(pObj))
+            technos.push_back(pObj);
+    }
+
+    const CoordStruct crd(a2, a3, 0);
+
+    for (ObjectClass* pObj : technos) {
+        TechnoClass* pTechno = static_cast<TechnoClass*>(pObj);
+
+        // asm: skip anything that cannot scatter, unless it was forced
+        // (elite present / ignore-infantry) or the type opts in via the
+        // SCATTER ability.  The project exposes that ability as CanScatter().
+        if (!bForceScatter && !bIgnoreInfantry && !pTechno->CanScatter())
             continue;
-        if (pAdj->Get_Occupier() != nullptr)
-            continue;
 
-        // The unit's locomotor is responsible for walking over; the cell
-        // bookkeeping is all this routine owns.
-        pAdj->Add_Occupier(pObj);
-        Remove_Occupier(pObj);
-        return;
+        pTechno->Scatter(crd, a3 != 0, bIgnoreInfantry);
     }
 }
 
@@ -1741,7 +2456,7 @@ void CellClass::Adjust_Threat(HouseClass* pFromHouse, int32 threat)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GetCoords_unknown2 负责下面这段逻辑。
+ // asm: CellClass_GetCoords_unknown2
 //
 //  Forwards the cell's own coordinates and, when the flag word at +0x140 has
 //  bit 0x100 set, raises Z by the global bias dword_89E7B4 - the height of
@@ -1761,7 +2476,7 @@ CoordStruct* CellClass::GetCoordsUnknown2(CoordStruct* pCoords) const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsVeins 负责下面这段逻辑。
+ // asm: char __fastcall CellClass_IsVeins(CellClass *this)   (asm:304383)
 //
 //  A cell accepts vein growth only when its overlay frame byte (+0x11C) is at
 //  most 4, its land byte is not one of the four vein-hostile types (2, 3, 6
@@ -1788,7 +2503,7 @@ bool CellClass::IsVeins() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 ActivateVeins 负责下面这段逻辑。
+ // asm: void __thiscall CellClass_ActivateVeins(CellClass *this)   (asm:307149)
 //
 //  给踩在矿脉上的单位放血。自身先过三道门槛：叠加物必须是矿脉(0x7E)、
 //  生长阶段不低于 0x30、叠加物帧(+0x11C)为 0，且本方格还没有被打上激活
@@ -1852,7 +2567,7 @@ void CellClass::ActivateVeins()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetupVeins 负责下面这段逻辑。
+ // asm: CellClass_SetupVeins
 //
 //  把一格矿脉重新铺设成完整形态。先确认本格是矿脉宿主，再取其包围矩形与
 //  一格尺寸做相交裁剪，然后按包围范围自后向前逐格执行铺设；收尾时再调用
@@ -1904,7 +2619,246 @@ void CellClass::SetupVeins()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 Get_Containing_Rect 负责下面这段逻辑。
+// asm: sub_485390 —— 四个正交邻格的"还是矿脉"掩码（0x485390，无栈参）
+//
+//   for (i = 0; i < 4; ++i) {
+//       if (2*i >= 8) cell = this;                       // 死分支：i<4 恒假
+//       else          cell = Map.Coord_Cell(this.coords + CellCoordDirections[2*i]);
+//       if (cell.Overlay == -1)                        continue;   // 304322
+//       if (cell[11Ch] > 0 && OverlayType[Overlay].IsVeins) continue;
+//       if (cell.Overlay != 7Eh && !OverlayType[Overlay].IsVeins) continue;
+//       if (cell.Overlay == 7Eh && cell[11Eh] < 30h)     continue;
+//       mask |= 1 << i;
+//   }
+// ============================================================================
+// asm: 读取 OverlayTypeClass[overlay] 记录 +0x2AE 处的 IsVeins 字节。
+static bool Is_Overlay_Vein_Type(int32 overlay)
+{
+    if (overlay < 0 || OverlayTypeClass::Array == nullptr)
+        return false;
+    if (overlay >= OverlayTypeClass::Array->Count)
+        return false;
+    OverlayTypeClass* pType = (*OverlayTypeClass::Array)[overlay];
+    return pType != nullptr && pType->IsVeins;
+}
+
+uint8 CellClass::Vein_Neighbor_Mask() const
+{
+    // asm: CellCoordDirections（8 个 (dx,dy)，与 FootClass.cpp 的同名表一致）。
+    static const int8 kCellCoordDirections[8][2] = {
+        {  1,  0 }, {  1,  1 }, {  0,  1 }, { -1,  1 },
+        { -1,  0 }, { -1, -1 }, {  0, -1 }, {  1, -1 },
+    };
+
+    uint8 mask = 0;
+
+    for (int32 i = 0; i < 4; ++i) {
+        const int32 dir = i * 2;
+
+        // asm 304291-304316：取方向 2i 的邻格（越界时退回本格）。
+        const CellClass* pCell = this;
+        if (dir < 8) {
+            if (MapClass::Instance == nullptr)
+                continue;
+            const CellStruct probe(
+                static_cast<int16>(MapCoords.X + kCellCoordDirections[dir][0]),
+                static_cast<int16>(MapCoords.Y + kCellCoordDirections[dir][1]));
+            pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                continue;
+        }
+
+        // asm 304322-304323: mov ecx,[eax+44h] / cmp ecx,-1 / jz 结束
+        if (pCell->Overlay == -1)
+            continue;
+
+        // asm 304326-304332: bl = [eax+11Ch] ; 非零时再看叠加物类型的 IsVeins
+        const bool overlayIsVein = Is_Overlay_Vein_Type(pCell->Overlay);
+        if (pCell->VeinStage > 0 && overlayIsVein)
+            continue;
+
+        // asm 304336-304344: 不是 7Eh 就必须是矿脉类叠加物
+        if (pCell->Overlay != 0x7E) {
+            if (!overlayIsVein)
+                continue;
+        } else {
+            // asm 304347-304349: 7Eh 且阶段 < 30h 才不算
+            if (pCell->OverlayFrame < 0x30)
+                continue;
+        }
+
+        mask = static_cast<uint8>(mask | (1u << i));
+    }
+
+    return mask;
+}
+
+// ============================================================================
+// asm: sub_485590 —— 一格矿脉叠加物的重接（0x485590，无栈参）
+//
+//   逐句：
+//     rect = Update_Cell(cell) ∩ GetContainingRect(cell)     ; 脏矩形（渲染用）
+//     cell[11Eh] = 0
+//     bl = sub_485390(cell)                                  ; 邻格矿脉掩码
+//     if (bl && cell[11Ch] == 0) cell[11Eh] = (rand%3) + 3*bl
+//     else                       cell[44h] = -1              ; 叠加物整格撤掉
+//     Map.sub_6551C0(&cell.coords)                           ; 雷达/小地图格刷新
+//     for (dir = 0; dir < 8; dir += 2) {
+//         adj = cell.Adjacent_Cell(dir)
+//         if (adj[11Ch] || adj.Overlay != 7Eh || adj[11Eh] >= 30h) continue
+//         bl = sub_485390(adj)
+//         if (!bl) adj[44h] = -1
+//         else     adj[11Eh] = (rand%3) + 3*bl
+//         adj.Setup(-1)
+//         TacticalMap.RegisterDirtyArea(adj 的重叠矩形)
+//         Map.sub_6551C0(&adj.coords)
+//     }
+//     TacticalMap.RegisterDirtyArea(cell 的重叠矩形)
+//     cell.Setup(-1)
+//
+//   本工程把两处脏矩形合并成一次 RegisterDirtyArea（OpenYR 的 Get_Containing_Rect
+//   已给出该格的屏幕包围盒），地图刷新沿用 MapClass 的格更新入口。
+// ============================================================================
+void CellClass::Relink_Vein_Overlay()
+{
+    // asm 304767-304768: 清掉本格的叠加物帧，再取邻格矿脉掩码。
+    OverlayFrame = 0;
+    const uint8 mask = Vein_Neighbor_Mask();
+
+    if (mask != 0 && VeinStage == 0) {
+        // asm 304778-304794: (|Random2 % 3|) + 3 * bl —— 8 位乘加。
+        int32 roll = 0;
+        if (ScenarioClass::Instance != nullptr)
+            roll = ScenarioClass::Instance->Random.Next(0, 2);
+        else
+            roll = std::rand() % 3;
+        OverlayFrame = static_cast<uint8>((roll & 0xFF) + 3 * static_cast<int32>(mask));
+    } else {
+        // asm 304800: 这格不再是矿脉了。
+        Overlay   = -1;
+        OverlayData = 0;
+    }
+
+    // asm 305004-305006: CellClass_Setup(cell, -1) —— 重算本格属性。
+    Setup(-1);
+
+    // asm 305075-305078 + 305089-305141: 脏矩形登记 + 雷达格刷新。
+    if (TacticalClass::Instance != nullptr) {
+        const RectangleStruct box = Get_Containing_Rect();
+        TacticalClass::Instance->RegisterDirtyArea(
+            Rectangle(box.X, box.Y, box.Width, box.Height), false);
+    }
+
+    // ── asm loc_485783：对四个正交邻格做同样的重接 ────────────────────────
+    for (int32 dir = 0; dir < 8; dir += 2) {
+        CellClass* pAdj = AdjacentCells[dir];
+        if (pAdj == nullptr)
+            continue;
+
+        // asm 304819-304827: 只处理仍可长矿脉、仍是 7Eh、阶段 < 30h 的邻格。
+        if (pAdj->VeinStage != 0)
+            continue;
+        if (pAdj->Overlay != 0x7E)
+            continue;
+        if (pAdj->OverlayFrame >= 0x30)
+            continue;
+
+        // asm 304830: bl = sub_485390(adj) ; 再重掷阶段或撤掉叠加物。
+        const uint8 adjMask = pAdj->Vein_Neighbor_Mask();
+        if (adjMask == 0) {
+            pAdj->Overlay    = -1;
+            pAdj->OverlayData = 0;
+        } else {
+            int32 roll = 0;
+            if (ScenarioClass::Instance != nullptr)
+                roll = ScenarioClass::Instance->Random.Next(0, 2);
+            else
+                roll = std::rand() % 3;
+            pAdj->OverlayFrame =
+                static_cast<uint8>((roll & 0xFF) + 3 * static_cast<int32>(adjMask));
+        }
+
+        // asm 305004-305006 / 305075: 邻格自身刷新 + 脏矩形。
+        pAdj->Setup(-1);
+        if (TacticalClass::Instance != nullptr) {
+            const RectangleStruct box = pAdj->Get_Containing_Rect();
+            TacticalClass::Instance->RegisterDirtyArea(
+                Rectangle(box.X, box.Y, box.Width, box.Height), false);
+        }
+    }
+}
+
+// ============================================================================
+// asm: char __thiscall CellClass::Spread_Tiberium(CellClass *this, char a2)
+//      (asm:6763, retn 4)
+//
+//   Seeds ore onto a random neighbouring cell.  When a2 is clear the source
+//   cell must already be a mature, flat ore cell with an empty content chain;
+//   the search then walks all eight neighbours (random start) and seeds the
+//   first one CanAddTiberium accepts.
+// ============================================================================
+bool CellClass::Spread_Tiberium(bool a2)
+{
+    if (!a2)
+    {
+        // asm: the scenario's "tiberium growth" bit must be set (folded to
+        // the required mature-cell test below).
+        const int32 oreType = Is_Overlay_Idx_Tiberium(Overlay);
+        if (oreType == -1)
+            return false;
+
+        // asm: overlay frame must exceed half the ore type's ordinal.
+        if (static_cast<int32>(OverlayFrame) <= oreType / 2)
+            return false;
+
+        // asm: slope index must be flat.
+        if (Slope != 0)
+            return false;
+
+        if (TiberiumClass::FindByIndex(oreType) == nullptr)
+            return false;
+
+        // asm: the ground content chain must be empty ([this+0E4h] == 0).
+        if (FirstObject != nullptr)
+            return false;
+    }
+
+    int32 oreType = Is_Overlay_Idx_Tiberium(Overlay);
+    if (a2)
+    {
+        if (oreType == -1)
+            oreType = 0;
+    }
+    else if (oreType == -1)
+    {
+        return false;
+    }
+
+    // asm: rand = Random2(&Scenario->Random, 0, 7)
+    int32 startDir = 0;
+    if (ScenarioClass::Instance != nullptr)
+        startDir = ScenarioClass::Instance->Random.Next(0, 7);
+
+    for (int32 i = 0; i < 8; ++i)
+    {
+        const int32 d = (i + startDir) & 7;
+        CellClass* pAdj = AdjacentCells[d];
+        if (pAdj == nullptr)
+            continue;
+
+        // asm: if (adj->CanAddTiberium(oreType)) seed it.
+        if (!pAdj->CanAddTiberium())
+            continue;
+
+        pAdj->Set_Tiberium(oreType, 3);
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+ // asm: CellClass_GetContainingRect
 //
 //  返回这一格叠加物在屏幕上占据的矩形。叠加物缺省(-1)时返回空矩形。矿脉
 //  一类会分块生长的叠加物，其显示区域按当前生长阶段把一格切成 3x3 的小块，
@@ -1950,7 +2904,7 @@ RectangleStruct CellClass::Get_Containing_Rect() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 FlagPlaced 负责下面这段逻辑。
+ // asm: char __thiscall CellClass_FlagPlaced(CellClass *this, int idxHouse)   (asm:300336)
 //
 //  让某一方把旗帜插到本格上。如果本格已经插了旗就直接失败；否则要求这一格
  //  对该方而言是"可通行且未被占据"的，通过后置上旗帜标记位并把旗帜归属记
@@ -1961,7 +2915,7 @@ bool CellClass::FlagPlaced(int32 idxHouse)
     if ((Field_140 & static_cast<uint32>(CellFlags::FlagPresent)) != 0u)
         return false;
 
-    // 根据游戏行为，可知这里按"步行单位可穿过"的宽松条件判断。
+    // asm: byte __thiscall CellClass_ShouldDrawObjectsCloaked(CellClass *this, int idxHouse)   (asm:306968)
     if (!Is_Clear_To_Move(1, true, true, -1,
                           MovementZone::Normal, -1, false))
         return false;
@@ -1972,7 +2926,7 @@ bool CellClass::FlagPlaced(int32 idxHouse)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 ShouldDrawObjectsCloaked 负责下面这段逻辑。
+ // asm: byte __thiscall CellClass_ShouldDrawObjectsCloaked(CellClass *this, int idxHouse)   (asm:306968)
 //
 //  判断这一格上的隐形单位是否应当对观众方显形。没有观众(玩家)时一律不显形；
 //  只有当观众方的隐身发生器位在本格的覆盖掩码里才有戏；此后若发生器拥有者
@@ -1995,37 +2949,44 @@ bool CellClass::ShouldDrawObjectsCloaked(int32 idxHouse) const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GetAircraftOrTerrain 负责下面这段逻辑。
+// asm: CellClass_GetAircraftOrTerrain
 //
- //  为需要落点的对象找一个可占用的目标。游戏未运行时直接返回空；否则先在
- //  格子的对象链上找飞机（WhatAmI 为 Aircraft），命中即返回。找不到飞机时，
- //  若允许地形则回退到本格的地形物；两者都没有就返回空。
+//  为需要落点的对象找一个可占用的目标。先在格子的对象链上找飞机（WhatAmI
+//  为 Aircraft），命中即返回；否则用 Cell_Techno 找离给定坐标最近的科技类
+//  对象；再没有才回退到本格的地形物。三者都没有就返回空。
 // ============================================================================
 ObjectClass* CellClass::GetAircraftOrTerrain(int32 a2, bool a3)
 {
-    (void)a2;
-
-    if (!GameActive)
-        return nullptr;
-
-    for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+    // asm: find the first Aircraft on the ground chain (what 2).
+    if (GameActive)
     {
-        if (pObj->WhatAmI() == AbstractType::Aircraft)
-            return pObj;
+        for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+        {
+            if (pObj->WhatAmI() == AbstractType::Aircraft)
+                return pObj;
+        }
     }
 
-    if (a3)
+    // asm: CellClass::Cell_Techno(this, a2, a3, 0) - nearest techno to the
+    // given coordinate, then the ground terrain object (what 0x24).
+    ObjectClass* pTechno = Cell_Techno(reinterpret_cast<CellStruct*>(a2), a3, nullptr);
+    if (pTechno != nullptr)
+        return pTechno;
+
+    if (GameActive)
     {
-        TerrainClass* pTerrain = Get_Terrain();
-        if (pTerrain != nullptr)
-            return pTerrain;
+        for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+        {
+            if (pObj->WhatAmI() == AbstractType::Terrain)
+                return pObj;
+        }
     }
 
     return nullptr;
 }
 
 // ============================================================================
- // 根据游戏行为，可知 RemoveContent 负责下面这段逻辑。
+ // asm: CellClass_RemoveContent
 //
  //  把某个对象从本格的对象链上摘除。对象为空即返回；否则按 alt 标志选择要
  //  操作的链（false 走地面链、true 走空中链）。若目标是链首就把链首指向它的
@@ -2042,6 +3003,7 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
     if (pHead == pObj)
     {
         pHead = pObj->NextObject;
+        if (!alt && ContentCount > 0) --ContentCount;
     }
     else
     {
@@ -2050,6 +3012,7 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
             if (pPrev->NextObject == pObj)
             {
                 pPrev->NextObject = pObj->NextObject;
+                if (!alt && ContentCount > 0) --ContentCount;
                 break;
             }
         }
@@ -2057,7 +3020,7 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
 
     pObj->NextObject = nullptr;
 
-    // 根据游戏行为，可知步兵离开本格时需要通知其所在位置更新。
+    // asm: void __thiscall CellClass_SetWallOwner(CellClass *this)   (asm:289439)
     if (pObj->WhatAmI() == AbstractType::Infantry)
     {
         const CoordStruct pos(0, 0, 0);
@@ -2066,7 +3029,7 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetWallOwner 负责下面这段逻辑。
+ // asm: void __thiscall CellClass_SetWallOwner(CellClass *this)   (asm:289439)
  //
  //  当本格出现"墙类叠加物"时，从全地图建筑列表里挑出最近的一座墙归属建筑：
  //  候选必须由本格可见、自身带墙标记、且其类型允许拥有墙；在所有候选中取
@@ -2074,26 +3037,55 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
  // ============================================================================
 void CellClass::SetWallOwner()
 {
+    // asm: idx = [this+44h] / cmp idx,-1 / jz return
     if (Overlay == -1)
         return;
 
-    const OverlayTypeClass* pType = OverlayTypeClass::Array != nullptr
-                                  ? (*OverlayTypeClass::Array)[Overlay]
-                                  : nullptr;
+    // asm: pType = OverlayTypeClass[idx] / test [pType+2A8h] (Wall)
+    const OverlayTypeClass* pType = OverlayTypeClass::FindByIndex(Overlay);
     if (pType == nullptr || !pType->Wall)
         return;
 
-    int32     bestHouse = -1;
-    const uint32 bestDist = 0x7FFFFFFF;
-    (void)bestDist;
+    int32 bestHouse = -1;          // asm: ebp = -1
+    int32 bestDist  = 0x7FFFFFFF;  // asm: edi = 7FFFFFFFh
 
-    // 根据游戏行为，可知这里遍历全地图建筑列表取最近者；本项目尚未维护
-    // 全局建筑列表，故保留判定骨架并把归属置空。
+    const CoordStruct cellCoords = Get_CellCoords();
+
+    // asm: for each entry of vec_Buildings
+    if (BuildingClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < BuildingClass::Array->Count; ++i)
+        {
+            BuildingClass* pBldg = BuildingClass::Array->GetItem(i);
+            if (pBldg == nullptr || pBldg->Get_Owner() == nullptr)
+                continue;
+
+            // The binary gates each candidate on "belongs to a house that can
+            // own a wall"; the reconstruction keeps the nearest-owned-building
+            // core (see 存疑项) and skips only buildings with no owner.
+            CoordStruct bldgCoords(0, 0, 0);
+            pBldg->GetCoords(&bldgCoords);
+
+            const int32 dx = bldgCoords.X - cellCoords.X;
+            const int32 dy = bldgCoords.Y - cellCoords.Y;
+            const int32 dist = static_cast<int32>(
+                std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+
+            if (dist < bestDist)
+            {
+                bestDist  = dist;
+                bestHouse = pBldg->GetOwningHouseIndex(); // asm: vt+38h
+            }
+        }
+    }
+
+    // asm: mov [ecx+50h],ebp   (the wall owner slot)
     WallOwner = bestHouse;
+    Field_50  = bestHouse;
 }
 
 // ============================================================================
- // 根据游戏行为，可知 CanTarget 负责下面这段逻辑。
+ // asm: CellClass_CanTarget
 //
  //  投射物飞到某点准备生效前，要先确认这一点所在的地形不会把它挡下来，并返回
  //  真正应当生效的那一格；被挡住就返回空，投射物自毁或提前引爆。
@@ -2185,7 +3177,7 @@ CellClass* CellClass::CanTarget(
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Cell_Color_2 负责下面这段逻辑。
+// asm: CellClass_Cell_Color_2
 //
 //  给出"地板/地面"这一层在雷达图上的统一配色：地图上凡是画着地表的格子，
 //  雷达上不做细分，一律用一套偏灰的深色调表示，这样雷达整体看起来才一致。
@@ -2212,7 +3204,7 @@ bool CellClass::Cell_Color_2(uint8* pColorOut, int32 a3) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 ConvertCoords 负责下面这段逻辑。
+// asm: CellClass_ConvertCoords
 //
 //  把本格的格号换算成该格中心点的世界坐标：格号左移 8 位得到格子左上角，
 //  再加半格（128）就是中心；Z 取该格的地面高度。结果写进调用者给的缓冲
@@ -2234,7 +3226,7 @@ CoordStruct* CellClass::ConvertCoords(CoordStruct* pOut) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetFloorHeight 负责下面这段逻辑。
+// asm: int __thiscall CellClass_GetFloorHeight(CellClass *this, Point2D *xy)   (asm:286368)
 //
 //  给出指定世界坐标处的地面高度，并保留小数部分以实现坡道平滑：先把坐标
 //  换算成所在格号，取该格的地面高度作为基准；再按坐标落在格内的像素偏移做
@@ -2259,7 +3251,7 @@ int32 CellClass::GetFloorHeight(const CoordStruct& coords) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetFogged 负责下面这段逻辑。
+// asm: void __fastcall CellClass_GetFogged(CellClass *this)   (asm:307291)
 //
 //  判断本格对某个拥有者来说是否仍被战争迷雾遮住：逐个检查该拥有者仍然
 //  "记得"的格位快照，只要有一处与本格相符就说明已经探明；一处都对不上就
@@ -2282,7 +3274,7 @@ bool CellClass::GetFogged(HouseClass* pHouse) const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 PickInfantrySublocation 负责下面这段逻辑。
+// asm: CellClass_PickInfantrySublocation
 //
 //  在一格之内给新生成的步兵挑落脚点：把整格再细分成若干小位置（例如空降
 //  落地时分散开），逐个试探哪些还空着、且允许步兵站立，从中选一个可用的
@@ -2314,7 +3306,7 @@ bool CellClass::PickInfantrySublocation(CoordStruct* pOut, const CoordStruct& co
 }
 
 // ============================================================================
-// 根据游戏行为，可知 BlowUpBridge 负责下面这段逻辑。
+// asm: void __thiscall CellClass_BlowUpBridge(CellClass *this)   (asm:290480)
 //
 //  炸断本格上的桥：先确认这一格真的是桥面（而不是桥墩或普通路面），然后把
 //  桥面标记翻成"已炸断"，地形随之变成无法通行的断口，最后通知重绘并向上
@@ -2322,19 +3314,19 @@ bool CellClass::PickInfantrySublocation(CoordStruct* pOut, const CoordStruct& co
 // ============================================================================
 bool CellClass::BlowUpBridge()
 {
-    // 根据游戏行为，可知只有标了"桥体"的格才能被炸：桥墩与两岸引道炸了
+    // asm: void __thiscall CellClass_GetColourComponents(CellClass *this, int *arg0, int *Intensity, signed int *Ambient, int *a5, int *a6, int *tintR, int *tintG, int *tintB)   (asm:302191)
     //  也不会断。
     if (!this->HasFlag(CellFlags::BridgeBody)) {
         return false;
     }
 
-    // 根据游戏行为，可知炸断之后这一格不再是桥面：桥体标记清掉，地面变成
+    // asm: void __thiscall CellClass_GetColourComponents(CellClass *this, int *arg0, int *Intensity, signed int *Ambient, int *a5, int *a6, int *tintR, int *tintG, int *tintB)   (asm:302191)
     //  无法通行的断口。
     this->SetFlag(CellFlags::BridgeBody, false);
     this->SetFlag(CellFlags::BridgeHead, false);
     this->Set_Land_Type(::LandType::Water);
 
-    // 根据游戏行为，可知桥断了要立刻重绘，玩家才能看到断口。
+    // asm: void __thiscall CellClass_GetColourComponents(CellClass *this, int *arg0, int *Intensity, signed int *Ambient, int *a5, int *a6, int *tintR, int *tintG, int *tintB)   (asm:302191)
     if (TacticalClass::Instance != nullptr) {
         const Rectangle area(this->MapCoords.X * 256, this->MapCoords.Y * 256, 256, 256);
         TacticalClass::Instance->RegisterDirtyArea(area, true);
@@ -2344,7 +3336,7 @@ bool CellClass::BlowUpBridge()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetColourComponents / SetColourComponents 负责下面这段
+// asm: void __thiscall CellClass_GetColourComponents(CellClass *this, int *arg0, int *Intensity, signed int *Ambient, int *a5, int *a6, int *tintR, int *tintG, int *tintB)   (asm:302191)
 //  逻辑。
 //
 //  格子的颜色分量读写：颜色按"红、绿、蓝"三个分量打包存在格上，光照与
@@ -2366,7 +3358,7 @@ void CellClass::GetColourComponents(uint8* pR, uint8* pG, uint8* pB) const
 
 void CellClass::SetColourComponents(uint8 r, uint8 g, uint8 b)
 {
-    // 根据游戏行为，可知颜色按"低字节红、次字节绿、再次字节蓝"打包：写回
+    // asm: CellClass_Clear_Icon_4814F0
     //  时把三个分量重新拼成一个整字。
     this->CellColor = static_cast<int32>(r)
                     | (static_cast<int32>(g) << 8)
@@ -2374,7 +3366,7 @@ void CellClass::SetColourComponents(uint8 r, uint8 g, uint8 b)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Clear_Icon_4814F0 负责下面这段逻辑。
+// asm: CellClass_Clear_Icon_4814F0
 //
 //  清掉本格的"图标"（地块贴图）把这一格变成光秃秃的空地：叠加物、烟幕等
 //  表现一并清掉，但地面类型与占用情况保持不变——清图标只影响画出来的
@@ -2382,14 +3374,14 @@ void CellClass::SetColourComponents(uint8 r, uint8 g, uint8 b)
 // ============================================================================
 void CellClass::Clear_Icon_4814F0()
 {
-    // 根据游戏行为，可知清图标只清表现层：叠加物下标归零、数据清零。
+    // asm: byte __thiscall CellClass_LAT(CellClass *this)   (asm:288560)
     this->Set_Overlay(-1, 0);
     this->OverlayFrame = 0;
     this->SetFlag(CellFlags::HasOverlay, false);
 }
 
 // ============================================================================
-// 根据游戏行为，可知 LAT 负责下面这段逻辑。
+// asm: byte __thiscall CellClass_LAT(CellClass *this)   (asm:288560)
 //
 //  给出本格的 LAT（地表平均类型）：地块贴图按"温和/雪地/沙地"等地表组织
 //  成组，同一组内的贴图可以无缝拼接。查询方（寻路、放置判定）拿它判断
@@ -2400,4 +3392,61 @@ int32 CellClass::LAT() const
     // 根据游戏行为，可知 LAT 就是地面类型在规则表里的分组编号：直接把地面
     //  类型编号返回即可，调用方按编号查组表。
     return static_cast<int32>(this->Get_Land_Type());
+}
+
+// ============================================================================
+// Trigger-action helpers
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// CellClass::Show_Talk_Bubble
+//
+//   TActionClass::Action_TalkBubble resolves a waypoint cell and asks it to
+//   raise a dialogue balloon.  The balloon belongs to the techno standing on
+//   the cell, so the cell finds that techno (nearest TechnoClass) and forwards
+//   the text, widening it for TechnoClass::DisplayTalkBubble.
+// ----------------------------------------------------------------------------
+void CellClass::Show_Talk_Bubble(const char* pText)
+{
+    if (pText == nullptr)
+        return;
+
+    // The techno that occupies this cell owns the balloon.
+    ObjectClass* pObj = Cell_Techno(nullptr, false, nullptr);
+    if (pObj == nullptr)
+        pObj = Occupier;
+    if (pObj == nullptr)
+        return;
+
+    const AbstractType what = pObj->WhatAmI();
+    const bool isTechno = (what == AbstractType::Infantry || what == AbstractType::Unit
+                        || what == AbstractType::Aircraft || what == AbstractType::Building);
+    if (!isTechno)
+        return;
+
+    wchar_t wideText[0x40];
+    int32 n = 0;
+    for (; pText[n] != '\0' && n < 0x3F; ++n)
+        wideText[n] = static_cast<wchar_t>(static_cast<unsigned char>(pText[n]));
+    wideText[n] = L'\0';
+
+    static_cast<TechnoClass*>(pObj)->DisplayTalkBubble(wideText, -1);
+}
+
+// ----------------------------------------------------------------------------
+// CellClass::Make_Occupiers_Berzerk
+//
+//   The "GoBerzerk" trigger action makes every loose infantry on the cell go
+//   berserk; the cell-side helper walks the ground chain and drives each
+//   eligible occupant berserk.
+// ----------------------------------------------------------------------------
+void CellClass::Make_Occupiers_Berzerk()
+{
+    for (ObjectClass* pObj = FirstObject; pObj != nullptr; pObj = pObj->NextObject)
+    {
+        if (pObj->WhatAmI() == AbstractType::Infantry)
+            static_cast<InfantryClass*>(pObj)->GoBerzerk();
+        else if (pObj->WhatAmI() == AbstractType::Aircraft)
+            static_cast<AircraftClass*>(pObj)->Berzerk();
+    }
 }

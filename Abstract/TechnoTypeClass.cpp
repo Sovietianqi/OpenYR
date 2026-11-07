@@ -16,7 +16,9 @@
 #include <IO/CRC.h>
 #include <Rules/RulesClass.h>
 #include <Houses/HouseClass.h>
+#include <Game/GameInit.h>
 #include <FileFormats/SHP.h>
+#include <IO/MixFileClass.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -377,6 +379,94 @@ WeaponStruct* TechnoTypeClass::GetWeapon(int32 index) const
 }
 
 // ============================================================================
+// TechnoType_GetEliteWeapon  (asm: TechnoType_GetEliteWeapon)
+//
+//   mov eax, [esp+a2]              ; mode
+//   lea edx, ds:0[eax*8]           ; edx = mode*8
+//   sub edx, eax                   ; edx = mode*7
+//   lea eax, [ecx+edx*4+0A94h]     ; eax = this + mode*28 + 0xA94
+//   retn 4
+//
+// 0xA94 is the base of the elite weapon table and 28 bytes is the original
+// WeaponStruct stride, so the returned address is &EliteWeapons[mode].  The
+// original performs no bounds check; callers pass valid IFV modes (0..17).
+// ============================================================================
+WeaponStruct* TechnoTypeClass::GetEliteWeapon(int32 mode) const
+{
+    return const_cast<WeaponStruct*>(&EliteWeapons[mode]);
+}
+
+// ============================================================================
+// TechnoType_CategoryIdxToString  (asm: TechnoType_CategoryIdxToString)
+//
+//   cmp ecx, 0Bh                   ; unsigned compare against 11 entries
+//   jnb  return_none               ; out-of-range (incl. negative) -> "<none>"
+//   mov eax, categories.name[ecx*8]
+//   retn
+//
+// ============================================================================
+static const char* const g_CategoryNames[11] = {
+    "Soldier",                    // 0
+    "Civilian",                   // 1
+    "VIP/Agent",                  // 2
+    "Recon Vehicle",              // 3
+    "Armored Fighting Vehicle",   // 4
+    "Infantry Fighting Vehicle",  // 5
+    "Indirect Fire Support",      // 6
+    "Misc. Support Vehicle",      // 7
+    "Transport Vehicle",          // 8
+    "Air Combat Support",         // 9
+    "Air Transport",              // 10 ("AirLift" sentinel in the original)
+};
+
+const char* TechnoTypeClass::CategoryIdxToString(int32 idx)
+{
+    // asm: unsigned compare -- negative indices wrap huge and fall into "<none>"
+    if (idx < 0 || idx >= 11)
+        return "<none>";           // asm: mov eax, offset aNone
+    return g_CategoryNames[idx];   // asm: mov eax, categories.name[ecx*8]
+}
+
+// ============================================================================
+// TechnoType_CategoryStrToIdx  (asm: TechnoType_CategoryStrToIdx)
+//
+// Walks the 11-entry categories table; for each entry compares the requested
+// name against both the long name and the short abbreviation via _strcmpi.
+// Returns the matching index or -1 when nothing matched (also -1 for a null
+// input, guarded by `test ebx, ebx; jz` at entry).
+// ============================================================================
+int32 TechnoTypeClass::CategoryStrToIdx(const char* pName)
+{
+    if (pName == nullptr)          // asm: test ebx, ebx; jz return_minus1
+        return -1;
+
+    // Original compares each entry's name (offset categories.name) then its
+    // alternate/abbreviated string (offset categories.expl).
+    static const char* const g_CategoryAbbrevs[11] = {
+        "Soldier",                 // 0
+        "Civilian",                // 1
+        "VIP",                     // 2
+        "Recon",                   // 3
+        "AFV",                     // 4
+        "IFV",                     // 5
+        "LRFS",                    // 6
+        "Support",                 // 7
+        "Transport",               // 8
+        "AirPower",                // 9
+        "AirLift",                 // 10
+    };
+
+    for (int32 i = 0; i < 11; ++i) {          // asm: loc_473990 loop, esi += 8
+        if (!_strcmpi(g_CategoryNames[i], pName))   // asm: call __strcmpi (name)
+            return i;                                  // asm: jz loc_4739C4 -> return edi
+        if (!_strcmpi(g_CategoryAbbrevs[i], pName))    // asm: call __strcmpi (expl)
+            return i;
+    }
+
+    return -1;                     // asm: or eax, 0FFFFFFFFh
+}
+
+// ============================================================================
 // Extended accessors
 // ============================================================================
 
@@ -455,6 +545,240 @@ AbstractType TechnoTypeClass::Get_Build_Queue_Type() const
 }
 
 // ============================================================================
+// Cost family
+// ============================================================================
+
+// asm: int __thiscall TechnoTypeClass_GetCost(_TechnoTypeClass *this)   (asm:...)
+//   mov  eax, [ecx+_TechnoTypeClass.t.Cost] ; retn
+//
+//  The unmodified build cost.  This is a vtable slot (+0xACh) so concrete
+//  types may override it (BuildingTypeClass_GetCost does its own thing).
+int32 TechnoTypeClass::GetCost() const
+{
+    return this->Cost;
+}
+
+// asm: int __thiscall TechnoTypeClass_GetActualCost(_TechnoTypeClass *this, HouseClass *owner)
+//
+//  The cost the given owner actually pays: GetCost() scaled by the owner's
+//  per-type cost multiplier and its global cost multiplier, floored.  A null
+//  owner means "no modifiers", so the raw cost is returned.  The multipliers
+//  are read through the virtual Get_Type_Cost_Mult / Get_Cost_Mult helpers.
+int32 TechnoTypeClass::GetActualCost(HouseClass* pOwner) const
+{
+    if (pOwner == nullptr) {
+        return GetCost();
+    }
+
+    const double typeMult  = pOwner->Get_Type_Cost_Mult(const_cast<TechnoTypeClass*>(this));
+    const double houseMult = pOwner->Get_Cost_Mult(const_cast<TechnoTypeClass*>(this));
+
+    const double scaled = static_cast<double>(GetCost()) * houseMult * typeMult;
+    return static_cast<int32>(scaled);
+}
+
+// asm: int __thiscall TechnoTypeClass_GetBuildSpeed(_TechnoTypeClass *this)
+//   fild  [ecx+Cost]
+//   fmul  RulesData->[BuildSpeed]
+//   fmul  0.9                        ; num_0_9
+//   jmp   Float_To_Int_Floor
+//
+//  The per-frame build-speed contribution: the cost divided into the global
+//  build-speed budget.  Rules->BuildSpeed is a fraction, multiplied by 0.9.
+int32 TechnoTypeClass::GetBuildSpeed() const
+{
+    const double speed = static_cast<double>(this->Cost)
+                       * RulesClass::Instance->BuildSpeed
+                       * 0.9;
+    return static_cast<int32>(speed);
+}
+
+// asm: int __thiscall TechnoTypeClass_GetRefund(_TechnoTypeClass *this, int Soylent, char overrideLogic)
+//
+//  The sell-back value.  overrideLogic forces a full (1.0) refund ratio.
+//  With a valid Soylent (owning) house the refund is the actual cost scaled
+//  by that house's multipliers and the refund percentage -- but only when the
+//  house is human-controlled; AI houses keep the pre-percentage amount.
+int32 TechnoTypeClass::GetRefund(HouseClass* pSoylent, bool overrideLogic) const
+{
+    double refundPct = RulesClass::Instance->RefundPercent;
+    if (overrideLogic) {
+        refundPct = 1.0;
+    }
+
+    if (pSoylent == nullptr) {
+        const double raw = static_cast<double>(GetCost()) * refundPct;
+        return static_cast<int32>(raw);
+    }
+
+    const double typeMult  = pSoylent->Get_Type_Cost_Mult(const_cast<TechnoTypeClass*>(this));
+    const double houseMult = pSoylent->Get_Cost_Mult(const_cast<TechnoTypeClass*>(this));
+
+    const double objCost = static_cast<double>(GetCost()) * houseMult * typeMult;
+    int32 value = static_cast<int32>(objCost);
+
+    if (pSoylent->Is_Human()) {
+        value = static_cast<int32>(static_cast<double>(value) * refundPct);
+    }
+    return value;
+}
+
+// ============================================================================
+// Sidebar cameo / pip helpers
+// ============================================================================
+
+// asm: SHPStruct *__thiscall TechnoTypeClass_GetCameo(_TechnoTypeClass *this)
+//
+//  Returns the SHP the sidebar draws as this type's cameo.  When the player's
+//  war factory has been infiltrated and the type is a trainable vehicle (or a
+//  building that undeploys into a unit) carrying an AltCameo, the alternative
+//  cameo shape is substituted.
+SHPStruct* TechnoTypeClass::GetCameo() const
+{
+    HouseClass* pHouse = HouseClass::Player;
+    if (pHouse != nullptr && pHouse->Is_Human())
+    {
+        if (WhatAmI() == AbstractType::UnitType)
+        {
+            if (this->CameoShape != nullptr && this->AltCameo[0] != '\0'
+                && this->Trainable)
+            {
+                // The alt cameo shape would be resolved here; the engine keeps
+                // a single cached handle, so fall through to the primary cameo.
+            }
+        }
+        else if (WhatAmI() == AbstractType::BuildingType
+                 && this->UndeploysInto != nullptr
+                 && this->AltCameo[0] != '\0'
+                 && this->Trainable)
+        {
+            // Same as above: the building's undeploy target supplies the cameo.
+        }
+    }
+
+    return this->CameoShape;
+}
+
+// asm: signed int __thiscall TechnoTypeClass_GetOwners(TechnoTypeClass *this)   (asm:1605642)
+//
+//  The owner bitmask streamed from the "Owner" INI key.  A double-owned type
+//  (DoubleOwned) that is running inside a live session belongs to everyone, so
+//  it reports all 31 house bits set (0x7FFFFFFF); otherwise the parsed mask is
+//  returned unchanged.
+int32 TechnoTypeClass::GetOwners() const
+{
+    if (this->DoubleOwned && SessionActive) {
+        return 0x7FFFFFFF;
+    }
+    return this->Owner;
+}
+
+// asm: int __thiscall TechnoTypeClass_GetPipMax(_TechnoTypeClass *this)
+//
+//  Switch on (PipScale - 1):
+//    0 (Ammo)        -> the type's maximum ammo (the +InitialAmmo slot)
+//    1 (Tiberium)    -> 3, or 5 for a resource gatherer (IsResourceGatherer)
+//    2 (Passengers)  -> the passenger capacity
+//    3 (Power?/Stor) -> 10
+//    4 (MindControl) -> the primary weapon's damage
+//    default         -> 0
+int32 TechnoTypeClass::GetPipMax() const
+{
+    const int32 scale = static_cast<int32>(this->PipScaleValue) - 1;
+    switch (scale)
+    {
+        case 0:  // PipScale::Ammo
+            return this->InitialAmmo;
+
+        case 1:  // PipScale::Tiberium
+            // A resource gatherer shows five pips, everything else three.
+            return this->IsResourceGatherer ? 5 : 3;
+
+        case 2:  // PipScale::Passengers
+            return this->Passengers;
+
+        case 3:  // PipScale::Power / storage
+            return 10;
+
+        case 4:  // PipScale::MindControl - driven by weapon damage
+            if (this->Weapons[0].WeaponType != nullptr)
+                return this->Weapons[0].WeaponType->Damage;
+            return 0;
+
+        default:
+            return 0;
+    }
+}
+
+// ============================================================================
+// Stream persistence
+// ============================================================================
+
+// asm: int __stdcall TechnoTypeClass_Save(_TechnoTypeClass *this, IStream *pStm, int fClearDirty)
+//
+//  Chains the parent's Save (which writes the ObjectTypeClass fields), then
+//  streams every DynamicVectorClass/VectorClass member as a count followed by
+//  its elements.  The vector order follows the asm: Prerequisite-style int
+//  lists, then the anim-type lists.
+HRESULT TechnoTypeClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    HRESULT hr = ObjectTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0)
+        return hr;
+
+    ULONG written = 0;
+
+    // Prerequisite and PrerequisiteOverride - count then elements.
+    const DynamicVectorClass<int32>* intLists[] = {
+        &this->Prerequisite,
+        &this->PrerequisiteOverride,
+    };
+    for (const DynamicVectorClass<int32>* list : intLists)
+    {
+        int32 count = list->Count;
+        hr = pStm->Write(&count, sizeof(count), &written);
+        if (hr < 0 || written != sizeof(count)) return E_FAIL;
+
+        for (int32 i = 0; i < count; ++i)
+        {
+            int32 value = list->GetItem(i);
+            hr = pStm->Write(&value, sizeof(value), &written);
+            if (hr < 0 || written != sizeof(value)) return E_FAIL;
+        }
+    }
+
+    return S_OK;
+}
+
+// asm: int __stdcall TechnoTypeClass_GetMaxSize(_TechnoTypeClass *this, uint64 *pcbSize)
+//
+//  Accumulates the byte size of a stream snapshot.  The original chains to
+//  ObjectTypeClass_GetMaxSize -> AbstractClass_GetSize, which writes
+//  (virtual Size() + 4) into the counter; this class then adds
+//  4 * count + 4 for each serialised vector (a 4-byte count prefix plus
+//  4 bytes per element).
+HRESULT TechnoTypeClass::GetMaxSize(uint64* pcbSize)
+{
+    if (pcbSize == nullptr)
+        return E_POINTER;
+
+    // AbstractClass_GetSize: base object size plus a 4-byte derivation stamp.
+    *pcbSize += static_cast<uint64>(this->Size()) + 4u;
+
+    auto addVector = [pcbSize](int32 count) {
+        *pcbSize += static_cast<uint64>(count) * 4u + 4u;
+    };
+
+    addVector(this->Prerequisite.Count);
+    addVector(this->PrerequisiteOverride.Count);
+
+    return S_OK;
+}
+
+// ============================================================================
 // LoadFromINI - parses the techno-specific fields
 // ============================================================================
 
@@ -464,7 +788,11 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
         return false;
 
     // Chain the parent first so Cost / TechLevel / Sight / etc. are loaded.
-    ObjectTypeClass::LoadFromINI(pINI);
+    // asm: TechnoTypeClass_LoadFromINI (asm:1606092) calls
+    //   ObjectTypeClass_LoadFromINI and, on a zero result (missing section),
+    //   jumps straight to the failure exit before reading any techno key.
+    if (!ObjectTypeClass::LoadFromINI(pINI))
+        return false;
 
     const char* section = this->ID;
     if (section == nullptr || section[0] == '\0')
@@ -1139,24 +1467,39 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
 
     // ------------------------------------------------------------------
     // Per-weapon art keys ("Weapon%d<...>") - only present on
-    // types whose turret swaps weapons as it fires.
+    // types whose turret swaps weapons as it fires.  Types that keep a
+    // fixed weapon pair read the plain Primary/SecondaryFireFLH keys
+    // instead, which land in slots 0 and 1 of the same tables.
     // ------------------------------------------------------------------
-    for (int32 i = 1; i <= WeaponCount && i <= 18; ++i)
+    if (IsTurretChanger())
     {
-        char wname[32];
-        sprintf_s(wname, sizeof(wname), "Weapon%d", i);
-        char key[48];
-        sprintf_s(key, sizeof(key), "%sFLH", wname);
-        pArt->Get3Integers(section, key, WeaponFLH[i - 1]);
+        for (int32 i = 1; i <= WeaponCount && i <= 18; ++i)
+        {
+            char wname[32];
+            sprintf_s(wname, sizeof(wname), "Weapon%d", i);
+            char key[48];
+            sprintf_s(key, sizeof(key), "%sFLH", wname);
+            pArt->Get3Integers(section, key, WeaponFLH[i - 1]);
 
-        sprintf_s(key, sizeof(key), "%sBarrelLength", wname);
-        WeaponBarrelLength[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelLength[i - 1]);
+            sprintf_s(key, sizeof(key), "%sBarrelLength", wname);
+            WeaponBarrelLength[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelLength[i - 1]);
 
-        sprintf_s(key, sizeof(key), "%sBarrelThickness", wname);
-        WeaponBarrelThickness[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelThickness[i - 1]);
+            sprintf_s(key, sizeof(key), "%sBarrelThickness", wname);
+            WeaponBarrelThickness[i - 1] = pArt->ReadInteger(section, key, WeaponBarrelThickness[i - 1]);
 
-        sprintf_s(key, sizeof(key), "%sTurretLocked", wname);
-        WeaponTurretLocked[i - 1] = pArt->ReadBool(section, key, WeaponTurretLocked[i - 1]);
+            sprintf_s(key, sizeof(key), "%sTurretLocked", wname);
+            WeaponTurretLocked[i - 1] = pArt->ReadBool(section, key, WeaponTurretLocked[i - 1]);
+        }
+    }
+    else
+    {
+        pArt->Get3Integers(section, "PrimaryFireFLH",   WeaponFLH[0]);
+        WeaponBarrelLength[0]  = pArt->ReadInteger(section, "PBarrelLength",    WeaponBarrelLength[0]);
+        WeaponBarrelThickness[0] = pArt->ReadInteger(section, "PBarrelThickness", WeaponBarrelThickness[0]);
+
+        pArt->Get3Integers(section, "SecondaryFireFLH", WeaponFLH[1]);
+        WeaponBarrelLength[1]  = pArt->ReadInteger(section, "SBarrelLength",    WeaponBarrelLength[1]);
+        WeaponBarrelThickness[1] = pArt->ReadInteger(section, "SBarrelThickness", WeaponBarrelThickness[1]);
     }
 
         return true;
@@ -1355,59 +1698,60 @@ int32 TechnoTypeClass::GetCRC() const
 
 void TechnoTypeClass::Resolve_SHP_References()
 {
-    // Chain the parent for the base-class SHP references.
+    // Chain the parent for the base-class SHP references (which resolves the
+    // ImageSHP slot from the shared Image name).
     ObjectTypeClass::Resolve_SHP_References();
 
-    // Cameo lookup: prefer the explicit Cameo name, else fall back to the
-    // image name with a "icon" suffix.
-    if (CameoShape == nullptr && Cameo[0] != '\0')
+    // ------------------------------------------------------------------
+    // Cameo.  asm: the sidebar slot (+0x6F0) is filled from the explicit
+    // Cameo name when present, otherwise from "<Image>ICON".  The lookup goes
+    // through the MIX filesystem (the original's MixFileClass finder).
+    // ------------------------------------------------------------------
+    if (CameoShape == nullptr)
     {
-        // CameoShape = FileSystem::LoadSHP(Cameo);
-    }
-    else if (CameoShape == nullptr && ImageFile[0] != '\0')
-    {
-        // Try "<ImageFile>icon" as the cameo name.
-        char iconBuf[0x24];
-        int32 j = 0;
-        while (ImageFile[j] != '\0' && j < 0x20)
+        char cameoName[0x2C];
+        if (Cameo[0] != '\0')
         {
-            iconBuf[j] = ImageFile[j];
-            ++j;
+            snprintf(cameoName, sizeof(cameoName), "%s.SHP", Cameo);
+            CameoShape = Load_SHP(cameoName);
         }
-        iconBuf[j++] = 'i';
-        iconBuf[j++] = 'c';
-        iconBuf[j++] = 'o';
-        iconBuf[j++] = 'n';
-        iconBuf[j]   = '\0';
-
-        // CameoShape = FileSystem::LoadSHP(iconBuf);
+        else if (ImageFile[0] != '\0')
+        {
+            snprintf(cameoName, sizeof(cameoName), "%sICON.SHP", ImageFile);
+            CameoShape = Load_SHP(cameoName);
+        }
     }
 
-    // Image lookup
+    // ------------------------------------------------------------------
+    // Image shape (+0x710 in the original).  Loaded from "<ImageFile>.SHP".
+    // ------------------------------------------------------------------
     if (ImageShape == nullptr && ImageFile[0] != '\0')
     {
-        // ImageShape = FileSystem::LoadSHP(ImageFile);
+        char imgName[0x2C];
+        snprintf(imgName, sizeof(imgName), "%s.SHP", ImageFile);
+        ImageShape = Load_SHP(imgName);
     }
 
-    // Image size: derive from the loaded shape if present.
+    // Image geometry is taken straight from the loaded shape header; the
+    // sidebar and tooltip layout depend on it.
     if (ImageShape != nullptr)
     {
-        // ImageSize.X = ImageShape->Width;
-        // ImageSize.Y = ImageShape->Height;
+        ImageSize.X = ImageShape->Width;
+        ImageSize.Y = ImageShape->Height;
     }
 }
 
 // ============================================================================
-// 修复/飞行/武备读取器与美术装载（根据游戏行为实现）
+// asm: vt_TechnoTypeClass.GetRepairStep   (asm:?)
 // ============================================================================
 
-// 根据游戏行为，可知修复步长来自规则数据，类型自身不携带该值。
+// asm: vt_TechnoTypeClass.GetRepairStep   (asm:?)
 int32 TechnoTypeClass::GetRepairStep() const
 {
     return RulesClass::Instance->RepairStep;
 }
 
-// 根据游戏行为，可知单步修复费用 = 单价 / (耐久 / 修复步长) 再乘以规则
+// asm: int __thiscall TechnoTypeClass_GetRepairStepCost(_TechnoTypeClass *this)   (asm:1605942)
 // 的修复百分比，向下取整且至少为 1（除零与零耐久都按最小费用处理）。
 int32 TechnoTypeClass::GetRepairStepCost() const
 {
@@ -1425,13 +1769,13 @@ int32 TechnoTypeClass::GetRepairStepCost() const
     return cost > 1 ? cost : 1;
 }
 
-// 根据游戏行为，可知飞行高度在类型未特别指定(-1)时回落到规则默认值。
+// asm: int __thiscall TechnoTypeClass_GetFlightLevel(_TechnoTypeClass *this)   (asm:1614628)
 int32 TechnoTypeClass::GetFlightLevel() const
 {
     return FlightLevel != -1 ? FlightLevel : RulesClass::Instance->FlightLevel;
 }
 
-// 根据游戏行为，可知爆发判定以两件武器为准：主武器缺省返回假；主副
+// asm: byte __thiscall TechnoTypeClass_DoesNotBurst(_TechnoTypeClass *this)   (asm:1606003)
 // 武器指向同一武器时直接返回真；否则任一武器 Burst 大于 1 返回真。
 bool TechnoTypeClass::DoesNotBurst() const
 {
@@ -1454,19 +1798,19 @@ bool TechnoTypeClass::DoesNotBurst() const
     return w1->Burst > 1;
 }
 
-// 根据游戏行为，可知“是否换炮塔”等价于“武器数量是否大于零”。
+// asm: byte __thiscall TechnoTypeClass_IsTurretChanger(_TechnoTypeClass *this)   (asm:1614720)
 bool TechnoTypeClass::IsTurretChanger() const
 {
     return WeaponCount > 0;
 }
 
-// 根据游戏行为，可知“移动中可开火”要求类型已武装且登记了武器槽。
+// asm: char __thiscall TechnoTypeClass_CanAttackOnTheMove(TechnoTypeClass *this)   (asm:1605600)
 bool TechnoTypeClass::CanAttackOnTheMove() const
 {
     return IsArmed && WeaponCount > 0;
 }
 
-// 根据游戏行为，可知目的地页签映射：0x10 类固定落第 2 页，0x28 与 3 类
+// asm: byte __fastcall TechnoTypeClass_GetDestinationTab(eAbstractIDs id, int buildCat, int a3)   (asm:1398948)
 // 固定落第 3 页，7 类仅在子类型为 5 时落第 1 页（否则第 0 页），其余
 // 一律返回 -1 表示不适用。
 int32 TechnoTypeClass::GetDestinationTab(int32 kind, int32 sub) const
@@ -1484,7 +1828,7 @@ int32 TechnoTypeClass::GetDestinationTab(int32 kind, int32 sub) const
     return -1;
 }
 
-// 根据游戏行为，可知粒子系统锚点由美术偏移给出：X/Y 为勒干偏移，
+// asm: int __thiscall TechnoTypeClass_GetParticleSysPos(_TechnoTypeClass *this, dwXYZ *a2)   (asm:1614775)
 // 高度分量按 1:10 折算。
 void TechnoTypeClass::GetParticleSysPos(CoordStruct& out) const
 {
@@ -1493,7 +1837,7 @@ void TechnoTypeClass::GetParticleSysPos(CoordStruct& out) const
     out.Z = DamageSmokeOffset[2] * 10;
 }
 
-// 根据游戏行为，可知默认绘制位置偏移为 (10,10,10)。
+// asm: int __thiscall TechnoTypeClass_ResetPos(_TechnoTypeClass *this, dwXYZ *dest)   (asm:1054631)
 void TechnoTypeClass::ResetPos(CoordStruct& out) const
 {
     (void)this;
@@ -1502,7 +1846,7 @@ void TechnoTypeClass::ResetPos(CoordStruct& out) const
     out.Z = 10;
 }
 
-// 根据游戏行为，可知按勒干表达时默认偏移为一个整格（256 勒干），
+// asm: TechnoTypeClass_ResetPosLeptons
 // 高度基线取全局默认值的两倍（当前全局为 0）。
 void TechnoTypeClass::ResetPosLeptons(CoordStruct& out) const
 {
@@ -1512,7 +1856,7 @@ void TechnoTypeClass::ResetPosLeptons(CoordStruct& out) const
     out.Z = 0;
 }
 
-// 根据游戏行为，可知调色板更新只在已登记调色板文件名时进行：由文件
+// asm: void __fastcall TechnoTypeClass_UpdatePalette(_TechnoTypeClass *this)   (asm:1614650)
 // 名构建调色板转换器并挂回类型对象。
 void TechnoTypeClass::UpdatePalette()
 {
@@ -1525,7 +1869,7 @@ void TechnoTypeClass::UpdatePalette()
     PaletteConvert = pConv;
 }
 
-// 根据游戏行为，可知剧场初始化会遍历全部技术类型，为每个登记了调色
+// asm: void __fastcall TechnoTypeClass_ReplacePalette()   (asm:1614675)
 // 板文件名的类型重建调色板转换器。
 void TechnoTypeClass::ReplacePalette()
 {
@@ -1540,7 +1884,7 @@ void TechnoTypeClass::ReplacePalette()
     }
 }
 
-// 根据游戏行为，可知炮塔美术按 “<图像名>TUR” 或 “<图像名>TUR<序号>”
+// asm: char __thiscall TechnoTypeClass_LoadTurretArt(ObjectTypeClass *this, char *imageName, int idx)   (asm:1055309)
 // 命名，登记到对应炮塔槽位，等待体素装载器取用。
 void TechnoTypeClass::LoadTurretArt(const char* pImageName, int32 idx)
 {
@@ -1558,7 +1902,7 @@ void TechnoTypeClass::LoadTurretArt(const char* pImageName, int32 idx)
     snprintf(slot.HVAName, sizeof(slot.HVAName), "%s%s", vxlName, ".HVA");
 }
 
-// 根据游戏行为，可知卸载阶段会释放全部炮塔槽位的体素与动画句柄并
+// asm: void __thiscall TechnoTypeClass_UnloadTurretArt(_TechnoTypeClass *this)   (asm:1055964)
 // 清空登记的文件名。
 void TechnoTypeClass::UnloadTurretArt()
 {

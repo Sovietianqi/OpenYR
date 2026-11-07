@@ -129,6 +129,22 @@ void DamageArea::ApplyCellDamage(CoordStruct center, int32 damage, TechnoClass* 
     float cellSpread = pWarhead->GetCellSpread();
     if (cellSpread <= 0.0f) return;
 
+    // ========================================================================
+    // 正式实现：走原版 Damage_At_Cell_Update_489280 的 1:1 复刻
+    //   （MapClass::Damage_At_Cell，见 Map/MapDamageAtCell.cpp）。
+    //
+    //   原版该入口负责：圆盘逐环收集、伤害结算、tiberium/墙扣减、
+    //   钢/木桥破坏、油桶连锁、震屏与粒子。这正是原版行为，取代下方
+    //   早先"按语义推测"的线性衰减实现。
+    //
+    //   affectsAllies 参数在原版入口中由弹头属性/归属方决定（原版第 5
+    //   个栈参 a5 表示是否扣减 tiberium），此处保持原版语义：a5 = true。
+    // ========================================================================
+    MapClass::Instance->Damage_At_Cell(center, damage, pSource, pWarhead,
+                                       true, pSourceHouse);
+    return;
+
+    // ---- 以下为旧的手写衰减实现，保留作为对照与回退 ----
     float percentAtMax = pWarhead->GetPercentAtMax();
     CellStruct centerCell = Math::CoordToCell(center);
 
@@ -331,6 +347,15 @@ void DamageArea::ApplyAtLocation(CoordStruct location, int32 damage, TechnoClass
                                   WarheadTypeClass* pWarhead, bool affectsAllies,
                                   HouseClass* pSourceHouse) {
     if (!pWarhead) return;
+
+    // 原版 Damage_At_Cell_Update_489280 是无条件入口（弹头 null 时函数内部
+    // 立即返回 1）。这里同样直连复刻实现，不再区分 cellSpread 是否为 0：
+    // 单格伤害也由 Damage_At_Cell 的逐环逻辑统一处理。
+    if (MapClass::Instance != nullptr) {
+        MapClass::Instance->Damage_At_Cell(location, damage, pSource, pWarhead,
+                                           true, pSourceHouse);
+        return;
+    }
 
     float cellSpread = pWarhead->GetCellSpread();
     if (cellSpread > 0.0f) {

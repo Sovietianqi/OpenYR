@@ -18,10 +18,20 @@ public:
 
     virtual Layer In_Which_Layer() override { return Layer::Ground; }
     virtual bool Process() override;
-    void blah();
+    // asm: sub_4B0F20 —— 载具每帧驱动主体（转身 / 摇车 / 地形速度 / 逐格推进）。
+    void UpdateDrive();
+    // asm: sub_4B0F20 的地表速度段：按格的地表类型调 SpeedPercentage。
+    void ApplyTerrainSpeed();
+    // asm: sub_4B0F20 的坡道段：按 CurrentRamp 与 SlopeTimer 收敛 MovementSpeed。
+    void UpdateSlopeSpeed();
+    // asm: sub_4B0F20 的逐格推进段：按 SpeedAccum>=256 推进并做到达判定。
+    void StepTowardsDestination(int32 effectiveSpeed);
     virtual void Move_To(CoordStruct to) override;
     virtual void Stop_Moving() override;
-    virtual bool Is_Moving_Now() override { return IsDriving; }
+    // asm: DriveLocomotionClass_ILocomotion_IsMoving        (asm:372)
+    virtual bool Is_Moving() override;
+    // asm: DriveLocomotionClass_ILocomotion_IsMovingNow     (asm:467)
+    virtual bool Is_Moving_Now() override;
     virtual void Do_Turn(DirStruct coord) override;
 
     virtual HRESULT Begin_Piggyback(ILocomotion* pointer) override;

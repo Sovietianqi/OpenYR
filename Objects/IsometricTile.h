@@ -32,6 +32,8 @@ class IsometricTileType;
 class OverlayClass;
 class SmudgeClass;
 class CellClass;
+class AbstractClass;
+class CRCEngine;
 
 // ============================================================================
 // Tile ramp types - define how elevation transitions between tiles
@@ -270,13 +272,93 @@ public:
     // resolve the "ToTile" key of a building section.
     static int32 FindIndex(const char* pID);
 
+    // ========================================================================
+    // asm: bool __thiscall IsometricTileTypeClass_CreateSome(
+    //          IsometricTileTypeClass *this, WhereType where)   (asm:714657)
+    //
+    //   push 0B0h / call new                 ; sizeof(IsometricTileClass)
+    //   test eax,eax / jz fail
+    //   ecx = where ; edx = [esi+294h]        ; 本类型的索引
+    //   push where / push idx ; ecx = eax     ; (__thiscall)
+    //   call IsometricTileClass_CTOR
+    //   test eax,eax / jz fail
+    //   mov al,1 ;; fail: xor al,al ; retn 8
+    //
+    //   即“按本类型创建一块等距瓦片”：以本类型的 ArrayIndex 作为类型号、
+    //   以 where 作为锚点格，构造 IsometricTileClass。★ 名字级缺口
+    //   `createsome` -> CreateSome。
+    // ========================================================================
+    bool CreateSome(const CellStruct& where, int32 a3 = 0);
+
+    // ========================================================================
+    // asm 原版命名形态（IsometricTileTypeClass 的其余 proc）
+    //
+    // 下列 proc 在 asm 中挂在 IsometricTileTypeClass 的 vtable / 邻接槽上，
+    // OpenYR 的 IsometricTileType 用等价成员还原（未建模的渲染后端按语义
+    // 落空，见各实现注释）。
+    // ========================================================================
+
+    // asm: IsometricTileTypeClass_544E00(this, int a2) retn 4 (asm:427)
+    //   以 [this+2F0h] 为模取余后，沿 [this+2BCh] 的 AttachesTo 链走 a2 步，
+    //   返回第 a2 个链节（链头为本类型自身）。OpenYR 用 AttachesToType。
+    IsometricTileType* GetTile(int32 index) const;
+
+    // asm: IsometricTileTypeClass_Get_Cell_Color(this, a2, a3) retn 8 (asm:940)
+    //   返回 [ [this+2A8h][a2] + a3*4 ] —— 每块的 (子格) 调色索引。
+    uint32 GetCellColor(int32 a2, int32 a3) const;
+
+    // asm: IsometricTileTypeClass_GetCRC(this, buf) retn 4 (asm:595)
+    //   先把基类 CRC，再把 [294h..2F0h] 的一批字段逐个喂入。
+    int32 GetCRC(CRCEngine& crc) const;
+
+    // asm: IsometricTileTypeClass_PointerGotInvalid(this, p, removed) retn 8
+    //   (asm:892) —— 若 [2BCh]==p 则清 0；若 [2C8h] 指向的 AnimType==p 则置 -1。
+    void PointerGotInvalid(AbstractClass* pInvalid, bool removed);
+
+    // asm: IsometricTileTypeClass_GetAbstractDerivationID -> 0x12 (asm:988)
+    int32 GetAbstractDerivationID() const;
+
+    // asm: IsometricTileTypeClass_GetSize -> 0x30Ch (asm:1017)
+    int32 GetSize() const;
+
+    // asm: sub_54A160 -> [this+294h]（本类型的索引）
+    int32 GetArrayIndex() const;
+
+    // asm: sub_544CB0(this) (asm:349) —— 惰性取回本类型的图像数据指针。
+    void* GetImageData();
+
+    // asm: sub_544D30(this, out) retn 4 (asm:406) —— 把脚印偏移表哨兵
+    //   0x7FFF7FFF 写进 out，返回全局表头。
+    const CellStruct* GetFoundationData(CellStruct* pOut) const;
+
+    // asm: sub_549B50(dst, src) retn 8 (asm:578) —— 拷贝 3 个 dword。
+    static void Copy3Dwords(void* pDst, const void* pSrc);
+
+    // asm: IsometricTileTypeClass_ReturnFalse (asm:479) —— 恒假槽。
+    static bool ReturnFalse();
+
     // IsometricTileTypeClass_CreateFromINIList - the tail of the walk: after a
     // tile set has been created, every [General] special-tile key whose value
     // equals this set's SetName has its ordinal updated to the running tile
     // count.  bTheater selects the [General] block that was read (the snow
     // theater fills from the MD.INI, the temperate one from the main INI).
     static void Apply_Special_Tile_Indices(CCINIClass* pINI, bool bTheater,
-                                           const char* pSetName, int32 ordinal);
+                                           const char* pSetName, int32 globalStart);
+
+    // ── 全局瓦片序号 → (瓦片集, 集内子序号) ────────────────────────────────
+    //
+    // asm: IsometricTileTypeClass_CreateFromINIList 维护一张
+    //      `dword_AA1140[setIndex] = 该集在全局序列中的起始号`
+    //      （asm 0x546C30 附近的 `mov dword_AA1140[eax*4], ebx`，
+    //        ebx 就是逐集累加 TilesInSet 得到的起点）。
+    //
+    // 地图文件 [IsoMapPack5] 里存的正是这个**全局序号**；原版在
+    // CellClass 里把它叫 IsoTileTypeIndex(+0x38)，判定形如
+    // `tile_BridgeSet <= idx < tile_BridgeSet + 0x10`，可见它跨越全部集。
+    // 绘制时必须先拆成“集”和“集内帧”，否则整张地图只会画第 0 套。
+    static bool Split_Global_Tile_Index(int32 globalIndex,
+                                        int32& outSetIndex,
+                                        int32& outSubIndex);
 
     // ---- [TileSet%04d] scalars ----
     int32       TilesInSet;
@@ -302,6 +384,25 @@ public:
     int32*      TileZAdjust;
 
     int32       ArrayIndex;
+
+    // 本瓦片集在**全局瓦片序列**中的起始号（asm dword_AA1140[ArrayIndex]）。
+    // 由 CreateFromINIList 按 TilesInSet 累加填入；运行期派生，不进存档。
+    int32       GlobalStartIndex;
+
+    // ---- asm 字段（+2A8h 起，供 GetTile / GetCellColor / PointerGotInvalid）----
+    // 每块的调色表（asm [this+2A8h]）：外层是 TilesInSet 行的指针数组，
+    // 每行指向 4 个子格的 32 位色（asm [row][a3]）。
+    uint32**    TileColorTable;
+    // AttachesTo 链下一节（asm [this+2BCh]）。 */
+    IsometricTileType* AttachesToType;
+    // 动画类型索引（asm [this+2C8h]，-1 表示无）。 */
+    int32       AnimTypeIndex;
+    // 每块实例数（asm [this+2F0h]，默认 1）。 */
+    int32       TilesPerSetInstances;
+    // 惰性图像数据指针（asm [this+0A4h]）。 */
+    void*       ImageData;
+    // 图像加载只尝试一次（素材缺失时避免每帧 fopen 失败重试）。
+    bool        ImageLoadAttempted;
 };
 
 extern DynamicVectorClass<IsometricTileType*>* TileTypeClass_Array;

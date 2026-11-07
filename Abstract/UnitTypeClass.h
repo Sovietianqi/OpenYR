@@ -2,6 +2,8 @@
 
 #include <Abstract/TechnoTypeClass.h>
 
+class HouseClass;
+
 // ============================================================================
 // UnitTypeClass - type definition for vehicle units
 // ============================================================================
@@ -46,6 +48,20 @@ public:
     bool   Is_Carryall() const;
     int32  Get_Charge_Level() const;
     virtual void Resolve_VXL_References();
+
+    // Factory: construct a UnitClass of this type owned by pOwner and wire up
+    // its Type back-pointer.  Mirrors UnitTypeClass_CreateUnit (returns nullptr
+    // if the allocation failed).
+    UnitClass* CreateUnit(HouseClass* pOwner) const;
+
+    // Stores the weapon index used by turret slot idxTur.  The original writes
+    // dword [this + idxTur*4 + 0x814], the base of the turret-weapon table
+    // that begins at NormalTurretWeapon.  Mirrors UnitTypeClass_SetTurretWeapon.
+    void SetTurretWeapon(int32 idxTur, int32 idxWeapon);
+
+    // Reads the weapon index for the given IFV mode from the turret-weapon
+    // table at +0x814.  Mirrors UnitTypeClass_GetTurretWeaponIndex.
+    int32 GetTurretWeaponIndex(int32 IFVMode) const;
     virtual Point2D Get_Image_Size() const override;
     virtual AbstractType Get_Build_Queue_Type() const override;
 

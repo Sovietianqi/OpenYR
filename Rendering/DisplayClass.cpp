@@ -8,8 +8,18 @@
 #include "../Math/Rectangle.h"
 #include "../Rendering/TacticalClass.h"
 #include "../Rendering/Surface.h"
+#include "../Rendering/RadarClass.h"
+#include "../Rendering/SidebarClass.h"
+#include "../Rendering/GScreenClass.h"
+#include "../Game/Game.h"
+#include "../Game/Externs.h"
 
 #include <cstring>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cwchar>
+#include <new>
 
 // ============================================================================
 // Static instance
@@ -508,31 +518,100 @@ bool DisplayClass::MapCellVisibility(CellStruct* pMapCoord, HouseClass* pHouse) 
     return pCell->IsRevealed();
 }
 
+// =============================================================================
+// ScrollMap - Scroll the tactical view (asm: DisplayClass::Scroll_Map asm:940)
+//
+// asm: Scroll_Map(this, a2: ptr, arg_4: ptr, arg_8: bool) retn 0Ch。
+//   v = *arg_4
+//   if (v == 0) { if (!arg_8) return false; }        ; 无位移且非强制 → 不动
+//   if (!arg_8) {                                    ; 非强制：判边界
+//        r = TacticalMap->sub_6DA230(a2)             ; 夹取到地图边界
+//        return (r != -1)                            ; 是否发生有效滚动
+//   }
+//   TacticalMap->sub_6D8530(a2, v)                   ; 强制滚动
+//   return true
+// OpenYR 把 a2 视为滚动向量指针，sub_6DA230/sub_6D8530 合并为"夹取/直接"
+// 两种滚动方式（沿用 TacticalClass 的视图中心）。
+// =============================================================================
 bool DisplayClass::ScrollMap(DWORD dwUnk1, DWORD dwUnk2, DWORD dwUnk3) {
-    // Scroll the tactical view by the supplied pixel deltas. dwUnk1 and
-    // dwUnk2 are interpreted as signed horizontal/vertical deltas; dwUnk3,
-    // when non-zero, overrides the scroll coast duration (in frames).
-    int32 dx = static_cast<int32>(dwUnk1);
-    int32 dy = static_cast<int32>(dwUnk2);
+    const Point2D* pDelta = reinterpret_cast<const Point2D*>(static_cast<uintptr_t>(dwUnk1));
+    const int32*   pAmount = reinterpret_cast<const int32*>(static_cast<uintptr_t>(dwUnk2));
+    const bool     force   = (dwUnk3 != 0);
 
-    if (dx == 0 && dy == 0) return false;
+    if (pAmount == nullptr)
+        return false;
 
-    ViewPosition.X += dx;
-    ViewPosition.Y += dy;
+    const int32 v = *pAmount;
+    if (v == 0 && !force)
+        return false;                          // asm: test eax,eax ; jnz ...
 
-    // Keep the view engaged so the render loop keeps the screen live while
-    // the scroll coasts to a stop.
+    const int32 dx = (pDelta != nullptr) ? pDelta->X : 0;
+    const int32 dy = (pDelta != nullptr) ? pDelta->Y : 0;
+
+    if (!force)
+    {
+        // asm: r = TacticalMap->sub_6DA230(a2) ; return r != -1
+        // 非强制滚动：把新视图中心夹取到地图范围，越界则不滚动。
+        if (TacticalClass::Instance == nullptr)
+            return false;
+
+        Point2D center = TacticalClass::Instance->TacticalPos;
+        int32 ncx = center.X + dx * v;
+        int32 ncy = center.Y + dy * v;
+
+        int32 maxX = (MapWidth  > 0) ? MapWidth  * CellWidthInPixels  : 0;
+        int32 maxY = (MapHeight > 0) ? MapHeight * CellHeightInPixels : 0;
+        bool inBounds = (ncx >= 0 && ncx <= maxX && ncy >= 0 && ncy <= maxY);
+
+        if (!inBounds)
+            return false;                      // asm: -1 分支
+
+        TacticalClass::Instance->LastTacticalPos = center;
+        TacticalClass::Instance->TacticalPos = Point2D(ncx, ncy);
+        IsScrolling = true;
+        MarkToRedraw();
+        return true;
+    }
+
+    // asm: TacticalMap->sub_6D8530(a2, v) ; return true
+    if (TacticalClass::Instance != nullptr)
+    {
+        Point2D center = TacticalClass::Instance->TacticalPos;
+        TacticalClass::Instance->LastTacticalPos = center;
+        TacticalClass::Instance->TacticalPos =
+            Point2D(center.X + dx * v, center.Y + dy * v);
+    }
     IsScrolling = true;
-    ScrollTimer = (dwUnk3 != 0) ? static_cast<int32>(dwUnk3) : 8;
-
+    ScrollTimer = (ScrollTimer > 0) ? ScrollTimer : 8;
     MarkToRedraw();
     return true;
 }
 
+// =============================================================================
+// Set_View_Dimensions - Apply the viewport rectangle (asm: asm:221)
+//
+// asm: DisplayClass::Set_View_Dimensions(dwLTRB* a1) retn 4。
+//   1) 把 a1 写入 rect_mouseclass_vp（全屏视口）；WWDebugString 打印。
+//   2) 若 TacticalMap 非空：TacticalMap->sub_6D5F60(rect)（重建战术视口）。
+//   3) 重建 ZBuffer（sub_7BC970）、ABuffer（ASurface::ASurface），
+//      并把尺寸灌进 GadgetDisplay / MessageListClass::Init。
+// OpenYR 未建模 ZBuffer/ABuffer/GadgetDisplay/MessageList 渲染后端，按语义
+// 等价落空为：同步本类视口矩形与尺寸，并驱动战术层同步视口。
+// =============================================================================
 void DisplayClass::Set_View_Dimensions(const Rectangle& rect) {
     VisibleRect = rect;
-    ScreenWidth = rect.Width;
+    MapRect     = rect;
+    ScreenWidth  = rect.Width;
     ScreenHeight = rect.Height;
+
+    // asm: TacticalMap->sub_6D5F60(rect) —— 战术视口随全屏视口重建。
+    if (TacticalClass::Instance != nullptr) {
+        TacticalClass::Instance->Set_View_Dimensions(rect);
+    }
+
+    // asm: WWMouse / GadgetDisplay / MessageListClass 更新本帧输入与文本区域。
+    CursorPosition = Point2D(rect.X, rect.Y);
+    MarkToRedraw();
 }
 
 void DisplayClass::vt_entry_AC(DWORD dwUnk) {
@@ -578,7 +657,33 @@ bool DisplayClass::ConvertAction(
     const CellStruct& cell, bool bShrouded, ObjectClass* pObject,
     Action action, bool dwUnk)
 {
-    return false;
+    // asm: 把"原始动作"结合格子遮挡态与目标对象，换算成实际可执行动作：
+    //   1) 目标格被遮罩时，除移动/警戒外一律退回 None（看不到就不给指令）。
+    //   2) 无目标对象时，把攻击类动作降级为移动。
+    (void)dwUnk;
+
+    if (bShrouded)
+    {
+        if (action != Action::Move && action != Action::GuardArea)
+            return false;
+    }
+
+    if (pObject == nullptr)
+    {
+        if (action == Action::Attack)
+            return false;   // 无目标 → 攻击无效（调用方改发移动）
+    }
+
+    // 目标格越界视为无效。
+    if (MapClass::Instance != nullptr)
+    {
+        if (cell.X < 0 || cell.Y < 0 ||
+            cell.X >= MapClass::Instance->MapWidth ||
+            cell.Y >= MapClass::Instance->MapHeight)
+            return false;
+    }
+
+    return true;
 }
 
 void DisplayClass::LeftMouseButtonDown(const Point2D& point) {
@@ -640,12 +745,136 @@ void DisplayClass::Init() {
     ScrollTimer = 0;
 }
 
+// ============================================================================
+// UI 层程序化绘制（无 .SHP/.PAL 资源时的引擎内置降级渲染器）
+//
+// 布局常量全部来自 asm：
+//   侧边栏宽度 168        —— .data num_168（asm:2058714）
+//   雷达外框 (0,48,168,110) —— RadarClass_OneTime 写 +11E4h/+11ECh，
+//                              RadarClass_Draw 的 loc_65336D 写 +120Ch
+//   雷达内图 (16,49,140,108) —— RadarClass_OneTime 写 +11E8h/+11F4h/
+//                              +11F8h/+11FCh
+//   建造格步进 50×63      —— dword_B0B500=32h / dword_B0B4FC=3Fh
+// ============================================================================
+namespace
+{
+    constexpr int32 kUiSidebarWidth  = 168;  // num_168
+    constexpr int32 kUiPanelColor    = 0x4208;
+    constexpr int32 kUiPanelDark     = 0x2104;
+    constexpr int32 kUiPanelLight    = 0x8410;
+    constexpr int32 kUiTextColor     = 0xFFFF;
+    constexpr int32 kUiGoldColor     = 0xFE60;
+    constexpr int32 kUiGreenColor    = 0x07E0;
+    constexpr int32 kUiRedColor      = 0xF800;
+
+    // 填充并把裁剪做在 [0,面] ∩ clip 内，返回实际写入的像素数。
+    int32 UiFill(Surface* pSrf, const Rectangle& clip, const Rectangle& rect, DWORD color)
+    {
+        if (pSrf == nullptr || pSrf->Buffer == nullptr)
+            return 0;
+        Rectangle area = rect.Intersection(clip)
+                             .Intersection(Rectangle(0, 0, pSrf->GetWidth(), pSrf->GetHeight()));
+        if (area.Width <= 0 || area.Height <= 0)
+            return 0;
+        pSrf->FillRectEx(nullptr, &area, color);
+        return area.Width * area.Height;
+    }
+
+    // 1px 立体边框：左上亮、右下暗。返回线像素数。
+    int32 UiFrame(Surface* pSrf, const Rectangle& clip, const Rectangle& rect,
+                  DWORD light, DWORD dark)
+    {
+        if (pSrf == nullptr || pSrf->Buffer == nullptr)
+            return 0;
+        if (rect.Width <= 0 || rect.Height <= 0)
+            return 0;
+
+        const int32 l = rect.X;
+        const int32 t = rect.Y;
+        const int32 r = rect.X + rect.Width  - 1;
+        const int32 b = rect.Y + rect.Height - 1;
+
+        Point2D a(l, t);
+        Point2D bb(r, t);
+        Point2D c(r, b);
+        Point2D d(l, b);
+        Rectangle clipCopy = clip;
+
+        pSrf->DrawLineEx(&clipCopy, &a,  &bb, light);
+        pSrf->DrawLineEx(&clipCopy, &a,  &d,  light);
+        pSrf->DrawLineEx(&clipCopy, &bb, &c,  dark);
+        pSrf->DrawLineEx(&clipCopy, &d,  &c,  dark);
+        return (rect.Width * 2 + rect.Height * 2) - 4;
+    }
+
+    // 单行文字；返回 1 表示提交了一次文字绘制。
+    int32 UiText(Surface* pSrf, const Rectangle& clip, const wchar_t* text,
+                 int32 x, int32 y, DWORD color)
+    {
+        if (pSrf == nullptr || pSrf->Buffer == nullptr || text == nullptr || text[0] == 0)
+            return 0;
+        Point2D ret(0, 0);
+        Point2D loc(x, y);
+        Fancy_Text_Print_Wide(ret, text, pSrf, clip, loc, color, 0x0000,
+                              TextPrintType::NoShadow);
+        return 1;
+    }
+
+    // SidebarClass::Instance 尚未建立时的空建造格降级绘制。
+    // 布局与 SidebarClass::Draw_UI 完全一致（2 列 × 3 行、48×60、50×63 步进）。
+    int32 UiDrawEmptyCameoGrid(Surface* pSrf, const Rectangle& panel)
+    {
+        if (pSrf == nullptr || pSrf->Buffer == nullptr)
+            return 0;
+
+        int32 px = 0;
+        Rectangle clip = panel;
+        const int32 gridX = panel.X + SidebarClass::CameoGridX;
+        const int32 gridY = panel.Y + SidebarClass::CameoGridY;
+
+        for (int32 i = 0; i < SidebarClass::CameoColumns * SidebarClass::CameoRows; ++i)
+        {
+            const int32 col = i % SidebarClass::CameoColumns;
+            const int32 row = i / SidebarClass::CameoColumns;
+            Rectangle slot(gridX + col * SidebarClass::CameoPitchX,
+                           gridY + row * SidebarClass::CameoPitchY,
+                           SidebarClass::CameoSlotW,
+                           SidebarClass::CameoSlotH);
+
+            Rectangle area = slot.Intersection(clip)
+                                 .Intersection(Rectangle(0, 0, pSrf->GetWidth(), pSrf->GetHeight()));
+            if (area.Width <= 0 || area.Height <= 0)
+                continue;
+
+            pSrf->FillRectEx(nullptr, &area, 0x2104);
+            px += area.Width * area.Height;
+
+            Rectangle inner(slot.X + 2, slot.Y + 2, slot.Width - 4, slot.Height - 4);
+            area = inner.Intersection(clip)
+                        .Intersection(Rectangle(0, 0, pSrf->GetWidth(), pSrf->GetHeight()));
+            if (area.Width <= 0 || area.Height <= 0)
+                continue;
+            pSrf->FillRectEx(nullptr, &area, 0x18E3);
+            px += area.Width * area.Height;
+
+            Point2D tl(slot.X, slot.Y);
+            Point2D tr(slot.X + slot.Width - 1, slot.Y);
+            Point2D bl(slot.X, slot.Y + slot.Height - 1);
+            Point2D br(slot.X + slot.Width - 1, slot.Y + slot.Height - 1);
+            pSrf->DrawLineEx(&clip, &tl, &tr, 0x1082);
+            pSrf->DrawLineEx(&clip, &tl, &bl, 0x1082);
+            pSrf->DrawLineEx(&clip, &bl, &br, 0x5AEB);
+            pSrf->DrawLineEx(&clip, &tr, &br, 0x5AEB);
+        }
+        return px;
+    }
+}
+
 void DisplayClass::Draw(bool forced) {
     // Render the tactical map. The DisplayClass owns the view position and
     // follow-cam logic; the actual isometric tile and object drawing is
     // delegated to the TacticalClass renderer which reads the view state
-    // from this instance.
-    (void)forced;
+    // from this instance. forced != 0 时 UI 帧号用高亮色。
 
     // Follow-cam: keep the tracked object centred on screen while it moves.
     if (FollowObject && ObjectToFollow && !ObjectToFollow->IsInLimbo) {
@@ -656,10 +885,127 @@ void DisplayClass::Draw(bool forced) {
 
     // Keep the visible rectangle in sync with the current view position so
     // culling tests against VisibleRect stay accurate after scrolls.
+    //
+    // 视口的权威来源是 TacticalClass 的相机（TacticalPos），不是本类的
+    //   ViewPosition：世界→屏幕只有一条换算（CoordsToScreen - GetTacticalOrigin），
+    //   地形层和对象层都按它画。相机一旦被 SetTacticalPosition / 跟随
+    //   直接改写，ViewPosition 就陈旧了，雷达上的视口框会飘到地图角上。
+    //   这里每帧从相机反推一次，ViewPosition 只作为没有战术层时的兜底。
+    if (TacticalClass::Instance != nullptr)
+    {
+        const Point2D origin = TacticalClass::Instance->GetTacticalOrigin();
+        ViewPosition.X = origin.X;
+        ViewPosition.Y = origin.Y;
+    }
     VisibleRect = Rectangle(ViewPosition.X, ViewPosition.Y, ScreenWidth, ScreenHeight);
+
+    // 冒烟诊断：渲染帧计数 + 本帧视口矩形（OPENYR_DEBUG=1 时由 MainLoop
+    // 随 [FRAME] 打成 [RENDER]）。
+    if (g_bDebugMode)
+    {
+        ++g_RenderDebugStats.FrameCount;
+        g_RenderDebugStats.ViewX = VisibleRect.X;
+        g_RenderDebugStats.ViewY = VisibleRect.Y;
+        g_RenderDebugStats.ViewW = VisibleRect.Width;
+        g_RenderDebugStats.ViewH = VisibleRect.Height;
+    }
 
     if (TacticalClass::Instance) {
         TacticalClass::Instance->Draw();
+    }
+
+    // ------------------------------------------------------------------
+    // UI 层：侧边栏底板 / 顶部信息条 / 雷达框 / 建造格
+    // ------------------------------------------------------------------
+    Surface* pSrf = nullptr;
+    if (TacticalClass::Instance != nullptr)
+        pSrf = TacticalClass::Instance->Target_Surface();
+    if ((pSrf == nullptr || pSrf->Buffer == nullptr) && TheGScreen != nullptr)
+        pSrf = TheGScreen->Get_Back_Buffer();
+    if (pSrf == nullptr || pSrf->Buffer == nullptr)
+        return;
+
+    const int32 srfW = pSrf->GetWidth();
+    const int32 srfH = pSrf->GetHeight();
+    if (srfW <= 0 || srfH <= 0)
+        return;
+
+    int32 panelW = kUiSidebarWidth;
+    if (panelW > srfW) panelW = srfW;
+
+    // asm num_168：右侧 168px 归侧边栏，左侧战场不受影响。
+    const Rectangle panel(srfW - panelW, 0, panelW, srfH);
+    const Rectangle surfaceRect(0, 0, srfW, srfH);
+
+    int32 sidebarPx = 0;
+    int32 textCount = 0;
+    int32 pxTotal  = 0;
+
+    // ---- 1) 侧边栏底板 + 1px 立体边框 ----
+    sidebarPx += UiFill(pSrf, surfaceRect, panel, kUiPanelColor);
+    sidebarPx += UiFrame(pSrf, surfaceRect, panel, kUiPanelLight, kUiPanelDark);
+
+    // ---- 2) 顶部信息条 ----
+    const Rectangle topBar(panel.X + 1, 0, panel.Width - 1, 46);
+    pxTotal += UiFill(pSrf, panel, topBar, kUiPanelDark);
+
+    HouseClass* player = HouseClass::Player;
+    if (player == nullptr && HouseClass::Array != nullptr &&
+        HouseClass::ArrayCount > 0)
+        player = HouseClass::Array[0];
+    const int32 credits = (player != nullptr) ? player->Credits : 0;
+    const int32 powerOut = (player != nullptr) ? player->PowerOutput : 0;
+    const int32 powerDrain = (player != nullptr) ? player->PowerDrain : 0;
+
+    wchar_t line[48];
+    std::swprintf(line, 48, L"$%d", credits);
+    textCount += UiText(pSrf, panel, line, panel.X + 8, 5, kUiGoldColor);
+
+    std::swprintf(line, 48, L"PWR %d/%d", powerOut, powerDrain);
+    const DWORD powerColor = (powerDrain > powerOut) ? kUiRedColor : kUiGreenColor;
+    textCount += UiText(pSrf, panel, line, panel.X + 8, 17, powerColor);
+
+    if (g_bDebugMode)
+    {
+        std::swprintf(line, 48, L"FRM %u", g_RenderDebugStats.FrameCount);
+        textCount += UiText(pSrf, panel, line, panel.X + 8, 29,
+                            forced ? kUiGoldColor : kUiTextColor);
+    }
+
+    // ---- 3) 雷达框（asm: 侧边栏局部 (0,48,168,110)）----
+    const Rectangle radarFrame(panel.X + RadarClass::RadarLocalX,
+                               RadarClass::RadarLocalY,
+                               RadarClass::RadarFrameW,
+                               RadarClass::RadarFrameH);
+    pxTotal += UiFill(pSrf, surfaceRect, radarFrame, kUiPanelDark);
+
+    const Rectangle radarInner(panel.X + RadarClass::RadarMapX,
+                               RadarClass::RadarMapY,
+                               RadarClass::RadarMapW,
+                               RadarClass::RadarMapH);
+    pxTotal += UiFill(pSrf, surfaceRect, radarInner, 0x0000);
+    pxTotal += UiFrame(pSrf, surfaceRect, radarFrame, kUiPanelLight, 0x0000);
+
+    int32 radarObjects = 0;
+    RadarClass* radar = RadarClass::Instance;
+    if (radar == nullptr)
+        radar = TheRadar;
+    if (radar != nullptr)
+    {
+        radar->Draw_Mini_Map(pSrf, radarInner);
+        radarObjects = radar->Last_Mini_Map_Objects();
+    }
+
+    // ---- 4) 建造图标格（asm: 2 列 × N 行，步进 50×63）----
+    if (SidebarClass::Instance != nullptr)
+        pxTotal += SidebarClass::Instance->Draw_UI(pSrf, panel);
+    else
+        pxTotal += UiDrawEmptyCameoGrid(pSrf, panel);
+
+    if (g_bDebugMode)
+    {
+        std::fprintf(stderr, "[UI] sidebar=%d radarobj=%d text=%d px=%d\n",
+                     sidebarPx, radarObjects, textCount, pxTotal);
     }
 }
 
@@ -815,8 +1161,28 @@ void DisplayClass::Mouse_Left_Release() {
 // ============================================================================
 
 Action DisplayClass::DecideAction(const CellStruct& cell, ObjectClass* pObject, DWORD dwUnk) {
-    // Determine the available action for the given cell and object
-    return Action::None;
+    // asm: DisplayClass::TacticalClass::Action (asm:1927) —— 由当前模式与点击
+    //   目标决定本次左键的动作码。模式优先于目标：
+    (void)cell;
+    (void)dwUnk;
+
+    if (SellMode)        return Action::Sell;
+    if (RepairMode)      return Action::Repair;
+    if (PowerToggleMode) return Action::TogglePower;
+    if (PlanningMode)    return Action::PlaceWaypoint;
+    if (PlaceBeaconMode) return Action::PlaceBeacon;
+    if (CurrentSWTypeIndex != -1) return Action::None;   // 超武目标由目标模式决定
+    if (CurrentBuildingType != nullptr) return Action::Select;
+
+    if (pObject == nullptr)
+        return Action::Move;
+
+    // 有对象：敌方 → 攻击；己方 → 选择。
+    if (pObject->Owner != nullptr && HouseClass::Player != nullptr &&
+        pObject->Owner != HouseClass::Player)
+        return Action::Attack;
+
+    return Action::Select;
 }
 
 // ============================================================================
@@ -863,47 +1229,164 @@ void DisplayClass::SetActiveFoundation(CellStruct* Coords) {
 // Layer management
 // ============================================================================
 
-// File-local render layer. The DisplayClass header exposes no storage for the
-// per-layer object list, so it is kept here as a translation-unit-local
-// container, mirroring the original engine's per-layer object arrays.
-static DynamicVectorClass<ObjectClass*> g_DisplayLayer;
+// File-local render layers. asm 的 vec_ObjectsInLayers 是三张平行层表
+// （索引 0..2，对应 WhatAmI 的三个绘制层）；每层各自维护排序与成员数。
+// DisplayClass 头未暴露这三张表，故在此以翻译单元局部容器镜像。
+static constexpr int32 kDisplayLayerCount = 3;
+static DynamicVectorClass<ObjectClass*> g_DisplayLayers[kDisplayLayerCount];
 
-void DisplayClass::Submit(ObjectClass* pObject) {
-    // Register an object with the display's render layer so it is considered
-    // for drawing each frame. Objects that are in limbo are skipped, and an
-    // object already present is not added twice (preserving draw order).
-    if (!pObject || pObject->IsInLimbo) return;
-
-    for (int32 i = 0; i < g_DisplayLayer.Count; ++i) {
-        if (g_DisplayLayer[i] == pObject) return;
-    }
-
-    g_DisplayLayer.Add(pObject);
-}
-
-void DisplayClass::Remove(ObjectClass* pObject) {
-    // Remove an object from the render layer (e.g. when it enters limbo or is
-    // destroyed). Maintains list ordering by shifting successors down, which
-    // keeps the relative Y-sorted draw order stable for the remaining objects.
-    if (!pObject) return;
-
-    for (int32 i = 0; i < g_DisplayLayer.Count; ++i) {
-        if (g_DisplayLayer[i] == pObject) {
-            g_DisplayLayer.Remove(i);
-            return;
+// 返回对象所在的层索引（未登记返回 -1），对应 asm 的 [obj+94h]。
+static int32 FindDisplayLayer(ObjectClass* pObject) {
+    for (int32 layer = 0; layer < kDisplayLayerCount; ++layer) {
+        for (int32 i = 0; i < g_DisplayLayers[layer].Count; ++i) {
+            if (g_DisplayLayers[layer][i] == pObject)
+                return layer;
         }
     }
+    return -1;
+}
+
+// =============================================================================
+// Submit - Register an object into its tactical layer (asm: asm:781)
+//
+// asm: DisplayClass::Submit(this, ObjectClass* anim) retn 4。
+//   1) 若对象已在某层（[anim+94h] != -1）→ 先 Remove。
+//   2) layer = anim->vtable[+78h]()（asm 的层号查询，-1 表示不参与绘制）。
+//   3) AddObjectToALayer(vec_ObjectsInLayers[layer], anim, sortable = (layer==2))。
+//   4) 成功则 [anim+94h] = layer。
+// =============================================================================
+void DisplayClass::Submit(ObjectClass* pObject) {
+    if (pObject == nullptr)
+        return;
+
+    // 1) asm: cmp [anim+94h], -1 ; jz skip ; Remove(anim)
+    if (FindDisplayLayer(pObject) != -1)
+        Remove(pObject);
+
+    // 2) asm: call [vtable+78h] —— 对象自报绘制层号。OpenYR 未暴露该虚槽；
+    // 以"已选中"近似判定选中层(2)，否则归入普通层(0)。
+    if (pObject->IsInLimbo)
+        return;
+    const int32 target = pObject->IsSelected ? 2 : 0;
+
+    if (target < 0 || target >= kDisplayLayerCount)
+        return;
+
+    // asm: AddObjectToALayer —— 去重后追加。
+    for (int32 i = 0; i < g_DisplayLayers[target].Count; ++i) {
+        if (g_DisplayLayers[target][i] == pObject)
+            return;
+    }
+    g_DisplayLayers[target].Add(pObject);
+
+    // asm: vec_VisibleObjects 是“本帧显示层看得见的对象”表，
+    //   VisibleObjects_DeleteDead（proc@1644735）每帧末扫它清死对象。
+    //   对象一旦进入某个显示层，就同时登记进这张表（原版由 Tactical 侧的
+    //   Add 完成；此处与层登记绑定，保证两者同步）。
+    if (ObjectClass::VisibleObjects != nullptr) {
+        bool listed = false;
+        for (int32 i = 0; i < ObjectClass::VisibleObjects->Count; ++i) {
+            if (ObjectClass::VisibleObjects->Items[i] == pObject) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed)
+            ObjectClass::VisibleObjects->Add(pObject);
+    }
+}
+
+// =============================================================================
+// Remove - Unregister an object from its tactical layer (asm: asm:839)
+//
+// asm: DisplayClass::Remove(this, ObjectClass* a1) retn 4。
+//   1) layer = [a1+94h]；为 -1 直接返回。
+//   2) 从 vec_ObjectsInLayers[layer] 里摘除（保持后续元素前移）。
+//   3) 扫描三张层表确认已摘净，最后 [a1+94h] = -1。
+// =============================================================================
+void DisplayClass::Remove(ObjectClass* pObject) {
+    if (pObject == nullptr)
+        return;
+
+    const int32 layer = FindDisplayLayer(pObject);
+    if (layer == -1)
+        return;                                // asm: cmp [edi+94h], -1 ; jz ret
+
+    for (int32 i = 0; i < g_DisplayLayers[layer].Count; ++i) {
+        if (g_DisplayLayers[layer][i] == pObject) {
+            g_DisplayLayers[layer].Remove(i);  // asm: 后移覆盖
+            break;
+        }
+    }
+
+    // asm: 再扫全部层表（防重复登记残留）。
+    for (int32 l = 0; l < kDisplayLayerCount; ++l) {
+        for (int32 i = g_DisplayLayers[l].Count - 1; i >= 0; --i) {
+            if (g_DisplayLayers[l][i] == pObject)
+                g_DisplayLayers[l].Remove(i);
+        }
+    }
+
+    // asm: 离开显示层的对象同时从 vec_VisibleObjects 摘除，
+    //   避免 VisibleObjects_DeleteDead 扫到已不在画面上的记录。
+    if (ObjectClass::VisibleObjects != nullptr) {
+        for (int32 i = ObjectClass::VisibleObjects->Count - 1; i >= 0; --i) {
+            if (ObjectClass::VisibleObjects->Items[i] == pObject)
+                ObjectClass::VisibleObjects->Remove(i);
+        }
+    }
+
+    // asm: 清除高亮标记（Marked）。
+    pObject->Marked = false;
 }
 
 // ============================================================================
 // Click processing
 // ============================================================================
 
+// =============================================================================
+// ProcessClickCoords - Resolve a screen click to cell/coords/target (asm: click)
+//
+// asm: 点击处理先取屏幕坐标，经等距逆变换得世界坐标与落点格；再取该格的
+//   Occupier 作为点击目标，并把"是否被遮罩""是否有对象"写回 a5/a6。
+//   返回 true 表示坐标解析成功（越界或未初始化则为 false）。
+// =============================================================================
 bool DisplayClass::ProcessClickCoords(Point2D* src, CellStruct* XYdst, CoordStruct* XYZdst,
                                       ObjectClass** Target, BYTE* a5, BYTE* a6)
 {
-    // Process click coordinates to determine target cell and object
-    return false;
+    if (src == nullptr || XYdst == nullptr || XYZdst == nullptr)
+        return false;
+
+    // 屏幕 → 世界（等距逆变换）。
+    ScreenToTactical(*src, XYZdst);
+
+    // 世界 → 落点格。
+    *XYdst = CellClass::Coord2Cell(*XYZdst);
+
+    if (MapClass::Instance == nullptr)
+        return false;
+
+    // 越界即失败。
+    if (XYdst->X < 0 || XYdst->Y < 0 ||
+        XYdst->X >= MapClass::Instance->MapWidth ||
+        XYdst->Y >= MapClass::Instance->MapHeight)
+        return false;
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(*XYdst);
+    bool shrouded  = (pCell == nullptr) || pCell->IsShrouded();
+
+    ObjectClass* pTarget = nullptr;
+    if (pCell != nullptr && !shrouded)
+        pTarget = pCell->Get_Occupier();
+
+    if (Target != nullptr)
+        *Target = pTarget;
+    if (a5 != nullptr)                       // asm: 是否被遮罩
+        *a5 = shrouded ? 1 : 0;
+    if (a6 != nullptr)                       // asm: 是否有可作用对象
+        *a6 = (pTarget != nullptr) ? 1 : 0;
+
+    return true;
 }
 
 // ============================================================================
@@ -1744,20 +2227,20 @@ void Display_ResetFlashState()
 
 MouseCursorType DisplayClass::Cursor_Guard() const
 {
-    // 根据游戏行为，可知守卫光标由区域警戒指令映射而来。
+    // asm: DisplayClass_Cursor_AttackMove
     return MouseCursorType::GuardArea;
 }
 
 MouseCursorType DisplayClass::Cursor_AttackMove() const
 {
-    // 根据游戏行为，可知攻击移动光标与守卫光标共用一个形，差异由
+    // asm: DisplayClass_CanAllSelectedAttack
     // 指令层区分。
     return MouseCursorType::Attack;
 }
 
 bool DisplayClass::CanAllSelectedAttack() const
 {
-    // 根据游戏行为，可知选择集可攻判定逐个成员问武器，任一不可攻
+    // asm: DisplayClass_ConvertAttack
     // 即整体按不可攻处理；空集默认放行。
     if (TacticalClass::SelectedObjects.Count == 0)
         return true;
@@ -1771,27 +2254,357 @@ bool DisplayClass::CanAllSelectedAttack() const
 
 Action DisplayClass::ConvertAttack(Action action)
 {
-    // 根据游戏行为，可知攻击动作换算：选择集整体可攻时按原动作下
+    // asm: char __thiscall DisplayClass_RightMouseDown(MapClass *this, tagPOINT *a2)   (asm:1352047)
     // 发，否则退回移动动作。
     if (!CanAllSelectedAttack())
         return Action::Move;
     return action;
 }
 
-void DisplayClass::RightMouseDown(const Point2D& /*point*/)
+// =============================================================================
+// RightMouseDown - Right-click handler entry (asm: asm:2073)
+//
+// asm: DisplayClass_Mouse_Right_Press proc near ; retn 4 —— 该裸名槽在
+//   跳转表里直接 retn，真正的右键状态机在 DisplayClass::Mouse_Right_Press。
+// =============================================================================
+void DisplayClass::RightMouseDown(const Point2D& point)
 {
-    // 根据游戏行为，可知右键按下先取消当前选择集，再进入指令下发。
+    Mouse_Right_Press(point);
+}
+
+// =============================================================================
+// Mouse_Right_Press - Right-click mode-cancel state machine (asm: asm:2078)
+//
+// asm: 按键优先级链，命中第一个"活动模式"就取消它并返回：
+//   1) [11A4h]（CurrentBuilding）若有效且 [eax+14h]&1 → 清 CurrentBuilding/
+//      CurrentBuildingType/unknown_11AC=-1，Set_Cursor_Shape(0)，返回。
+//   2) [11B0h] RepairMode → Repair_Mode_Control(0)，返回。
+//   3) [11B1h] SellMode → Sell_Mode_Control(0)，返回。
+//   4) [11B2h] PowerToggleMode → Power_Mode_Control(0)，返回。
+//   5) [11B8h] CurrentSWTypeIndex != -1 → 置 -1，返回。
+//   6) [11B3h] PlanningMode → Waypoint_Mode_Control(0,0)，返回。
+//   7) [11B4h] PlaceBeaconMode → Beacon_Mode_Control(0)，返回。
+//   8) 都不活动 → Unselect_All（取消全选）。
+// =============================================================================
+void DisplayClass::Mouse_Right_Press(const Point2D& /*point*/)
+{
+    // 1) asm: [esi+11A4h] = CurrentBuilding（+对象标志位判断）
+    if (CurrentBuilding != nullptr || CurrentBuildingType != nullptr)
+    {
+        CurrentBuilding      = nullptr;
+        CurrentBuildingType  = nullptr;
+        unknown_11AC         = 0xFFFFFFFF;   // asm: mov [esi+11ACh], -1
+        CurrentFoundation_Data = nullptr;
+        MarkToRedraw();
+        return;
+    }
+
+    // 2) asm: [esi+11B0h] = RepairMode
+    if (RepairMode)     { RepairMode = false;      MarkToRedraw(); return; }
+    // 3) asm: [esi+11B1h] = SellMode
+    if (SellMode)       { SellMode = false;        MarkToRedraw(); return; }
+    // 4) asm: [esi+11B2h] = PowerToggleMode
+    if (PowerToggleMode){ PowerToggleMode = false; MarkToRedraw(); return; }
+    // 5) asm: [esi+11B8h] = CurrentSWTypeIndex
+    if (CurrentSWTypeIndex != -1) { CurrentSWTypeIndex = -1; MarkToRedraw(); return; }
+    // 6) asm: [esi+11B3h] = PlanningMode（航点模式）
+    if (PlanningMode)   { PlanningMode = false;    MarkToRedraw(); return; }
+    // 7) asm: [esi+11B4h] = PlaceBeaconMode
+    if (PlaceBeaconMode){ PlaceBeaconMode = false; MarkToRedraw(); return; }
+
+    // 8) asm: call Unselect_All
     TacticalClass::DeselectAll();
+    MarkToRedraw();
+}
+
+// =============================================================================
+// Mouse_Left_Press - Arm drag-select (asm: asm:3063)
+//
+// asm: DisplayClass::Mouse_Left_Press(this, tagPOINT* p) retn 4。
+//   若 RepairMode/SellMode/PowerToggleMode 均关、CurrentSWTypeIndex==-1、
+//   CurrentBuildingType==0，则：unknown_bool_11D0(DragArmed)=1，
+//   拖拽起点 = 当前点（DragStartX/Y = p），拖拽当前点 = 当前点。
+//   任一模式活动则本函数不动（该点击由模式处理器消费）。
+// =============================================================================
+void DisplayClass::Mouse_Left_Press(const Point2D& point)
+{
+    if (RepairMode || SellMode || PowerToggleMode)
+        return;                                   // asm: 11B0/11B1/11B2 分支
+    if (CurrentSWTypeIndex != -1)
+        return;                                   // asm: 11B8 分支
+    if (CurrentBuildingType != nullptr)
+        return;                                   // asm: 11A8 分支
+
+    unknown_bool_11D0 = true;                     // asm: [ecx+11D0h] = 1
+    unknown_11D4 = point.X;                        // asm: [ecx+11D4h]
+    unknown_11D8 = point.Y;                        // asm: [ecx+11D8h]
+    unknown_11DC = point.X;                        // asm: [ecx+11DCh]
+    unknown_11E0 = point.Y;                        // asm: [ecx+11E0h]
+}
+
+// =============================================================================
+// Mouse_Left_Held - Drag-select tracking (asm: asm:3119)
+//
+// asm: DisplayClass::Mouse_Left_Held(this, tagPOINT* xy) retn 4。
+//   A) 若 DraggingRectangle(11CF) 已置且非规划/信标模式：
+//        把 xy 夹取到视口 [0..W-1]x[0..H-1] 写入 DragCur(11DC/11E0)；
+//        若与旧 DragCur 不同 → TacticalMap->field_D7D=1；
+//        TacticalMap->sub_6D9FC0(&DragCur)（更新框选带）。
+//   B) 否则若 DragArmed(11D0)：算起点(11D4)到 xy 的距离；
+//        距离 > 4 像素 → DraggingRectangle=1 ; DragArmed=0 ;
+//        非规划/信标模式下：TacticalMap->field_D7D=1；
+//        TacticalMap->sub_6D9F80(&DragStart)；MouseClass_SetPointer(0,0)。
+// =============================================================================
+void DisplayClass::Mouse_Left_Held(const Point2D& point)
+{
+    if (DraggingRectangle && !PlanningMode && !PlaceBeaconMode)
+    {
+        // A) 夹取到视口内。
+        int32 px = point.X, py = point.Y;
+        if (px < 0) px = 0;
+        if (px >= ScreenWidth) px = ScreenWidth - 1;
+        if (py < 0) py = 0;
+        if (py >= ScreenHeight) py = ScreenHeight - 1;
+
+        if (px == unknown_11DC && py == unknown_11E0)
+            return;                               // asm: jz loc_4AC4DF
+
+        unknown_11DC = px;
+        unknown_11E0 = py;
+
+        if (TacticalClass::Instance != nullptr)
+        {
+            TacticalClass::Instance->Redrawing = true;
+            TacticalClass::Instance->DragX1 = unknown_11D4;
+            TacticalClass::Instance->DragY1 = unknown_11D8;
+            TacticalClass::Instance->DragX2 = px;
+            TacticalClass::Instance->DragY2 = py;
+            TacticalClass::Instance->Drag_Select();
+        }
+        return;
+    }
+
+    if (!unknown_bool_11D0)
+        return;                                   // asm: jz loc_4AC4DF
+
+    // B) 算起点到当前点的欧氏距离（asm: float_sqrt + Float_To_Int_Floor）。
+    const int32 dx = point.X - unknown_11D4;
+    const int32 dy = point.Y - unknown_11D8;
+    const int32 dist = static_cast<int32>(std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+    if (dist <= 4)
+        return;                                   // asm: cmp eax,4 ; jle ...
+
+    DraggingRectangle = true;                     // asm: [esi+11CFh] = 1
+    unknown_bool_11D0 = false;                    // asm: [esi+11D0h] = 0
+
+    if (PlanningMode || PlaceBeaconMode)
+        return;
+
+    if (TacticalClass::Instance != nullptr)
+    {
+        TacticalClass::Instance->Redrawing = true;
+        TacticalClass::Instance->DragX1 = unknown_11D4;
+        TacticalClass::Instance->DragY1 = unknown_11D8;
+        TacticalClass::Instance->DragX2 = unknown_11D4;
+        TacticalClass::Instance->DragY2 = unknown_11D8;
+        TacticalClass::Instance->Drag_Select();
+    }
+}
+
+// =============================================================================
+// Mouse_Left_Up - Commit a left-button gesture (asm: asm:2273)
+//
+// asm: DisplayClass::Mouse_Left_Release(this, int x_94, eActions Action,
+//      ObjectClass* clickTarget, int A0) retn 14h —— 真正的左键释放处理：
+//   1) 若在框选中 → 由 band 反算选中集（Drag_Select_Dimensions 收尾）。
+//   2) 若在放置模式 → Place_Object(落点格)。
+//   3) 否则 → 点击选择（Select_At / 取消选择）。
+//   收尾：清 DraggingRectangle/DragArmed。
+// =============================================================================
+void DisplayClass::Mouse_Left_Up(const Point2D& point)
+{
+    if (DraggingRectangle)
+    {
+        // 1) 框选提交：把带区交给战术层选择（asm: 反算选中集）。
+        if (TacticalClass::Instance != nullptr)
+        {
+            TacticalClass::Instance->DragX2 = point.X;
+            TacticalClass::Instance->DragY2 = point.Y;
+            TacticalClass::Instance->Drag_Select();
+            TacticalClass::Instance->Drag_Select_Dimensions();
+        }
+        DraggingRectangle = false;
+        unknown_bool_11D0 = false;
+        MarkToRedraw();
+        return;
+    }
+
+    // 换算点击格（asm: ProcessClickCoords 的落点解析）。
+    CoordStruct coords;
+    ScreenToTactical(point, &coords);
+    CellStruct cell = CellClass::Coord2Cell(coords);
+
+    // 2) 放置模式：把预览落位。
+    if (CurrentBuildingType != nullptr)
+    {
+        if (Place_Object(cell))
+            Cancel_Placement();
+        unknown_bool_11D0 = false;
+        return;
+    }
+
+    // 3) 普通点选：命中则加入选择集，未命中则清空选择。
+    if (TacticalClass::Instance != nullptr)
+    {
+        bool hit = TacticalClass::Instance->Select_At(point, false);
+        if (!hit)
+            TacticalClass::DeselectAll();
+    }
+
+    unknown_bool_11D0 = false;
+    MarkToRedraw();
+}
+
+// =============================================================================
+// Mouse_Move - Cursor tracking / hover (asm: asm:768)
+//
+// asm: DisplayClass_MouseMove(this, int* elementID, dwXY* mouseCoords) retn
+//   0Ch —— 记录最新光标位置并刷新 UI 悬停态。
+// =============================================================================
+void DisplayClass::Mouse_Move(const Point2D& point)
+{
+    CursorPosition = point;
+
+    // asm: 悬停格 → 帮助文本/光标形状由 Gadget 层随最新坐标刷新；
+    // 若处于放置模式则保持屏幕 live，供脚印预览跟随光标。
+    if (CurrentBuildingType != nullptr)
+        MarkToRedraw();
+}
+
+// =============================================================================
+// Place_Object - Commit a building placement (asm: Mouse_Left_Release 放置分支)
+//
+// asm: 放置时遍历当前购买对象的脚印（FoundationBoundsSize / SetActiveFoundation
+//   维护的 CurrentFoundation_Data），逐格 Map->Is_Placement_Allowed 校验；
+//   全部通过则实际建造并消耗资金、退出放置模式；否则保持放置模式。
+// =============================================================================
+bool DisplayClass::Place_Object(const CellStruct& cell)
+{
+    if (CurrentBuildingType == nullptr)
+        return false;
+
+    // 落点中心格。
+    CurrentFoundation_CenterCell = cell;
+
+    bool allValid = true;
+
+    if (CurrentFoundation_Data != nullptr)
+    {
+        const CellStruct* pIter = CurrentFoundation_Data;
+        while (pIter->X != 0x7FFF || pIter->Y != 0x7FFF)
+        {
+            CellStruct target;
+            target.X = static_cast<int16>(cell.X + pIter->X);
+            target.Y = static_cast<int16>(cell.Y + pIter->Y);
+            ++pIter;
+
+            if (!MapClass::Instance->Is_Placement_Allowed(target))
+            {
+                allValid = false;
+                break;
+            }
+        }
+    }
+    else
+    {
+        allValid = MapClass::Instance->Is_Placement_Allowed(cell);
+    }
+
+    if (!allValid)
+        return false;
+
+    // asm: 建造成功后清除购买对象与脚印数据（对象创建由 BuildingClass 工厂
+    // 承担；此处按语义等价停下在"校验通过"这一步，交由上层触发工厂）。
+    MarkToRedraw();
+    return true;
+}
+
+// =============================================================================
+// Cancel_Placement - Abort building placement (asm: 右键取消分支)
+//
+// asm: 清 CurrentBuilding/CurrentBuildingType/未知索引 -1，并释放脚印数据。
+// =============================================================================
+void DisplayClass::Cancel_Placement()
+{
+    CurrentBuilding     = nullptr;
+    CurrentBuildingType = nullptr;
+    unknown_11AC        = 0xFFFFFFFF;
+    CurrentFoundation_Data     = nullptr;
+    CurrentFoundationCopy_Data = nullptr;
+    unknown_bool_11CE  = false;
+    MarkToRedraw();
+}
+
+// =============================================================================
+// Process_Input - Per-frame input dispatch (asm: Main_Loop 输入段)
+//
+// asm: 主循环每帧把鼠标/拖拽状态喂进显示层：若正在拖拽则据最新坐标更新
+//   框选带；滚动的惯性计时递减；把最新带区交给战术层重绘。
+// =============================================================================
+void DisplayClass::Process_Input()
+{
+    if (DraggingRectangle && TacticalClass::Instance != nullptr)
+    {
+        TacticalClass::Instance->DragX1 = unknown_11D4;
+        TacticalClass::Instance->DragY1 = unknown_11D8;
+        TacticalClass::Instance->DragX2 = unknown_11DC;
+        TacticalClass::Instance->DragY2 = unknown_11E0;
+        TacticalClass::Instance->Drag_Select();
+    }
+
+    Update();
+}
+
+// =============================================================================
+// AI - Per-frame display update (asm: DisplayClass::AI)
+//
+// asm: 逐帧：跟随相机把视图中心挪到被跟随对象；滚动惯性计时递减；
+//   若本帧有变化则标记重绘。
+// =============================================================================
+void DisplayClass::AI()
+{
+    // 跟随相机（asm: FollowObject 分支：把 ObjectToFollow 居中）。
+    if (FollowObject && ObjectToFollow != nullptr && !ObjectToFollow->IsInLimbo)
+    {
+        CoordStruct coord;
+        ObjectToFollow->GetCoords(&coord);
+        CenterOn(coord);
+        MarkToRedraw();
+    }
+
+    // 滚动惯性（asm: ScrollTimer 递减）。
+    Update();
+
+    // 正在滚动时保持屏幕live。
+    if (IsScrolling)
+        MarkToRedraw();
 }
 
 void DisplayClass::Refresh()
 {
-    // 根据游戏行为，可知重绘请求把整个可视面标记脏区。
+    // asm: DisplayClass::Refresh —— 把脏区并集重绘并清空脏区。
+    if (TacticalClass::Instance != nullptr)
+    {
+        TacticalClass::Instance->ContainingMapCoords = Rectangle(0, 0, 0, 0);
+    }
+    MarkToRedraw();
 }
 
 void DisplayClass::Restore()
 {
-    // 根据游戏行为，可知恢复把备份面贴回主面。
+    // asm: DisplayClass::Restore —— 把备份面贴回主面（合成后端未建模，
+    // 语义等价为标记整屏重绘）。
+    MarkToRedraw();
 }
 
 // ------------------------------------------------------------------------
@@ -1799,21 +2612,241 @@ void DisplayClass::Restore()
 // ------------------------------------------------------------------------
 void DisplayClass::Left_Press()
 {
+    Mouse_Left_Press(CursorPosition);
 }
 
 void DisplayClass::Left_Release()
 {
-    Mouse_Left_Release();
+    Mouse_Left_Up(CursorPosition);
 }
 
 void DisplayClass::Left_Held()
 {
+    Mouse_Left_Held(CursorPosition);
 }
 
 void DisplayClass::Left_Up()
 {
+    Mouse_Left_Up(CursorPosition);
 }
 
 void DisplayClass::Right_Press()
 {
+    Mouse_Right_Press(CursorPosition);
+}
+
+// ============================================================================
+// 视频模式切换：重建五张全局表面
+//
+// asm: void_RecreateSurfaces (0x533F70)
+//   __usercall(ecx -> rect1/ebp, edx -> rect2/edi; arg_4, arg_8); retn 0Ch
+//   恒返回 al = 1。唯一调用点 SetVideoMode+41Eh。
+//
+// 逐段对应：
+//   533F70  WWDebugString("Allocating new surfaces\n")
+//   534005  Alternate   : 非空 -> "Deleting AlternateSurface\n"  -> vt[0](1) -> 清槽
+//   534013  Hidden      : 同上（"Deleting HiddenSurface\n"）
+//   53403E  Composite   : 同上（"Deleting CompositeSurface\n"）
+//   534069  Tile        : 同上（"Deleting TileSurface\n"）
+//   534094  Sidebar     : 同上（"Deleting SidebarSurface\n"）
+//   5340BF  bl = (bVideoBackBuffer == 0) ; var_1 = (unk_A8EB96 == 0)
+//   5340C7  Hidden 第一趟（仅 arg_8 低字节 != 0）
+//   534146  Composite  (a4 = bl,  a5 = 1)
+//   5341B4  Tile       (a4 = bl,  a5 = 1)
+//   53422B  Composite/Tile 的 [surf+19h] 不一致 -> 双双删掉重建成 (1,1)
+//   5342D6  Sidebar    (a4 = var_1, a5 = 0)
+//   534352  Hidden 第二趟（仅 arg_8 低字节 == 0）
+//   5343CB  Alternate  (a4 = 1, a5 = 0)
+//
+// vt[0] 是 DSurface_SDDTOR（标量删除析构，参数 1）—— 本工程即 delete。
+// vt+18h(0) 是 vt_DSurface 第 6 槽 sub_7BBAB0：取整面矩形后交给
+// sub_4BB620 填充，即"新建面先整面清 0"—— 本工程即 DSurface::Fill(0)。
+// ============================================================================
+
+// asm: unk_A8EB96
+uint8 g_UnkA8EB96 = 0;
+
+namespace {
+
+// 与原版 WWDebugString 同一出口（Rendering 侧走 stderr）。
+void RS_Debug(const char* pFormat, ...)
+{
+    va_list args;
+    va_start(args, pFormat);
+    std::vfprintf(stderr, pFormat, args);
+    va_end(args);
+}
+
+// asm: mov eax,DSurface_X / cmp eax,esi / jz skip —— 打印 + 删除 + 清槽。
+void RS_DeleteSurface(DSurface*& pSlot, const char* pDebug)
+{
+    if (pSlot == nullptr)
+        return;                                  // asm: cmp X, esi / jz
+
+    RS_Debug(pDebug);
+    delete pSlot;                                // asm: push 1 / call [eax]（vt[0]）
+    pSlot = nullptr;                             // asm: mov X, esi
+}
+
+// asm: push 24h / call new + DSurfaceClass(w, h, a4, a5)；分配失败给 nullptr。
+DSurface* RS_MakeSurface(int32 w, int32 h, bool bSystemMemory, bool bEnable3D)
+{
+    return new (std::nothrow) DSurface(w, h, bSystemMemory, bEnable3D);
+}
+
+// asm 每段重建的尾巴：vt+18h(0) 清面，再按 [surf+19h] 选 "VRAM" /
+// "SYSTEM MEMORY" 打印。asm 在此处无条件解引用新面；空指针只可能来自
+// 分配失败，仍然保留判空以免踩空。
+void RS_FinishSurface(DSurface* pSurface, int32 w, int32 h, const char* pFormat)
+{
+    if (pSurface == nullptr)
+        return;
+
+    pSurface->Fill(0);                           // asm: vt+18h(0)
+    RS_Debug(pFormat, w, h,
+             pSurface->IsInVideoRam ? "VRAM" : "SYSTEM MEMORY");
+}
+
+} // namespace
+
+int32 DisplayClass::RecreateSurfaces(const LTRBStruct& visRect,
+                                     const LTRBStruct& altRect,
+                                     const LTRBStruct& tileRect,
+                                     const LTRBStruct& sidebarRect)
+{
+    RS_Debug("Allocating new surfaces\n");                 // 533F70
+
+    RS_DeleteSurface(DSurface_Alternate, "Deleting AlternateSurface\n");
+    RS_DeleteSurface(DSurface_Hidden,    "Deleting HiddenSurface\n");
+    RS_DeleteSurface(DSurface_Composite, "Deleting CompositeSurface\n");
+    RS_DeleteSurface(DSurface_Tile,      "Deleting TileSurface\n");
+    RS_DeleteSurface(DSurface_Sidebar,   "Deleting SidebarSurface\n");
+
+    // asm 5340BF-5340D2:
+    //   bl    = (bVideoBackBuffer == 0)   setz bl
+    //   var_1 = (unk_A8EB96 == 0)         setz [esp+var_1]
+    const bool bSystemMemory = (Game::bVideoBackBuffer == 0);
+    const bool bSidebarSysMem = (g_UnkA8EB96 == 0);
+
+    // asm: mov al, byte ptr [esp+arg_8] —— arg_8 是指针，读的是指针值低字节；
+    // 调用点传栈上矩形地址，故这一位由地址对齐决定，两支互斥。
+    const bool bHiddenFirstPass =
+        (reinterpret_cast<uintptr_t>(&sidebarRect) & 0xFFu) != 0;
+
+    // --- Hidden 第一趟（asm 5340C7-53413F）----------------------------------
+    if (bHiddenFirstPass) {
+        const int32 w = visRect.Right;                     // asm: [ebp+8]
+        const int32 h = visRect.Bottom;                    // asm: [ebp+0Ch]
+        if (w > 0 && h > 0) {
+            DSurface_Hidden = RS_MakeSurface(w, h, false, false);
+            RS_FinishSurface(DSurface_Hidden, w, h,
+                             "HiddenSurface (%dx%d) %s\n");
+        }
+    }
+
+    // --- Composite（asm 534146-5341AE）：a4 = bl，a5 = 1 --------------------
+    {
+        const int32 w = altRect.Right;                     // asm: [edi+8]
+        const int32 h = altRect.Bottom;                    // asm: [edi+0Ch]
+        if (w > 0 && h > 0) {
+            DSurface_Composite = RS_MakeSurface(w, h, bSystemMemory, true);
+            RS_FinishSurface(DSurface_Composite, w, h,
+                             "CompositeSurface (%dx%d) %s ENABLE_3D\n");
+        }
+    }
+
+    // --- Tile（asm 5341B4-534222）：矩形取自 a3，a4/a5 与 Composite 相同 ----
+    {
+        const int32 w = tileRect.Right;                    // asm: [esi+8]
+        const int32 h = tileRect.Bottom;                   // asm: [esi+0Ch]
+        if (w > 0 && h > 0) {
+            DSurface_Tile = RS_MakeSurface(w, h, bSystemMemory, true);
+            RS_FinishSurface(DSurface_Tile, w, h,
+                             "TileSurface (%dx%d) %s ENABLE_3D\n");
+        }
+    }
+
+    // --- VRAM 不一致（asm 53422B-5342D6）：两张面都存在且 [surf+19h] 不同时
+    //     双双删掉，改按 (a4=1, a5=1) 强制系统内存重建；这条路径不再调
+    //     vt+18h，也不打印。------------------------------------------------
+    if (DSurface_Composite != nullptr && DSurface_Tile != nullptr &&
+        (DSurface_Tile->IsInVideoRam != DSurface_Composite->IsInVideoRam)) {
+        delete DSurface_Composite;                         // asm: vt[0](1)
+        DSurface_Composite = nullptr;
+        delete DSurface_Tile;
+        DSurface_Tile = nullptr;
+
+        RS_Debug("Moving TileSurface and CompositeSurface into system memory\n");
+
+        DSurface_Composite = RS_MakeSurface(altRect.Right, altRect.Bottom,
+                                            true, true);
+        DSurface_Tile = RS_MakeSurface(tileRect.Right, tileRect.Bottom,
+                                       true, true);
+    }
+
+    // --- Sidebar（asm 5342D6-534346）：矩形取自 a4 本身，a4 = var_1，a5 = 0 --
+    {
+        const int32 w = sidebarRect.Right;                 // asm: [esi+8]
+        const int32 h = sidebarRect.Bottom;                // asm: [esi+0Ch]
+        if (w > 0 && h > 0) {
+            DSurface_Sidebar = RS_MakeSurface(w, h, bSidebarSysMem, false);
+            RS_FinishSurface(DSurface_Sidebar, w, h,
+                             "SidebarSurface (%dx%d) %s\n");
+        }
+    }
+
+    // --- Hidden 第二趟（asm 534352-5343C5）：仅 arg_8 低字节 == 0 ----------
+    if (!bHiddenFirstPass) {
+        const int32 w = visRect.Right;
+        const int32 h = visRect.Bottom;
+        if (w > 0 && h > 0) {
+            DSurface_Hidden = RS_MakeSurface(w, h, false, false);
+            RS_FinishSurface(DSurface_Hidden, w, h,
+                             "HiddenSurface (%dx%d) %s\n");
+        }
+    }
+
+    // --- Alternate（asm 5343CB-534438）：a4 = 1，a5 = 0 --------------------
+    {
+        const int32 w = visRect.Right;
+        const int32 h = visRect.Bottom;
+        if (w > 0 && h > 0) {
+            DSurface_Alternate = RS_MakeSurface(w, h, true, false);
+            RS_FinishSurface(DSurface_Alternate, w, h,
+                             "AlternateSurface (%dx%d) %s\n");
+        }
+    }
+
+    return 1;                                              // asm: mov al,1
+}
+
+// ============================================================================
+// asm: vec_ObjectsInLayers 的只读访问器
+//
+// 三张层表在 asm 里是 .data 里的三组 {data, length} 对（stride 18h，
+// 首项起点 0Ch 字节在 length 之前），本文件以 g_DisplayLayers 镜像。
+// 同步日志的 MAP LAYER 段按层号顺序逐条转储，故只需这两条查询。
+// ============================================================================
+int32 DisplayClass::GetLayerCount()
+{
+    return kDisplayLayerCount;
+}
+
+int32 DisplayClass::GetLayerObjectCount(int32 layer)
+{
+    if (layer < 0 || layer >= kDisplayLayerCount) {
+        return 0;
+    }
+    return g_DisplayLayers[layer].Count;
+}
+
+ObjectClass* DisplayClass::GetLayerObject(int32 layer, int32 index)
+{
+    if (layer < 0 || layer >= kDisplayLayerCount) {
+        return nullptr;
+    }
+    if (index < 0 || index >= g_DisplayLayers[layer].Count) {
+        return nullptr;
+    }
+    return g_DisplayLayers[layer][index];
 }

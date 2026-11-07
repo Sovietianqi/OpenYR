@@ -79,13 +79,38 @@ public:
 
     // ── Global dialog list ───────────────────────────────────────────────
     static DynamicVectorClass<VoxClass*>* Array;
-    // 根据游戏行为，可知语音播放面以索引与名字两个入口落地：索引
-    // 直达表项，名字侧先做大小写不敏感的线性定位；优先级为 -1 时
-    // 沿用表内默认档位。
-    static int32 PlayFromIndex(int32 index, int32 typeFlags, int32 priorityFlags);
-    static int32 PlayFromName(const char* pName, int32 typeFlags, int32 priorityFlags);
-    static int32 PlayEVASideSpecific(int32 index, int32 sideIndex);
-    static void StopIndex(int32 index);
+
+    // -------------------------------------------------------------------
+    // 播放面（asm 0x7524xx..0x752Bxx）
+    //
+    // 原版用一组全局量驱动 EVA：
+    //   SoundIndices+0Ch  表长             (+0x0C)
+    //   SoundIndices+14h  当前语音句柄槽
+    //   SoundIndices+20h  正在播的 VoxClass*
+    //   SoundIndices+24h  阵营号（0=通用 1=苏军 2=尤里）
+    //   SoundIndices+28h  语音通道（非空才可播）
+    //   SoundIndices+2C/30 播放计时（64 位）
+    //   dword_B1D3D8      全局语音静音开关
+    // -------------------------------------------------------------------
+    static void  PlayFromIndex(int32 index, int32 typeFlags, int32 priorityFlags);
+    static void  PlayFromName(const char* pName, int32 typeFlags, int32 priorityFlags);
+    static void  PlayEVASideSpecific();
+    static void  StopIndex(int32 index);
+
+    static const char* FindByIndex(int32 index);   // asm: VoxClass_FindByIndex
+    static int32 FindIndex(const char* pID);       // asm: VoxClass_FindIndex
+    static void  DeleteAll();                      // asm: VoxClass_DeleteAll
+
+    static bool  Get_Speech_Enabled();             // asm: dword_B1D3D8
+    static void  Set_Speech_Enabled(bool on);
+    static void  Set_Voice_Side(int32 side);       // asm: SoundIndices+24h
+    static int32 Get_Voice_Side();
+    static VoxClass* Get_Current();                // asm: SoundIndices+20h
+
+    // 音频后端未建模：AudioStream_Play_WAV 以可注入回调落点，返回是否
+    // 成功开播；默认回调只记录样本名并视为成功（静默环境）。
+    typedef bool (*VoiceBackendProc)(const char* pFileName);
+    static void Set_Voice_Backend(VoiceBackendProc pProc);
 
     static VoxClass* Find(const char* pID);
     static void Clear();

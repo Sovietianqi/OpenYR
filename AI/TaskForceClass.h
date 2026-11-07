@@ -39,12 +39,18 @@ public:
     // one task force per listed name.
     // 根据游戏行为，可知任务力补全原版命名形态：成员表与 INI 的
     // 双向同步、成员计数与一个弃用查找槽。
-    bool SaveListToINI(class CCINIClass* pINI, const char* pSection);
-    void LoadObjects(class CCINIClass* pINI, const char* pSection);
+    // asm: TaskForceClass_SaveListToINI (0x6E833F) retn 0 —— __fastcall
+    // (CCINIClass* this, int global)：按 isGlobal 归属回写 [TaskForces]。
+    void SaveListToINI(CCINIClass* pINI, int32 global);
+
+    // asm: TaskForceClass_LoadObjects —— 解析一条 "数量,单位ID" 串，
+    // 数量写入 pOut->Count，类型经步兵/载具/飞机三张类型表解析到 pOut->Type。
+    static void LoadObjects(TaskForceMember* pOut, const char* str);
+
     int32 CountObjects() const;
     static TaskForceClass* Find_obsolete(const char* pID);
 
-    static void CreateFromINIList(CCINIClass* pINI);
+    static void CreateFromINIList(CCINIClass* pINI, int32 global);
 
     static TaskForceClass* Find(const char* pID);
     static TaskForceClass* FindOrAllocate(const char* pID);
@@ -60,9 +66,17 @@ public:
 
     virtual AbstractType WhatAmI() const override;
     virtual int32 Size() const override;
+    // asm: TaskForceClass_GetAbstractDerivationID (0x6E87D4) -> 常量 0x21
+    virtual AbstractType GetAbstractDerivationID() const;
 
     virtual bool LoadFromINI(CCINIClass* pINI) override;
+    // asm: TaskForceClass_SaveToINI (0x6E852F) retn 4 —— 回写本段：6 个编号
+    // 成员条目 + Group 键；越界条目按空串清除。
+    virtual bool SaveToINI(CCINIClass* pINI) override;
     virtual int32 GetCRC() const;
+    // asm: TaskForceClass_GetTechLevel (0x6E87E0) —— 遍历成员取最大
+    // Prerequisite[0]，遇 -1（需全部前提）且会话在跑时记 0x0B。
+    int32 GetTechLevel() const;
 
     int32 GetMemberCount() const;
     int32 GetTotalUnitCount() const;
@@ -81,4 +95,6 @@ public:
 
     DynamicVectorClass<TaskForceMember> Members;
     int32 Grouping;
+    // asm 偏移 +0xA0：写入 [TaskForces] 时按归属（global）分组。
+    int32 IsGlobal;
 };

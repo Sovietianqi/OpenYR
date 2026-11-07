@@ -139,12 +139,15 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
     : Type(pType), Owner(pOwner), CreationFrame(0), IsTransient(false),
       IsFullStrength(false), NeedsToDisappear(false), JustDisappeared(false),
       Value(0), RecruitRadius(DEFAULT_RECRUIT_RADIUS), RecruitTimer(0),
-      Script(nullptr), NextTeam(nullptr), PrevTeam(nullptr), GuardAreaTimer(0),
+      Script(nullptr), IsFlashing(false), ITarget(nullptr), PrevTarget(nullptr),
+      SpawnCell(nullptr), FollowAnchor(nullptr),
+      NextTeam(nullptr), PrevTeam(nullptr), GuardAreaTimer(0),
       CurrentMission(MISSION_SLEEP), TotalThreatValue(0),
       totalStrength(0), idxTeam(0), ActionExecuted(false), AchievedSuccess(false),
       IsFullyLoaded(false), IsMissingMembers(false), IsLeavingMap(false),
       HasLeftMap(false), NeedsToDelete(false), TimeToDissapear(false),
-      WantsToDelete(false), TeamSuspended(false), SuspendFrame(0) {
+      WantsToDelete(false), TeamSuspended(false), SuspendFrame(-1),
+      SuspendDuration(0), IsForming(false), HasTakenDamage(false) {
 
     for (int32 i = 0; i < MaxTaskForceSlots; ++i)
         TeamCounts[i] = 0;
@@ -178,12 +181,44 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
     if (pType) {
         Value = pType->Priority;
     }
+
+    // asm: TeamClass_CTOR (asm:1526848) 尾段 ——
+    //   mov eax,vec_Teams.count / cmp vec_Teams.length,eax /
+    //   ... call [eax+8] (扩容) / mov ecx,vec_Teams.length / inc /
+    //   mov vec_Teams.length,ecx / mov [data+ecx*4],esi
+    //   即构造完立刻把自己登记进 vec_Teams。缺这一步时，任何经
+    //   TeamTypeClass_CreateTeam 新建的队伍都不会被 LogicClass_Update
+    //   的 Team 循环（asm L751785）驱动，等于「建了但不动」。
+    //   幂等：重复登记会被跳过（同一指针只保留一份）。
+    if (TeamClass::Array != nullptr) {
+        bool alreadyListed = false;
+        for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
+            if (TeamClass::Array->GetItem(i) == this) {
+                alreadyListed = true;
+                break;
+            }
+        }
+        if (!alreadyListed) {
+            TeamClass::Array->Add(this);
+        }
+    }
 }
 
 // =============================================================================
 // Destructor - release the script and clear the member roster.
 // =============================================================================
 TeamClass::~TeamClass() {
+    // asm: TeamClass_DTOR (asm:1527224) → TeamClass::Remove —— 先从 vec_Teams
+    //   摘除自身，再释放成员脚本与名单，避免悬垂指针留在逐帧遍历表里。
+    if (TeamClass::Array != nullptr) {
+        for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
+            if (TeamClass::Array->GetItem(i) == this) {
+                TeamClass::Array->Remove(i);
+                break;
+            }
+        }
+    }
+
     if (Script) {
         delete Script;
         Script = nullptr;
@@ -193,61 +228,171 @@ TeamClass::~TeamClass() {
 }
 
 // =============================================================================
-// Update - per-frame team AI tick.
+// Update - per-frame team AI tick (asm: TeamClass_Update, 0x6E940x).
 //
-// The update sequence is:
-//   1. If the team is flagged for disappearance, finalise it now.
-//   2. Remove dead or null members from the roster.
-//   3. If the roster is empty, schedule disappearance (unless transient teams
-//      are allowed to persist for reinforcement).
-//   4. Decrement the recruit cooldown timer.
-//   5. Drive the behaviour script, which in turn calls back into the
-//      mission/target helpers below.
+// 原版把队伍脚本的"取指/派发"整段写在 TeamClass_Update 里（一个 65 分支的
+// 巨型 switch）。本项目把"派发"下沉到 ScriptClass::Execute()，所以这里只负责
+// 原版 switch 之前的**每帧前缀**，顺序与原版一致：
+//   1. 挂起计时：被暂停的队伍等到 Frame - SuspendFrame >= SuspendDuration
+//      才解除暂停（SuspendFrame == -1 表示未计时，直接看剩余时长）。
+//   2. 消失流程：TimeToDissapear 置位就调 LeaveMap()，返回假说明本队整个
+//      消失，本帧就此结束。
+//   3. 编队/动员：IsForming 已置位时，若队伍正要离场就先跑一次集结
+//      （原 sub_6EA0D0，这里映射为 ReGroup + FindUnitToFollow）；否则若
+//      还缺人（IsMissingMembers）或需要跟随，就把 IsForming/IsFullyLoaded
+//      拉起、清掉 IsLeavingMap，给每个成员打上"队长跟随"标记并复位脚本首行。
+//   4. 跟随锚点：用 FindUnitToFollow() 找到队伍该跟的对象。
+//   5. 补员扫描：逐个 task-force 坑位，缺口为正就 SearchForRecruit(idx)。
+//   6. 成功事件：AchievedSuccess 置位时向所有 Tag 抛一次事件。
+//   7. 脚本推进：ActionExecuted 置位则 StepToNextLine()，随后交给
+//      ScriptClass::Execute() 派发当前行；脚本非末行时清空队伍目标。
+//   8. 自杀队脚本结束时整体消失。
 // =============================================================================
 void TeamClass::Update() {
+    const int32 frame = Game::CurrentFrame;
+
+    // ---- 1. 挂起计时 -------------------------------------------------------
+    if (TeamSuspended) {
+        bool wake = false;
+        if (SuspendFrame == -1) {
+            // 没有起始帧：只要剩余时长归零就醒。
+            wake = (SuspendDuration <= 0);
+        } else {
+            const int32 elapsed = frame - SuspendFrame;
+            if (elapsed >= SuspendDuration) {
+                wake = true;
+            } else {
+                SuspendDuration -= elapsed;
+            }
+        }
+        if (wake) {
+            TeamSuspended = false;
+        } else {
+            // 仍被挂起：本帧不参与任何行动。
+            return;
+        }
+    }
+
+    // ---- 2. 消失流程 -------------------------------------------------------
+    if (TimeToDissapear) {
+        if (!LeaveMap()) {
+            // 整队已经退场，本帧结束。
+            return;
+        }
+    }
+
+    CleanupDeadMembers();
+
+    // ---- 3. 编队 / 动员 ----------------------------------------------------
+    // ---- 3. 编队 / 动员 (asm @@5-@@12) ------------------------------------
+    //  IsForming 已置位时若队伍正要离场，先跑一次集结（原 sub_6EA0D0）。
+    if (IsForming && IsLeavingMap) {
+        ReGroup();
+        FindUnitToFollow();
+    }
+
+    // 需要凑人（缺员）时才正式"动员"：拉起 IsForming/IsFullyLoaded、清
+    // IsLeavingMap，给每个成员打上队长跟随标记并复位脚本首行。动员后继续
+    // 往下走（原 asm 落到 @@13），不会本帧直接返回。
+    if (IsMissingMembers || WantsToDelete) {
+        IsForming       = true;
+        IsFullyLoaded   = true;
+        IsLeavingMap    = false;
+
+        for (int32 i = 0; i < Members.Count; ++i) {
+            TechnoClass* pTechno = Members[i];
+            if (pTechno == nullptr || pTechno->IsDead())
+                continue;
+            if (!IsFootMember(pTechno))
+                continue;
+            FootClass* pFoot = static_cast<FootClass*>(pTechno);
+            pFoot->IsTeamLeader = (i == 0) || HasLeftMap;
+        }
+
+        if (Script) {
+            Script->ResetCurrentLine();
+        }
+        ActionExecuted = true;
+    }
+
+    // ---- 4. 跟随锚点 (asm @@13-@@14) --------------------------------------
+    FindUnitToFollow();
+
+    // ---- 5. 补员扫描 (asm @@15-@@19) --------------------------------------
+    //  仅在队伍已动员、且没有离场/缺员时才补员；逐个 task-force 坑位，
+    //  缺口为正就招一名。
+    const bool canScanRecruit = IsForming && !HasLeftMap && !IsLeavingMap;
+    if (canScanRecruit && Type != nullptr && Type->TaskForce != nullptr) {
+        TaskForceClass* pTask = Type->TaskForce;
+        const int32 slots = pTask->Members.Count;
+        for (int32 idx = 0; idx < slots && idx < MaxTaskForceSlots; ++idx) {
+            const int32 need = pTask->Members.Items[idx].Count;
+            if (TeamCounts[idx] < need) {
+                SearchForRecruit(idx);
+            }
+        }
+    }
+
+    // ---- 6. 成功事件 (asm @@21-@@23) --------------------------------------
+    if (AchievedSuccess && TagClass::Array != nullptr) {
+        const int32 tagCount = TagClass::Array->GetCount();
+        for (int32 i = tagCount - 1; i >= 0; --i) {
+            TagClass* pTag = (*TagClass::Array)[i];
+            if (pTag == nullptr)
+                continue;
+            const int32 trigCount = pTag->TriggerList.GetCount();
+            for (int32 t = trigCount - 1; t >= 0; --t) {
+                TriggerClass* pTrig = pTag->TriggerList[t];
+                if (pTrig == nullptr)
+                    continue;
+                pTrig->Spring(TriggerEventType::AnyEvent, nullptr, CellStruct());
+                break;
+            }
+        }
+    }
+
+    // 队员已被清空则本帧到此为止，交给下一帧的消失流程。
+    if (Members.Count == 0) {
+        if (!IsTransient) {
+            NeedsToDisappear = true;
+        }
+        return;
+    }
+
+    // ---- 7. 脚本推进 -------------------------------------------------------
+    if (ActionExecuted) {
+        ActionExecuted = false;
+        if (Script) {
+            Script->StepToNextLine();
+        }
+        // 脚本推进后，若处于"非末行"，清空当前目标。
+        AssignTargetToAll(nullptr);
+        PrevTarget = nullptr;
+    } else if (PrevTarget == nullptr) {
+        // 无新脚本动作时保留上一目标。
+        PrevTarget = ITarget;
+    }
+
+    // 交给脚本 VM 派发当前行（原版 65 分支 switch 的现代实现）。
+    if (Script) {
+        Script->Execute();
+    }
+
+    // ---- 8. 自杀队收尾 -----------------------------------------------------
     if (NeedsToDisappear) {
         DoDisappear();
         return;
     }
-    if (JustDisappeared) return;
 
-    CleanupDeadMembers();
-
-    if (Members.Count == 0) {
-        if (!IsTransient) {
-            // Non-transient teams with no members are defunct.
-            NeedsToDisappear = true;
-        }
-        return;
+    if (Script && Script->IsComplete() && Type && Type->Suicide) {
+        NeedsToDisappear = true;
     }
 
-    // Decrement the recruit cooldown so recruitment can resume later.
     if (RecruitTimer > 0) {
         --RecruitTimer;
     }
-
-    // Decrement the guard-area timer if active.
     if (GuardAreaTimer > 0) {
         --GuardAreaTimer;
-    }
-
-    // Execute the behaviour script.  The script dispatches actions that call
-    // back into AssignMissionToAll / MoveToWaypoint / AttackTarget etc.
-    if (Script) {
-        Script->Execute();
-        if (Script->IsComplete() && Type && Type->Suicide) {
-            // Suicide teams self-destruct once their script finishes.
-            NeedsToDisappear = true;
-        }
-    }
-
-    // Periodically attempt reinforcement if the team is understrength.
-    if (CanRecruit() && !IsTeamFull()) {
-        int32 deficit = Type->Max - Members.Count;
-        if (deficit > 0) {
-            ReinforceTeam(deficit);
-            RecruitTimer = RECRUIT_COOLDOWN_FRAMES;
-        }
     }
 }
 
@@ -831,7 +976,6 @@ void TeamClass::ReinforceTeam(int32 nUnits) {
         // Match against the task force composition.  Since we cannot read the
         // candidate's TechnoTypeClass, we accept any foot unit up to the task
         // force's total unit count per slot.
-        AbstractType candType = pCandidate->WhatAmI();
         bool typeMatched = false;
         for (int32 m = 0; m < tfMemberCount; ++m) {
             TaskForceMember* pMember = pTaskForce->GetMember(m);
@@ -1541,7 +1685,7 @@ bool TeamClass::Remove(FootClass* pUnit, int32 idx, bool count)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 TRUCKBtoTRUCKA 负责下面这段逻辑。
+ // asm: TeamClass_TRUCKBtoTRUCKA
  //
  //  遍历本队成员：凡是单位类型 ID 为 TRUCKB 的载具，都被改写成 TRUCKA 类型
  //  记录；处理完成后把本行动作标记为已执行。
@@ -1588,7 +1732,7 @@ void TeamClass::TRUCKBtoTRUCKA(void* pParam)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 TRUCKAtoTRUCKB 负责下面这段逻辑。
+ // asm: TeamClass_TRUCKAtoTRUCKB
  //
  //  与 TRUCKBtoTRUCKA 对称：把队伍里类型 ID 为 TRUCKA 的载具改写为 TRUCKB，
  //  处理完成后把本行动作标记为已执行。
@@ -1635,7 +1779,7 @@ void TeamClass::TRUCKAtoTRUCKB(void* pParam)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 LiberateAllMembers 负责下面这段逻辑。
+ // asm: TeamClass_LiberateAllMembers
  //
  //  逐个成员检查"是否可以被解放"，可解放的从队伍里移除；遍历过程中同步取下
  //  一个成员，避免移除导致的链断裂。所有成员处理完后把本行动作标记为已执行。
@@ -1661,7 +1805,7 @@ void TeamClass::LiberateAllMembers(void* pParam)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GuardAreaForX 负责下面这段逻辑。
+ // asm: int __thiscall TeamClass_GuardAreaForX(AITeamClass *this, cAIScriptActionType *a2, char a3)   (asm:1537241)
  //
  //  按给定参数换算出一个守备时长并写入守备计时器；随后交给底层守备逻辑推进
  //  一次。计时器到期即把本行动作标记为已执行。
@@ -1683,7 +1827,7 @@ void TeamClass::GuardAreaForX(void* pParam, bool resetTimer)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 LoadIntoTransport 负责下面这段逻辑。
+ // asm: TeamClass_LoadIntoTransport
  //
  //  逐个成员比较其"可载人数"与已载乘客数：只要还有一座载具装得下（可载人数
  //  大于当前乘客数），就直接结束、不标记动作完成；全部装不下才把本行动作
@@ -1711,7 +1855,7 @@ void TeamClass::LoadIntoTransport(void* pParam)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 ChangeToScript 负责下面这段逻辑。
+ // asm: TeamClass_ChangeToScript
  //
  //  把本队脚本换成参数指定的新脚本：先释放旧脚本，再按脚本类型新建一份并
  //  复位到首行；新脚本建立后写入本队。无论成功与否都把本行动作标记为已执行。
@@ -1736,7 +1880,7 @@ void TeamClass::ChangeToScript(void* pParam)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CloneAndDie 负责下面这段逻辑。
+// asm: TeamClass_CloneAndDie
 //
 //  把本队"换一个实例继续存在"：按同样的队伍类型、同样的拥有者新建一支克隆
 //  队，然后把本队现有成员逐个过户过去——先从本队名单上摘掉，再让克隆队把
@@ -1771,7 +1915,7 @@ void TeamClass::CloneAndDie(TeamTypeClass* pTeamType)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 LeaveMap 负责下面这段逻辑。
+// asm: TeamClass_LeaveMap
 //
 //  编成核对：把编成表规定的总人数和当前实到人数相比，得出三种结论并把它们
 //  记在本队上——
@@ -1803,8 +1947,9 @@ bool TeamClass::LeaveMap()
         if (!IsMissingMembers)
             IsFullyLoaded = true;
 
-        // 队伍类型上"可以缺人出行"的开关决定凑够一半即算可用。
-        if (Type != nullptr && Type->TransportsReturn)
+        // 队伍类型上"可以缺人出行"的开关（asm TeamType+0xAB = Reinforce）
+        // 决定凑够一半即算可用。
+        if (Type != nullptr && Type->Reinforce)
         {
             IsLeavingMap = (required > 2) ? (actual >= (required / 2))
                                           : (actual >= required);
@@ -1831,7 +1976,7 @@ bool TeamClass::LeaveMap()
         WantsToDelete   = false;
         IsLeavingMap    = true;
         IsMissingMembers = false;
-        Value           = 0;
+        SpawnCell       = nullptr;
 
         if (wasFull)
         {
@@ -1872,7 +2017,158 @@ bool TeamClass::LeaveMap()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SuspendTeamsByPriority 负责下面这段逻辑。
+// asm: void __thiscall TeamClass::Took_Damage(AITeamClass *this, TechnoClass *a2,
+//      int damageState, TechnoClass *attacker)   (asm:0x6EB3xx, retn 0Ch)
+//
+//  FootClass_ReceiveDamage 在队员被击中时回调这里。队伍据此重建锚点，好让
+//  成员围绕交火地点重新集结：
+//    * 攻击者/伤害状态为空，或本队是自杀队 -> 不反应。
+//    * 尚未开始编队（+0x7F==0）：清空锚点（spawnCell=0），打上"挨过打"
+//      (+0x75) 与"需重编"(+0x7B) 标记后返回。
+//    * 已编队：仅当攻击者不是本队成员、其类型不是建筑/步兵之类的特殊类、
+//      且不是当前目标时，才把本队锚点改到攻击者身上（队伍类型允许时）；
+//      最后让队长朝攻击者开火。
+// ============================================================================
+void TeamClass::Took_Damage(TechnoClass* pObject, int32 damageState, TechnoClass* pAttacker)
+{
+    (void)pObject;
+
+    if (pAttacker == nullptr || damageState == 0)
+        return;
+
+    // 自杀队不会因为挨打而重新定位。
+    if (Type != nullptr && Type->Suicide)
+        return;
+
+    // 尚未编队：清锚点、记标记。
+    if (!IsForming) {
+        SpawnCell       = nullptr;
+        HasTakenDamage  = true;
+        HasLeftMap      = true;
+        return;
+    }
+
+    // 攻击者必须是"敌对且非本队成员"的实体。
+    if (UnitInTeam(pAttacker))
+        return;
+
+    // 目标已经是攻击者则无需处理。
+    if (ITarget == pAttacker)
+        return;
+
+    // 队伍类型允许重新索敌时，把锚点改到攻击者身上。
+    if (Type != nullptr && Type->Aggressive) {
+        SpawnCell = pAttacker;
+        HasTakenDamage = true;
+        HasLeftMap = true;
+    }
+}
+
+// ============================================================================
+// asm: bool __thiscall TeamClass::Is_Leaving_Map(AITeamClass *this)   (asm:0x6EC2xx)
+//
+//  仅当本队真的开始撤离时才返回真：已经进入编队（+0x7F）、脚本不是最后
+//  一行、且当前脚本行是"移动到路径点"，同时该路径点落在玩家雷达视野之外
+//  （说明队伍正朝地图外行军）。
+// ============================================================================
+bool TeamClass::Is_Leaving_Map() const
+{
+    if (!IsForming)
+        return false;
+    if (Script == nullptr || Script->ScriptType == nullptr)
+        return false;
+
+    // 脚本不能停在最后一行。
+    const int32 total = Script->ScriptType->GetTotalActionCount();
+    if (Script->CurrentLine + 1 >= total)
+        return false;
+
+    // 当前行必须是 "Move to waypoint"（action == 3）。
+    if (Script->ScriptType->ScriptActions[Script->CurrentLine].Action != 3)
+        return false;
+
+    const int32 waypoint = Script->ScriptType->ScriptActions[Script->CurrentLine].Argument;
+    if (ScenarioClass::Instance == nullptr)
+        return false;
+
+    // 路径点坐标已经是 CellStruct，直接拿来测雷达。
+    CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(waypoint);
+
+    // 在雷达范围内就不算离场。
+    if (MapClass::Instance != nullptr && MapClass::Instance->In_Radar(cell, true))
+        return false;
+
+    return true;
+}
+
+// ============================================================================
+// asm: bool __thiscall TeamClass::Has_Entered_Map(AITeamClass *this)   (asm:0x6EC3xx)
+//
+//  队伍成员全部真正落到地图上（已生成标志置位）时返回真；空队视为已进场。
+// ============================================================================
+bool TeamClass::Has_Entered_Map() const
+{
+    TechnoClass* pMember = (Members.Count > 0) ? Members.Items[0] : nullptr;
+    if (pMember == nullptr)
+        return true;
+
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTechno = Members[i];
+        if (pTechno == nullptr)
+            continue;
+        if (!pTechno->Is_On_Map())
+            return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// asm: void __thiscall AITeamClass_FindUnitToFollow(AITeamClass *this, ...)   (asm:0x6EB7xx)
+//
+//  为队伍确定"跟随锚点"：优先取离队伍锚点最近的、仍在场上的成员作为
+//  FollowAnchor；若队伍锚点（SpawnCell）为空，则用第一个成员补齐。
+// ============================================================================
+void TeamClass::FindUnitToFollow()
+{
+    TechnoClass* pBest = nullptr;
+    int32 bestDist = 0x7FFFFFFF;
+
+    // 锚点必须是一个能给出坐标的实体（非空即用其坐标做基准）。
+    const bool haveAnchor = (SpawnCell != nullptr);
+
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTechno = Members[i];
+        if (pTechno == nullptr || pTechno->IsDead())
+            continue;
+
+        if (haveAnchor) {
+            const CoordStruct a = pTechno->Get_Coord();
+            const CoordStruct b = SpawnCell->GetCoords();
+            const int32 dx = a.X - b.X;
+            const int32 dy = a.Y - b.Y;
+            const int32 dz = a.Z - b.Z;
+            const int32 d  = dx * dx + dy * dy + dz * dz;
+            if (d < bestDist) {
+                bestDist = d;
+                pBest = pTechno;
+            }
+        } else {
+            // 没有锚点：第一个成员充当锚点。
+            pBest = pTechno;
+            break;
+        }
+    }
+
+    if (pBest == nullptr)
+        return;
+
+    if (SpawnCell == nullptr)
+        SpawnCell = pBest;
+    FollowAnchor = pBest;
+}
+
+// ============================================================================
+// asm: void __fastcall TeamClass_SuspendTeamsByPriority(int suspendPriority, HouseClass_old *House)   (asm:1534239)
 //
 //  某处基地遇袭时，指挥部要把"次要"的 AI 队伍集体暂时冻结，好把资源让给
 //  正面战场：凡是属于该拥有者、且优先度低于给定门槛的队伍，都先把队员依次
@@ -1907,20 +2203,21 @@ void TeamClass::SuspendTeamsByPriority(HouseClass* pOwner, int32 maxPriority)
             pMember = (pTeam->Members.Count > 0) ? pTeam->Members.Items[0] : nullptr;
         }
 
-        // 打上暂停标记并写下到期帧。到期时长由规则表里的基地遇袭响应秒数
-        // 换算成帧（每秒按 900 帧计）。
+        // 打上暂停标记并写下起始帧与时长。时长由规则表里的基地遇袭响应
+        // 秒数换算成帧（每秒按 900 帧计）；Update 用
+        // Frame - SuspendFrame >= SuspendDuration 判定解除。
         pTeam->NeedsToDelete    = true;
         pTeam->TimeToDissapear  = true;
         pTeam->TeamSuspended    = true;
-        pTeam->SuspendFrame     = Game::CurrentFrame
-                                + static_cast<int32>(RulesClass::Instance != nullptr
+        pTeam->SuspendFrame     = Game::CurrentFrame;
+        pTeam->SuspendDuration  = static_cast<int32>(RulesClass::Instance != nullptr
                                         ? RulesClass::Instance->BaseDefenseSuspendSeconds * 900.0
                                         : 0.0);
     }
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SearchForRecruit 负责下面这段逻辑。
+// asm: signed int __thiscall TeamClass_SearchForRecruit(AITeamClass *this, int idx)   (asm:1531212)
 //
 //  替编成表的第 idx 个坑位找一名新兵：
 //    * 先确定本队此刻的集结点——有专职的集结点就用它，否则退回队伍类型的
@@ -2037,14 +2334,14 @@ bool TeamClass::SearchForRecruit(int32 idx)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 DoesTeamHaveTransportAircraft 负责下面这段逻辑。
+// asm: char __thiscall TeamClass_DoesTeamHaveTransportAircraft(AITeamClass *this)   (asm:1540924)
 //
 //  判断本队里有没有"运输机"类的成员：空降、机降类的队伍要靠运输机把队员
 //  送到目的地，编队时先查一遍。有任何一个成员是 loaded 状态的运输机就算有。
 // ============================================================================
 bool TeamClass::DoesTeamHaveTransportAircraft() const
 {
-    // 根据游戏行为，可知逐个翻成员名册：谁的身份是飞机、且当前确实装着
+    // asm: TeamClass_ReduceTiberium
     //  货（或具备装载能力），本队就算有运输机。
     for (int32 i = 0; i < this->Members.GetCount(); ++i) {
         TechnoClass* pTech = this->Members[i];
@@ -2066,7 +2363,7 @@ bool TeamClass::DoesTeamHaveTransportAircraft() const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 ReduceTiberium 负责下面这段逻辑。
+// asm: TeamClass_ReduceTiberium
 //
 //  让本队的采集成员把身上的矿卸掉一部分：采矿队满载时调用这一步，把每个
 //  成员车斗里的矿按给定的量扣掉，扣出来的量记给调用方统计用。返回实际卸
@@ -2080,7 +2377,7 @@ int32 TeamClass::ReduceTiberium(int32 amount)
 
     int32 total = 0;
 
-    // 根据游戏行为，可知只有采集类的成员身上才有矿可卸：逐个翻名册，谁的
+    // asm: int __thiscall TeamClass_GetStrayDistance(AITeamClass *this)   (asm:1542858)
     //  车斗里有矿就卸谁的。
     for (int32 i = 0; i < this->Members.GetCount(); ++i) {
         TechnoClass* pTech = this->Members[i];
@@ -2093,7 +2390,7 @@ int32 TeamClass::ReduceTiberium(int32 amount)
             continue;
         }
 
-        // 根据游戏行为，可知每个成员按自己的载量参与分摊：车斗里的矿不够
+        // asm: int __thiscall TeamClass_GetStrayDistance(AITeamClass *this)   (asm:1542858)
         //  份额时有多少卸多少。
         const int32 carried = pUnit->GetTiberiumLoad();
         if (carried <= 0) {
@@ -2104,7 +2401,7 @@ int32 TeamClass::ReduceTiberium(int32 amount)
         total += take;
         amount -= take;
 
-        // 根据游戏行为，可知卸完就停：要卸的总量已经凑够时不必再翻名册。
+        // asm: int __thiscall TeamClass_GetStrayDistance(AITeamClass *this)   (asm:1542858)
         if (amount <= 0) {
             break;
         }
@@ -2114,7 +2411,7 @@ int32 TeamClass::ReduceTiberium(int32 amount)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 GetStrayDistance 负责下面这段逻辑。
+// asm: int __thiscall TeamClass_GetStrayDistance(AITeamClass *this)   (asm:1542858)
 //
 //  量出本队"走散"的程度：以队形中心为基准，量出离中心最远的那名成员有多
 //  远。散得太远的队伍要被拉回来，AI 与队形维护都拿这个值做判断。
@@ -2125,7 +2422,7 @@ int32 TeamClass::GetStrayDistance() const
         return 0;
     }
 
-    // 根据游戏行为，可知队形中心按所有成员的平均位置算：先把每个人的坐标
+    // asm: TeamClass_StartLStorm
     //  加起来再除以人数。
     int32 sumX = 0;
     int32 sumY = 0;
@@ -2151,7 +2448,7 @@ int32 TeamClass::GetStrayDistance() const
     const int32 cx = sumX / counted;
     const int32 cy = sumY / counted;
 
-    // 根据游戏行为，可知"散得最远"以最远那名成员与中心的平面距离为准。
+    // asm: TeamClass_StartLStorm
     int32 worst = 0;
     for (int32 i = 0; i < this->Members.GetCount(); ++i) {
         TechnoClass* pTech = this->Members[i];
@@ -2174,7 +2471,7 @@ int32 TeamClass::GetStrayDistance() const
 }
 
 // ============================================================================
-// 根据游戏行为，可知 StartLStorm 负责下面这段逻辑。
+// asm: TeamClass_StartLStorm
 //
 //  让本队发起一场"闪电风暴"式的集中火力：队长（第一名还能开火的成员）被
 //  指定为风暴核心，其余成员把火力都朝核心的目标上招呼。没有可开火成员时
@@ -2182,7 +2479,7 @@ int32 TeamClass::GetStrayDistance() const
 // ============================================================================
 void TeamClass::StartLStorm()
 {
-    // 根据游戏行为，可知风暴核心从名册头部往下找：第一个还能开火的成员
+    // asm: TeamClass_Suicide
     //  就是核心。
     TechnoClass* pCore = nullptr;
     for (int32 i = 0; i < this->Members.GetCount(); ++i) {
@@ -2197,7 +2494,7 @@ void TeamClass::StartLStorm()
         return;
     }
 
-    // 根据游戏行为，可知核心当前的目标就是风暴的落点：其余成员依次把自己的
+    // asm: TeamClass_Suicide
     //  目标改成同一个，形成集火。
     AbstractClass* pTarget = pCore->GetTarget();
     if (pTarget == nullptr) {
@@ -2219,7 +2516,7 @@ void TeamClass::StartLStorm()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 Suicide 负责下面这段逻辑。
+// asm: TeamClass_Suicide
 //
 //  让全队自毁：每个成员对自己的生命值来一次全额伤害，走完整的死亡结算
 //  （残骸、经验、统计都不缺席）。"自杀式攻击"的脚本动作走这一路。
@@ -2236,7 +2533,9 @@ void TeamClass::Suicide()
 
         // 根据游戏行为，可知自毁按全额伤害走通用流程：谁的血厚谁多撑一帧，
         //  但结局一样。
-        pTech->ReceiveDamage(pTech->Health, pTech, nullptr, 0);
+        // asm: TechnoClass_ReceiveDamage(pTech, &health, 0, nullptr, 0, 0, 0, nullptr)
+        int32 suicideDamage = pTech->Health;
+        pTech->ReceiveDamage(&suicideDamage, 0, nullptr, 0, 0, 0, nullptr);
     }
 }
 

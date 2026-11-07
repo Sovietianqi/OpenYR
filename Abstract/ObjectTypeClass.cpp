@@ -12,6 +12,7 @@
 #include <Map/MapClass.h>
 #include <Houses/HouseClass.h>
 #include <FileFormats/SHP.h>
+#include <IO/MixFileClass.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -133,6 +134,52 @@ void ObjectTypeClass::Delete_All()
         }
         Array->Remove(i);
     }
+}
+
+// ============================================================================
+// asm: ObjectTypeClass_One_Time (asm:740)
+//
+//  Engine-global one-shot sprite preload, invoked a single time from
+//  Init_BulkData.  For each of the four shared sidebar / pip sprites the
+//  original first tests a cached handle; when absent it constructs a
+//  RawFileClass, reads the file, and on failure falls back to the MIX
+//  filesystem finder.  The handle and a "resident" byte are cached in module
+//  globals so a second call short-circuits.
+//
+//    PIPBRD.SHP   -> CCFile_PIPBRD_SHP   byte_AC1488
+//    PIPS.SHP     -> CCFile_PIPS_SHP     byte_AC1489
+//    PIPS2.SHP    -> CCFile_PIPS2_SHP    byte_AC148A
+//    TALKBUBL.SHP -> CCFile_TALKBUBL_SHP byte_AC148B
+// ============================================================================
+static SHPStruct* g_OneTime_PipBoardSHP   = nullptr;
+static bool       g_OneTime_PipBoardValid = false;
+static SHPStruct* g_OneTime_PipsSHP       = nullptr;
+static bool       g_OneTime_PipsValid     = false;
+static SHPStruct* g_OneTime_Pips2SHP      = nullptr;
+static bool       g_OneTime_Pips2Valid    = false;
+static SHPStruct* g_OneTime_TalkBubbleSHP = nullptr;
+static bool       g_OneTime_TalkBubbleValid = false;
+
+// Shared body for one of the four preloads: skip when the slot is already
+// filled, otherwise resolve through the MIX filesystem (asm's
+// RawFileClass / Read_File / Finder sequence collapsed to a single lookup).
+static void ObjectTypeClass_One_Time_Load(const char* pFileName,
+                                          SHPStruct*& pSlot,
+                                          bool& bValid)
+{
+    if (pSlot != nullptr)
+        return;                               // asm: test eax,eax ; jnz done
+
+    pSlot  = Load_SHP(pFileName);
+    bValid = (pSlot != nullptr);              // asm: setnz cl / mov byte,cl
+}
+
+void ObjectTypeClass::One_Time()
+{
+    ObjectTypeClass_One_Time_Load("PIPBRD.SHP",   g_OneTime_PipBoardSHP,   g_OneTime_PipBoardValid);
+    ObjectTypeClass_One_Time_Load("PIPS.SHP",     g_OneTime_PipsSHP,       g_OneTime_PipsValid);
+    ObjectTypeClass_One_Time_Load("PIPS2.SHP",    g_OneTime_Pips2SHP,      g_OneTime_Pips2Valid);
+    ObjectTypeClass_One_Time_Load("TALKBUBL.SHP", g_OneTime_TalkBubbleSHP, g_OneTime_TalkBubbleValid);
 }
 
 // ============================================================================
@@ -356,6 +403,13 @@ bool ObjectTypeClass::LoadFromINI(CCINIClass* pINI)
     if (section == nullptr || section[0] == '\0')
         return false;
 
+    // asm: ObjectTypeClass_LoadFromINI (asm:1806) chains the abstract base
+    // first and bails out when the section is missing (the base returns 0 for
+    // an absent section).  This is what populates Name / UIName before the
+    // object-specific keys are read.
+    if (!AbstractTypeClass::LoadFromINI(pINI))
+        return false;
+
     // ------------------------------------------------------------------
     // Economy / build metadata
     // ------------------------------------------------------------------
@@ -485,6 +539,29 @@ bool ObjectTypeClass::LoadFromINI(CCINIClass* pINI)
     Theater = pArt->ReadBool(section, "Theater", Theater);
     NewTheater = pArt->ReadBool(section, "NewTheater", NewTheater);
     Voxel = pArt->ReadBool(section, "Voxel", Voxel);
+
+    // ------------------------------------------------------------------
+    // asm: ObjectTypeClass_LoadFromINI tail (asm:1806, loc_5F9652)
+    //   test Voxel ; jnz skip
+    //   call vt[+0x2C] (WhatAmI) ; cmp eax,5 ; jz skip   ; 5 = BuildingType
+    //   call ObjectTypeClass_Load_Theater_Art           ; 建筑/载具剧场美术
+    // skip:
+    //   if (Image[0]) MixFileClass::Retrieve("<Image>.SHP") -> ImageSHP
+    //
+    // 非体素且非建筑类型在读完 art 段后即时装载剧场美术；随后若 Image
+    // 名字非空，用 mix 文件查找器把 SHP 句柄缓存到 ImageSHP（+0xAC）。
+    // ------------------------------------------------------------------
+    if (!Voxel && WhatAmI() != AbstractType::BuildingType)
+    {
+        Load_Theater_Art(0);
+    }
+
+    if (Image[0] != '\0')
+    {
+        char shpName[0x40];
+        snprintf(shpName, sizeof(shpName), "%s.SHP", Image);
+        ImageSHP = Load_SHP(shpName);
+    }
 
         return true;
 }
@@ -904,10 +981,20 @@ int32 ObjectTypeClass::GetBuildSpeed() const
 
 // ObjectTypeClass_GetCameo (asm: xor eax, eax ; retn).
 //
-//  Sidebar cameo index.  The base type has no cameo, so it reports index 0.
-int32 ObjectTypeClass::GetCameo() const
+//  Sidebar cameo SHP.  The base type has no cameo art of its own, so it
+//  returns null; TechnoTypeClass supplies the cached CameoShape.
+SHPStruct* ObjectTypeClass::GetCameo() const
 {
-    return 0;
+    return nullptr;
+}
+
+// ObjectTypeClass_GetOwners (asm: or eax, 0FFFFFFFFh ; retn).
+//
+//  Owner bitmask.  The generic object type claims no owning house, so it
+//  reports all bits set; TechnoTypeClass supplies the real mask.
+int32 ObjectTypeClass::GetOwners() const
+{
+    return -1;
 }
 
 // ObjectTypeClass_Generic (asm: mov byte ptr [ecx+1], 'G' ; retn).
@@ -920,10 +1007,10 @@ void ObjectTypeClass::Generic()
 }
 
 // ============================================================================
-// 地基/建造分类/剧场美术（根据游戏行为实现）
+// asm: vt_ObjectTypeClass.GetFoundationData   (asm:?)
 // ============================================================================
 
-// 根据游戏行为，可知地基尺寸只有建筑类型携带，其余类型按 1×1 处理。
+// asm: vt_ObjectTypeClass.GetFoundationData   (asm:?)
 void ObjectTypeClass::GetFoundationData(int32& w, int32& h)
 {
     if (WhatAmI() == AbstractType::BuildingType) {
@@ -936,7 +1023,7 @@ void ObjectTypeClass::GetFoundationData(int32& w, int32& h)
     h = 1;
 }
 
-// 根据游戏行为，可知该判定只对建筑类型有意义：建筑类型且其 BuildCat
+// asm: int __fastcall ObjectTypeClass_IsBuildingBuildCat5(eAbstractIDs abstractID, int idx)   (asm:568135)
 // 取值为第 5 类时返回真，其余一律返回假。
 bool ObjectTypeClass::IsBuildingBuildCat5()
 {
@@ -947,7 +1034,7 @@ bool ObjectTypeClass::IsBuildingBuildCat5()
     return pBT->BuildCatValue == static_cast<BuildCat>(5);
 }
 
-// 根据游戏行为，可知三维美术装载时建筑会装载全部炮塔槽位的体素与
+// asm: void __fastcall ObjectTypeClass_Load3DArt(_ObjectTypeClass *this)   (asm:1056055)
 // 动画数据，其余类型由派生类自行处理。
 void ObjectTypeClass::Load3DArt(int32 idxTheater)
 {
@@ -961,14 +1048,14 @@ void ObjectTypeClass::Load3DArt(int32 idxTheater)
     }
 }
 
-// 根据游戏行为，可知炮筒美术跟随炮塔美术走同一装载管线；没有炮塔的
+// asm: char __thiscall ObjectTypeClass_LoadBarrelArt(_TechnoTypeClass *this, char *ImageName, int Idx)   (asm:1055649)
 // 类型自然没有炮筒可装。
 void ObjectTypeClass::LoadBarrelArt()
 {
     LoadTurret3DArt();
 }
 
-// 根据游戏行为，可知带炮塔的设备在载入三维美术时会按炮塔数量逐槽
+// asm: int __thiscall ObjectTypeClass_LoadTurret3DArt(_DWORD)   (asm:1057367)
 // 装载体素与动画数据。
 void ObjectTypeClass::LoadTurret3DArt()
 {
@@ -983,7 +1070,7 @@ void ObjectTypeClass::LoadTurret3DArt()
     }
 }
 
-// 根据游戏行为，可知进入新剧场时三维美术整体重载；建筑还要求重载
+// asm: void __thiscall ObjectTypeClass_Load_Theater_Art(_ObjectTypeClass *this)   (asm:1057744)
 // 按需加载的建造图动画。
 void ObjectTypeClass::Load_Theater_Art(int32 idxTheater)
 {
@@ -993,7 +1080,7 @@ void ObjectTypeClass::Load_Theater_Art(int32 idxTheater)
     }
 }
 
-// 对应原版槽位 ObjectTypeClass::Unload_5F77F0：根据游戏行为，可知场景
+// asm: ObjectTypeClass_Unload_5F77F0
 // 卸载阶段会把已装载的建造图动画与炮塔体素一并释放。
 void ObjectTypeClass::Unload_5F77F0()
 {
@@ -1005,7 +1092,7 @@ void ObjectTypeClass::Unload_5F77F0()
     pBT->UnloadTurretArt();
 }
 
-// 根据游戏行为，可知剧场相关文件名按剧场序号替换扩展名：温带 .TMP、
+// asm: void __fastcall ObjectTypeClass_TheaterSpecificID(char *ID, signed int idxTheater)   (asm:1058409)
 // 雪地 .SNO、城市 .URB、沙漠 .DES、月球 .LUN、新城市 .NUB；越界或
 // 未知剧场沿用温带扩展名。输入带扩展名时保留主名再追加。
 void ObjectTypeClass::TheaterSpecificID(const char* pBase, int32 idxTheater, char* pOut) const

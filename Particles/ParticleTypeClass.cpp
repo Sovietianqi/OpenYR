@@ -2,7 +2,10 @@
 #include <Combat/WarheadTypeClass.h>
 #include <Particles/ParticleTypeClass.h>
 #include "../IO/CCFileClass.h"
+#include "../IO/CRC.h"
 #include "../INI/INIClass.h"
+#include "../Core/SwizzleManagerClass.h"
+#include "../COM/IUnknown.h"
 
 #include <cmath>
 #include <cstring>
@@ -12,8 +15,14 @@
 // ParticleTypeClass
 // ============================================================
 
-ParticleTypeClass::ParticleTypeClass()
-    : Name{}, MaxLifetime(60), EmissionRate(10), MaxParticles(100)
+// asm: ParticleTypeClass_CTOR.  Chains ObjectTypeClass_CTOR(name) - the identity
+// string is stored in the inherited ID slot - then initialises the particle
+// specific fields.  Defaults mirror the asm exactly:
+//   XVelocity=YVelocity=ZVelocityRange=MaxEC=NumLoopFrames=1
+//   StateAIAdvance=4, Translucent25/50State=0xFF, NextParticleIndex=BehavesLike=-1
+ParticleTypeClass::ParticleTypeClass() noexcept
+    : ObjectTypeClass()
+    , MaxLifetime(60), EmissionRate(10), MaxParticles(100)
     , InitialVelocity(0.0f, 0.0f, 0.0f), VelocityVariation(0.0f, 0.0f, 0.0f)
     , Acceleration(0.0f, 0.0f, -0.1f), Gravity(0.0f), Drag(0.0f)
     , InitialSize(1.0f), FinalSize(1.0f), SizeVariation(0.0f)
@@ -42,19 +51,44 @@ ParticleTypeClass::ParticleTypeClass()
     , IsEnabled(true), IniIndex(-1), ColorGradientKeys(nullptr)
     , ColorGradientKeyCount(0), SizeGradientKeys(nullptr), SizeGradientKeyCount(0)
     , AlphaGradientKeys(nullptr), AlphaGradientKeyCount(0)
-    , MaxDC(0), MaxEC(0), Damage(0), Warhead(nullptr)
+    , MaxDC(0), MaxEC(1), Damage(0), Warhead(nullptr)
     , StartFrame(0), NumLoopFrames(1), Translucency(0), WindEffect(0)
     , Velocity(0.0), Deacc(0.0), Radius(0), DeleteOnStateLimit(false)
-    , EndStateAI(0), StartStateAI(0), StateAIAdvance(0)
-    , Translucent50State(0), Translucent25State(0), Normalized(false)
-    , ColorSpeed(0.0), XVelocity(0), YVelocity(0), MinZVelocity(0)
-    , ZVelocityRange(0), FinalDamageState(0), BehavesLike(-1)
+    , EndStateAI(0), StartStateAI(0), StateAIAdvance(4)
+    , Translucent50State(0xFF), Translucent25State(0xFF), Normalized(false)
+    , ColorSpeed(0.0), XVelocity(1), YVelocity(1), MinZVelocity(0)
+    , ZVelocityRange(1), FinalDamageState(0), BehavesLike(-1)
     , NextParticleIndex(-1)
     , NextParticleOffset{ 0, 0, 0 }, StartColor1{ 0, 0, 0 }, StartColor2{ 0, 0, 0 } {
     NextParticle[0] = '\0';
+    // asm: the constructor registers the new type in the ParticleTypeClass
+    // array (unk_A83D98 / unk_A83D9C in the original binary).
+    if (Array != nullptr) {
+        Array->Add(this);
+    }
 }
 
+// asm: ParticleTypeClass_CTOR(this, char* name) - convenience overload that
+// seeds the inherited ID with the type name.
+ParticleTypeClass::ParticleTypeClass(const char* pID) noexcept
+    : ParticleTypeClass() {
+    if (pID != nullptr) {
+        std::strncpy(ID, pID, sizeof(ID) - 1);
+        ID[sizeof(ID) - 1] = '\0';
+    }
+}
+
+// asm: ParticleTypeClass_SDDTOR.  Unregisters from the array and frees the
+// gradient key buffers the extended implementation maintains.
 ParticleTypeClass::~ParticleTypeClass() {
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            if (Array->Items[i] == this) {
+                Array->Remove(i);
+                break;
+            }
+        }
+    }
     if (ColorGradientKeys) {
         delete[] ColorGradientKeys;
         ColorGradientKeys = nullptr;
@@ -213,6 +247,28 @@ bool ParticleTypeClass::ReadFromINI(INIClass* ini, const char* section) {
     BehavesLike = BehavesLikeFromName(behavesBuffer);
 
     return true;
+}
+
+// ----------------------------------------------------------------------------
+// asm: ParticleTypeClass_LoadFromINI(CCINIClass* INI_) -- retn 4.
+//
+// Chains ObjectTypeClass_LoadFromINI (which parses the common object-type
+// keys against this->ID) and then reads the particle-specific keys from the
+// same section.  Returns false when the base load fails, matching the asm
+// which jumps to the "xor al,al" exit in that case.
+// ----------------------------------------------------------------------------
+bool ParticleTypeClass::LoadFromINI(CCINIClass* pINI)
+{
+    if (pINI == nullptr)
+        return false;
+
+    if (ID[0] == '\0')
+        return false;
+
+    if (!ObjectTypeClass::LoadFromINI(pINI))
+        return false;
+
+    return ReadFromINI(pINI, ID);
 }
 
 int32 ParticleTypeClass::BehavesLikeFromName(const char* pName)
@@ -388,11 +444,11 @@ void ParticleTypeClass::AddAlphaGradientKey(float time, float value) {
 void ParticleTypeClass::SetName(const char* name) {
     if (name) {
         int32 i = 0;
-        while (name[i] && i < 31) {
-            Name[i] = name[i];
+        while (name[i] && i < static_cast<int32>(sizeof(ID)) - 1) {
+            ID[i] = name[i];
             ++i;
         }
-        Name[i] = '\0';
+        ID[i] = '\0';
     }
 }
 
@@ -449,7 +505,7 @@ void ParticleTypeClass::SetEnabled(bool enabled) {
 }
 
 const char* ParticleTypeClass::GetName() const {
-    return Name;
+    return ID;
 }
 
 int32 ParticleTypeClass::GetMaxLifetime() const {
@@ -479,7 +535,7 @@ ParticleTypeClass* ParticleTypeClass::Find(const char* pID)
     for (int32 i = 0; i < Array->Count; ++i)
     {
         ParticleTypeClass* item = Array->GetItem(i);
-        if (item && !_strcmpi(item->Name, pID)) return item;
+        if (item && !_strcmpi(item->ID, pID)) return item;
     }
     return nullptr;
 }
@@ -492,8 +548,8 @@ ParticleTypeClass* ParticleTypeClass::FindOrAllocate(const char* pID)
     ParticleTypeClass* newItem = GameCreate<ParticleTypeClass>();
     if (newItem)
     {
-        strncpy(newItem->Name, pID, sizeof(newItem->Name) - 1);
-        newItem->Name[sizeof(newItem->Name) - 1] = '\0';
+        strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
+        newItem->ID[sizeof(newItem->ID) - 1] = '\0';
     }
     if (newItem && Array) Array->Add(newItem);
     return newItem;
@@ -512,7 +568,7 @@ int32 ParticleTypeClass::FindIndexOrAllocate(const char* pID)
         for (int32 i = 0; i < Array->Count; ++i)
         {
             ParticleTypeClass* item = Array->GetItem(i);
-            if (item && !_strcmpi(item->Name, pID)) return i;
+            if (item && !_strcmpi(item->ID, pID)) return i;
         }
     }
 
@@ -520,4 +576,161 @@ int32 ParticleTypeClass::FindIndexOrAllocate(const char* pID)
     if (!pNew || !Array) return -1;
 
     return Array->Count - 1;
+}
+
+// ============================================================================
+// ParticleTypeClass - vtable contract (IPersistStream / IRTTITypeInfo / CRC)
+// ============================================================================
+
+// asm: ParticleTypeClass_GetClassID (retn 8).  Null out -> E_POINTER; otherwise
+// stamps the ParticleTypeClass CLSID (AbstractType::ParticleType).
+HRESULT ParticleTypeClass::GetClassID(CLSID* pClassID)
+{
+    if (pClassID == nullptr)
+        return E_POINTER;
+    pClassID->Data1 = static_cast<uint32>(AbstractType::ParticleType);
+    return S_OK;
+}
+
+AbstractType ParticleTypeClass::WhatAmI() const
+{
+    return AbstractType::ParticleType;
+}
+
+// asm: ParticleTypeClass_GetSize: mov eax, 318h.
+int32 ParticleTypeClass::Size() const
+{
+    return 0x318;
+}
+
+// asm: ParticleTypeClass_GetAbstractDerivationID: mov eax, 17h.
+AbstractType ParticleTypeClass::GetAbstractDerivationID() const
+{
+    return AbstractType::ParticleType;
+}
+
+// asm: ParticleTypeClass_PointerGotInvalid ([esp+arg_0] compared against the
+// Warhead slot [this+0x2E4h]); on a match that slot is zeroed.  The removed
+// flag is unused by the original.
+void ParticleTypeClass::PointerGotInvalid(AbstractClass* pInvalid, bool /*removed*/)
+{
+    if (reinterpret_cast<AbstractClass*>(Warhead) == pInvalid)
+        Warhead = nullptr;
+}
+
+// ----------------------------------------------------------------------------
+// asm: ParticleTypeClass_GetCRC (retn 4) -- chains AbstractTypeClass_GetCRC
+// then folds the particle-specific identity in the exact order the original
+// uses: MaxDC, MaxEC, Damage, StartFrame, NumLoopFrames, Translucency,
+// WindEffect, Velocity, Deacc, Radius, DeleteOnStateLimit, EndStateAI,
+// StartStateAI, StateAIAdvance, Translucent25State, Translucent50State,
+// Normalized, NextParticleIndex, BehavesLike, ColorSpeed.
+// ----------------------------------------------------------------------------
+void ParticleTypeClass::ComputeCRC(CRCEngine& crc) const
+{
+    ObjectTypeClass::ComputeCRC(crc);
+
+    auto crcBool = [&crc](bool v) { uint8 b = v ? 1 : 0; crc.AddData(&b, sizeof(b)); };
+
+    crc.AddData(&MaxDC, sizeof(MaxDC));
+    crc.AddData(&MaxEC, sizeof(MaxEC));
+    crc.AddData(&Damage, sizeof(Damage));
+    crc.AddData(&StartFrame, sizeof(StartFrame));
+    crc.AddData(&NumLoopFrames, sizeof(NumLoopFrames));
+    crc.AddData(&Translucency, sizeof(Translucency));
+    crc.AddData(&WindEffect, sizeof(WindEffect));
+
+    float velocity = static_cast<float>(Velocity);
+    float deacc = static_cast<float>(Deacc);
+    crc.AddData(&velocity, sizeof(velocity));
+    crc.AddData(&deacc, sizeof(deacc));
+
+    crc.AddData(&Radius, sizeof(Radius));
+    crcBool(DeleteOnStateLimit);
+
+    crc.AddData(&EndStateAI, sizeof(EndStateAI));
+    crc.AddData(&StartStateAI, sizeof(StartStateAI));
+    crc.AddData(&StateAIAdvance, sizeof(StateAIAdvance));
+
+    // asm reads the 25-state first ([+30Dh]) then the 50-state ([+30Eh]).
+    crc.AddData(&Translucent25State, sizeof(Translucent25State));
+    crc.AddData(&Translucent50State, sizeof(Translucent50State));
+
+    crcBool(Normalized);
+    crc.AddData(&NextParticleIndex, sizeof(NextParticleIndex));
+    crc.AddData(&BehavesLike, sizeof(BehavesLike));
+    crc.AddData(&ColorSpeed, sizeof(ColorSpeed));
+}
+
+int32 ParticleTypeClass::GetCRC() const
+{
+    CRCEngine crc;
+    ComputeCRC(crc);
+    return static_cast<int32>(crc.GetCRC());
+}
+
+// ----------------------------------------------------------------------------
+// asm: ParticleTypeClass_Load (retn 8).  Chains ObjectTypeClass_Load, swizzles
+// the cached Warhead pointer, then reads the ColorList vector: a DWORD count
+// followed by that many 3-byte RGB triples.
+// ----------------------------------------------------------------------------
+HRESULT ParticleTypeClass::Load(IStream* pStm)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    HRESULT hr = ObjectTypeClass::Load(pStm);
+    if (hr < 0)
+        return hr;
+
+    {
+        static SwizzleManagerClass SwizzleManager;
+        SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&Warhead));
+    }
+
+    ULONG read = 0;
+    int32 count = 0;
+    hr = pStm->Read(&count, sizeof(count), &read);
+    if (hr < 0 || read != sizeof(count))
+        return E_FAIL;
+
+    for (int32 i = 0; i < count; ++i) {
+        uint8 rgb[3] = { 0, 0, 0 };
+        hr = pStm->Read(rgb, sizeof(rgb), &read);
+        if (hr < 0 || read != sizeof(rgb))
+            return E_FAIL;
+        ColorList.Add(ColorStruct(rgb[0], rgb[1], rgb[2]));
+    }
+
+    return S_OK;
+}
+
+// ----------------------------------------------------------------------------
+// asm: ParticleTypeClass_Save (retn 0Ch).  Chains ObjectTypeClass_Save then
+// writes the ColorList vector as a DWORD count plus 3-byte RGB triples.
+// ----------------------------------------------------------------------------
+HRESULT ParticleTypeClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    HRESULT hr = ObjectTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0)
+        return hr;
+
+    ULONG written = 0;
+    int32 count = ColorList.Count;
+    hr = pStm->Write(&count, sizeof(count), &written);
+    if (hr < 0 || written != sizeof(count))
+        return E_FAIL;
+
+    for (int32 i = 0; i < count; ++i) {
+        const ColorStruct& c = ColorList.Items[i];
+        uint8 rgb[3] = { c.R, c.G, c.B };
+        hr = pStm->Write(rgb, sizeof(rgb), &written);
+        if (hr < 0 || written != sizeof(rgb))
+            return E_FAIL;
+    }
+
+    return S_OK;
 }

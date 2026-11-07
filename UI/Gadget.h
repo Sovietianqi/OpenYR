@@ -163,6 +163,29 @@ public:
     void SetSize(int32 w, int32 h) noexcept;
     void SetRect(int32 x, int32 y, int32 w, int32 h) noexcept;
 
+    // ------------------------------------------------------------------------
+    // asm: Gadget_SetTopLeft (0x4F4310 area)
+    //   mov eax,[esp+a2] / mov edx,[esp+a3]
+    //   mov [ecx+0Ch],eax    ; X
+    //   mov [ecx+10h],edx    ; Y
+    //   retn 8
+    // ------------------------------------------------------------------------
+    void SetTopLeft(int32 x, int32 y) noexcept
+    {
+        Rect.X = x;      // asm: mov [ecx+0Ch],eax
+        Rect.Y = y;      // asm: mov [ecx+10h],edx
+    }
+
+    // ------------------------------------------------------------------------
+    // asm: Gadget_MakeVisible (0x4F4340 area)
+    //   mov byte ptr [ecx+1Ch], 1 / retn
+    // Sets the original's visibility byte at +1Ch.
+    // ------------------------------------------------------------------------
+    void MakeVisible() noexcept
+    {
+        IsVisibleFlag = 1;   // asm: mov byte ptr [ecx+1Ch],1
+    }
+
     // True if the point is inside the gadget's bounds.
     bool Contains(int32 x, int32 y) const noexcept;
     bool Contains(const Point2D& pt) const noexcept { return Contains(pt.X, pt.Y); }
@@ -259,6 +282,8 @@ protected:
     ColorStruct        BackColor;       // Background color
     GadgetCallback     Callback;        // Event callback
     void*              CallbackData;    // User data for callback
+    uint8              IsVisibleFlag;   // asm +0x1C visibility byte
+                                        // (Gadget_MakeVisible writes 1 here)
 
 public:
     // Parent / children (public for simplicity; managed by container gadgets)

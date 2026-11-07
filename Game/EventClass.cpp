@@ -9,9 +9,22 @@
 #include "../INI/INIClass.h"
 #include "../Game/Game.h"
 #include "../COM/IUnknown.h"
+#include "../AI/TEventClass.h"
+#include "../AI/TriggerClass.h"
+#include "../AI/TeamClass.h"
+#include "../AI/TeamTypeClass.h"
+#include "../Abstract/AbstractClass.h"
+#include "../Abstract/TechnoClass.h"
+#include "../Abstract/TechnoTypeClass.h"
+#include "../Abstract/BuildingClass.h"
+#include "../Abstract/BuildingTypeClass.h"
+#include "../Houses/HouseClass.h"
+#include "../Scenario/ScenarioClass.h"
+#include "../Map/CellClass.h"
 
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 
 // ============================================================================
 // Construction / destruction
@@ -672,4 +685,420 @@ bool EventClass::Load_From_INI(CCINIClass* pINI)
     }
 
     return true;
+}
+
+// ============================================================================
+// asm: int __thiscall EventClass_HasOccured(EventClass *this, int eventKind,
+//        HouseClass *pHouse, _ObjectClass *Object, TimerStruct *ActivationFrame,
+//        char *isRepeating, _ObjectClass *source)      (asm 0x71E964, retn 18h)
+//
+// 三个跳转表（off_71F218 / off_71F27C / off_71F328）逐条对应下面的三段
+// switch。所有常量（含 0x88888889 的 15 帧/秒换算、1280 的近距离阈值）
+// 与 asm 逐字节一致；HouseClass 的 asm 偏移在注释中标出，字段名取 OpenYR
+// 侧语义最近的成员。
+// ============================================================================
+
+namespace {
+
+// asm 内联 strcmp 扫描 vec_TechnoTypes，按 nameINI 找类型下标（找不到 -1）。
+int32 FindTechnoTypeIndex(const char* pName)
+{
+    if (pName == nullptr || TechnoTypeClass::Array == nullptr) return -1;
+
+    for (int32 i = TechnoTypeClass::Array->Count - 1; i >= 0; --i) {
+        TechnoTypeClass* pType = TechnoTypeClass::Array->GetItem(i);
+        if (pType == nullptr) continue;
+        const char* pID = pType->get_ID();
+        if (pID != nullptr && std::strcmp(pID, pName) == 0) return i;
+    }
+    return -1;
+}
+
+// CounterClass_GetItemAmount —— 类型计数表求和（asm 逐项累加）。
+int32 CounterTotal(const int32* pCounts, int32 count)
+{
+    if (pCounts == nullptr) return 0;
+    int32 total = 0;
+    for (int32 i = 0; i < count; ++i) total += pCounts[i];
+    return total;
+}
+
+// asm: CounterClass_GetItemCount —— 单个类型槽位的计数。
+int32 CounterItem(const int32* pCounts, int32 count, int32 idx)
+{
+    if (pCounts == nullptr || idx < 0 || idx >= count) return 0;
+    return pCounts[idx];
+}
+
+}  // namespace
+
+bool EventClass::HasOccurred(TEventClass* pEvent, int32 eventKind,
+                             HouseClass* pHouse, AbstractClass* pObject,
+                             TriggerClass* pTrigger, AbstractClass* pSource,
+                             bool* isRepeating)
+{
+    if (pEvent == nullptr) return false;
+
+    ScenarioClass* pScenario = ScenarioClass::Instance;
+    const int32 ev    = pEvent->EventKind;   // asm: [ecx+EventClass.eventKind]
+    const int32 param = pEvent->Data;        // asm: [ecx+EventClass.param]
+    const int32 frame = Game::CurrentFrame;  // asm: 全局 Frame
+
+    // 若干分支命中时把"本事件已发生"写回调用方的重复标志槽。
+    const auto markRepeating = [isRepeating]() {
+        if (isRepeating != nullptr) *isRepeating = true;
+    };
+
+    // ------------------------------------------------------------------
+    // 第一跳转表 off_71F218 / byte_71F248：ev-13 落在 [0,48] 时进入。
+    // ------------------------------------------------------------------
+    if (static_cast<uint32>(ev - 13) <= 48u) {
+        switch (ev) {
+        case 13:   // SecondsHaveElapsed（asm 首落点 = 13）
+        case 51: { // 同 SecondsHaveElapsed（跳转表索引 38）
+            // asm: ActivationFrame { TimeStart @0x00, TimeLeft @0x08 }。
+            // OpenYR 側 TriggerClass 用单值 Timer 承接同一语义（剩余帧数）。
+            if (pTrigger == nullptr) return false;
+            return pTrigger->Timer <= 0;
+        }
+        case 14: { // MissionTimerExpired
+            if (pScenario == nullptr) return false;
+            const int32 start = pScenario->MissionTimer.StartTime;
+            if (start == -1) return false;
+            int32 left = pScenario->MissionTimer.TimeLeft;
+            const int32 elapsed = frame - start;
+            if (elapsed >= left) return true;
+            left -= elapsed;
+            return left == 0;
+        }
+        case 27: // GlobalIsSet（间接表索引 14）
+            return pScenario != nullptr && pScenario->GetGlobalValue(param);
+        case 28: // GlobalIsClear（间接表索引 15）
+            return pScenario != nullptr && !pScenario->GetGlobalValue(param);
+        case 36: // localIsSet
+            return pScenario != nullptr && pScenario->GetLocalValue(param);
+        case 37: // localIsClear
+            return pScenario != nullptr && !pScenario->GetLocalValue(param);
+        case 45: // AmbientLightBelow：AmbientCopy <= param（setle）
+            return pScenario != nullptr &&
+                   pScenario->AmbientCurrent <= param;
+        case 46: // AmbientLightNotBelow：AmbientCopy >= param（setnl）
+            return pScenario != nullptr &&
+                   pScenario->AmbientCurrent >= param;
+        case 47: { // ScenarioTimeElapsed：param <= Frame / 15
+            // asm 0x88888889 + add + sar 3 + 取反补 1 == 有符号 Frame/15。
+            return param <= frame / 15;
+        }
+        case 60:   // TechnoTypeOnMap
+        case 61: { // TechnoTypeNotOnMap
+            const bool wantOnMap = (ev == 60);
+            const int32 idx = FindTechnoTypeIndex(pEvent->TechnoININame);
+            if (idx < 0) return false;
+
+            TechnoTypeClass* pFound = TechnoTypeClass::Array->GetItem(idx);
+            const int32 technoCount =
+                TechnoClass::Array != nullptr ? TechnoClass::Array->Count : 0;
+
+            if (wantOnMap) {
+                // asm: 逆序扫描 vec_Techno，statistics 到 param 即真。
+                if (technoCount <= 0) return false;
+                int32 count = 0;
+                for (int32 i = technoCount - 1; i >= 0; --i) {
+                    TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+                    if (pTechno != nullptr && pTechno->GetType() == pFound) {
+                        ++count;
+                    }
+                    if (count >= param) return true;
+                }
+                return false;
+            }
+
+            // TechnoTypeNotOnMap：地图为空 → 真；出现任一实例 → 假。
+            if (technoCount <= 0) return true;
+            for (int32 i = technoCount - 1; i >= 0; --i) {
+                TechnoClass* pTechno = TechnoClass::Array->GetItem(i);
+                if (pTechno != nullptr && pTechno->GetType() == pFound) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        default:
+            break;  // 跳转表 11 = skip，落入第二段
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 第二跳转表 off_71F27C / byte_71F284（skip 段）。
+    //   byte==0 -> loc_71EC9A：要求 eventKind == ev 且 Debug_Map 关闭；
+    //   byte==1 -> loc_71ECAF：不要求 kind 匹配。
+    // ------------------------------------------------------------------
+    if (ev == 0) return false;
+
+    if (!(ev >= 19 && ev <= 22)) {
+        if (static_cast<uint32>(ev - 1) <= 58u) {
+            static const uint8 kindMatch[59] = {
+                0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0,
+                0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0 };
+            if (kindMatch[ev - 1] == 0) {
+                if (eventKind != ev) return false;
+                if (Game::bShowDebugInfo) return false;
+            }
+        }
+    }
+
+    // loc_71ECAF：通用对象/关联方判定。
+    if (ev == 1 || ev == 24 || ev == 25 || ev == 26 || ev == 59) {
+        // loc_71F1BD
+        if (eventKind != ev) return false;
+
+        if (param != -1 &&
+            HouseClass::Find_By_Index_No_MP(param) == nullptr) {
+            return false;
+        }
+        if (pObject == nullptr) return false;
+
+        if (param != -1) {
+            // asm: Object->[+38h]（所属玩家号）与 house->PlayerNumber 比较。
+            HouseClass* pOwner = pObject->GetOwningHouse();
+            HouseClass* pHouseOfParam = HouseClass::Find_By_Index_No_MP(param);
+            if (pHouseOfParam == nullptr) return false;
+            if (pOwner == nullptr) return false;
+            if (pOwner->PlayerNumber != pHouseOfParam->PlayerNumber) {
+                return false;
+            }
+        }
+
+        markRepeating();
+        pEvent->House = pObject->GetOwningHouse();  // asm: [obj+3Ch] 写回
+        return true;
+    }
+
+    if (ev == 53) {
+        // 对象所属方与 param 指定方的 PlayerNumber 相同。
+        if (eventKind != ev) return false;
+        if (pObject == nullptr) return false;
+        if (param == -1) return false;
+
+        HouseClass* pHouseOfParam = HouseClass::Find_By_Index_No_MP(param);
+        if (pHouseOfParam == nullptr) return false;
+
+        HouseClass* pOwner = pObject->GetOwningHouse();  // asm: [obj+0D0h](1)
+        if (pOwner == nullptr) return false;
+        if (pOwner->PlayerNumber != pHouseOfParam->PlayerNumber) return false;
+
+        markRepeating();
+        return true;
+    }
+
+    if (ev == 54) {
+        // 对象是步兵，且其类型下标 == param。
+        if (eventKind != ev) return false;
+        if (pObject == nullptr) return false;
+        if (pObject->WhatAmI() != AbstractType::Infantry) return false;
+        if (param == -1) return false;
+
+        TechnoClass* pTechno = static_cast<TechnoClass*>(pObject);
+        TechnoTypeClass* pType = pTechno->GetType();
+        if (pType == nullptr) return false;
+        if (pType->Get_ArrayIndex() != param) return false;  // asm: [obj+40h]
+
+        markRepeating();
+        return true;
+    }
+
+    if (ev == 34) {
+        // comesNearWaypoint：对象到 param 号路点的距离 <= 1280。
+        if (eventKind != ev) return false;
+        if (pObject == nullptr) return false;
+        if (pScenario == nullptr) return false;
+
+        CellClass* pCell = pScenario->LocateWaypoint(param);
+        if (pCell == nullptr) return false;
+
+        // 原版路点以 lepton 存储；OpenYR 存 CellStruct，换算回 lepton。
+        const int32 wpX = static_cast<int32>(pCell->MapCoords.X) * 256;
+        const int32 wpY = static_cast<int32>(pCell->MapCoords.Y) * 256;
+        const int32 wpZ = 0;
+
+        const CoordStruct coords = pObject->GetCoords();  // asm: [obj+48h]
+        const int32 dx = coords.X - wpX;
+        const int32 dy = coords.Y - wpY;
+        const int32 dz = coords.Z - wpZ;
+
+        // asm 的 FPU 累加顺序：dx*dx + dz*dz + dy*dy，再开方取整。
+        const double dist2 = static_cast<double>(dx) * dx +
+                             static_cast<double>(dz) * dz +
+                             static_cast<double>(dy) * dy;
+        const int32 dist = static_cast<int32>(std::sqrt(dist2));
+        return dist <= 1280;
+    }
+
+    if (ev == 44) {
+        // sameHouse：源对象的 OwningPlayer 的 PlayerNumber == param。
+        if (eventKind != ev) return false;
+        if (pSource == nullptr) return false;
+        HouseClass* pOwner = pSource->GetOwningHouse();
+        if (pOwner == nullptr) return false;
+        if (param != pOwner->PlayerNumber) return false;
+    }
+
+    // ------------------------------------------------------------------
+    // 第三跳转表 off_71F2C0 / byte_71F2F8：pHouse 非空、ev-12 ∈ [0,45]。
+    // ------------------------------------------------------------------
+    if (pHouse != nullptr && static_cast<uint32>(ev - 12) <= 45u) {
+        switch (ev) {
+        case 12:   // case 0：pHouse 的阵营下标 < param 则假
+            if (pHouse->GetArrayIndex() < param) return false;
+            break;
+
+        case 15:   // case 3：TotalKilledBuildings >= param
+            if (pHouse->TotalKilledBuildings < param) return false;
+            break;
+
+        case 16: { // case 4：TotalKilledUnits >= param
+            if (pHouse->TotalKilledUnits < param) return false;
+            break;
+        }
+
+        case 17: { // case 5：houseHasNoFactories —— 还有工厂则假
+            if (pHouse->OwnedBuildingCount > 0) {
+                for (int32 i = 0; i < pHouse->OwnedBuildings.Count; ++i) {
+                    BuildingClass* pBuilding = pHouse->OwnedBuildings.GetItem(i);
+                    if (pBuilding == nullptr) continue;
+                    if (pBuilding->InLimbo()) continue;
+                    BuildingTypeClass* pType =
+                        static_cast<BuildingTypeClass*>(pBuilding->GetType());
+                    if (pType != nullptr && pType->IsFactory()) return false;
+                }
+            }
+            break;
+        }
+
+        case 18:   // case 6：pHouse 的 +0x1F9 标志必须非零（存疑）
+            if (!pHouse->IsDiscovered) return false;
+            break;
+
+        case 19:   // case 7：+0x26C == param
+            if (pHouse->OwnedUnitCount != param) return false;
+            markRepeating();
+            break;
+
+        case 20:   // case 8：+0x274 == param
+            if (pHouse->OwnedAircraftCount != param) return false;
+            markRepeating();
+            break;
+
+        case 21:   // case 9：+0x270 == param
+            if (pHouse->OwnedInfantryCount != param) return false;
+            markRepeating();
+            break;
+
+        case 22:   // case 10：+0x278 == param
+            if (pHouse->OwnedBuildingCount != param) return false;
+            markRepeating();
+            break;
+
+        case 23: { // case 11：loc_71EEA9 —— 已消失的同型队伍
+            bool found = false;
+            if (pEvent->Team != nullptr && TeamClass::Array != nullptr) {
+                for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
+                    TeamClass* pTeam = TeamClass::Array->GetItem(i);
+                    if (pTeam == nullptr) continue;
+                    if (pTeam->Type != pEvent->Team) continue;
+                    if (pTeam->Members.Count != 0) continue;   // FirstUnitInTeam
+                    if (!pTeam->TimeToDissapear) continue;     // asm +0x82
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+            markRepeating();
+            break;
+        }
+
+        case 32: { // case 20：HouseOwnsBuilding
+            const int32 n = CounterItem(pHouse->OwnedBuildingTypeCounts,
+                                        HouseClass::MaxTypeCounts, param);
+            if (n == 0) return false;
+            markRepeating();
+            break;
+        }
+
+        case 52: { // case 40：pHouse 的 +0x24 子对象 vt+18h > param 则假
+            if (pHouse->Type != nullptr &&
+                pHouse->Type->Get_ArrayIndex() > param) {
+                return false;
+            }
+            break;
+        }
+
+        case 57: { // case 45：isValidAmount —— 该类型建筑必须已清零
+            const int32 n = CounterItem(pHouse->OwnedBuildingTypeCounts,
+                                        HouseClass::MaxTypeCounts, param);
+            if (n != 0) return false;
+            markRepeating();
+            break;
+        }
+
+        default:
+            break;  // 跳转表 13 = isValidHouse
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // isValidHouse / 第四跳转表 off_71F328 / byte_71F350（索引 ev-3）。
+    // ------------------------------------------------------------------
+    HouseClass* pHouseOfParam = HouseClass::Find_By_Index_No_MP(param);
+    if (pHouseOfParam == nullptr) return true;         // returnTrue_
+    if (static_cast<uint32>(ev - 3) > 0x37u) return true;
+
+    switch (ev) {
+    case 3:   // case 0：+0x244 标志（asm House.IsHuman）
+        return pHouseOfParam->IsHumanPlayer;
+
+    case 5:   // case 1：+0x1F4 标志（存疑）
+        return pHouseOfParam->IsDiscovered;
+
+    case 9: { // case 2：还有载具则假，否则步兵计数 <= 0 为真
+        const int32 veh = CounterTotal(pHouseOfParam->OwnedUnitTypeCounts,
+                                       HouseClass::MaxTypeCounts);
+        if (veh > 0) return false;
+        const int32 inf = CounterTotal(pHouseOfParam->OwnedInfantryTypeCounts,
+                                       HouseClass::MaxTypeCounts);
+        return inf <= 0;
+    }
+
+    case 10:  // case 3：+0x2F0 <= 0
+        return pHouseOfParam->OwnedBuildingCount <= 0;
+
+    case 11: { // case 4：建筑/载具/步兵任一非空则假
+        if (pHouseOfParam->OwnedBuildingCount > 0) return false;
+        if (CounterTotal(pHouseOfParam->OwnedUnitTypeCounts,
+                         HouseClass::MaxTypeCounts) > 0) return false;
+        if (CounterTotal(pHouseOfParam->OwnedInfantryTypeCounts,
+                         HouseClass::MaxTypeCounts) > 0) return false;
+        return true;
+    }
+
+    case 30:   // case 27：houseNotEnoughPower（< 1.0）
+        return pHouseOfParam->Current_Power_Percentage() < 1.0;
+
+    case 55:   // case 52：+0x2EC <= 0
+        return pHouseOfParam->OwnedInfantryCount <= 0;
+
+    case 56: { // case 53：OwnedUnits - 0x2EC <= 0 且 +0x2F4 <= 0
+        if (pHouseOfParam->UnitCount - pHouseOfParam->OwnedInfantryCount > 0) {
+            return false;
+        }
+        return pHouseOfParam->OwnedAircraftCount <= 0;
+    }
+
+    case 58:   // case 55：houseEnoughPower（>= 1.0）
+        return pHouseOfParam->Current_Power_Percentage() >= 1.0;
+
+    default:
+        return true;   // returnTrue_
+    }
 }

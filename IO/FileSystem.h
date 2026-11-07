@@ -54,8 +54,80 @@ public:
     virtual int32 ReadNextBytes(void* pBuffer, int32 nSize);
     virtual bool  SetFileName(const char* pName);
 
+    // asm: RawFileClass_FileExists (0x65CBF0) - probe the file.  A null name
+    // fails; otherwise the file is opened (mode 1) if not already open, probed,
+    // closed again and the verdict cached.  nArg selects the "open if needed"
+    // path used by BufferIOFileClass.
+    bool FileExists(int32 nArg = 1);
+
+    // asm: [this+0Ch] / [this+10h] - the sub-file window.
+    //
+    //   A RawFileClass can be bound to a byte range inside an already-open file
+    //   (how MIX members are served without a second open).  FileSize() and
+    //   MoveFilePointer() report positions relative to SubFileStart and clamp to
+    //   SubFileStart + SubFileLength; RawFileClass_SetFilePointer re-binds it.
+    int32 SubFileStart;    // [this+0Ch]
+    int32 SubFileLength;   // [this+10h]; -1 while the true size is unknown
+
     char FileName[MAX_PATH_LEN];
     void* Handle;
+};
+
+// ============================================================================
+// RAMFileClass - a file whose backing store is a plain memory buffer
+//
+//   The retail engine uses this to feed a byte blob (e.g. an INI embedded in a
+//   string) into the same file interface INIClass consumes.  The constructor
+//   wraps an existing buffer, or allocates one when handed only a size.
+// ============================================================================
+class RAMFileClass {
+public:
+    RAMFileClass();
+    // asm: sub_65C250 - wrap <pData> (borrowed) as a Size-byte file.  When
+    // pData is null and Size > 0, an owned buffer of Size bytes is allocated.
+    RAMFileClass(void* pData, int32 nSize);
+    explicit RAMFileClass(int32 nSize);
+    ~RAMFileClass();
+
+    // asm: RAMFileClass_OpenFile (0x65C38F) - (re)arm the read/write cursor.
+    // Mode 2 re-zeroes the logical size; the return is HasHandle().
+    bool OpenFile(int32 nMode);
+    // asm: RAMFileClass_ReadNextBytes (0x65C3A0)
+    int32 ReadNextBytes(void* pBuffer, int32 nSize);
+    // asm: RAMFileClass_MoveFilePointer (0x65C420)
+    int32 MoveFilePointer(int32 nDistance, int32 nMethod);
+    // asm: RAMFileClass_FileSize (0x65C4D0)
+    int32 FileSize();
+    // asm: RAMFileClass_HasHandle (0x65C2F0) / _FileExists (0x65C2E8)
+    bool HasHandle() const;
+    bool FileExists(int32 nArg = 0) const;
+    // asm: RAMFileClass_GetFileName returns the literal "UNKNOWN"
+    const char* GetFileName() const;
+    bool SetFileName(const char* pName);
+    // asm: RAMFileClass_GetFileTime (0) / _SetFileTime (true)
+    int32 GetFileTime();
+    bool  SetFileTime(int32 nTime);
+
+    void Close();
+    // asm: sub_65C300 - clear the logical size (refused while open).
+    bool Reset();
+
+    // Accessors for the backing store.
+    uint8* GetBuffer() const { return Buffer; }
+    int32  GetCapacity() const { return Capacity; }
+    int32  GetPosition() const { return Position; }
+    int32  GetMode() const { return OpenMode; }
+    bool   IsOpen() const { return Open; }
+    bool   SetBuffer(void* pData, int32 nSize);
+
+private:
+    uint8* Buffer;     // [this+8]
+    int32  Capacity;   // [this+0Ch]
+    int32  Size;       // [this+10h]
+    int32  Position;   // [this+14h]
+    int32  OpenMode;   // [this+18h]
+    bool   OwnsBuffer; // [this+1Dh] - free Buffer on close/destroy
+    bool   Open;       // [this+1Ch]
 };
 
 // ============================================================================
@@ -109,16 +181,54 @@ public:
     int64 Size() const;
 
     // ------------------------------------------------------------------------
-    // 根据游戏行为，可知 CC 层还提供缓冲分配、光盘源校验与扩展打开。
+    // 根据游戏行为，原版 vt_CCFileClass 的 16 个槽位依次为：析构、文件名、
+    // 设置文件名、Create、Delete、Is_Available、HasHandle、OpenFile、
+    // OpenEx、ReadNextBytes、MoveFilePointer、FileSize、WriteBytes、Close、
+    // GetFileTime、SetFileTime、CDCheck。下面把这套原始接口补齐。
     // ------------------------------------------------------------------------
     virtual void* AllocateMemory(int32 nSize);
     virtual bool  CDCheck();
     virtual bool  OpenEx(const char* pFilename, int32 nMode);
 
+    // asm: CCFileClass::Is_Available  (vtable slot 5)
+    bool Is_Available(int32 nMode);
+    // asm: CCFileClass_HasHandle      (vtable slot 6)
+    bool HasHandle();
+    // asm: CCFileClass_OpenFile       (vtable slot 7)
+    bool OpenFile(int32 nMode);
+    // asm: CCFileClass_ReadNextBytes  (vtable slot 9)
+    int32 ReadNextBytes(void* pBuffer, int32 nSize);
+    // asm: CCFileClass_MoveFilePointer(vtable slot 10)
+    int32 MoveFilePointer(int32 nDistance, int32 nMethod);
+    // asm: CCFileClass_FileSize       (vtable slot 11)
+    int32 FileSize();
+    // asm: CCFileClass_WriteBytes     (vtable slot 12)
+    int32 WriteBytes(const void* pBuffer, int32 nSize);
+    // asm: CCFileClass_GetFileTime    (vtable slot 14)
+    int32 GetFileTime();
+    // asm: CCFileClass_SetFileTime    (vtable slot 15)
+    bool  SetFileTime(int32 nTime);
+    // asm: CCFileClass_SetFileName    (vtable slot 2)
+    bool  SetFileName(const char* pName);
+    // asm: CCFileClass_Create         (vtable slot 3)
+    bool  Create();
+    // asm: CCFileClass_Delete         (vtable slot 4)
+    bool  Delete();
+
     char FileName[MAX_PATH_LEN];
     bool IsFileOpen;
     void* FileHandle;
     RawFileClass m_RawFile;
+
+    // asm: [this+58h] 指向 MIX 命中项的常驻缓冲；非空表示该文件由 MIX 提供，
+    //       此时所有读写/定位都在内存里完成。
+    //      [this+64h] 当前在内存缓冲中的读指针。
+    //      [this+5Ch] 缓冲总字节数（即 MIX 条目长度）。
+    //      [this+68h] Is_Available 的缓存结果：0=未判定，1=可用，2=不可用。
+    void* MixBuffer;
+    int32 MixBufferSize;
+    int32 MixBufferPos;
+    int32 AvailabilityCache;
 };
 
 // ============================================================================

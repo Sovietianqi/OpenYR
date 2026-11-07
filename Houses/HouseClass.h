@@ -11,9 +11,12 @@
 #include <SW/SuperWeaponTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
 #include <Audio/VocClass.h>
+#include <Houses/BaseClass.h>
 
 // Forward declarations
+class TagClass;
 class CCINIClass;
+class INIClass;      // asm: 基类 —— CCINIClass : public INIClass
 class RulesClass;
 class AbstractClass;
 class BuildingClass;
@@ -119,6 +122,23 @@ public:
     virtual int32 Size() const override;
     virtual int32 GetArrayIndex() const override;
     virtual bool IsDead() const override;
+
+    // ------------------------------------------------------------------------
+    // HouseClass::Is_Human (0x50B740)
+    //
+    //   asm:
+    //     mov eax,Session / test eax,eax / mov al,[ecx+HouseClass.IsHuman]
+    //     jnz ret                        ; in a session -> answer is just IsHuman
+    //     test al,al / jnz true
+    //     mov al,[ecx+HouseClass.IsPlayer]
+    //     test al,al / jnz true
+    //     xor al,al / ret                ; neither -> false
+    //
+    //   项目字段对应：IsHuman -> IsHumanPlayer(+0x1EC)，IsPlayer -> PlayerControl。
+    //   注意 Session 非空时直接返回 IsHuman，不会再看 PlayerControl —— 多人
+    //   对局里"玩家所属"是按 IsHuman 标记而不是控制权来判定的。
+    // ------------------------------------------------------------------------
+    bool Is_Human() const;
     virtual HRESULT GetClassID(CLSID* pClassID) override;
 
     // IHouse interface implementation
@@ -146,6 +166,21 @@ public:
     virtual HRESULT Save(IStream* pStm, BOOL bSave) override;
     virtual void ComputeCRC(CRCEngine& crc) const override;
 
+    // HouseClass_GetCRC (asm 0x50BAE0): vtable CRC entry.  Hashes the base
+    // AbstractClass state plus the house-specific scalars (ActLike index,
+    // the type's country index, the colour triple and the four credit
+    // accumulators) so two peers in a session can detect divergence.
+    void Get_CRC(CRCEngine& crc) const;
+
+    // HouseClass_SaveToMapINIList (asm 0x501160).  Writes every house's
+    // index into the map's [Houses] registry, then delegates each house's own
+    // fields to SaveToMapINI.
+    static void Save_To_Map_INI_List(INIClass* pINI);
+    // HouseClass_SaveToMapINI (asm 0x5012A0).  Persists a single house's
+    // map-scope fields (country, tech level, credits, IQ, edge, control
+    // flags, ...) under its own section of the map INI.
+    void Save_To_Map_INI(INIClass* pINI);
+
     // ── COM identity (asm HouseClass_QueryInterface 0x4F67F8 / the
     //    HouseClass_AddRef / _Release thunks) ──────────────────────────────
     // The object exposes five interfaces; every interface's own AddRef /
@@ -164,7 +199,101 @@ public:
 
     // Initialization
     void Init();
+
+    // ------------------------------------------------------------------------
+    // asm: HouseClass::Init_Data (0x501xxx, retn 0Ch)
+    //
+    //   Colour = 颜色槽；Side = 国家/阵营下标；Money = 初始资金。
+    //     [this+1DCh] = Money                      ; 资金
+    //     [this+30Ch] = Money                      ; 资金镜像
+    //     [Type(0x34h)+CountryClass.Color] = Colour
+    //     [this+16054h] = Colour                   ; ColorSchemeIndex
+    //
+    //   Assign_Houses 每新建一个房子就调一次（剧本房 + AI 房各一次）。
+    // ------------------------------------------------------------------------
+    void Init_Data(int32 colour, int32 side, int32 money);
+
+    // ------------------------------------------------------------------------
+    // asm: HouseClass::Assign_Handicap (0x4F6F50, retn 4)
+    //
+    //   把难度写进 AIDifficulty，再按"是否有 Session"分两条路算乘子：
+    //     有 Session：Difficulties[diff].X * Type->XMult
+    //     无 Session：直接取 Difficulties[diff].X
+    //   然后按 TeamDelays[diff][PlayerNumber] 重排 TeamDelayTimer。
+    // ------------------------------------------------------------------------
+    void Assign_Handicap(int32 newDifficulty);
+
+    // ------------------------------------------------------------------------
+    // asm: HouseClass::Harvested (0x554176, retn 8)
+    //
+    //   SiloMoney += floor(percentage * 1.0)
+    //   Credits   += floor(Tiberium.Value * Type->IncomeMult * percentage)
+    //   返回 percentage（原版 fstp 前把入参留在 st0）。
+    // ------------------------------------------------------------------------
+    float Harvested(float percentage, int32 idxTiberium);
+
+    // ------------------------------------------------------------------------
+    // asm: HouseClass_50BA00 (0x50BA00) —— 由本房的颜色三分量算归一化色向：
+    //   len = sqrt(r^2+g^2+b^2)；len == 0 时三分量都取 255，
+    //   否则各分量除以 len 后存回向量槽。Assign_Houses 每建房一次就调一次。
+    // ------------------------------------------------------------------------
+    void Recalc_Color_Vector();
+    // ========================================================================
+    // asm: HouseClass_Update (0x4F83E8) —— 阵营逐帧更新主循环。按 asm 顺序：
+    //   黑屏计时到点复位 -> 雷达黑屏计时到点复位 -> RecheckItems 触发
+    //   Update_Power -> RadarOutage 时 Radar_Activate + SpySat_Update ->
+    //   每 100 帧衰减 AngerNodes -> 自动建造开关 -> 胜/败计时 -> ...
+    //   末尾在非人类阵营时走 AI()。逐段见 .cpp。
+    // ========================================================================
     void Update();
+    // ========================================================================
+    // asm: HouseClass_Update_AI (0x4FD4D0) —— 阵营 AI 主循环（逐帧）。逐段见 .cpp。
+    //   非 MP 会话/难度判定后：Update_AI_TryFireSW -> 按 Mode 决定是否跑
+    //   建造型 AI（AI_Build_Income / Expert_AI_Building / AI_Building ...）。
+    //   返回值 = Random2(1,7)+0x69，由 HouseClass_Update 写入 AITimer.TimeLeft
+    //   作为下一次调度的间隔（asm retn 前的 `add eax,69h`）。
+    // ========================================================================
+    int32 AI();
+
+    // ========================================================================
+    // asm: HouseClass::AI_Building (0x4FE3B0) —— 从基地节点表里挑下一个
+    //   可造建筑，写回 BuildingTypeToProduce。逐段见 .cpp。
+    // ========================================================================
+    void AI_Building();
+    // ========================================================================
+    // asm: HouseClass::AI_Unit (0x4FEA40) —— 选一个可造的载具（含采矿车/
+    //   精炼厂）写回 UnitTypeToProduce。逐段见 .cpp。
+    // ========================================================================
+    void AI_Unit();
+    // ========================================================================
+    // asm: HouseClass::AI_Infantry (0x4FEEB0) —— 选一个可造的步兵，写回
+    //   InfantryTypeToProduce。逐段见 .cpp。
+    // ========================================================================
+    void AI_Infantry();
+    // ========================================================================
+    // asm: HouseClass::AI_Aircraft (0x4FF1E0) —— 选一个可造的飞机，写回
+    //   AircraftTypeToProduce。逐段见 .cpp。
+    // ========================================================================
+    void AI_Aircraft();
+    // ========================================================================
+    // asm: HouseClass::Expert_AI_Building (0x4FDD00) —— AI 的"专家建造"：
+    //   按优先级依次探 防御/发电/科技/兵营/重工/精炼厂 清单，挑出第一个
+    //   可造项并写回 BuildingTypeToProduce；无可造项时清空该索引。
+    // ========================================================================
+    void Expert_AI_Building();
+
+    // ------------------------------------------------------------------------
+    // asm: 建造类"能不能造"判定（AI_Building/AI_Unit 里反复出现的
+    //   `call [type+0x94h](type, 1, 1, 0, this)`）——本房能否生产该类型。
+    //   原版该虚函数综合 Owners/前置/上限；这里落到 Can_Build 等价判定。
+    // ------------------------------------------------------------------------
+    bool Can_Produce_Type(TechnoTypeClass* pType) const;
+
+    // ========================================================================
+    // asm: HouseClass_Update 里的 AI 建造状态机字段（+0x1C0）。
+    //   0/1/2 三种状态按资金与建筑构成轮转，决定本帧跑哪几路 AI_*。
+    // ========================================================================
+    int32               AIBuildState;
 
     // INI
     bool InitFromINI(class CCINIClass* pINI);
@@ -301,6 +430,29 @@ public:
     int32 GetAvailableMoney() const;
     void GiveMoney(int32 amount);
     void SpendMoney(int32 amount);
+    // ========================================================================
+    // asm: 阵营经济三入口（+0x30C Credits / +0x2DC CreditsSpent）：
+    //   GiveMoney    (0x4F9960, retn 4)  —— Credits += amount，无其它副作用。
+    //   SpendMoney   (0x4F9740, retn 4)  —— 先扣 Credits；不足时按矿仓储量
+    //                 折算补足，最后把本次实付累加到 CreditsSpent 并联动
+    //                 建筑侧的资金事件（sub_4F9970）。
+    //   AvailableMoney —— 仅返回 Credits（+0x30C）；TakeMoney 是 SpendMoney
+    //                 的布尔化封装（够则扣并返回 true）。
+    // ========================================================================
+    int32 AvailableMoney() const { return Credits; }
+    bool  TakeMoney(int32 amount);
+    // ========================================================================
+    // asm: HouseClass_Update_Unit_Counts —— 重算 +Unit/Infantry/Aircraft/
+    //   Building 五档的"现存/累计"计数（供侧边栏与 AI 查询）。返回技术单位
+    //   总数。逐段见 .cpp。
+    // ========================================================================
+    int32 Update_Unit_Counts();
+    // ========================================================================
+    // asm: HouseClass 里 +0x2DCh（DamageLedger 累计伤害值）的增减更新。
+    //   正数表示本房对外造成的伤害额，负数表示吸收的伤害额；供
+    //   Damaged_For_Credits / 计分簿使用。
+    // ========================================================================
+    void Update_Damage_Charge(int32 amount) { DamageCharge += amount; }
 
     // ========================================================================
  // Type multiplier dispatch (..0x50C134 / 0x50D9C8 / 0x50CEB8)
@@ -431,6 +583,19 @@ public:
     BuildingClass* GetFactoryProducingThis(TechnoTypeClass* pType) const;
 
     // ========================================================================
+    // asm: HouseClass::Fetch_Factory (0x5004C0)
+    //
+    //   FactoryClass *__thiscall Fetch_Factory(HouseClass *this,
+    //                                          eAbstractIDs id, char naval,
+    //                                          int buildcat)
+    //
+    // 按建造分类取本阵营对应工厂：原版用 house+0x53AC..0x53CC 六张缓存槽，
+    // 这里改为按工厂建筑的 Type->Factory 归类实时查找（OpenYR 没有那六张槽）。
+    // ========================================================================
+    FactoryClass* Fetch_Factory(int32 abstractId, bool isNaval,
+                                int32 buildCat) const;
+
+    // ========================================================================
     // 根据游戏行为，可知 SuspendProductionOf 把正在生产的工厂挂起（进度保留），
     //  AbandonProductionOf 则彻底放弃并退还部分资金。
     // ========================================================================
@@ -483,23 +648,62 @@ public:
     // 基地墙网维护、电力中心得失、超级武器开火、生产推进与初始部队生成。
     //========================================================================
     static int32 PlayerColorType_Convert_(int32 nColor);
+    // ========================================================================
+    // asm: HouseClass_AI_Building_Defense_Misc (0x508430, __thiscall) —— AI 的
+    //   "沿基地边界砌墙"。不是造某一座建筑，而是把基地矩形四周扫一遍，把
+    //   "墙段 + 段中点一座门"的候选节点成批写进 Base 的节点表（+5704h），
+    //   随后由 AI_Building 按顺序把它们变成真正的生产序列。
+    //
+    //   逐段：
+    //     * 基地区域矩形 [+5754h]={left,top,width,height} 外扩一格
+    //       （left/top 各 -1、width/height 各 +2），结束时整体写回 [+5754h]。
+    //     * Rules 三条列表各取一个"本房可造"的建筑原型：
+    //       +0A50h=ConcreteWalls 作墙，+0A88h=EWGates、+0A6Ch=NSGates 作门。
+    //     * 以基地中心格 [+5750h] 的高度层号为基准，沿警戒圈的"南/北外沿"
+    //       与"东/西内列"四条线逐格扫描。
+    //     * 判据（格本身 + 朝外一格同时满足）：地面不是 水/岩石/冰、
+    //       高度层号与中心相差 <= 2、本格无叠加物、两格都无建筑与地形物件、
+    //       本格坡度为 0、本格在雷达范围内。连续满足的长度 >= 5 才算一段。
+    //     * 段内在 len/2-1 处放门（南/北边用 EW 门，东/西列用 NS 门），
+    //       其余格子放墙；先落墙段、再落门。
+    //   逐段对照见 .cpp。
+    // ========================================================================
     void AI_Building_Defense_Misc();
+    // ========================================================================
+    // asm: HouseClass::Attacked (0x4F93E0, retn 4) —— 本房（或其盟军）的单位
+    //   遭到攻击时由 BuildingClass::Take_Damage 调用。按受害对象类别给出
+    //   对应的雷达事件（矿车/基地/盟军）与 EVA 播报，并向本房全部标签
+    //   RaiseEvent(6)。逐段见 .cpp。
+    // ========================================================================
+    void Attacked(TechnoClass* pSource);
+    // ========================================================================
+    // asm: HouseClass_Update 里读 +1ECh=RecheckItems / +1EDh=recheckTechLevels
+    //   两个"脏标记"：置位后下一次 Update 重算电力与科技可用项，然后清零。
+    //   这里给出显式的重算入口，语义与 asm 的两处清零一致。
+    // ========================================================================
+    bool Recheck_Items();
+    bool Recheck_Tech_Levels();
     TechnoClass* PickAntiAirDefense();
     TechnoClass* PickAntiArmorDefense();
     TechnoClass* PickAntiInfantryDefense();
     static HouseClass* FindPlayerAtX(int32 index);
     void EndScenario();
-    TechnoTypeClass* FirstBuildableTechno_FromVector(DynamicVectorClass<TechnoTypeClass*>& rList);
-    TechnoTypeClass* FindFirstAccessibleTechnoTypeFromArray(TechnoTypeClass** ppTypes, int32 count);
+    // asm HouseClass_FirstBuildableTechno_FromVector (0x5051xx, retn 4):
+    //   list 为 TechnoTypeClass* 向量。
+    TechnoTypeClass* FirstBuildableTechno_FromVector(DynamicVectorClass<TechnoTypeClass*>* pList);
+    // asm HouseClass_FindFirstAccessibleTechnoTypeFromArray (0x505320, retn 4).
+    TechnoTypeClass* FindFirstAccessibleTechnoTypeFromArray(DynamicVectorClass<TechnoTypeClass*>* pList);
     bool DoWeNeedWalls();
     int32 Base_WhatNeedsWalls();
     bool Base_ShouldRebuildNow();
-    void LostPoweredCenter();
+    // asm HouseClass_LostPoweredCenter / _GotPoweredCenter (retn 4): 电力中心
+    //  计数增减，并让机械单位上线/下线。参数 type 为受影响单位的类型索引。
+    void LostPoweredCenter(int32 type);
     void Fire_GenMutator(int32 a3);
     bool ClickWaypoint_unused(const CoordStruct* pPos);
     void GotPoweredCenter_unused(int32 type);
     void LostPoweredCenter_unused(int32 type);
-    void GotPoweredCenter();
+    void GotPoweredCenter(int32 type);
     bool CanSeePsiWarning();
     void ActivateBaseBuilding(BuildingClass* pBuilding);
     void AcquiredConyard(BuildingClass* pConyard);
@@ -511,17 +715,63 @@ public:
     int32 GetPlanningWaypointProperties(int32 index);
     void AcquiredThreatNode(const CellStruct& cell);
     void Fire_PsyDom(const CellStruct& target);
-    bool TryFindEligibleAITriggers();
+    // asm: HouseClass_TryFindEligibleAITriggers (0x6F0AF2, retn 4)
+    //   int __fastcall(VectorPtrAITeamTypeClass *resultVector, HouseClass *Owner, int arg)
+    //   pResult 为 null 时只返回"是否命中"；非空时把选中触发器的
+    //   Team1 / Team2 依次追加进去（原版 resultVector 的语义）。
+    bool TryFindEligibleAITriggers(DynamicVectorClass<TeamTypeClass*>* pResult = nullptr);
     bool CanInstantiateTeam(TeamTypeClass* pTeamType);
-    BuildingClass* FindRepairBay();
+    // ========================================================================
+    // asm: HouseClass_Update 的建队段 (asm:552780..552900, loc_4F8A00..loc_4F8B08)
+    //
+    //   HouseClass_Update 在跑 AI() 之前先过 TeamDelayTimer 时间窗；到点后
+    //   HouseClass_TryFindEligibleAITriggers 选出的 TeamType 逐个交给
+    //   TeamTypeClass_CreateTeam 成军，再把下一次窗口写回 TeamDelayTimer
+    //   （时长 = Rules->TeamDelays[AIDifficulty]）。逐段见 .cpp。
+    // ========================================================================
+    void Update_Team_Production();
+    // asm HouseClass_FindRepairBay (0x455xxx，retn，__fastcall this/unit):
+    //  在己方舰船/维修坞中挑选离 pUnit 最近、且在修理半径内的那座。
+    BuildingClass* FindRepairBay(TechnoClass* pUnit);
     void Update_AI_TryFireSW();
     void Radar_Activate();
     void GenerateStartingUnits();
-    TechnoTypeClass* GetTechnoToProduce();
+    // ========================================================================
+    // asm: HouseClass_GetTechnoToProduce (0x4FBD80, retn 8)
+    //   TechnoTypeClass *__thiscall(HouseClass *this, int TechnoKind, int a3)
+    //   按 TechnoKind（AbstractType 值）把本房对应的 "+56xx ToProduce" 索引
+    //   解析回类型对象；未设置（-1）或未知类别返回 null。
+    // ========================================================================
+    TechnoTypeClass* GetTechnoToProduce(AbstractType technoKind);
+    // ========================================================================
+    // asm: HouseClass::Find_Building (0x4FD060, retn 8)
+    //   BuildingClass *__thiscall(HouseClass *this, int idx, int distance)
+    //   在本房已拥有该类建筑（按类型数组下标 idx 过滤）中挑一座未处于 limbo
+    //   的；distance != -1 时还要求它到本房目标格的路径距离相等。找不到返回
+    //   null。
+    // ========================================================================
+    BuildingClass* Find_Building(int32 idx, int32 distance);
+    // ========================================================================
+    // asm: HouseClass::Find_Unit / Find_Infantry / Find_Aircraft
+    //   （0x4FDxxx，均为 retn 8 形态的 "Find_<Kind>(idx, distance)" 家族）
+    //   与 Find_Building 同构：在对应类别的己方对象列表里挑出类型数组下标
+    //   等于 idx、未处于 limbo，且（distance==-1 或路径距离相等）的第一个。
+    //   三者共用下面的模板 helper。
+    // ========================================================================
+    TechnoClass* Find_Unit(int32 idx, int32 distance);
+    TechnoClass* Find_Infantry(int32 idx, int32 distance);
+    TechnoClass* Find_Aircraft(int32 idx, int32 distance);
     void DroppedFlag();
     void CreateWaypointPath(const CellStruct& from, const CellStruct& to);
     void CreateWaypointPath2(const CellStruct& from, const CellStruct& to, int32 hop);
-    void Update_AI_Production();
+    void Update_AI_Production(int32 arg0 = -1);
+    // ========================================================================
+    // asm: HouseClass::AI_Build_Income (0x4FD980, __thiscall this) ——
+    //   AI 的"补经济"评估：不可负担时检查是否有采矿单位/精炼厂在线，必要时
+    //   从 Rules 的 _HarvesterUnit 列表挑一个可建造的采矿车加入生产。返回
+    //   1 表示"需要继续建"，0 表示无需动作。逐段见 .cpp。
+    // ========================================================================
+    int32 AI_Build_Income();
     void CreateBulletWarningAnim(const CellStruct& target);
     void LoadVectors();
 
@@ -551,6 +801,14 @@ public:
     void Set_Base_Center(const CellStruct& cell);
     void Clear_Base_Center();
     void Set_Base_Spawn_Cell(const CellStruct& cell);
+
+    // ------------------------------------------------------------------------
+    // asm: HouseClass::Flag_Attach(HouseClass_old* this, _ObjectClass* a2, int what)
+    //   把本阵营的旗帜挂到 a2 上：先让旧旗主收旗（UpdateFlagCoords），
+    //   再让 a2 举起本阵营的旗，最后记下新的旗主。a2 为空或仍在 limbo
+    //   时不做事并返回假。
+    // ------------------------------------------------------------------------
+    bool Flag_Attach(TechnoClass* pObject, int32 what);
 
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 GetBaseCenterCell 负责给出本阵营的基地中心格：
@@ -656,6 +914,9 @@ public:
     // Members
     // ========================================================================
     HouseTypeClass*     Type;
+    // asm HouseClass+0x30 —— 玩家编号。外交屏用它与行索引比较：相等即"本机
+    //   玩家"，行索引折回 0（即 dword_83923C/_83925C 的 -1 槽）。
+    int32               PlayerNumber = 0;
     char                InitialName[21];
     uint8               pad_InitialName[3];
     wchar_t             CSFName[21];
@@ -718,6 +979,15 @@ public:
     int32               IQLevel2;
     int32               Edge;
     int32               ColorSchemeIndex;
+    // asm +0x1F5 —— 外交屏用的"灰显"标记（为真时名字静态文本用 "Grey" 配色）
+    bool                IsGreyedOut = false;
+    // asm +0x53E4..+0x5433 / +0x5438.. —— 20 类击杀统计（外交屏的击杀列 =
+    //   两张表逐项求和；asm RadarClass_Diplomacy 的 sub_658330 里
+    //   `add ebx,53E4h` 之后 20 次 `[ebx] + [ebx+54h]` 累加即此）。
+    int32               KilledUnits[20] = {};
+    int32               TotalKilledUnits = 0;
+    int32               KilledBuildings[20] = {};
+    int32               TotalKilledBuildings = 0;
     int32               UnitCount;
     int32               InfantryCount;
     int32               AircraftCount;
@@ -774,6 +1044,18 @@ public:
     CellStruct          BaseCenter;
     int32               BaseNodesCount;
 
+    // ------------------------------------------------------------------------
+    // 原版把整个 BaseClass 内嵌在 HouseClass 里（asm 里表现为
+    //   `add ecx, HouseClass.Base` 之后调用 BaseClass_* 系列）。
+    // 这里同样内嵌一份，BaseClass_Placed / WhatNeedsWalls / ShouldRebuildNow
+    // 都通过它访问起始基地的节点表。
+    //
+    // 注意它与上面的 BaseCenter / BaseNodesCount 不是同一份数据：那两个是
+    // 项目早期的扁平占位字段（基地中心格、节点计数），而 Base 才是原版真正
+    // 存放节点数组（Nodes/NodeCount/PercentBuilt/OwnerHouseIndex）的对象。
+    // ------------------------------------------------------------------------
+    BaseClass           Base;
+
     // 根据游戏行为，可知 PlanningWaypoints 是玩家在地图上画出的若干条
     //  行军路线的槽位，共 12 条：每条路线可以是一条折线。AI 与玩家都用它
     //  预先规划进攻或撤退的走法，路线为空时该槽位可以再被占用。
@@ -802,6 +1084,13 @@ public:
     CellStruct          TargetCell;         // +0x54F0
     CellStruct          DefensiveCell;      // +0x54F4
     int32               DefensiveCellField; // +0x54FC
+
+    // ── CTF flag bookkeeping ──────────────────────────────────────────────
+    // asm: HouseClass_old.IHouse._.ObjectWithOurFlag / .FlagCoords —— 本阵营
+    //   "旗帜"当前挂在哪台单位上，以及旗帜所在格。Create_Units 落好基地车后
+    //   把两者清零，CTF 模式下再经 Flag_Attach 把旗挂到基地车上。
+    TechnoClass*        ObjectWithOurFlag = nullptr;
+    CellStruct          FlagCoords;         // +0x54F8 起的两字 wXY
 
     // ── Preferred defensive cell ──────────────────────────────────────────
     // Chosen by SW_Defend_Against when the AI decides to intercept an inbound
@@ -854,11 +1143,28 @@ public:
 
     // ── Powered centers / production pick ─────────────────────────────────
     // PoweredCenters counts the house's active powered structures (asm +0x2D8);
-    // HasPoweredCenters is a mere "> 0" test over it.  BuildingTypeToProduce is
-    // the index (asm +0x2A8) of the building the house's primary factory is
-    // currently set to build, or -1 for none.
+    // HasPoweredCenters is a mere "> 0" test over it.
+    //
+    // The four "*ToProduce" indices cache which type each category's primary
+    // factory is currently building (asm +0x564C/+0x5650/+0x5654/+0x5658);
+    // GetTechnoToProduce resolves them back into type objects.  -1 = none.
+    // asm HouseClass_GetTechnoToProduce reads exactly these four slots:
+    //   +0x564C  BuildingTypeToProduce
+    //   +0x5650  UnitTypeToProduce
+    //   +0x5654  InfantryTypeToProduce
+    //   +0x5658  AircraftTypeToProduce
     int32               PoweredCenters;
+    // 根据游戏行为，可知 RecheckItems/recheckTechLevels 是阵营层的两个"脏
+    //  标记"：某处改变了建筑构成（如电力中心得失、建筑被摧毁）时置位，下一次
+    //  Update 重算电力与科技可用项后清零。原版偏移见上（+1EC/+1ED）。
+    bool                RecheckItems;
+    bool                recheckTechLevels;
+    // asm: +0x2DCh —— 本房"对外造成的伤害总值"累计；Attack/受击记账使用。
+    int32               DamageCharge;
     int32               BuildingTypeToProduce;
+    int32               UnitTypeToProduce;
+    int32               InfantryTypeToProduce;
+    int32               AircraftTypeToProduce;
 
     // ── Refinery storage / resource totals ────────────────────────────────
     // TiberiumValue is the raw value of every tiberium type the house tracks
@@ -884,6 +1190,10 @@ public:
 
     // Index of the house currently judged to be our primary aggressor, or -1.
     int32               PrimaryAggressor;
+
+    // asm HouseClass_EndScenario (0x4FCDB6) 里的 +0x298 时间戳：当本阵营
+    //  已经胜/败时记录“场景结束”的帧号，-1 表示尚未记录。
+    int32               EndScenarioTimer;
 
     // Owned type counts
     int32               OwnedUnitTypeCounts[MaxTypeCounts];
@@ -926,6 +1236,17 @@ public:
     // Timestamps
     int32 LastBuildTime, LastProductionTime, LastAttackTime, LastEnemySightingTime;
     int32 LastTeamCreationTime, LastBaseScanTime, LastCombatTime, LastNavalCombatTime;
+
+    // asm: HouseClass +0x5610 —— TimerStruct { TimeStart, TimeLeft }。
+    //   HouseClass_Update 用它节流 HouseClass_Update_AI：AI() 返回
+    //   Random2(1,7)+0x69（106..112 帧），写入 TimeLeft 作为下一次的间隔。
+    CDTimerClass AITimer;
+
+    // asm: HouseClass +0x5624 —— TeamDelayTimer。
+    //   与 AITimer 不同：它节流的是「AI 触发器 → 组建新 Team」那一段
+    //   （asm:552777 loc_4F8A00 的 TimeStart/TimeLeft 比较），而不是 AI()
+    //   本身。到点时取 Rules->TeamDelays[DifficultyLevel] 作下一次窗口。
+    CDTimerClass TeamDelayTimer;
     int32 LastAirCombatTime, LastSpySatTime, LastIronCurtainTime, LastForceShieldTime;
 
     // 根据游戏行为，可知规划路径点除对象表外还有一份坐标侧记录，供
@@ -973,4 +1294,44 @@ public:
     int32 LastXiTime, LastOmicronTime, LastPiTime, LastRhoTime;
     int32 LastSigmaTime, LastTauTime, LastUpsilonTime, LastPhiTime;
     int32 LastChiTime, LastPsiTime, LastOmegaTime2;
+
+    // ========================================================================
+    // Assign_Houses 批新增的真实成员（asm 偏移见注释）
+    // ========================================================================
+    // asm +0x16058 —— 起始槽：StartingSpotClass_GetStartSlot 的结果，
+    //   AI 房则取 AISlots.StartSlots[i]。
+    int32 StartingSlot;
+    // asm +0x1605C —— 队伍号：剧本房的 node+63h（idxTeam），
+    //   AI 房取 AISlots[+0x60]（-1 表示无队伍，同时把 Scenario+11E0h 置位）。
+    int32 TeamIndex;
+    // asm AllowWinBlocks —— 本房已挂载的"允许胜利"标签实例计数，
+    //   ScenarioClass::Fill_In_Data 的 AllowWin 扫描逐个加一。
+    int32 AllowWinBlocks;
+    // asm SiloMoney —— 筒仓内矿石折算的金额（Harvested 累加）。
+    int32 SiloMoney;
+    // asm +0x30Ch —— 初始资金镜像：Init_Data 与 Credits 写同一个值，
+    //   记分/结算面板读这一份。
+    int32 InitialCredits;
+    // asm +0x38 —— 本房挂载的 TagClass 实例表（DynamicVectorClass）。
+    DynamicVectorClass<TagClass*> Tags;
+
+    // asm FirepowerMultiplier / GroundspeedMultiplier / AirspeedMultiplier /
+    //     ArmorMultiplier / ROFMultiplier / CostMultiplier /
+    //     BuildTimeMultiplier / RepairDelay / BuildDelay
+    //   Assign_Handicap 按难度表计算出来的本房乘子。
+    double FirepowerMultiplier;
+    double GroundspeedMultiplier;
+    double AirspeedMultiplier;
+    double ArmorMultiplier;
+    double ROFMultiplier;
+    double CostMultiplier;
+    double BuildTimeMultiplier;
+    double RepairDelay;
+    double BuildDelay;
+
+    // asm +0x56F9 / +0x56FA / +0x56FB —— 本房颜色三分量（字节），
+    //   HouseClass_50BA00 读取它们算归一化色向。
+    uint8 HouseColorR, HouseColorG, HouseColorB;
+    // 归一化后的色向（HouseClass_50BA00 的结果）。
+    double ColorVecR, ColorVecG, ColorVecB;
 };

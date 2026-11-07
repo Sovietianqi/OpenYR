@@ -26,6 +26,7 @@
 // =============================================================================
 
 #include "FileFormats/HVA.h"
+#include "IO/MixFileClass.h"
 #include "Math/Matrix3D.h"
 #include "Math/Point3D.h"
 
@@ -312,6 +313,27 @@ bool HVAClass::LoadFromFile(const char* pFilename)
     // Null filename is a no-op.
     if (!pFilename) return false;
 
+    // ------------------------------------------------------------------
+    // MIX archives first (see VXLClass::LoadFromFile for the rationale).
+    // ------------------------------------------------------------------
+    {
+        int32 mixSize = 0;
+        void* pMixData = MixFileClass::RetrieveSized(pFilename, &mixSize);
+        if (pMixData != nullptr && mixSize > static_cast<int32>(HVA_HEADER_SIZE))
+        {
+            m_pRawData = static_cast<BYTE*>(std::malloc(static_cast<size_t>(mixSize)));
+            if (m_pRawData != nullptr)
+            {
+                std::memcpy(m_pRawData, pMixData, static_cast<size_t>(mixSize));
+                m_RawDataSize = mixSize;
+                m_bOwnsData = true;
+            }
+            YRMemory::Deallocate(pMixData);
+        }
+    }
+
+    if (m_pRawData == nullptr)
+    {
     // Open the file in binary mode.
     std::FILE* pFile = std::fopen(pFilename, "rb");
     if (!pFile)
@@ -352,6 +374,7 @@ bool HVAClass::LoadFromFile(const char* pFilename)
     }
 
     m_bOwnsData = true;
+    }
 
     // ── Parse and validate the header ───────────────────────────────────
     // The header is 12 bytes: 4-byte signature + 4-byte frame count + 4-byte

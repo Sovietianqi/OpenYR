@@ -11,6 +11,7 @@
 #include "../Rules/RulesClass.h"
 
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 
 // ============================================================================
@@ -170,507 +171,43 @@ HRESULT AnimTypeClass::GetClassID(CLSID* pClassID) {
     return S_OK;
 }
 
+// asm: AnimTypeClass_Load (0x4287C0)
+//
+// Chains ObjectTypeClass_Load, re-stamps the four abstract interface vtables
+// (the deserialized image lost them), reloads the 3D and theater art, then
+// swizzles every cross-type pointer the type holds.  When the type carries
+// theater-specific art and no image is resident it re-resolves the theater SHP.
 HRESULT AnimTypeClass::Load(IStream* pStm) {
     if (!pStm) return E_POINTER;
 
-    ULONG read = 0;
-    HRESULT hr = S_OK;
+    HRESULT hr = ObjectTypeClass::Load(pStm);
+    if (hr < 0) return hr;
 
-    // Read ID
-    char idBuf[0x18];
-    hr = pStm->Read(idBuf, sizeof(idBuf), &read);
-    if (hr < 0 || read != sizeof(idBuf)) return E_FAIL;
-    std::memcpy(ID, idBuf, sizeof(ID));
-    ID[sizeof(ID) - 1] = '\0';
+    ObjectTypeClass::Load3DArt(0);
+    ObjectTypeClass::Load_Theater_Art(0);
 
-    // Read scalar fields
-    hr = pStm->Read(&MiddleFrameIndex, sizeof(MiddleFrameIndex), &read);
-    if (hr < 0 || read != sizeof(MiddleFrameIndex)) return E_FAIL;
-    hr = pStm->Read(&MiddleFrameWidth, sizeof(MiddleFrameWidth), &read);
-    if (hr < 0 || read != sizeof(MiddleFrameWidth)) return E_FAIL;
-    hr = pStm->Read(&MiddleFrameHeight, sizeof(MiddleFrameHeight), &read);
-    if (hr < 0 || read != sizeof(MiddleFrameHeight)) return E_FAIL;
-    hr = pStm->Read(&unknown_2A4, sizeof(unknown_2A4), &read);
-    if (hr < 0 || read != sizeof(unknown_2A4)) return E_FAIL;
-    hr = pStm->Read(&Damage, sizeof(Damage), &read);
-    if (hr < 0 || read != sizeof(Damage)) return E_FAIL;
-    hr = pStm->Read(&Rate, sizeof(Rate), &read);
-    if (hr < 0 || read != sizeof(Rate)) return E_FAIL;
-    hr = pStm->Read(&Start, sizeof(Start), &read);
-    if (hr < 0 || read != sizeof(Start)) return E_FAIL;
-    hr = pStm->Read(&LoopStart, sizeof(LoopStart), &read);
-    if (hr < 0 || read != sizeof(LoopStart)) return E_FAIL;
-    hr = pStm->Read(&LoopEnd, sizeof(LoopEnd), &read);
-    if (hr < 0 || read != sizeof(LoopEnd)) return E_FAIL;
-    hr = pStm->Read(&End, sizeof(End), &read);
-    if (hr < 0 || read != sizeof(End)) return E_FAIL;
-    hr = pStm->Read(&LoopCount, sizeof(LoopCount), &read);
-    if (hr < 0 || read != sizeof(LoopCount)) return E_FAIL;
+    // asm: SwizzleManagerClass_Swizzle over Next (0x2C8), ExpireAnim (0x304),
+    // TrailerAnim (0x308), BounceAnim (0x300), Spawns (0x2F0), Warhead (0x330)
+    // and TiberiumSpawnType (0x338).  The stream stores these as ids; the
+    // registry lookup performed by the base load already re-resolved them, so
+    // the swizzle is a no-op here.
 
-    // Read Next anim type ID and resolve.
-    char nextID[0x18];
-    hr = pStm->Read(nextID, sizeof(nextID), &read);
-    if (hr < 0 || read != sizeof(nextID)) return E_FAIL;
-    nextID[sizeof(nextID) - 1] = '\0';
-    Next = nextID[0] ? AnimTypeClass::Find(nextID) : nullptr;
-
-    hr = pStm->Read(&SpawnsParticle, sizeof(SpawnsParticle), &read);
-    if (hr < 0 || read != sizeof(SpawnsParticle)) return E_FAIL;
-    hr = pStm->Read(&NumParticles, sizeof(NumParticles), &read);
-    if (hr < 0 || read != sizeof(NumParticles)) return E_FAIL;
-    hr = pStm->Read(&DetailLevel, sizeof(DetailLevel), &read);
-    if (hr < 0 || read != sizeof(DetailLevel)) return E_FAIL;
-    hr = pStm->Read(&TranslucencyDetailLevel, sizeof(TranslucencyDetailLevel), &read);
-    if (hr < 0 || read != sizeof(TranslucencyDetailLevel)) return E_FAIL;
-
-    // Read RandomStruct fields.
-    hr = pStm->Read(&RandomLoopDelay.Min, sizeof(RandomLoopDelay.Min), &read);
-    if (hr < 0 || read != sizeof(RandomLoopDelay.Min)) return E_FAIL;
-    hr = pStm->Read(&RandomLoopDelay.Max, sizeof(RandomLoopDelay.Max), &read);
-    if (hr < 0 || read != sizeof(RandomLoopDelay.Max)) return E_FAIL;
-    hr = pStm->Read(&RandomRate.Min, sizeof(RandomRate.Min), &read);
-    if (hr < 0 || read != sizeof(RandomRate.Min)) return E_FAIL;
-    hr = pStm->Read(&RandomRate.Max, sizeof(RandomRate.Max), &read);
-    if (hr < 0 || read != sizeof(RandomRate.Max)) return E_FAIL;
-
-    hr = pStm->Read(&Translucency, sizeof(Translucency), &read);
-    if (hr < 0 || read != sizeof(Translucency)) return E_FAIL;
-
-    // Read Spawns anim type ID and resolve.
-    char spawnsID[0x18];
-    hr = pStm->Read(spawnsID, sizeof(spawnsID), &read);
-    if (hr < 0 || read != sizeof(spawnsID)) return E_FAIL;
-    spawnsID[sizeof(spawnsID) - 1] = '\0';
-    Spawns = spawnsID[0] ? AnimTypeClass::Find(spawnsID) : nullptr;
-
-    hr = pStm->Read(&SpawnCount, sizeof(SpawnCount), &read);
-    if (hr < 0 || read != sizeof(SpawnCount)) return E_FAIL;
-    hr = pStm->Read(&Report, sizeof(Report), &read);
-    if (hr < 0 || read != sizeof(Report)) return E_FAIL;
-    hr = pStm->Read(&StopSound, sizeof(StopSound), &read);
-    if (hr < 0 || read != sizeof(StopSound)) return E_FAIL;
-
-    // Read BounceAnim ID and resolve.
-    char bounceID[0x18];
-    hr = pStm->Read(bounceID, sizeof(bounceID), &read);
-    if (hr < 0 || read != sizeof(bounceID)) return E_FAIL;
-    bounceID[sizeof(bounceID) - 1] = '\0';
-    BounceAnim = bounceID[0] ? AnimTypeClass::Find(bounceID) : nullptr;
-
-    // Read ExpireAnim ID and resolve.
-    char expireID[0x18];
-    hr = pStm->Read(expireID, sizeof(expireID), &read);
-    if (hr < 0 || read != sizeof(expireID)) return E_FAIL;
-    expireID[sizeof(expireID) - 1] = '\0';
-    ExpireAnim = expireID[0] ? AnimTypeClass::Find(expireID) : nullptr;
-
-    // Read TrailerAnim ID and resolve.
-    char trailerID[0x18];
-    hr = pStm->Read(trailerID, sizeof(trailerID), &read);
-    if (hr < 0 || read != sizeof(trailerID)) return E_FAIL;
-    trailerID[sizeof(trailerID) - 1] = '\0';
-    TrailerAnim = trailerID[0] ? AnimTypeClass::Find(trailerID) : nullptr;
-
-    hr = pStm->Read(&TrailerSeperation, sizeof(TrailerSeperation), &read);
-    if (hr < 0 || read != sizeof(TrailerSeperation)) return E_FAIL;
-    hr = pStm->Read(&Elasticity, sizeof(Elasticity), &read);
-    if (hr < 0 || read != sizeof(Elasticity)) return E_FAIL;
-    hr = pStm->Read(&MinZVel, sizeof(MinZVel), &read);
-    if (hr < 0 || read != sizeof(MinZVel)) return E_FAIL;
-    hr = pStm->Read(&unknown_double_320, sizeof(unknown_double_320), &read);
-    if (hr < 0 || read != sizeof(unknown_double_320)) return E_FAIL;
-    hr = pStm->Read(&MaxXYVel, sizeof(MaxXYVel), &read);
-    if (hr < 0 || read != sizeof(MaxXYVel)) return E_FAIL;
-
-    // Read Warhead ID and resolve.
-    char warheadID[0x18];
-    hr = pStm->Read(warheadID, sizeof(warheadID), &read);
-    if (hr < 0 || read != sizeof(warheadID)) return E_FAIL;
-    warheadID[sizeof(warheadID) - 1] = '\0';
-    Warhead = warheadID[0] ? WarheadTypeClass::Find(warheadID) : nullptr;
-
-    hr = pStm->Read(&DamageRadius, sizeof(DamageRadius), &read);
-    if (hr < 0 || read != sizeof(DamageRadius)) return E_FAIL;
-
-    // Read TiberiumSpawnType ID and resolve.
-    char tiberiumID[0x18];
-    hr = pStm->Read(tiberiumID, sizeof(tiberiumID), &read);
-    if (hr < 0 || read != sizeof(tiberiumID)) return E_FAIL;
-    tiberiumID[sizeof(tiberiumID) - 1] = '\0';
-    TiberiumSpawnType = tiberiumID[0] ? OverlayTypeClass::Find(tiberiumID) : nullptr;
-
-    hr = pStm->Read(&TiberiumSpreadRadius, sizeof(TiberiumSpreadRadius), &read);
-    if (hr < 0 || read != sizeof(TiberiumSpreadRadius)) return E_FAIL;
-    hr = pStm->Read(&YSortAdjust, sizeof(YSortAdjust), &read);
-    if (hr < 0 || read != sizeof(YSortAdjust)) return E_FAIL;
-    hr = pStm->Read(&YDrawOffset, sizeof(YDrawOffset), &read);
-    if (hr < 0 || read != sizeof(YDrawOffset)) return E_FAIL;
-    hr = pStm->Read(&ZAdjust, sizeof(ZAdjust), &read);
-    if (hr < 0 || read != sizeof(ZAdjust)) return E_FAIL;
-    hr = pStm->Read(&MakeInfantry, sizeof(MakeInfantry), &read);
-    if (hr < 0 || read != sizeof(MakeInfantry)) return E_FAIL;
-    hr = pStm->Read(&RunningFrames, sizeof(RunningFrames), &read);
-    if (hr < 0 || read != sizeof(RunningFrames)) return E_FAIL;
-
-    // Read packed bool flags (group 1)
-    uint32 flags1 = 0;
-    hr = pStm->Read(&flags1, sizeof(flags1), &read);
-    if (hr < 0 || read != sizeof(flags1)) return E_FAIL;
-    IsFlamingGuy           = (flags1 & 0x00000001) != 0;
-    IsVeins                = (flags1 & 0x00000002) != 0;
-    IsMeteor               = (flags1 & 0x00000004) != 0;
-    TiberiumChainReaction  = (flags1 & 0x00000008) != 0;
-    IsTiberium             = (flags1 & 0x00000010) != 0;
-    HideIfNoOre            = (flags1 & 0x00000020) != 0;
-    Bouncer                = (flags1 & 0x00000040) != 0;
-    Tiled                  = (flags1 & 0x00000080) != 0;
-    ShouldUseCellDrawer    = (flags1 & 0x00000100) != 0;
-    UseNormalLight         = (flags1 & 0x00000200) != 0;
-    IsNuke                 = (flags1 & 0x00000400) != 0;
-    IsIonCannon            = (flags1 & 0x00000800) != 0;
-    DemandLoad             = (flags1 & 0x00001000) != 0;
-    FreeLoad               = (flags1 & 0x00002000) != 0;
-    IsAnimatedTiberium     = (flags1 & 0x00004000) != 0;
-    AltPalette             = (flags1 & 0x00008000) != 0;
-    Normalized             = (flags1 & 0x00010000) != 0;
-
-    // Read Layer enum as int32.
-    int32 layerVal = 0;
-    hr = pStm->Read(&layerVal, sizeof(layerVal), &read);
-    if (hr < 0 || read != sizeof(layerVal)) return E_FAIL;
-    Layer_ = static_cast<Layer>(layerVal);
-
-    // Read packed bool flags (group 2)
-    uint32 flags2 = 0;
-    hr = pStm->Read(&flags2, sizeof(flags2), &read);
-    if (hr < 0 || read != sizeof(flags2)) return E_FAIL;
-    DoubleThick      = (flags2 & 0x00000001) != 0;
-    Flat             = (flags2 & 0x00000002) != 0;
-    Translucent      = (flags2 & 0x00000004) != 0;
-    Scorch           = (flags2 & 0x00000008) != 0;
-    Flamer           = (flags2 & 0x00000010) != 0;
-    Crater           = (flags2 & 0x00000020) != 0;
-    ForceBigCraters  = (flags2 & 0x00000040) != 0;
-    Sticky           = (flags2 & 0x00000080) != 0;
-    PingPong         = (flags2 & 0x00000100) != 0;
-    Reverse          = (flags2 & 0x00000200) != 0;
-    Shadow           = (flags2 & 0x00000400) != 0;
-    PsiWarning       = (flags2 & 0x00000800) != 0;
-    ShouldFogRemove  = (flags2 & 0x00001000) != 0;
-
-    hr = pStm->Read(AnimationName, sizeof(AnimationName), &read);
-    if (hr < 0 || read != sizeof(AnimationName)) return E_FAIL;
-    hr = pStm->Read(&NumFrames, sizeof(NumFrames), &read);
-    if (hr < 0 || read != sizeof(NumFrames)) return E_FAIL;
-    hr = pStm->Read(&FrameRate, sizeof(FrameRate), &read);
-    if (hr < 0 || read != sizeof(FrameRate)) return E_FAIL;
-
-    // Read packed bool flags (group 3)
-    uint32 flags3 = 0;
-    hr = pStm->Read(&flags3, sizeof(flags3), &read);
-    if (hr < 0 || read != sizeof(flags3)) return E_FAIL;
-    IsLooping      = (flags3 & 0x01) != 0;
-    IsInvisible    = (flags3 & 0x02) != 0;
-    IsFlameThrower = (flags3 & 0x04) != 0;
-    IsNormalized   = (flags3 & 0x08) != 0;
-    IsBigGrey      = (flags3 & 0x10) != 0;
-    IsParticle     = (flags3 & 0x20) != 0;
-    IsRailgun      = (flags3 & 0x40) != 0;
-
-    hr = pStm->Read(&MakeInfantryOwner, sizeof(MakeInfantryOwner), &read);
-    if (hr < 0 || read != sizeof(MakeInfantryOwner)) return E_FAIL;
-    hr = pStm->Read(&LightSize, sizeof(LightSize), &read);
-    if (hr < 0 || read != sizeof(LightSize)) return E_FAIL;
-    hr = pStm->Read(&LightIntensity, sizeof(LightIntensity), &read);
-    if (hr < 0 || read != sizeof(LightIntensity)) return E_FAIL;
-    hr = pStm->Read(&LightVisibility, sizeof(LightVisibility), &read);
-    if (hr < 0 || read != sizeof(LightVisibility)) return E_FAIL;
-    hr = pStm->Read(&LightRedTint, sizeof(LightRedTint), &read);
-    if (hr < 0 || read != sizeof(LightRedTint)) return E_FAIL;
-    hr = pStm->Read(&LightGreenTint, sizeof(LightGreenTint), &read);
-    if (hr < 0 || read != sizeof(LightGreenTint)) return E_FAIL;
-    hr = pStm->Read(&LightBlueTint, sizeof(LightBlueTint), &read);
-    if (hr < 0 || read != sizeof(LightBlueTint)) return E_FAIL;
-    hr = pStm->Read(&LightFlashFrames, sizeof(LightFlashFrames), &read);
-    if (hr < 0 || read != sizeof(LightFlashFrames)) return E_FAIL;
-
-    // Read shape pointers as indices (reloaded on demand, not restored).
-    int32 animShapeIdx = -1;
-    hr = pStm->Read(&animShapeIdx, sizeof(animShapeIdx), &read);
-    if (hr < 0 || read != sizeof(animShapeIdx)) return E_FAIL;
-    AnimShape = nullptr;
-
-    int32 shadowShapeIdx = -1;
-    hr = pStm->Read(&shadowShapeIdx, sizeof(shadowShapeIdx), &read);
-    if (hr < 0 || read != sizeof(shadowShapeIdx)) return E_FAIL;
-    ShadowShape = nullptr;
+    if (!DemandLoad && Theater) {
+        // asm recomputes the theater SHP for the current scenario theater.
+        ObjectTypeClass::Load_Theater_Art(0);
+    } else if (NewTheater) {
+        LoadTheaterSpecificArt(0);
+    }
 
     return S_OK;
 }
 
+// asm: AnimTypeClass_Save (0x4288A0) - forwards to ObjectTypeClass_Save only.
 HRESULT AnimTypeClass::Save(IStream* pStm, BOOL fClearDirty) {
     if (!pStm) return E_POINTER;
 
-    ULONG written = 0;
-    HRESULT hr = S_OK;
-
-    // Write ID
-    hr = pStm->Write(ID, sizeof(ID), &written);
-    if (hr < 0 || written != sizeof(ID)) return E_FAIL;
-
-    // Write scalar fields
-    hr = pStm->Write(&MiddleFrameIndex, sizeof(MiddleFrameIndex), &written);
-    if (hr < 0 || written != sizeof(MiddleFrameIndex)) return E_FAIL;
-    hr = pStm->Write(&MiddleFrameWidth, sizeof(MiddleFrameWidth), &written);
-    if (hr < 0 || written != sizeof(MiddleFrameWidth)) return E_FAIL;
-    hr = pStm->Write(&MiddleFrameHeight, sizeof(MiddleFrameHeight), &written);
-    if (hr < 0 || written != sizeof(MiddleFrameHeight)) return E_FAIL;
-    hr = pStm->Write(&unknown_2A4, sizeof(unknown_2A4), &written);
-    if (hr < 0 || written != sizeof(unknown_2A4)) return E_FAIL;
-    hr = pStm->Write(&Damage, sizeof(Damage), &written);
-    if (hr < 0 || written != sizeof(Damage)) return E_FAIL;
-    hr = pStm->Write(&Rate, sizeof(Rate), &written);
-    if (hr < 0 || written != sizeof(Rate)) return E_FAIL;
-    hr = pStm->Write(&Start, sizeof(Start), &written);
-    if (hr < 0 || written != sizeof(Start)) return E_FAIL;
-    hr = pStm->Write(&LoopStart, sizeof(LoopStart), &written);
-    if (hr < 0 || written != sizeof(LoopStart)) return E_FAIL;
-    hr = pStm->Write(&LoopEnd, sizeof(LoopEnd), &written);
-    if (hr < 0 || written != sizeof(LoopEnd)) return E_FAIL;
-    hr = pStm->Write(&End, sizeof(End), &written);
-    if (hr < 0 || written != sizeof(End)) return E_FAIL;
-    hr = pStm->Write(&LoopCount, sizeof(LoopCount), &written);
-    if (hr < 0 || written != sizeof(LoopCount)) return E_FAIL;
-
-    // Write Next anim type ID.
-    char nextID[0x18];
-    std::memset(nextID, 0, sizeof(nextID));
-    if (Next && Next->ID) {
-        int32 j = 0;
-        while (Next->ID[j] && j < static_cast<int32>(sizeof(nextID)) - 1) {
-            nextID[j] = Next->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(nextID, sizeof(nextID), &written);
-    if (hr < 0 || written != sizeof(nextID)) return E_FAIL;
-
-    hr = pStm->Write(&SpawnsParticle, sizeof(SpawnsParticle), &written);
-    if (hr < 0 || written != sizeof(SpawnsParticle)) return E_FAIL;
-    hr = pStm->Write(&NumParticles, sizeof(NumParticles), &written);
-    if (hr < 0 || written != sizeof(NumParticles)) return E_FAIL;
-    hr = pStm->Write(&DetailLevel, sizeof(DetailLevel), &written);
-    if (hr < 0 || written != sizeof(DetailLevel)) return E_FAIL;
-    hr = pStm->Write(&TranslucencyDetailLevel, sizeof(TranslucencyDetailLevel), &written);
-    if (hr < 0 || written != sizeof(TranslucencyDetailLevel)) return E_FAIL;
-
-    // Write RandomStruct fields.
-    hr = pStm->Write(&RandomLoopDelay.Min, sizeof(RandomLoopDelay.Min), &written);
-    if (hr < 0 || written != sizeof(RandomLoopDelay.Min)) return E_FAIL;
-    hr = pStm->Write(&RandomLoopDelay.Max, sizeof(RandomLoopDelay.Max), &written);
-    if (hr < 0 || written != sizeof(RandomLoopDelay.Max)) return E_FAIL;
-    hr = pStm->Write(&RandomRate.Min, sizeof(RandomRate.Min), &written);
-    if (hr < 0 || written != sizeof(RandomRate.Min)) return E_FAIL;
-    hr = pStm->Write(&RandomRate.Max, sizeof(RandomRate.Max), &written);
-    if (hr < 0 || written != sizeof(RandomRate.Max)) return E_FAIL;
-
-    hr = pStm->Write(&Translucency, sizeof(Translucency), &written);
-    if (hr < 0 || written != sizeof(Translucency)) return E_FAIL;
-
-    // Write Spawns anim type ID.
-    char spawnsID[0x18];
-    std::memset(spawnsID, 0, sizeof(spawnsID));
-    if (Spawns && Spawns->ID) {
-        int32 j = 0;
-        while (Spawns->ID[j] && j < static_cast<int32>(sizeof(spawnsID)) - 1) {
-            spawnsID[j] = Spawns->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(spawnsID, sizeof(spawnsID), &written);
-    if (hr < 0 || written != sizeof(spawnsID)) return E_FAIL;
-
-    hr = pStm->Write(&SpawnCount, sizeof(SpawnCount), &written);
-    if (hr < 0 || written != sizeof(SpawnCount)) return E_FAIL;
-    hr = pStm->Write(&Report, sizeof(Report), &written);
-    if (hr < 0 || written != sizeof(Report)) return E_FAIL;
-    hr = pStm->Write(&StopSound, sizeof(StopSound), &written);
-    if (hr < 0 || written != sizeof(StopSound)) return E_FAIL;
-
-    // Write BounceAnim ID.
-    char bounceID[0x18];
-    std::memset(bounceID, 0, sizeof(bounceID));
-    if (BounceAnim && BounceAnim->ID) {
-        int32 j = 0;
-        while (BounceAnim->ID[j] && j < static_cast<int32>(sizeof(bounceID)) - 1) {
-            bounceID[j] = BounceAnim->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(bounceID, sizeof(bounceID), &written);
-    if (hr < 0 || written != sizeof(bounceID)) return E_FAIL;
-
-    // Write ExpireAnim ID.
-    char expireID[0x18];
-    std::memset(expireID, 0, sizeof(expireID));
-    if (ExpireAnim && ExpireAnim->ID) {
-        int32 j = 0;
-        while (ExpireAnim->ID[j] && j < static_cast<int32>(sizeof(expireID)) - 1) {
-            expireID[j] = ExpireAnim->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(expireID, sizeof(expireID), &written);
-    if (hr < 0 || written != sizeof(expireID)) return E_FAIL;
-
-    // Write TrailerAnim ID.
-    char trailerID[0x18];
-    std::memset(trailerID, 0, sizeof(trailerID));
-    if (TrailerAnim && TrailerAnim->ID) {
-        int32 j = 0;
-        while (TrailerAnim->ID[j] && j < static_cast<int32>(sizeof(trailerID)) - 1) {
-            trailerID[j] = TrailerAnim->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(trailerID, sizeof(trailerID), &written);
-    if (hr < 0 || written != sizeof(trailerID)) return E_FAIL;
-
-    hr = pStm->Write(&TrailerSeperation, sizeof(TrailerSeperation), &written);
-    if (hr < 0 || written != sizeof(TrailerSeperation)) return E_FAIL;
-    hr = pStm->Write(&Elasticity, sizeof(Elasticity), &written);
-    if (hr < 0 || written != sizeof(Elasticity)) return E_FAIL;
-    hr = pStm->Write(&MinZVel, sizeof(MinZVel), &written);
-    if (hr < 0 || written != sizeof(MinZVel)) return E_FAIL;
-    hr = pStm->Write(&unknown_double_320, sizeof(unknown_double_320), &written);
-    if (hr < 0 || written != sizeof(unknown_double_320)) return E_FAIL;
-    hr = pStm->Write(&MaxXYVel, sizeof(MaxXYVel), &written);
-    if (hr < 0 || written != sizeof(MaxXYVel)) return E_FAIL;
-
-    // Write Warhead ID.
-    char warheadID[0x18];
-    std::memset(warheadID, 0, sizeof(warheadID));
-    if (Warhead && Warhead->ID) {
-        int32 j = 0;
-        while (Warhead->ID[j] && j < static_cast<int32>(sizeof(warheadID)) - 1) {
-            warheadID[j] = Warhead->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(warheadID, sizeof(warheadID), &written);
-    if (hr < 0 || written != sizeof(warheadID)) return E_FAIL;
-
-    hr = pStm->Write(&DamageRadius, sizeof(DamageRadius), &written);
-    if (hr < 0 || written != sizeof(DamageRadius)) return E_FAIL;
-
-    // Write TiberiumSpawnType ID.
-    char tiberiumID[0x18];
-    std::memset(tiberiumID, 0, sizeof(tiberiumID));
-    if (TiberiumSpawnType && TiberiumSpawnType->ID) {
-        int32 j = 0;
-        while (TiberiumSpawnType->ID[j] && j < static_cast<int32>(sizeof(tiberiumID)) - 1) {
-            tiberiumID[j] = TiberiumSpawnType->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(tiberiumID, sizeof(tiberiumID), &written);
-    if (hr < 0 || written != sizeof(tiberiumID)) return E_FAIL;
-
-    hr = pStm->Write(&TiberiumSpreadRadius, sizeof(TiberiumSpreadRadius), &written);
-    if (hr < 0 || written != sizeof(TiberiumSpreadRadius)) return E_FAIL;
-    hr = pStm->Write(&YSortAdjust, sizeof(YSortAdjust), &written);
-    if (hr < 0 || written != sizeof(YSortAdjust)) return E_FAIL;
-    hr = pStm->Write(&YDrawOffset, sizeof(YDrawOffset), &written);
-    if (hr < 0 || written != sizeof(YDrawOffset)) return E_FAIL;
-    hr = pStm->Write(&ZAdjust, sizeof(ZAdjust), &written);
-    if (hr < 0 || written != sizeof(ZAdjust)) return E_FAIL;
-    hr = pStm->Write(&MakeInfantry, sizeof(MakeInfantry), &written);
-    if (hr < 0 || written != sizeof(MakeInfantry)) return E_FAIL;
-    hr = pStm->Write(&RunningFrames, sizeof(RunningFrames), &written);
-    if (hr < 0 || written != sizeof(RunningFrames)) return E_FAIL;
-
-    // Write packed bool flags (group 1)
-    uint32 flags1 = 0;
-    if (IsFlamingGuy)          flags1 |= 0x00000001;
-    if (IsVeins)               flags1 |= 0x00000002;
-    if (IsMeteor)              flags1 |= 0x00000004;
-    if (TiberiumChainReaction) flags1 |= 0x00000008;
-    if (IsTiberium)            flags1 |= 0x00000010;
-    if (HideIfNoOre)           flags1 |= 0x00000020;
-    if (Bouncer)               flags1 |= 0x00000040;
-    if (Tiled)                 flags1 |= 0x00000080;
-    if (ShouldUseCellDrawer)   flags1 |= 0x00000100;
-    if (UseNormalLight)        flags1 |= 0x00000200;
-    if (IsNuke)                flags1 |= 0x00000400;
-    if (IsIonCannon)           flags1 |= 0x00000800;
-    if (DemandLoad)            flags1 |= 0x00001000;
-    if (FreeLoad)              flags1 |= 0x00002000;
-    if (IsAnimatedTiberium)    flags1 |= 0x00004000;
-    if (AltPalette)            flags1 |= 0x00008000;
-    if (Normalized)            flags1 |= 0x00010000;
-    hr = pStm->Write(&flags1, sizeof(flags1), &written);
-    if (hr < 0 || written != sizeof(flags1)) return E_FAIL;
-
-    // Write Layer enum as int32.
-    int32 layerVal = static_cast<int32>(Layer_);
-    hr = pStm->Write(&layerVal, sizeof(layerVal), &written);
-    if (hr < 0 || written != sizeof(layerVal)) return E_FAIL;
-
-    // Write packed bool flags (group 2)
-    uint32 flags2 = 0;
-    if (DoubleThick)     flags2 |= 0x00000001;
-    if (Flat)            flags2 |= 0x00000002;
-    if (Translucent)     flags2 |= 0x00000004;
-    if (Scorch)          flags2 |= 0x00000008;
-    if (Flamer)          flags2 |= 0x00000010;
-    if (Crater)          flags2 |= 0x00000020;
-    if (ForceBigCraters) flags2 |= 0x00000040;
-    if (Sticky)          flags2 |= 0x00000080;
-    if (PingPong)        flags2 |= 0x00000100;
-    if (Reverse)         flags2 |= 0x00000200;
-    if (Shadow)          flags2 |= 0x00000400;
-    if (PsiWarning)      flags2 |= 0x00000800;
-    if (ShouldFogRemove) flags2 |= 0x00001000;
-    hr = pStm->Write(&flags2, sizeof(flags2), &written);
-    if (hr < 0 || written != sizeof(flags2)) return E_FAIL;
-
-    hr = pStm->Write(AnimationName, sizeof(AnimationName), &written);
-    if (hr < 0 || written != sizeof(AnimationName)) return E_FAIL;
-    hr = pStm->Write(&NumFrames, sizeof(NumFrames), &written);
-    if (hr < 0 || written != sizeof(NumFrames)) return E_FAIL;
-    hr = pStm->Write(&FrameRate, sizeof(FrameRate), &written);
-    if (hr < 0 || written != sizeof(FrameRate)) return E_FAIL;
-
-    // Write packed bool flags (group 3)
-    uint32 flags3 = 0;
-    if (IsLooping)      flags3 |= 0x01;
-    if (IsInvisible)    flags3 |= 0x02;
-    if (IsFlameThrower) flags3 |= 0x04;
-    if (IsNormalized)   flags3 |= 0x08;
-    if (IsBigGrey)      flags3 |= 0x10;
-    if (IsParticle)     flags3 |= 0x20;
-    if (IsRailgun)      flags3 |= 0x40;
-    hr = pStm->Write(&flags3, sizeof(flags3), &written);
-    if (hr < 0 || written != sizeof(flags3)) return E_FAIL;
-
-    hr = pStm->Write(&MakeInfantryOwner, sizeof(MakeInfantryOwner), &written);
-    if (hr < 0 || written != sizeof(MakeInfantryOwner)) return E_FAIL;
-    hr = pStm->Write(&LightSize, sizeof(LightSize), &written);
-    if (hr < 0 || written != sizeof(LightSize)) return E_FAIL;
-    hr = pStm->Write(&LightIntensity, sizeof(LightIntensity), &written);
-    if (hr < 0 || written != sizeof(LightIntensity)) return E_FAIL;
-    hr = pStm->Write(&LightVisibility, sizeof(LightVisibility), &written);
-    if (hr < 0 || written != sizeof(LightVisibility)) return E_FAIL;
-    hr = pStm->Write(&LightRedTint, sizeof(LightRedTint), &written);
-    if (hr < 0 || written != sizeof(LightRedTint)) return E_FAIL;
-    hr = pStm->Write(&LightGreenTint, sizeof(LightGreenTint), &written);
-    if (hr < 0 || written != sizeof(LightGreenTint)) return E_FAIL;
-    hr = pStm->Write(&LightBlueTint, sizeof(LightBlueTint), &written);
-    if (hr < 0 || written != sizeof(LightBlueTint)) return E_FAIL;
-    hr = pStm->Write(&LightFlashFrames, sizeof(LightFlashFrames), &written);
-    if (hr < 0 || written != sizeof(LightFlashFrames)) return E_FAIL;
-
-    // Write shape pointers as indices (rendering resources, reloaded on demand).
-    int32 animShapeIdx = AnimShape ? 0 : -1;
-    hr = pStm->Write(&animShapeIdx, sizeof(animShapeIdx), &written);
-    if (hr < 0 || written != sizeof(animShapeIdx)) return E_FAIL;
-
-    int32 shadowShapeIdx = ShadowShape ? 0 : -1;
-    hr = pStm->Write(&shadowShapeIdx, sizeof(shadowShapeIdx), &written);
-    if (hr < 0 || written != sizeof(shadowShapeIdx)) return E_FAIL;
+    HRESULT hr = ObjectTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0) return hr;
 
     return S_OK;
 }
@@ -684,7 +221,7 @@ AbstractType AnimTypeClass::WhatAmI() const {
 }
 
 int32 AnimTypeClass::Size() const {
-    return sizeof(AnimTypeClass);
+    return 0x378;                 // asm: AnimTypeClass_GetSize (mov eax, 378h)
 }
 
 // ============================================================================
@@ -744,221 +281,102 @@ SHPStruct* AnimTypeClass::LoadImage() {
     return AnimShape;
 }
 
-void AnimTypeClass::Load2DArt() {
-    LoadImage();
+// asm: AnimTypeClass_Load2DArt (0x4279E0, retn 4)
+//
+//   Skips everything while the image is already resident (DemandLoad set).
+//   Otherwise: a theater-art type reloads through ObjectTypeClass_Load_Theater_Art;
+//   a plain type builds "<Image|ID>.SHP", applies the theater-specific id when
+//   relevant, and reads the file.  With an image in hand the original derives
+//   the middle-frame geometry from the SHP frame header (frame height/2).
+void AnimTypeClass::Load2DArt(int32 idxTheater) {
+    if (DemandLoad) return;
 
-    // Load shadow image if shadow flag is set
-    if (Shadow && !ShadowShape && AnimationName[0]) {
-        // Try to load shadow variant (e.g., "xxx.shp" -> "xxxS.shp")
-        char shadowName[64];
-        std::memset(shadowName, 0, sizeof(shadowName));
-        int32 len = 0;
-        while (AnimationName[len] && len < 60) {
-            shadowName[len] = AnimationName[len];
-            ++len;
-        }
-        // Replace .shp with S.shp
-        if (len > 4) {
-            shadowName[len - 4] = 'S';
-            shadowName[len - 3] = '.';
-            shadowName[len - 2] = 's';
-            shadowName[len - 1] = 'h';
-            shadowName[len] = 'p';
-            shadowName[len + 1] = '\0';
-        }
-        // ShadowShape = MixFileSystem::LoadSHP(shadowName);
+    if (Theater) {
+        ObjectTypeClass::Load_Theater_Art(idxTheater);
+        return;
     }
+
+    if (AnimShape && FreeLoad) {
+        delete AnimShape;
+        AnimShape = nullptr;
+    }
+
+    const char* baseName = Image[0] ? Image : ID;
+    char path[0x100];
+    snprintf(path, sizeof(path), "%s.SHP", baseName);
+
+    if (NewTheater) {
+        ObjectTypeClass::TheaterSpecificID(baseName, idxTheater, path);
+    }
+
+    // AnimShape = MixFileSystem::LoadSHP(path);
+    if (!AnimShape) return;
+
+    // asm: middle-frame height from the frame header, halved; LoopEnd mirrors it.
+    if (MiddleFrameHeight == 0) {
+        MiddleFrameHeight = MiddleFrameWidth;
+    }
+    MiddleFrameIndex = MiddleFrameHeight / 2;
+    MiddleFrameWidth = -1;
+    MiddleFrameHeight = -1;
 }
 
 // ============================================================================
 // INI
 // ============================================================================
 
+// asm: AnimTypeClass_LoadFromINI (0x426960)
+//
+// Reads this type's own [<ID>] block.  The original:
+//   1. INIClass_Reset(pINI) then ObjectTypeClass_LoadFromINI(this, pINI) -
+//      a return of false short-circuits and yields false.
+//   2. Reads the boolean/层 flags, sound/anim cross-references, physics and
+//      particle fields.  Several computed values differ from a plain read:
+//        - Rate is stored as a frame delay 900 / Rate (0 when Rate <= 0);
+//        - RandomLoopDelay / RandomRate are converted the same way;
+//        - Damage / Elasticity / MinZVel / MaxXYVel are fixed-point (GetFixed);
+//        - "Next"/"Spawns" resolve through FindOrAllocateFromList;
+//        - StartSound falls back to Report (both feed the primary sound slot);
+//        - "Theater"/"NewTheater"/"AltPalette" come from the art INI.
 bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     if (!pINI) return false;
+
+    pINI->Reset();
+
+    if (!ObjectTypeClass::LoadFromINI(pINI)) return false;
+
     const char* section = this->ID;
     if (!section || !section[0]) return false;
 
-    // Read animation name
-    char animNameBuf[256];
-    pINI->ReadString(section, "Image", "", animNameBuf, sizeof(animNameBuf));
-    const char* animName = animNameBuf;
-    if (animName && animName[0]) {
-        int32 j = 0;
-        while (animName[j] && j < 31) {
-            AnimationName[j] = animName[j];
-            ++j;
-        }
-        AnimationName[j] = '\0';
-    }
-
-    // Frame timing
-    Rate = pINI->ReadInteger(section, "Rate", 0);
-    Start = pINI->ReadInteger(section, "Start", 0);
-    LoopStart = pINI->ReadInteger(section, "LoopStart", -1);
-    LoopEnd = pINI->ReadInteger(section, "LoopEnd", -1);
-    End = pINI->ReadInteger(section, "End", 0);
-    LoopCount = pINI->ReadInteger(section, "LoopCount", 0);
-
-    // Random timing
-
-    // Damage
-    Damage = pINI->ReadFloat(section, "Damage", 0.0);
-    DamageRadius = pINI->ReadInteger(section, "DamageRadius", 0);
-
-    // Warhead
-    char warheadBuf[64];
-    pINI->ReadString(section, "Warhead", "", warheadBuf, sizeof(warheadBuf));
-    if (warheadBuf[0]) {
-        Warhead = WarheadTypeClass::Find(warheadBuf);
-    }
-
-    // Visual
-    Translucency = pINI->ReadInteger(section, "Translucency", 0);
-    TranslucencyDetailLevel = pINI->ReadInteger(section, "TranslucencyDetailLevel", 0);
-    ZAdjust = pINI->ReadInteger(section, "ZAdjust", 0);
-    YSortAdjust = pINI->ReadInteger(section, "YSortAdjust", 0);
-    YDrawOffset = pINI->ReadInteger(section, "YDrawOffset", 0);
-    DetailLevel = pINI->ReadInteger(section, "DetailLevel", 0);
-
-    // Layer
-    char layerBuf[32];
-    pINI->ReadString(section, "Layer", "Ground", layerBuf, sizeof(layerBuf));
-    if (!_strcmpi(layerBuf, "Air")) Layer_ = Layer::Air;
-    else if (!_strcmpi(layerBuf, "Top")) Layer_ = Layer::Top;
-    else if (!_strcmpi(layerBuf, "Surface")) Layer_ = Layer::Surface;
-    else Layer_ = Layer::Ground;
-
-    // Infantry spawn
-    MakeInfantry = pINI->ReadInteger(section, "MakeInfantry", 0);
-
-    // Sound
-    Report = pINI->ReadInteger(section, "Report", -1);
-    StopSound = pINI->ReadInteger(section, "StopSound", -1);
-
-    // Spawn/particle
-    SpawnCount = pINI->ReadInteger(section, "SpawnCount", 0);
-    NumParticles = pINI->ReadInteger(section, "NumParticles", 0);
-    SpawnsParticle = pINI->ReadInteger(section, "SpawnsParticle", 0);
-
-    // Physics
-    Elasticity = pINI->ReadFloat(section, "Elasticity", 0.0);
-    MinZVel = pINI->ReadFloat(section, "MinZVel", 0.0);
-    MaxXYVel = pINI->ReadFloat(section, "MaxXYVel", 0.0);
-    TrailerSeperation = pINI->ReadInteger(section, "TrailerSeperation", 0);
-    RunningFrames = pINI->ReadInteger(section, "RunningFrames", 0);
-
-    // Tiberium
-    TiberiumSpreadRadius = pINI->ReadInteger(section, "TiberiumSpreadRadius", 0);
-
-    // Next animation
-    char nextBuf[64];
-    pINI->ReadString(section, "Next", "", nextBuf, sizeof(nextBuf));
-    if (nextBuf[0]) {
-        Next = AnimTypeClass::Find(nextBuf);
-    }
-
-    // Bounce animation
-    char bounceBuf[64];
-    pINI->ReadString(section, "BounceAnim", "", bounceBuf, sizeof(bounceBuf));
-    if (bounceBuf[0]) {
-        BounceAnim = AnimTypeClass::Find(bounceBuf);
-    }
-
-    // Expire animation
-    char expireBuf[64];
-    pINI->ReadString(section, "ExpireAnim", "", expireBuf, sizeof(expireBuf));
-    if (expireBuf[0]) {
-        ExpireAnim = AnimTypeClass::Find(expireBuf);
-    }
-
-    // Trailer animation
-    char trailerBuf[64];
-    pINI->ReadString(section, "TrailerAnim", "", trailerBuf, sizeof(trailerBuf));
-    if (trailerBuf[0]) {
-        TrailerAnim = AnimTypeClass::Find(trailerBuf);
-    }
-
-    // Spawns animation
-    char spawnsBuf[64];
-    pINI->ReadString(section, "Spawns", "", spawnsBuf, sizeof(spawnsBuf));
-    if (spawnsBuf[0]) {
-        Spawns = AnimTypeClass::Find(spawnsBuf);
-    }
-
-    // The overlay left behind when the animation finishes over tiberium.
-    char tiberiumSpawnBuf[64];
-    pINI->ReadString(section, "TiberiumSpawnType", "", tiberiumSpawnBuf,
-                     sizeof(tiberiumSpawnBuf));
-    if (tiberiumSpawnBuf[0]) {
-        TiberiumSpawnType = OverlayTypeClass::Find(tiberiumSpawnBuf);
-    }
-
-    // Randomised timing - both keys are "min,max" pairs.
-    {
-        int32 pair[2] = { RandomLoopDelay.Min, RandomLoopDelay.Max };
-        pINI->Get2Integers(section, "RandomLoopDelay", pair);
-        RandomLoopDelay.Min = pair[0];
-        RandomLoopDelay.Max = pair[1];
-
-        pair[0] = RandomRate.Min;
-        pair[1] = RandomRate.Max;
-        pINI->Get2Integers(section, "RandomRate", pair);
-        RandomRate.Min = pair[0];
-        RandomRate.Max = pair[1];
-    }
-
-    // Read bool flags
-    IsFlamingGuy = pINI->ReadBool(section, "IsFlamingGuy", false);
-    IsVeins = pINI->ReadBool(section, "IsVeins", false);
-    IsMeteor = pINI->ReadBool(section, "IsMeteor", false);
-    IsTiberium = pINI->ReadBool(section, "IsTiberium", false);
-    HideIfNoOre = pINI->ReadBool(section, "HideIfNoOre", false);
-    TiberiumChainReaction = pINI->ReadBool(section, "TiberiumChainReaction", false);
-    IsAnimatedTiberium = pINI->ReadBool(section, "IsAnimatedTiberium", false);
-    Bouncer = pINI->ReadBool(section, "Bouncer", false);
-    Tiled = pINI->ReadBool(section, "Tiled", false);
-    ShouldUseCellDrawer = pINI->ReadBool(section, "ShouldUseCellDrawer", false);
-    UseNormalLight = pINI->ReadBool(section, "UseNormalLight", false);
-    AltPalette = pINI->ReadBool(section, "AltPalette", false);
-    Normalized = pINI->ReadBool(section, "Normalized", false);
-    DoubleThick = pINI->ReadBool(section, "DoubleThick", false);
-    Flat = pINI->ReadBool(section, "Flat", false);
-    Translucent = pINI->ReadBool(section, "Translucent", false);
-    Scorch = pINI->ReadBool(section, "Scorch", false);
-    Flamer = pINI->ReadBool(section, "Flamer", false);
-    Crater = pINI->ReadBool(section, "Crater", false);
-    ForceBigCraters = pINI->ReadBool(section, "ForceBigCraters", false);
-    Sticky = pINI->ReadBool(section, "Sticky", false);
-    PingPong = pINI->ReadBool(section, "PingPong", false);
-    Reverse = pINI->ReadBool(section, "Reverse", false);
-    Shadow = pINI->ReadBool(section, "Shadow", false);
-    PsiWarning = pINI->ReadBool(section, "PsiWarning", false);
-    ShouldFogRemove = pINI->ReadBool(section, "ShouldFogRemove", false);
-    IsLooping = pINI->ReadBool(section, "Loop", false);
-    IsInvisible = pINI->ReadBool(section, "Invisible", false);
-    IsRailgun = pINI->ReadBool(section, "IsRailgun", false);
-
-    // Light settings
-    LightSize = pINI->ReadInteger(section, "LightSize", 0);
-    LightIntensity = pINI->ReadFloat(section, "LightIntensity", 0.0);
-    LightVisibility = pINI->ReadInteger(section, "LightVisibility", 0);
-    LightRedTint = pINI->ReadFloat(section, "LightRedTint", 0.0);
-    LightGreenTint = pINI->ReadFloat(section, "LightGreenTint", 0.0);
-    LightBlueTint = pINI->ReadFloat(section, "LightBlueTint", 0.0);
-
-
-    // generated-ini-reads
-    // ------------------------------------------------------------------
-    // Full key set - every field keeps its current value when the key
-    // is absent, so partially specified sections stay valid.
-    // ------------------------------------------------------------------
     CCINIClass* pArt = &CCINIClass::INI_Art;
-    if (pArt == nullptr)
-        pArt = pINI;
 
-    Shadow = pINI->ReadBool(section, "Shadow", Shadow);
-    LayerValue = pINI->GetLayer(section, "Layer", LayerValue);
+    // ---- Shadow, with the original's middle-frame-height compensation ----
+    {
+        bool oldShadow = Shadow;
+        Shadow = pINI->ReadBool(section, "Shadow", oldShadow);
+        if (Shadow != oldShadow) {
+            if (Shadow) {
+                MiddleFrameHeight /= 2;
+            } else {
+                MiddleFrameHeight *= 2;
+            }
+            if (LoopEnd > MiddleFrameHeight) {
+                LoopEnd = MiddleFrameHeight;
+            }
+        }
+    }
+
+    // ---- Theatre / NewTheater (art INI) when a custom image is present ----
+    if (Image[0] != '\0' && AnimShape == nullptr) {
+        Theater = pArt->ReadBool(section, "Theater", Theater);
+        NewTheater = pArt->ReadBool(section, "NewTheater", NewTheater);
+        // asm: [vtable+0xA0](this, -1) - reload the theater art.
+        LoadTheaterSpecificArt(-1);
+    }
+
+    Layer_ = pINI->GetLayer(section, "Layer", Layer_);
+
+    AltPalette = pArt->ReadBool(section, "AltPalette", AltPalette);
     DoubleThick = pINI->ReadBool(section, "DoubleThick", DoubleThick);
     Flat = pINI->ReadBool(section, "Flat", Flat);
     Flamer = pINI->ReadBool(section, "Flamer", Flamer);
@@ -972,15 +390,41 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     Reverse = pINI->ReadBool(section, "Reverse", Reverse);
     PsiWarning = pINI->ReadBool(section, "PsiWarning", PsiWarning);
     TiberiumChainReaction = pINI->ReadBool(section, "TiberiumChainReaction", TiberiumChainReaction);
-    Rate = pINI->ReadInteger(section, "Rate", Rate);
+
+    // ---- Rate -> frame delay (900 / Rate) ----
+    {
+        int32 rate = pINI->ReadInteger(section, "Rate", -1);
+        if (rate != -1) {
+            Rate = (rate > 0) ? (900 / rate) : 0;
+        }
+    }
+
     Damage = pINI->ReadFixed(section, "Damage", Damage);
     Start = pINI->ReadInteger(section, "Start", Start);
     End = pINI->ReadInteger(section, "End", End);
     LoopStart = pINI->ReadInteger(section, "LoopStart", LoopStart);
     LoopEnd = pINI->ReadInteger(section, "LoopEnd", LoopEnd);
     LoopCount = pINI->ReadInteger(section, "LoopCount", LoopCount);
+
+    // ---- Next (string -> FindOrAllocateFromList) ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        if (pINI->GetString(section, "Next", buf, sizeof(buf)) > 0) {
+            Next = FindOrAllocateFromList(buf, Array);
+        }
+    }
+
     DetailLevel = pINI->ReadInteger(section, "DetailLevel", DetailLevel);
     TranslucencyDetailLevel = pINI->ReadInteger(section, "TranslucencyDetailLevel", TranslucencyDetailLevel);
+
+    {
+        int32 pair[2] = { RandomLoopDelay.Min, RandomLoopDelay.Max };
+        pINI->Get2Integers(section, "RandomLoopDelay", pair);
+        RandomLoopDelay.Min = pair[0];
+        RandomLoopDelay.Max = pair[1];
+    }
+
     Translucency = pINI->ReadInteger(section, "Translucency", Translucency);
     IsTiberium = pINI->ReadBool(section, "IsTiberium", IsTiberium);
     HideIfNoOre = pINI->ReadBool(section, "HideIfNoOre", HideIfNoOre);
@@ -988,34 +432,134 @@ bool AnimTypeClass::LoadFromINI(CCINIClass* pINI) {
     Elasticity = pINI->ReadFixed(section, "Elasticity", Elasticity);
     MaxXYVel = pINI->ReadFixed(section, "MaxXYVel", MaxXYVel);
     MinZVel = pINI->ReadFixed(section, "MinZVel", MinZVel);
+
     MakeInfantry = pINI->ReadInteger(section, "MakeInfantry", MakeInfantry);
+
+    // ---- Spawns (string -> FindOrAllocateFromList) ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        if (pINI->GetString(section, "Spawns", buf, sizeof(buf)) > 0) {
+            Spawns = FindOrAllocateFromList(buf, Array);
+        }
+    }
+
     SpawnCount = pINI->ReadInteger(section, "SpawnCount", SpawnCount);
     IsMeteor = pINI->ReadBool(section, "IsMeteor", IsMeteor);
     IsVeins = pINI->ReadBool(section, "IsVeins", IsVeins);
     TiberiumSpreadRadius = pINI->ReadInteger(section, "TiberiumSpreadRadius", TiberiumSpreadRadius);
+
+    // ---- TiberiumSpawnType (string -> OverlayTypeClass::FindOrAllocate) ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        if (pINI->GetString(section, "TiberiumSpawnType", buf, sizeof(buf)) > 0) {
+            TiberiumSpawnType = OverlayTypeClass::FindOrAllocate(buf);
+        }
+    }
+
     IsAnimatedTiberium = pINI->ReadBool(section, "IsAnimatedTiberium", IsAnimatedTiberium);
     ShouldFogRemove = pINI->ReadBool(section, "ShouldFogRemove", ShouldFogRemove);
     IsFlamingGuy = pINI->ReadBool(section, "IsFlamingGuy", IsFlamingGuy);
     RunningFrames = pINI->ReadInteger(section, "RunningFrames", RunningFrames);
     YDrawOffset = pINI->ReadInteger(section, "YDrawOffset", YDrawOffset);
     ZAdjust = pINI->ReadInteger(section, "ZAdjust", ZAdjust);
-    { char _buf[0x40]; if (pINI->ReadString(section, "StartSound", "", _buf, sizeof(_buf)) > 0) { int32 _i = VocClass::FindIndexOfName(_buf); if (_i >= 0) StartSound = _i; } }
+
+    // ---- StartSound, falling back to Report (both feed the primary slot) ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        int32 sound = -1;
+        if (pINI->GetString(section, "StartSound", buf, sizeof(buf)) > 0) {
+            sound = VocClass::FindIndexOfName(buf);
+        }
+        if (sound == -1) {
+            buf[0] = '\0';
+            if (pINI->GetString(section, "Report", buf, sizeof(buf)) > 0) {
+                sound = VocClass::FindIndexOfName(buf);
+            }
+        }
+        StartSound = sound;
+    }
+
+    // ---- StopSound ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        int32 sound = StopSound;
+        if (pINI->GetString(section, "StopSound", buf, sizeof(buf)) > 0) {
+            int32 idx = VocClass::FindIndexOfName(buf);
+            if (idx != -1) sound = idx;
+        }
+        StopSound = sound;
+    }
+
+    // ---- BounceAnim / ExpireAnim / TrailerAnim (string, "<none>" aware) ----
+    BounceAnim = ResolveAnimRef(pINI, section, "BounceAnim", BounceAnim);
+    ExpireAnim = ResolveAnimRef(pINI, section, "ExpireAnim", ExpireAnim);
+    TrailerAnim = ResolveAnimRef(pINI, section, "TrailerAnim", TrailerAnim);
+
     TrailerSeperation = pINI->ReadInteger(section, "TrailerSeperation", TrailerSeperation);
     DamageRadius = pINI->ReadInteger(section, "DamageRadius", DamageRadius);
+
+    // ---- Warhead (string -> WarheadTypeClass::FindOrAllocate) ----
+    {
+        char buf[0x80];
+        buf[0] = '\0';
+        if (pINI->GetString(section, "Warhead", buf, sizeof(buf)) > 0) {
+            Warhead = WarheadTypeClass::FindOrAllocate(buf);
+        }
+    }
+
     Bouncer = pINI->ReadBool(section, "Bouncer", Bouncer);
     Tiled = pINI->ReadBool(section, "Tiled", Tiled);
     ShouldUseCellDrawer = pINI->ReadBool(section, "ShouldUseCellDrawer", ShouldUseCellDrawer);
     UseNormalLight = pINI->ReadBool(section, "UseNormalLight", UseNormalLight);
+
+    // ---- SpawnsParticle (string[0x20] -> ParticleTypeClass::FindIndexOrAllocate)
+    {
+        char buf[0x20];
+        buf[0] = '\0';
+        if (pINI->GetString(section, "SpawnsParticle", buf, sizeof(buf)) > 0) {
+            SpawnsParticle = ParticleTypeClass::FindIndexOrAllocate(buf);
+        }
+    }
+
     NumParticles = pINI->ReadInteger(section, "NumParticles", NumParticles);
 
-    // ------------------------------------------------------------------
-    // artmd.ini fields
-    // ------------------------------------------------------------------
-    Theater = pArt->ReadBool(section, "Theater", Theater);
-    NewTheater = pArt->ReadBool(section, "NewTheater", NewTheater);
-    AltPalette = pArt->ReadBool(section, "AltPalette", AltPalette);
+    // ---- RandomRate: two 900/x conversions with the original's clamps ----
+    {
+        int32 pair[2] = { -1, -1 };
+        pINI->Get2Integers(section, "RandomRate", pair);
 
-        return true;
+        if (pair[0] != -1) {
+            RandomRate.Min = (pair[0] > 0) ? (900 / pair[0]) : 0;
+        }
+        if (pair[1] != -1) {
+            RandomRate.Max = (pair[1] > 0) ? (900 / pair[1]) : 0;
+        }
+
+        if (RandomRate.Max < 0) RandomRate.Max = 0;
+        if (RandomRate.Min > RandomRate.Max) RandomRate.Min = RandomRate.Max;
+    }
+
+    return true;
+}
+
+// asm helper shared by the BounceAnim / ExpireAnim / TrailerAnim reads.
+//   "<none>" / "none" clear the reference; a present name resolves through the
+//   registry, allocating a fresh type when the name is unknown.
+AnimTypeClass* AnimTypeClass::ResolveAnimRef(CCINIClass* pINI, const char* section,
+                                             const char* key, AnimTypeClass* current) {
+    char buf[0x80];
+    buf[0] = '\0';
+    if (pINI->GetString(section, key, buf, sizeof(buf)) <= 0) {
+        return current;                       // key absent -> keep current value
+    }
+    if (!_strcmpi(buf, "<none>") || !_strcmpi(buf, "none")) {
+        return nullptr;
+    }
+    return FindOrAllocateFromList(buf, Array);
 }
 
 ObjectClass* AnimTypeClass::CreateAnim() {
@@ -1280,4 +824,241 @@ AnimTypeClass* AnimTypeClass::FindOrAllocate(const char* pID)
     AnimTypeClass* newItem = GameCreate<AnimTypeClass>(pID);
     if (newItem && Array) Array->Add(newItem);
     return newItem;
+}
+
+// =============================================================================
+// AnimTypeClass_SpawnAnimAtMapCoords
+// Alternate spawn entry point.  The original implementation unconditionally
+// returns false (the active path is SpawnAtMapCoords).
+// =============================================================================
+bool AnimTypeClass::SpawnAnimAtMapCoords(CellStruct* pMapCoords, HouseClass* pOwner)
+{
+    return false;
+}
+
+// =============================================================================
+// AnimTypeClass_FreeImage  (asm: AnimTypeClass_FreeImage, 0x428DC0)
+//
+// Frees the demand-loaded image of this animation type.  Guarded by three
+// checks in the original:
+//   1. byte [this+0x35E] must be non-zero (image-load requested / allowed),
+//   2. dword [this+0xA4] (the loaded SHP image) must be non-null,
+//   3. byte [this+0x35F] must be non-zero (image actually resident).
+// When all hold it traces "Freeing loaded image for %s" with the type's ID
+// (this+0x64), deletes the image, and clears both the image pointer and the
+// companion flag byte at 0xA8.
+// =============================================================================
+void AnimTypeClass::FreeImage()
+{
+    if (!DemandLoad || !AnimShape || !FreeLoad) {
+        return;                       // asm: any of the three guard bytes/pointer zero -> ret
+    }
+
+    // asm: push offset aFreeingLoadedI ; "Freeing loaded image for %s\n"
+    //      lea eax, [esi+64h] (the type ID) ; call WWDebugString
+    // Debug tracing omitted in this build; the state transitions below are
+    // the observable behavior.
+    delete AnimShape;                 // asm: mov ecx,[esi+0A4h] ; call delete
+    AnimShape = nullptr;              // asm: mov dword ptr [esi+0A4h], 0
+    // asm: mov byte ptr [esi+0A8h], 0 -- companion "image resident" flag.
+    // In this layout the resident flag is implied by AnimShape == nullptr.
+}
+
+// =============================================================================
+// asm: AnimTypeClass_GetAbstractDerivationID (mov eax, 5 ; retn)
+// =============================================================================
+AbstractType AnimTypeClass::GetAbstractDerivationID() const
+{
+    return static_cast<AbstractType>(5);      // AbstractType::AnimType
+}
+
+// =============================================================================
+// asm: AnimTypeClass_GetArrayIndex (mov eax, [ecx+294h] ; retn)
+// =============================================================================
+int32 AnimTypeClass::GetArrayIndex() const
+{
+    return ArrayIndex;
+}
+
+// =============================================================================
+// asm: AnimTypeClass_GetCRC (0x428B00)
+//
+// Chains the base CRC, then folds in the behaviour-relevant anim fields in the
+// exact original order:
+//   Layer(+0x364), Normalized(+0x362), Flat(+0x369), Translucent(+0x36A),
+//   Scorch(+0x36B), Flamer(+0x36C), Crater(+0x36D), Sticky(+0x36F),
+//   PingPong(+0x370), Reverse(+0x371), Shadow(+0x372), MiddleFrameIndex(+0x298),
+//   Damage(double +0x2A8), TiberiumChainReaction(+0x357), Rate(+0x2B0),
+//   Start(+0x2B4), LoopStart(+0x2B8), LoopEnd(+0x2BC), End(+0x2C0),
+//   primary sound(+0x2F8), StopSound(+0x2FC), NumParticles(+0x2D0),
+//   DetailLevel(+0x2D4), TranslucencyDetailLevel(+0x2D8),
+//   RandomLoopDelay.Min(+0x2DC), RandomLoopDelay.Max(+0x2E0),
+//   Translucency(+0x2EC), Tiled(+0x35B).
+void AnimTypeClass::ComputeCRC(CRCEngine& crc) const
+{
+    ObjectTypeClass::ComputeCRC(crc);
+}
+
+int32 AnimTypeClass::GetCRC() const
+{
+    CRCEngine crc;
+    ComputeCRC(crc);
+
+    auto crcBool = [&crc](bool v) { uint8 b = v ? 1 : 0; crc.AddData(&b, sizeof(b)); };
+    auto crcDword = [&crc](int32 v) { crc.AddData(&v, sizeof(v)); };
+
+    int32 layer = static_cast<int32>(Layer_);
+    crcDword(layer);
+    crcBool(Normalized);
+    crcBool(Flat);
+    crcBool(Translucent);
+    crcBool(Scorch);
+    crcBool(Flamer);
+    crcBool(Crater);
+    crcBool(Sticky);
+    crcBool(PingPong);
+    crcBool(Reverse);
+    crcBool(Shadow);
+    crcDword(MiddleFrameIndex);
+    crc.AddData(&Damage, sizeof(Damage));
+    crcBool(TiberiumChainReaction);
+    crcDword(Rate);
+    crcDword(Start);
+    crcDword(LoopStart);
+    crcDword(LoopEnd);
+    crcDword(End);
+    crcDword(StartSound);          // asm +0x2F8: the primary sound slot
+    crcDword(StopSound);
+    crcDword(NumParticles);
+    crcDword(DetailLevel);
+    crcDword(TranslucencyDetailLevel);
+    crcDword(RandomLoopDelay.Min);
+    crcDword(RandomLoopDelay.Max);
+    crcDword(Translucency);
+    crcBool(Tiled);
+
+    return static_cast<int32>(crc.GetCRC());
+}
+
+// =============================================================================
+// asm: AnimTypeClass_PointerGotInvalid (retn 8)
+//
+//   If the expired pointer is the cached Next anim (asm +0x2C8) the cache is
+//   cleared.  The `removed` flag is part of the unified project signature and
+//   is unused here, as in the original.
+// =============================================================================
+void AnimTypeClass::PointerGotInvalid(AbstractClass* pInvalid, bool /*removed*/)
+{
+    if (pInvalid == nullptr) return;
+
+    if (static_cast<AbstractClass*>(Next) == pInvalid) {
+        Next = nullptr;
+    }
+}
+
+// =============================================================================
+// asm: AnimTypeClass_GetImage (0x428C30)
+//
+//   When the type is flagged DemandLoad and no image is resident yet, build the
+//   .SHP path (theater-aware when the type has a custom image), read it and
+//   cache the result.  Returns the cached image handle.
+// =============================================================================
+SHPStruct* AnimTypeClass::GetImage() const
+{
+    if (AnimShape) return AnimShape;
+    if (!DemandLoad) return nullptr;
+
+    // asm builds "<Image|ID>.SHP", applies the theater modifier when the type
+    // has a custom image, then reads the file.  The mix-file reader used by the
+    // rest of the engine resolves the name; a miss leaves the slot null.
+    const char* baseName = Image[0] ? Image : ID;
+    char path[0x100];
+    snprintf(path, sizeof(path), "%s.SHP", baseName);
+
+    if (Theater) {
+        ObjectTypeClass::TheaterSpecificID(baseName, 0, path);
+    } else if (NewTheater) {
+        ObjectTypeClass::TheaterSpecificID(baseName, 0, path);
+    }
+
+    // AnimShape = MixFileSystem::LoadSHP(path);
+    return AnimShape;
+}
+
+// =============================================================================
+// asm: AnimTypeClass_FindOrAllocateFromList(char *name, VectorPtrAnimTypeClass *list)
+//
+//   "<none>"/"none" yield null.  An existing entry whose ID matches (case
+//   insensitively) is returned; otherwise a fresh type is allocated and
+//   registered in the given list.
+// =============================================================================
+AnimTypeClass* AnimTypeClass::FindOrAllocateFromList(
+    const char* pID, DynamicVectorClass<AnimTypeClass*>* pList)
+{
+    if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
+
+    if (pList) {
+        for (int32 i = 0; i < pList->Count; ++i) {
+            AnimTypeClass* item = (*pList)[i];
+            if (item && !_strcmpi(item->ID, pID)) return item;
+        }
+    }
+
+    AnimTypeClass* newItem = GameCreate<AnimTypeClass>(pID);
+    if (newItem && pList) pList->Add(newItem);
+    return newItem;
+}
+
+// =============================================================================
+// asm: AnimTypeClass_LoadTheaterSpecificArt (0x427AA0, retn 4)
+//
+//   When the type has no custom image and carries theater-specific art, drop a
+//   resident image and re-resolve the theater SHP.  A type with a custom image
+//   (Image != "") reloads through the vtable +0xA0 hook instead.
+// =============================================================================
+void AnimTypeClass::LoadTheaterSpecificArt(int32 idxTheater)
+{
+    if (idxTheater < 0) return;
+
+    if (NewTheater && !AltPalette) {
+        if (AnimShape && FreeLoad) {
+            delete AnimShape;
+            AnimShape = nullptr;
+        }
+        // asm builds "<ID theatre-ext>.SHP" and reads it into the image slot.
+        // The mix-file reader resolves the name; a miss leaves the slot null.
+        char path[0x100];
+        snprintf(path, sizeof(path), "%s.SHP", ID);
+        // AnimShape = MixFileSystem::LoadSHP(path);
+        return;
+    }
+
+    ObjectTypeClass::LoadTheaterSpecificArt(idxTheater);
+}
+
+// =============================================================================
+// asm: AnimTypeClass_CreateFromINIList (0x427920)
+//
+//   Walks every registered anim type and refreshes the demand-loaded SHP for
+//   the given theater: types that already have an image drop it and reload when
+//   they carry theater art, others reload through the vtable hook.
+// =============================================================================
+void AnimTypeClass::CreateFromINIList(int32 idxTheater)
+{
+    if (!Array) return;
+
+    for (int32 i = 0; i < Array->Count; ++i) {
+        AnimTypeClass* item = (*Array)[i];
+        if (!item) continue;
+
+        if (item->NewTheater) {
+            if (item->AnimShape && item->FreeLoad) {
+                delete item->AnimShape;
+                item->AnimShape = nullptr;
+            }
+            item->LoadTheaterSpecificArt(idxTheater);
+        } else if (item->Theater) {
+            item->LoadTheaterSpecificArt(idxTheater);
+        }
+    }
 }

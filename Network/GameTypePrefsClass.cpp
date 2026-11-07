@@ -136,3 +136,73 @@ void GameTypePrefsClass::ReadFromINI(CCINIClass* pINI, const char* pSection,
         idxGameMode    = third;
     }
 }
+
+// ============================================================================
+// asm: GameMode_SaveNthSlotIntoINI
+//
+//   ; int __stdcall GameMode_SaveNthSlotIntoINI(char *section, char *key,
+//   ;                                            int, int, int)
+//   （asm 行 277123；调用者 GameMode_SaveGameSettings+...）
+//   内部走 INIClass::WriteString 写 "%d,%d,%d"     —— 不是 WriteInteger。
+// ============================================================================
+void GameTypePrefsClass::SaveNthSlotIntoINI(CCINIClass* pINI,
+                                            const char* pSection,
+                                            const char* pKey,
+                                            int32 a, int32 b, int32 c)
+{
+    if (pINI == nullptr)
+        return;
+
+    // asm: sprintf(buf, "%d,%d,%d", a, b, c) / call INIClass_WriteString
+    char buf[0x40];
+    std::sprintf(buf, "%d,%d,%d", static_cast<int>(a),
+                 static_cast<int>(b), static_cast<int>(c));
+    pINI->WriteString(pSection, pKey, buf);
+}
+
+// ============================================================================
+// asm: GameMode_SaveGameSettings (真实入口 ≈0x698F5E)
+//
+//   ; int __thiscall GameMode_SaveGameSettings(GameTypePrefsClass *this,
+//   ;                                          CCINIClass *INI, char *section)
+//   ; CODE XREF: Game_SaveNetworkConfig+135
+//   尾部 retn 8 -> 3 个参数。
+//
+// 修正 AsmComplex4 的两处错误：
+//   1. 地址 0x698FB0 在 asm 中不存在（真实 ≈0x698F5E）。
+//   2. 批注把 this 写成 const void* pSettings —— 真实类型是
+//      GameTypePrefsClass*；INI 是 CCINIClass*；section 是 char*。
+// ============================================================================
+void GameTypePrefsClass::SaveGameSettings(CCINIClass* pINI,
+                                          const char* pSection)
+{
+    if (pINI == nullptr)
+        return;
+
+    // asm: five INIClass::WriteInteger(section, key, value, 0) calls
+    pINI->WriteInteger(pSection, "GameMode",  GameMode,  false);
+    pINI->WriteInteger(pSection, "ScenIndex", ScenIndex, false);
+    pINI->WriteInteger(pSection, "GameSpeed", GameSpeed, false);
+    pINI->WriteInteger(pSection, "Credits",   Credits,   false);
+    pINI->WriteInteger(pSection, "UnitCount", UnitCount, false);
+
+    // asm: five INIClass::WriteBool(section, key, byte) calls
+    pINI->WriteBool(pSection, "ShortGame",           ShortGame);
+    pINI->WriteBool(pSection, "SuperWeaponsAllowed", SuperWeaponsAllowed);
+    pINI->WriteBool(pSection, "BuildOffAlly",        BuildOffAlly);
+    pINI->WriteBool(pSection, "MCVRepacks",          MCVRepacks);
+    pINI->WriteBool(pSection, "CratesAppear",        CratesAppear);
+
+    // asm: mov ebp,1 / add ebx,2Ch ; loop while (ebp < 8), ebx += 0Ch
+    for (int32 n = 1; n < 8; ++n)
+    {
+        // asm: push ebp / push offset aSlot02d / lea ecx,[var_10] / call _sprintf
+        char key[0x10];
+        std::sprintf(key, "Slot%02d", static_cast<int>(n));
+
+        // asm: call GameMode_SaveNthSlotIntoINI(section, name,
+        //                                        Slot[n].First/Second/Third)
+        SaveNthSlotIntoINI(pINI, pSection, key,
+                           Slot[n].First, Slot[n].Second, Slot[n].Third);
+    }
+}

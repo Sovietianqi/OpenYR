@@ -1,5 +1,7 @@
 #include "WaypointPathClass.h"
 
+DynamicVectorClass<WaypointPathClass*>* WaypointPathClass::Array = nullptr;
+
 WaypointPathClass::WaypointPathClass() noexcept
     : Nodes(nullptr)
     , NodeCount(0)
@@ -9,7 +11,20 @@ WaypointPathClass::WaypointPathClass() noexcept
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知命中查询逐节点比对格位坐标，序列为空或越界
+// asm: WaypointPathClass::ComputeCRC（vt+34h，同步日志的 Waypoint Path 段）
+//   先喂节点数，再按顺序把每个节点格的两个 int16 喂进累积器。
+// ------------------------------------------------------------------------
+void WaypointPathClass::ComputeCRC(CRCEngine& crc) const
+{
+    crc.AddData(&NodeCount, sizeof(NodeCount));
+    for (int32 i = 0; i < NodeCount; ++i) {
+        crc.AddData(&Nodes[i].X, sizeof(Nodes[i].X));
+        crc.AddData(&Nodes[i].Y, sizeof(Nodes[i].Y));
+    }
+}
+
+// ------------------------------------------------------------------------
+// asm: char __thiscall WaypointPathClass_WaypointExistsHere(WaypointPathClass *this, WaypointClass *wpt)   (asm:1762296)
 // 时立即报告未命中。
 // ------------------------------------------------------------------------
 bool WaypointPathClass::WaypointExistsHere(const CellStruct& cell) const

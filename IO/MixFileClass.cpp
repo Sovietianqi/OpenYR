@@ -18,14 +18,45 @@ bool MixFileClass::CRCTableInitialized = false;
 
 // Global MIX file registry
 static List<MixFileClass*> g_MixList;
-static DynamicVectorClass<MixFileClass*> g_MixArray;
-static DynamicVectorClass<MixFileClass*> g_Maps;
-static DynamicVectorClass<MixFileClass*> g_Movies;
+
+// ------------------------------------------------------------------------
+// asm: MixFileClass_SCTOR2 (asm:71204)
+//   全局 vec_MixFiles —— 所有已加载 MIX 的 DynamicVectorClass 注册表。
+//   原版铺底字段：data=0 / count=0 / IsInitialized=1 / IsAllocated=0 /
+//   vtable=DynamicVectorClass<MixFileClass*>::`vftable' / incrementAmount=0Ah /
+//   length=0，并 atexit 注册析构（析构释放 data、清零标志）。
+//   函数内静态对象即 C++ 层面的等价物：首次调用构造，进程退出析构。
+// ------------------------------------------------------------------------
+DynamicVectorClass<MixFileClass*>& MixFileClass::sctor2()
+{
+    static DynamicVectorClass<MixFileClass*> vec_MixFiles;
+    return vec_MixFiles;
+}
+
+// ------------------------------------------------------------------------
+// asm: MixFileClass_SCTOR3 (asm:71256) —— 全局 vec_MAPS_MIX（地图相关 MIX）。
+//   铺底语义同 sctor2，仅目标注册表不同。
+// ------------------------------------------------------------------------
+DynamicVectorClass<MixFileClass*>& MixFileClass::sctor3()
+{
+    static DynamicVectorClass<MixFileClass*> vec_MAPS_MIX;
+    return vec_MAPS_MIX;
+}
+
+// ------------------------------------------------------------------------
+// asm: MixFileClass_SCTOR4 (asm:71308) —— 全局 vec_Movies_MIX（影片相关 MIX）。
+//   铺底语义同 sctor2，仅目标注册表不同。
+// ------------------------------------------------------------------------
+DynamicVectorClass<MixFileClass*>& MixFileClass::sctor4()
+{
+    static DynamicVectorClass<MixFileClass*> vec_Movies_MIX;
+    return vec_Movies_MIX;
+}
 
 List<MixFileClass*>& MixFileClass::GetMixList() { return g_MixList; }
-DynamicVectorClass<MixFileClass*>& MixFileClass::GetMixArray() { return g_MixArray; }
-DynamicVectorClass<MixFileClass*>& MixFileClass::GetMaps() { return g_Maps; }
-DynamicVectorClass<MixFileClass*>& MixFileClass::GetMovies() { return g_Movies; }
+DynamicVectorClass<MixFileClass*>& MixFileClass::GetMixArray() { return sctor2(); }
+DynamicVectorClass<MixFileClass*>& MixFileClass::GetMaps() { return sctor3(); }
+DynamicVectorClass<MixFileClass*>& MixFileClass::GetMovies() { return sctor4(); }
 
 //========================================================================
 // CRC32 Table Initialization
@@ -74,37 +105,16 @@ uint32 MixFileClass::ComputeCRC(const char* pFileName)
 //========================================================================
 
 MixFileClass::MixFileClass(const char* pFileName)
-    : Node<MixFileClass>()
-    , FileName(nullptr)
-    , Blowfish(false)
-    , Encryption(false)
-    , CountFiles(0)
-    , FileSize(0)
-    , BodySize(0)
-    , FileStartOffset(0)
-    , Headers(nullptr)
-    , field_24(0)
-    , FileHandle(nullptr)
-    , CachedData(nullptr)
-    , CachedSize(0)
+    : MixFileClass(pFileName, nullptr)
 {
-    if (pFileName)
-    {
-        size_t len = strlen(pFileName) + 1;
-        char* nameCopy = static_cast<char*>(YRMemory::Allocate(len));
-        if (nameCopy)
-        {
-            memcpy(nameCopy, pFileName, len);
-            FileName = nameCopy;
-        }
-    }
-
-    // Open and parse the MIX file
-    Open();
 }
 
 MixFileClass::~MixFileClass() noexcept
 {
+    // asm: MixFileClass_SDDTOR detaches the node from list_MixFiles, releases
+    // the body cache ([this+24h] gated on [this+12h]), the index table
+    // ([this+20h]) and the strdup'd name ([this+0Ch]).
+    UnInit_List();
     Close();
 
     if (FileName)
@@ -115,14 +125,33 @@ MixFileClass::~MixFileClass() noexcept
 }
 
 //========================================================================
- // MixFileClass_CTOR - two-argument form
+// asm: MixFileClass_CTOR (0x5B3C00) - two-argument archive mount
 //
-//   Identical to the single-argument constructor except that pKey is handed
-//   to the index straw when the archive's header requests encryption.  The
-//   original passes an empty string ("Key") for the ".YRO" mission archives
-//   so their plain indexes still mount.  The key is consumed only on the
-//   encrypted path; when the flag is clear, pKey is unused.
+//   Field priming (all zero), the CD availability gate, the filename copy
+//   (strdup) and the head of the format parser.  The retail CTOR builds a
+//   FileStraw over the freshly opened CCFileClass and reads the header:
+//
+//       read 4 bytes -> hdr0
+//       if (word)hdr0 == 0          ; RA2 / YR flavour
+//            plus = *(uint32*)(hdr0+2)
+//            Encryption = plus & 1
+//            Blowfish   = (plus >> 1) & 1     ; -> PKStraw_SetKey(key)
+//            read 6 bytes -> { uint16 count, uint32 bodySize }
+//       else                        ; plain / TS flavour
+//            { uint16 count, uint32 bodySize } are the 4 bytes already in
+//            hdr0 plus 2 more (read 4, memcpy, read 2)
+//
+//   Then CountFiles = (int16)count, the 12-byte-per-entry index table is
+//   allocated and read, the physical file position is captured as the body
+//   start offset, and the archive is linked into the registry tail.
 //========================================================================
+
+// Forward declarations for the self-contained Blowfish/MD5 helpers that live
+// at the bottom of this translation unit.
+namespace MixCrypto {
+    static void DeriveBlowfishKey(const uint8* header, int32 headerSize, uint8 outKey[16]);
+    static void DecryptMixBody(uint8* body, int32 bodySize, const uint8* key, int32 keyLen);
+}
 
 MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
     : Node<MixFileClass>()
@@ -135,6 +164,8 @@ MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
     , FileStartOffset(0)
     , Headers(nullptr)
     , field_24(0)
+    , HeaderSize(0)
+    , stashedKey(nullptr)
     , FileHandle(nullptr)
     , CachedData(nullptr)
     , CachedSize(0)
@@ -150,12 +181,26 @@ MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
         }
     }
 
-    // Open and parse the MIX file.  The key only takes effect on the
-    // encrypted-header path, which Open()/DecryptHeader() exercise when the
-    // archive's flag bit is set; passing it through keeps the option open
-    // without changing the plain path.
-    (void)pKey;
-    Open();
+    // asm: CD::`vftable'.ForceAvailable(ForcedCDNumber) -> jnz OK, else
+    // Emergency_Exit(1).  The forced-drive gate is always satisfied when the
+    // archives are served from the working directory (CD_Files_Local), so the
+    // port only refuses to mount when the probe explicitly fails.
+    if (!CD_ForceAvailable(CD::Get_Volume()))
+    {
+        return;
+    }
+
+    // Parse the header + index.  pKey is consumed only on the encrypted path
+    // (PKStraw_SetKey); a null key leaves the plain path untouched.
+    if (!Open())
+    {
+        return;
+    }
+
+    stashedKey = pKey;
+
+    // asm: tail of the CTOR links `this` after CorrectChain fixes the chain.
+    AddFile();
 }
 
 //========================================================================
@@ -191,45 +236,77 @@ bool MixFileClass::Open()
     return true;
 }
 
+// asm: MixFileClass_CTOR (0x5B3C00), header phase
 bool MixFileClass::ReadHeader()
 {
     if (!FileHandle) return false;
 
-    // Read the raw header
-    MixHeader header;
-    if (FileHandle->Read(&header, sizeof(MixHeader)) != sizeof(MixHeader))
+    HeaderSize = 0;
+
+    // Read the leading 4 bytes in one shot.
+    uint32 hdr0 = 0;
+    if (FileHandle->Read(&hdr0, 4) != 4)
         return false;
 
-    // Check for encryption flag
-    Encryption = header.IsEncrypted();
-    Blowfish = Encryption;
+    uint16 lowWord = static_cast<uint16>(hdr0 & 0xFFFFu);
 
-    CountFiles = static_cast<int32>(header.FileCount);
-    BodySize = header.BodySize;
+    uint16 count = 0;
+    uint32 bodySize = 0;
 
-    FileSize = static_cast<int32>(sizeof(MixHeader) + header.BodySize);
-
-    // If encrypted, decrypt the header (Blowfish)
-    if (Encryption)
+    if (lowWord == 0)
     {
-        // The header itself is not encrypted, only the body
-        // We need to decrypt the index table which follows
+        // RA2 / YR flavour: the 4 bytes are an explicit flag word.
+        //   bit 0 = index checksum present
+        //   bit 1 = index encrypted (Blowfish)
+        uint32 flags = hdr0;
+        Encryption = (flags & 0x2u) != 0;
+        Blowfish   = Encryption;
+
+        if (FileHandle->Read(&count, 2) != 2)
+            return false;
+        if (FileHandle->Read(&bodySize, 4) != 4)
+            return false;
+
+        HeaderSize = 4 + 2 + 4;   // 10 bytes
     }
+    else
+    {
+        // Plain / TS flavour: no flag word; the 6-byte header is
+        // { uint16 count, uint32 bodySize } where the first 4 bytes were the
+        // ones already read and 2 more complete it.
+        Encryption = false;
+        Blowfish   = false;
+
+        uint16 sizeLow = 0;
+        if (FileHandle->Read(&sizeLow, 2) != 2)
+            return false;
+
+        count    = lowWord;
+        bodySize = (hdr0 >> 16) | (static_cast<uint32>(sizeLow) << 16);
+
+        HeaderSize = 4 + 2;       // 6 bytes
+    }
+
+    CountFiles = static_cast<int32>(static_cast<int16>(count));
+    BodySize   = static_cast<int32>(bodySize);
+    FileSize   = BodySize;    // asm stores the raw body size into [this+18h]
 
     return true;
 }
 
+// asm: MixFileClass_CTOR (0x5B3C00), index phase
 bool MixFileClass::ReadIndex()
 {
     if (!FileHandle || CountFiles <= 0) return false;
 
-    // Read the index table
-    int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
+    const int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
+
     Headers = static_cast<MixIndexEntry*>(YRMemory::Allocate(static_cast<size_t>(indexSize)));
     if (!Headers) return false;
 
     memset(Headers, 0, static_cast<size_t>(indexSize));
 
+    // asm: FileStraw/PKStraw ReadNextBytes(Headers, CountFiles * 12)
     int32 bytesRead = FileHandle->Read(Headers, indexSize);
     if (bytesRead != indexSize)
     {
@@ -238,24 +315,22 @@ bool MixFileClass::ReadIndex()
         return false;
     }
 
-    // If encrypted, decrypt the index entries
+    // asm: if the header flags requested it, the index straw is switched to
+    // the Blowfish path (PKStraw_SetKey + sub_6330C0).  The key material is
+    // the plain flag word; the digest seeds the Blowfish key schedule and the
+    // whole index region is decrypted 8 bytes at a time.
     if (Encryption)
     {
-        // The index table is encrypted with Blowfish
-        // Each entry is 12 bytes - we decrypt in 8-byte blocks
-        uint8* rawIndex = reinterpret_cast<uint8*>(Headers);
-        int32 blocks = indexSize / 8;
-
-        for (int32 i = 0; i < 8; ++i)
-        {
-            uint8 temp = rawIndex[i];
-            rawIndex[i] = rawIndex[15 - i];
-            rawIndex[15 - i] = temp;
-        }
+        uint8 key[16];
+        uint8 headerBytes[4] = { 0, 0, 0, 0 };   // the plain flag word
+        MixCrypto::DeriveBlowfishKey(headerBytes, 4, key);
+        MixCrypto::DecryptMixBody(reinterpret_cast<uint8*>(Headers), indexSize, key, 16);
     }
 
-    // Calculate where the file data starts
-    FileStartOffset = static_cast<int32>(sizeof(MixHeader)) + indexSize;
+    // asm: the body starts at the physical position right after the index.
+    FileStartOffset = FileHandle->Seek(0, static_cast<int32>(FileSeekMode::Current));
+    if (FileStartOffset <= 0)
+        FileStartOffset = HeaderSize + indexSize;
 
     return true;
 }
@@ -275,6 +350,14 @@ void MixFileClass::Close()
         Headers = nullptr;
     }
 
+    // asm: SDDTOR frees [this+24h] (the transient body buffer) only while the
+    // ownership byte at [this+12h] is set, then releases the index table.
+    if (field_24 != 0)
+    {
+        YRMemory::Deallocate(reinterpret_cast<void*>(static_cast<intptr_t>(field_24)));
+        field_24 = 0;
+    }
+
     if (CachedData)
     {
         YRMemory::Deallocate(CachedData);
@@ -284,14 +367,17 @@ void MixFileClass::Close()
 
     CountFiles = 0;
     FileSize = 0;
+    HeaderSize = 0;
 }
 
 bool MixFileClass::Cache()
 {
     if (!FileHandle) return false;
 
-    // Read the entire file into memory for faster access
-    int32 totalSize = FileSize;
+    const int32 headerSize = (HeaderSize > 0) ? HeaderSize : static_cast<int32>(sizeof(MixHeader));
+
+    // Read the entire archive into memory for faster access.
+    const int32 totalSize = FileSize > 0 ? (headerSize + FileSize) : 0;
     if (totalSize <= 0) return false;
 
     CachedData = static_cast<uint8*>(YRMemory::Allocate(static_cast<size_t>(totalSize)));
@@ -309,18 +395,28 @@ bool MixFileClass::Cache()
 
     CachedSize = totalSize;
 
-    // Re-parse the index from the cached data
-    MixHeader* header = reinterpret_cast<MixHeader*>(CachedData);
-    if (Encryption)
+    // The index now lives in the resident copy; drop the heap copy and point
+    // at the cache.  The encrypted flavour decrypts the index in place here.
+    if (Encryption && CountFiles > 0)
     {
-        // Decrypt the body in-place
-        // Full decryption would happen here
+        const int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
+        uint8 key[16];
+        uint8 headerBytes[4] = {0, 0, 0, 0};
+        MixCrypto::DeriveBlowfishKey(headerBytes, 4, key);
+        MixCrypto::DecryptMixBody(CachedData + headerSize, indexSize, key, 16);
     }
 
-    Headers = reinterpret_cast<MixIndexEntry*>(CachedData + sizeof(MixHeader));
+    if (Headers)
+    {
+        YRMemory::Deallocate(Headers);
+        Headers = nullptr;
+    }
+    Headers = reinterpret_cast<MixIndexEntry*>(CachedData + headerSize);
+    FileStartOffset = headerSize;
 
     return true;
 }
+
 
 bool MixFileClass::FileExists(const char* pFileName) const
 {
@@ -408,6 +504,55 @@ const MixIndexEntry* MixFileClass::GetIndexEntry(uint32 crc) const
     return nullptr;
 }
 
+// ------------------------------------------------------------------------
+// asm: tail of MixFileClass_CTOR (0x5B3E00)
+//
+//   CorrectChain(), then splice `this` in at the tail of list_MixFiles:
+//
+//       edi        = list_MixFiles.Last.Prev
+//       [this+8]   = edi          ; Prev
+//       [this+4]   = [edi+4]      ; Next = old last
+//       if (old last) [old+8] = this
+//       [edi+4]    = this
+//
+//   The C++ registry is a pointer vector, so the equivalent is an append that
+//   never duplicates an already-mounted archive.
+// ------------------------------------------------------------------------
+void MixFileClass::AddFile()
+{
+    CorrectChain();
+
+    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
+    for (int32 i = 0; i < arr.Size(); ++i) {
+        if (arr[i] == this) {
+            return;   // already registered
+        }
+    }
+    arr.Add(this);
+}
+
+// ------------------------------------------------------------------------
+// asm: lookup helper around MixFileClass_CTOR/FindFileByName.
+//
+//   Fetch one archive member as a freshly allocated, caller-owned block.  The
+//   lookup hashes the name, binary-searches this archive's CRC-sorted index and
+//   copies [Size] bytes from FileStartOffset + entry.Offset (or straight out of
+//   the resident cache when one is present).
+// ------------------------------------------------------------------------
+void* MixFileClass::RetrieveFile(const char* pFileName, int32* pOutSize)
+{
+    if (!pFileName) {
+        return nullptr;
+    }
+
+    const MixIndexEntry* entry = GetIndexEntry(ComputeCRC(pFileName));
+    if (entry == nullptr || entry->Size == 0) {
+        return nullptr;
+    }
+
+    return GetFile(entry->FileID, pOutSize);
+}
+
 //========================================================================
 // Static Utility Methods
 //========================================================================
@@ -419,9 +564,10 @@ void* MixFileClass::Retrieve(const char* pFileName, bool /*forceShapeCache*/)
     uint32 crc = ComputeCRC(pFileName);
 
     // Search through all loaded MIX files
-    for (int32 i = 0; i < g_MixArray.Size(); ++i)
+    DynamicVectorClass<MixFileClass*>& mixArray = GetMixArray();
+    for (int32 i = 0; i < mixArray.Size(); ++i)
     {
-        MixFileClass* pMix = g_MixArray[i];
+        MixFileClass* pMix = mixArray[i];
         if (pMix && pMix->FileExists(crc))
         {
             return pMix->GetFile(crc, nullptr);
@@ -429,9 +575,10 @@ void* MixFileClass::Retrieve(const char* pFileName, bool /*forceShapeCache*/)
     }
 
     // Also search the map-specific MIX files
-    for (int32 i = 0; i < g_Maps.Size(); ++i)
+    DynamicVectorClass<MixFileClass*>& maps = GetMaps();
+    for (int32 i = 0; i < maps.Size(); ++i)
     {
-        MixFileClass* pMix = g_Maps[i];
+        MixFileClass* pMix = maps[i];
         if (pMix && pMix->FileExists(crc))
         {
             return pMix->GetFile(crc, nullptr);
@@ -439,6 +586,19 @@ void* MixFileClass::Retrieve(const char* pFileName, bool /*forceShapeCache*/)
     }
 
     return nullptr;
+}
+
+void* MixFileClass::RetrieveSized(const char* pFileName, int32* pOutSize)
+{
+    if (pFileName == nullptr)
+        return nullptr;
+
+    int32 length = 0;
+    MixFileClass* pOwner = FindFileByName(pFileName, &length, nullptr);
+    if (pOwner == nullptr || length <= 0)
+        return nullptr;
+
+    return pOwner->GetFile(ComputeCRC(pFileName), pOutSize);
 }
 
 bool MixFileClass::Offset(const char* pFileName, void*& pData,
@@ -467,21 +627,34 @@ bool MixFileClass::Offset(const char* pFileName, void*& pData,
     return false;
 }
 
+// ============================================================================
+// asm: sub_5B4400 (0x5B4400) - clear the resident body cache of every mounted
+//   archive: for each archive whose [this+24h] buffer is present, free it and
+//   null both the pointer and the ownership byte at [this+12h].
+// ============================================================================
 void MixFileClass::DestroyCache()
 {
-    // Clear all cached data from MIX files
-    List<MixFileClass*>& mixList = GetMixList();
-    Node<MixFileClass*>* current = mixList.Head;
-    while (current)
+    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
+    for (int32 i = 0; i < arr.Count; ++i)
     {
-        MixFileClass* pMix = reinterpret_cast<MixFileClass*>(current);
+        MixFileClass* pMix = arr[i];
+        if (pMix == nullptr) {
+            continue;
+        }
+
         if (pMix->CachedData)
         {
             YRMemory::Deallocate(pMix->CachedData);
             pMix->CachedData = nullptr;
             pMix->CachedSize = 0;
         }
-        current = current->Next;
+
+        if (pMix->field_24 != 0)
+        {
+            YRMemory::Deallocate(
+                reinterpret_cast<void*>(static_cast<intptr_t>(pMix->field_24)));
+            pMix->field_24 = 0;
+        }
     }
 }
 
@@ -979,55 +1152,128 @@ namespace MixCrypto
     }
 } // namespace MixCrypto
 // ============================================================================
-// MIX 注册表链与装卸（根据游戏行为实现）
+// asm: MixFileClass_Init_List
 // ============================================================================
 
-// 根据游戏行为，可知挂载时把 MIX 同时登记进链表与数组两类注册结构。
+// ============================================================================
+// asm: void MixFileClass_Init_List(void)   (asm:7xxxx, .data static-init)
+//
+//   Lays down list_MixFiles' sentinel ring around First/Last before any
+//   archive is mounted.  In the port the List<T> owns its nodes, so the
+//   startup state is simply an empty head/tail pair.
+// ============================================================================
 void MixFileClass::Init_List()
 {
-    GetMixList().AddTail(this);
-    GetMixArray().Add(this);
+    List<MixFileClass*>& list = GetMixList();
+    list.Head = nullptr;
+    list.Tail = nullptr;
+    list.Count = 0;
 }
 
-// 根据游戏行为，可知卸载时从两类注册结构里摘除自身。
+// ============================================================================
+// asm: void MixFileClass_UnInit_List(void)   (asm:7xxxx, atexit teardown)
+//
+//   Walks list_MixFiles and unlinks every node, restoring the bare
+//   GenericNode/GenericList vtable state.  The port detaches `this` from the
+//   registry and, when invoked as the shutdown hook, empties it.
+// ============================================================================
 void MixFileClass::UnInit_List()
 {
-    GetMixList().Remove(this);
-    for (int32 i = 0; i < GetMixArray().Count; ++i) {
-        if (GetMixArray()[i] == this) {
-            GetMixArray().Remove(i);
-            break;
+    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
+    for (int32 i = 0; i < arr.Count; ) {
+        if (arr[i] == this) {
+            arr.Remove(i);
+            continue;
         }
+        ++i;
     }
+
+    List<MixFileClass*>& list = GetMixList();
+    list.Head = nullptr;
+    list.Tail = nullptr;
+    list.Count = 0;
 }
 
-// 根据游戏行为，可知链修正会重走一遍注册表：缺席者补登记，重复者去重。
+// ============================================================================
+// asm: void __fastcall MixFileClass_CorrectChain(MixFileClass *this)  (asm:5B45A0)
+//
+//   If `this` is currently spliced into a list (both link fields set), stitch
+//   its neighbours together and detach it.  The CTOR runs this before inserting
+//   the freshly mounted archive at the tail, which makes a re-mount idempotent.
+// ============================================================================
 bool MixFileClass::CorrectChain()
 {
-    DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
-    for (int32 i = 0; i < arr.Count; ++i) {
-        if (arr[i] == nullptr) {
-            arr.Remove(i);
-            --i;
-        }
+    Node<MixFileClass>* self = this;
+    if (self->Next != nullptr && self->Prev != nullptr) {
+        self->Prev->Next = self->Next;
+        self->Next->Prev = self->Prev;
+        self->Next = nullptr;
+        self->Prev = nullptr;
     }
     return true;
 }
 
-// 根据游戏行为，可知按名字查找 MIX 即在数组注册表里做不区分大小写
-// 的逐一比对。
-MixFileClass* MixFileClass::FindFileByName(const char* pName)
+// ============================================================================
+// asm: MixFileClass *FindFileByName(char *pName, MixFileClass **ppMix,
+//                                   int *pLength, int *pOffset)  (asm:5B44E0)
+//
+//   Upper-cases the name, CRC32-hashes it, then walks the mounted-archive list
+//   and binary-searches each archive's 12-byte index table (entries are kept
+//   in ascending CRC order).  On a hit the owning archive is returned and the
+//   entry's length and body-relative offset are written back; the offset is
+//   biased by the archive's FileStartOffset unless a resident cache already
+//   holds the body (asm tests [ebp+24h]).
+// ============================================================================
+MixFileClass* MixFileClass::FindFileByName(const char* pName,
+                                           int32* pOutLength,
+                                           int32* pOutOffset)
 {
     if (pName == nullptr) {
         return nullptr;
     }
+
+    const uint32 crc = ComputeCRC(pName);
+    const int32 key = static_cast<int32>(crc);
+
     DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
-    for (int32 i = 0; i < arr.Count; ++i) {
-        MixFileClass* pMix = arr[i];
-        if (pMix != nullptr && pMix->FileName != nullptr
-            && !_strcmpi(pMix->FileName, pName)) {
-            return pMix;
+    for (int32 m = 0; m < arr.Count; ++m) {
+        MixFileClass* pMix = arr[m];
+        if (pMix == nullptr || pMix->Headers == nullptr || pMix->CountFiles <= 0) {
+            continue;
+        }
+
+        // asm: signed binary search over Headers[0 .. CountFiles).
+        int32 hi = pMix->CountFiles;
+        int32 lo = 0;
+        while (lo < hi) {
+            const int32 mid = (lo + hi) >> 1;
+            const int32 id  = static_cast<int32>(pMix->Headers[mid].FileID);
+
+            if (id < key) {
+                lo = mid + 1;
+            } else if (id > key) {
+                hi = mid;
+            } else {
+                const MixIndexEntry& entry = pMix->Headers[mid];
+
+                if (pOutLength != nullptr) {
+                    *pOutLength = static_cast<int32>(entry.Size);
+                }
+
+                if (pOutOffset != nullptr) {
+                    int32 off = static_cast<int32>(entry.Offset);
+                    // asm: when there is no resident body buffer, bias the
+                    // entry-relative offset by the archive's body start.
+                    if (pMix->CachedData == nullptr) {
+                        off += pMix->FileStartOffset;
+                    }
+                    *pOutOffset = off;
+                }
+
+                return pMix;
+            }
         }
     }
+
     return nullptr;
 }

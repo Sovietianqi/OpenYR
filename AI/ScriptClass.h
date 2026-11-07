@@ -26,6 +26,16 @@ public:
     int32 GetAction() const;
     int32 GetLine() const;
 
+    // ------------------------------------------------------------------------
+    // asm: AIScriptClass_NotLastAction (0x5CA2A0, __fastcall, retn)
+    //   eax = [ecx+24h]           ; ScriptType
+    //   ecx = [ecx+2Ch]           ; CurrentLine
+    //   cmp ecx, [eax+0A0h]       ; vs ScriptType->cntActions
+    //   sbb eax, eax / neg eax    ; **无符号**小于 -> 1
+    // TeamClass_Update 用它判断"脚本还有下一行可执行"。
+    // ------------------------------------------------------------------------
+    bool Not_Last_Action() const;
+
     // AIScriptClass::SetCurrentLine (asm 0x754E5D): stores idx into the
     // current-line slot (+0x2C) and always reports success.
     // 根据游戏行为，可知脚本执行面补全行游标的三步推进：回卷、

@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex13.cpp
+start=698
+end=749
+symbol=Screen_DrawScoreScreen
+target=Game/ScoreScreenClass.cpp

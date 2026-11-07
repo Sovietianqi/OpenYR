@@ -1,23 +1,33 @@
 #include "AITriggerTypeClass.h"
 #include "AITeamTypeClass.h"
 #include "TeamTypeClass.h"
+#include "TaskForceClass.h"
 #include "../Abstract/TechnoClass.h"
 #include "../Abstract/TechnoTypeClass.h"
+#include "../Abstract/InfantryTypeClass.h"
+#include "../Abstract/UnitTypeClass.h"
+#include "../Abstract/AircraftTypeClass.h"
+#include "../Abstract/BuildingTypeClass.h"
 #include "../Houses/HouseClass.h"
+#include "../Houses/HouseTypeClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Scenario/ScenarioClass.h"
-#include "../Game/Game.h"
-#include "../SW/SuperWeaponTypeClass.h"
 #include "../INI/INIClass.h"
+#include "../IO/CRC.h"
+#include "../Core/SwizzleManagerClass.h"
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 
 DynamicVectorClass<AITriggerTypeClass*>* AITriggerTypeClass::Array = nullptr;
 
+// ---------------------------------------------------------------------------
+// Find —— 按 ID 查 [AITriggerTypes] 表。
+// ---------------------------------------------------------------------------
 AITriggerTypeClass* AITriggerTypeClass::Find(const char* pID) {
-    if (!Array) return nullptr;
+    if (!Array || !pID) return nullptr;
     for (int32 i = 0; i < Array->Count; ++i) {
         AITriggerTypeClass* item = Array->GetItem(i);
         if (item && !_strcmpi(item->ID, pID)) return item;
@@ -25,20 +35,27 @@ AITriggerTypeClass* AITriggerTypeClass::Find(const char* pID) {
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_FindOrAllocate(const char *name)
+//   "<none>"/"none" → 空；查到则返回；否则 new + CTOR（CTOR 自身入表）。
+// ---------------------------------------------------------------------------
 AITriggerTypeClass* AITriggerTypeClass::FindOrAllocate(const char* pID) {
     if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
     AITriggerTypeClass* found = Find(pID);
     if (found) return found;
-    AITriggerTypeClass* newItem = GameCreate<AITriggerTypeClass>(pID);
-    if (newItem && Array) Array->Add(newItem);
-    return newItem;
+    return GameCreate<AITriggerTypeClass>(pID);
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_CTOR
+//   默认值：idxHouse/idxSide = -1；三个 Weight 分量初值 1.875；难度位全开；
+//   params 清零；Team1/Team2/objCondition = nullptr。
+// ---------------------------------------------------------------------------
 AITriggerTypeClass::AITriggerTypeClass(const char* pID) noexcept
     : AbstractTypeClass(pID), ConditionType(AITriggerCondition::HouseOwns),
       IsGlobal(0), OwnerHouseType(AITriggerHouseType::None), IsEnabled(true),
-      HouseIndex(-1), SideIndex(-1), TechLevel(1), unknown_B4(0),
-      Weight_Current(1.0), Weight_Minimum(0.0), Weight_Maximum(10.0),
+      HouseIndex(-1), SideIndex(-1), TechLevel(0), unknown_B4(0),
+      Weight_Current(1.875), Weight_Minimum(1.875), Weight_Maximum(1.875),
       IsForSkirmish(false), IsForBaseDefense(false),
       Enabled_Easy(true), Enabled_Normal(true), Enabled_Hard(true),
       ConditionObject(nullptr), Team1(nullptr), Team2(nullptr),
@@ -47,214 +64,66 @@ AITriggerTypeClass::AITriggerTypeClass(const char* pID) noexcept
         Conditions[i].ComparatorType = 0;
         Conditions[i].ComparatorOperand = 0;
     }
+    std::memset(Params, 0, sizeof(Params));
+
+    // CTOR 末尾把自己挂进全局表（asm 中由 CTOR 内联完成）。
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<AITriggerTypeClass*>();
+    }
+    Array->Add(this);
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_DTOR
+//   析构时先从全局表移除自身。
+// ---------------------------------------------------------------------------
 AITriggerTypeClass::~AITriggerTypeClass() {
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            if (Array->GetItem(i) == this) {
+                Array->Remove(i);
+                break;
+            }
+        }
+    }
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_GetClassID
+//   CLSID 来自 .data:CLSID_AITriggerTypeClass（4 个 DWORD）。
+// ---------------------------------------------------------------------------
 HRESULT AITriggerTypeClass::GetClassID(CLSID* pClassID) {
-    if (pClassID) {
-        pClassID->Data1 = 0xA1A1A1A1;
-        for (int32 i = 0; i < 8; ++i) pClassID->Data4[i] = 0;
-        return S_OK;
-    }
-    return E_POINTER;
+    if (pClassID == nullptr) return E_POINTER;
+    static const CLSID kCLSID_AITriggerTypeClass = {
+        0xA1A1A1A1, 0x0000, 0x0000, { 0, 0, 0, 0, 0, 0, 0, 0 }
+    };
+    *pClassID = kCLSID_AITriggerTypeClass;
+    return S_OK;
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_Load —— 调 AbstractTypeClass::Load，再 swizzle 三个
+//   指针字段（objCondition / Team1 / Team2）。extra 字段不单独落盘。
+// ---------------------------------------------------------------------------
 HRESULT AITriggerTypeClass::Load(IStream* pStm) {
-    if (!pStm) return E_POINTER;
+    if (pStm == nullptr) return E_POINTER;
 
-    ULONG read = 0;
-    HRESULT hr = S_OK;
+    HRESULT hr = AbstractTypeClass::Load(pStm);
+    if (hr < 0) return hr;
 
-    // Read ID
-    char idBuf[0x18];
-    hr = pStm->Read(idBuf, sizeof(idBuf), &read);
-    if (hr < 0 || read != sizeof(idBuf)) return E_FAIL;
-    std::memcpy(ID, idBuf, sizeof(ID));
-    ID[sizeof(ID) - 1] = '\0';
-
-    // Read scalar fields
-    int32 condType = 0;
-    hr = pStm->Read(&condType, sizeof(condType), &read);
-    if (hr < 0 || read != sizeof(condType)) return E_FAIL;
-    ConditionType = static_cast<AITriggerCondition>(condType);
-
-    hr = pStm->Read(&IsGlobal, sizeof(IsGlobal), &read);
-    if (hr < 0 || read != sizeof(IsGlobal)) return E_FAIL;
-
-    int32 ownerType = 0;
-    hr = pStm->Read(&ownerType, sizeof(ownerType), &read);
-    if (hr < 0 || read != sizeof(ownerType)) return E_FAIL;
-    OwnerHouseType = static_cast<AITriggerHouseType>(ownerType);
-
-    // Read packed bool flags
-    uint32 flags = 0;
-    hr = pStm->Read(&flags, sizeof(flags), &read);
-    if (hr < 0 || read != sizeof(flags)) return E_FAIL;
-    IsEnabled       = (flags & 0x01) != 0;
-    IsForSkirmish   = (flags & 0x02) != 0;
-    IsForBaseDefense = (flags & 0x04) != 0;
-    Enabled_Easy    = (flags & 0x08) != 0;
-    Enabled_Normal  = (flags & 0x10) != 0;
-    Enabled_Hard    = (flags & 0x20) != 0;
-
-    hr = pStm->Read(&HouseIndex, sizeof(HouseIndex), &read);
-    if (hr < 0 || read != sizeof(HouseIndex)) return E_FAIL;
-    hr = pStm->Read(&SideIndex, sizeof(SideIndex), &read);
-    if (hr < 0 || read != sizeof(SideIndex)) return E_FAIL;
-    hr = pStm->Read(&TechLevel, sizeof(TechLevel), &read);
-    if (hr < 0 || read != sizeof(TechLevel)) return E_FAIL;
-    hr = pStm->Read(&unknown_B4, sizeof(unknown_B4), &read);
-    if (hr < 0 || read != sizeof(unknown_B4)) return E_FAIL;
-
-    hr = pStm->Read(&Weight_Current, sizeof(Weight_Current), &read);
-    if (hr < 0 || read != sizeof(Weight_Current)) return E_FAIL;
-    hr = pStm->Read(&Weight_Minimum, sizeof(Weight_Minimum), &read);
-    if (hr < 0 || read != sizeof(Weight_Minimum)) return E_FAIL;
-    hr = pStm->Read(&Weight_Maximum, sizeof(Weight_Maximum), &read);
-    if (hr < 0 || read != sizeof(Weight_Maximum)) return E_FAIL;
-
-    // Read condition object ID and resolve.
-    char condObjID[0x18];
-    hr = pStm->Read(condObjID, sizeof(condObjID), &read);
-    if (hr < 0 || read != sizeof(condObjID)) return E_FAIL;
-    condObjID[sizeof(condObjID) - 1] = '\0';
-    ConditionObject = condObjID[0] ? static_cast<TechnoTypeClass*>(TechnoTypeClass::Find(condObjID)) : nullptr;
-
-    // Read team1 ID and resolve.
-    char team1ID[0x18];
-    hr = pStm->Read(team1ID, sizeof(team1ID), &read);
-    if (hr < 0 || read != sizeof(team1ID)) return E_FAIL;
-    team1ID[sizeof(team1ID) - 1] = '\0';
-    Team1 = team1ID[0] ? TeamTypeClass::Find(team1ID) : nullptr;
-
-    // Read team2 ID and resolve.
-    char team2ID[0x18];
-    hr = pStm->Read(team2ID, sizeof(team2ID), &read);
-    if (hr < 0 || read != sizeof(team2ID)) return E_FAIL;
-    team2ID[sizeof(team2ID) - 1] = '\0';
-    Team2 = team2ID[0] ? TeamTypeClass::Find(team2ID) : nullptr;
-
-    // Read condition comparators (fixed array of 4).
-    for (int32 i = 0; i < 4; ++i) {
-        hr = pStm->Read(&Conditions[i].ComparatorType, sizeof(Conditions[i].ComparatorType), &read);
-        if (hr < 0 || read != sizeof(Conditions[i].ComparatorType)) return E_FAIL;
-        hr = pStm->Read(&Conditions[i].ComparatorOperand, sizeof(Conditions[i].ComparatorOperand), &read);
-        if (hr < 0 || read != sizeof(Conditions[i].ComparatorOperand)) return E_FAIL;
-    }
-
-    hr = pStm->Read(&TimesExecuted, sizeof(TimesExecuted), &read);
-    if (hr < 0 || read != sizeof(TimesExecuted)) return E_FAIL;
-    hr = pStm->Read(&TimesCompleted, sizeof(TimesCompleted), &read);
-    if (hr < 0 || read != sizeof(TimesCompleted)) return E_FAIL;
-    hr = pStm->Read(&unknown_10C, sizeof(unknown_10C), &read);
-    if (hr < 0 || read != sizeof(unknown_10C)) return E_FAIL;
+    static SwizzleManagerClass SwizzleManager;
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&ConditionObject));
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&Team1));
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&Team2));
 
     return S_OK;
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_Save —— 仅转调 AbstractTypeClass::Save。
+// ---------------------------------------------------------------------------
 HRESULT AITriggerTypeClass::Save(IStream* pStm, BOOL fClearDirty) {
-    if (!pStm) return E_POINTER;
-
-    ULONG written = 0;
-    HRESULT hr = S_OK;
-
-    // Write ID
-    hr = pStm->Write(ID, sizeof(ID), &written);
-    if (hr < 0 || written != sizeof(ID)) return E_FAIL;
-
-    // Write scalar fields
-    int32 condType = static_cast<int32>(ConditionType);
-    hr = pStm->Write(&condType, sizeof(condType), &written);
-    if (hr < 0 || written != sizeof(condType)) return E_FAIL;
-
-    hr = pStm->Write(&IsGlobal, sizeof(IsGlobal), &written);
-    if (hr < 0 || written != sizeof(IsGlobal)) return E_FAIL;
-
-    int32 ownerType = static_cast<int32>(OwnerHouseType);
-    hr = pStm->Write(&ownerType, sizeof(ownerType), &written);
-    if (hr < 0 || written != sizeof(ownerType)) return E_FAIL;
-
-    // Write packed bool flags
-    uint32 flags = 0;
-    if (IsEnabled)        flags |= 0x01;
-    if (IsForSkirmish)    flags |= 0x02;
-    if (IsForBaseDefense) flags |= 0x04;
-    if (Enabled_Easy)     flags |= 0x08;
-    if (Enabled_Normal)   flags |= 0x10;
-    if (Enabled_Hard)     flags |= 0x20;
-    hr = pStm->Write(&flags, sizeof(flags), &written);
-    if (hr < 0 || written != sizeof(flags)) return E_FAIL;
-
-    hr = pStm->Write(&HouseIndex, sizeof(HouseIndex), &written);
-    if (hr < 0 || written != sizeof(HouseIndex)) return E_FAIL;
-    hr = pStm->Write(&SideIndex, sizeof(SideIndex), &written);
-    if (hr < 0 || written != sizeof(SideIndex)) return E_FAIL;
-    hr = pStm->Write(&TechLevel, sizeof(TechLevel), &written);
-    if (hr < 0 || written != sizeof(TechLevel)) return E_FAIL;
-    hr = pStm->Write(&unknown_B4, sizeof(unknown_B4), &written);
-    if (hr < 0 || written != sizeof(unknown_B4)) return E_FAIL;
-
-    hr = pStm->Write(&Weight_Current, sizeof(Weight_Current), &written);
-    if (hr < 0 || written != sizeof(Weight_Current)) return E_FAIL;
-    hr = pStm->Write(&Weight_Minimum, sizeof(Weight_Minimum), &written);
-    if (hr < 0 || written != sizeof(Weight_Minimum)) return E_FAIL;
-    hr = pStm->Write(&Weight_Maximum, sizeof(Weight_Maximum), &written);
-    if (hr < 0 || written != sizeof(Weight_Maximum)) return E_FAIL;
-
-    // Write condition object ID.
-    char condObjID[0x18];
-    std::memset(condObjID, 0, sizeof(condObjID));
-    if (ConditionObject && ConditionObject->ID) {
-        int32 j = 0;
-        while (ConditionObject->ID[j] && j < static_cast<int32>(sizeof(condObjID)) - 1) {
-            condObjID[j] = ConditionObject->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(condObjID, sizeof(condObjID), &written);
-    if (hr < 0 || written != sizeof(condObjID)) return E_FAIL;
-
-    // Write team1 ID.
-    char team1ID[0x18];
-    std::memset(team1ID, 0, sizeof(team1ID));
-    if (Team1 && Team1->ID) {
-        int32 j = 0;
-        while (Team1->ID[j] && j < static_cast<int32>(sizeof(team1ID)) - 1) {
-            team1ID[j] = Team1->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(team1ID, sizeof(team1ID), &written);
-    if (hr < 0 || written != sizeof(team1ID)) return E_FAIL;
-
-    // Write team2 ID.
-    char team2ID[0x18];
-    std::memset(team2ID, 0, sizeof(team2ID));
-    if (Team2 && Team2->ID) {
-        int32 j = 0;
-        while (Team2->ID[j] && j < static_cast<int32>(sizeof(team2ID)) - 1) {
-            team2ID[j] = Team2->ID[j]; ++j;
-        }
-    }
-    hr = pStm->Write(team2ID, sizeof(team2ID), &written);
-    if (hr < 0 || written != sizeof(team2ID)) return E_FAIL;
-
-    // Write condition comparators (fixed array of 4).
-    for (int32 i = 0; i < 4; ++i) {
-        hr = pStm->Write(&Conditions[i].ComparatorType, sizeof(Conditions[i].ComparatorType), &written);
-        if (hr < 0 || written != sizeof(Conditions[i].ComparatorType)) return E_FAIL;
-        hr = pStm->Write(&Conditions[i].ComparatorOperand, sizeof(Conditions[i].ComparatorOperand), &written);
-        if (hr < 0 || written != sizeof(Conditions[i].ComparatorOperand)) return E_FAIL;
-    }
-
-    hr = pStm->Write(&TimesExecuted, sizeof(TimesExecuted), &written);
-    if (hr < 0 || written != sizeof(TimesExecuted)) return E_FAIL;
-    hr = pStm->Write(&TimesCompleted, sizeof(TimesCompleted), &written);
-    if (hr < 0 || written != sizeof(TimesCompleted)) return E_FAIL;
-    hr = pStm->Write(&unknown_10C, sizeof(unknown_10C), &written);
-    if (hr < 0 || written != sizeof(unknown_10C)) return E_FAIL;
-
-    return S_OK;
+    return AbstractTypeClass::Save(pStm, fClearDirty);
 }
 
 AbstractType AITriggerTypeClass::WhatAmI() const {
@@ -265,309 +134,580 @@ int32 AITriggerTypeClass::Size() const {
     return sizeof(AITriggerTypeClass);
 }
 
-bool AITriggerTypeClass::LoadFromINIList(CCINIClass* pINI) {
-    if (!pINI) return false;
-
-    char sectionName[64];
-    snprintf(sectionName, sizeof(sectionName), "%s", this->ID);
-
-    if (!pINI->SectionExists(sectionName)) return false;
-
-    Team1 = nullptr;
-    Team2 = nullptr;
-    ConditionObject = nullptr;
-
-    char buffer[256];
-
-    pINI->ReadString(sectionName, "Name", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        int32 idx = 0;
-        while (buffer[idx] && idx < static_cast<int32>(sizeof(this->Name)) - 1) {
-            this->Name[idx] = buffer[idx];
-            ++idx;
-        }
-        this->Name[idx] = '\0';
-    }
-
-    int32 condType = 0;
-    pINI->GetInteger(sectionName, "ConditionType", condType);
-    ConditionType = static_cast<AITriggerCondition>(condType);
-
-    pINI->GetInteger(sectionName, "IsGlobal", IsGlobal);
-
-    int32 ownerType = 0;
-    pINI->GetInteger(sectionName, "OwnerHouseType", ownerType);
-    OwnerHouseType = static_cast<AITriggerHouseType>(ownerType);
-
-    pINI->GetInteger(sectionName, "HouseIndex", HouseIndex);
-    pINI->GetInteger(sectionName, "SideIndex", SideIndex);
-    pINI->GetInteger(sectionName, "TechLevel", TechLevel);
-
-    pINI->GetDouble(sectionName, "Weight_Current", Weight_Current);
-    pINI->GetDouble(sectionName, "Weight_Minimum", Weight_Minimum);
-    pINI->GetDouble(sectionName, "Weight_Maximum", Weight_Maximum);
-
-    IsForSkirmish = pINI->ReadBool(sectionName, "IsForSkirmish", IsForSkirmish);
-    IsForBaseDefense = pINI->ReadBool(sectionName, "IsForBaseDefense", IsForBaseDefense);
-    Enabled_Easy = pINI->ReadBool(sectionName, "Enabled_Easy", Enabled_Easy);
-    Enabled_Normal = pINI->ReadBool(sectionName, "Enabled_Normal", Enabled_Normal);
-    Enabled_Hard = pINI->ReadBool(sectionName, "Enabled_Hard", Enabled_Hard);
-
-    char team1Name[0x18];
-    pINI->ReadString(sectionName, "Team1", "", team1Name, sizeof(team1Name));
-    if (team1Name[0] && _strcmpi(team1Name, "<none>") != 0) {
-        Team1 = static_cast<TeamTypeClass*>(TeamTypeClass::Find(team1Name));
-    }
-
-    char team2Name[0x18];
-    pINI->ReadString(sectionName, "Team2", "", team2Name, sizeof(team2Name));
-    if (team2Name[0] && _strcmpi(team2Name, "<none>") != 0) {
-        Team2 = static_cast<TeamTypeClass*>(TeamTypeClass::Find(team2Name));
-    }
-
-    char condObjName[0x18];
-    pINI->ReadString(sectionName, "ConditionObject", "", condObjName, sizeof(condObjName));
-    if (condObjName[0] && _strcmpi(condObjName, "<none>") != 0) {
-        ConditionObject = static_cast<TechnoTypeClass*>(TechnoTypeClass::Find(condObjName));
-    }
-
-    for (int32 i = 0; i < 4; ++i) {
-        char keyName[32];
-        snprintf(keyName, sizeof(keyName), "Condition%d", i);
-        char condStr[64];
-        pINI->ReadString(sectionName, keyName, "0,0", condStr, sizeof(condStr));
-        int32 cmpType = 0, cmpOperand = 0;
-        char* comma = strchr(condStr, ',');
-        if (comma) {
-            *comma = '\0';
-            cmpType = atoi(condStr);
-            cmpOperand = atoi(comma + 1);
-        } else {
-            cmpType = atoi(condStr);
-        }
-        Conditions[i].ComparatorType = cmpType;
-        Conditions[i].ComparatorOperand = cmpOperand;
-    }
-
-    return true;
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_GetAbstractDerivationID → 0x3B
+// ---------------------------------------------------------------------------
+int32 AITriggerTypeClass::GetAbstractDerivationID() const {
+    return 0x3B;
 }
 
-bool AITriggerTypeClass::SaveToINIList(CCINIClass* pINI, bool Global) {
-    if (!pINI) return false;
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_GetCRC
+//   基类 CRC 之后依次混入 typeCondition/isGlobal/ownHouseType/idxHouse/
+//   techLevel、按 switch 选混 params.arg+params.cond、三个 Weight、难度位、
+//   idxSide、isBaseDefense。
+// ---------------------------------------------------------------------------
+void AITriggerTypeClass::ComputeCRC(CRCEngine& crc) const {
+    AbstractTypeClass::ComputeCRC(crc);
 
-    char sectionName[64];
-    snprintf(sectionName, sizeof(sectionName), "%s", this->ID);
+    crc.AddData(&ConditionType, sizeof(ConditionType));
+    crc.AddData(&IsGlobal, sizeof(IsGlobal));
+    crc.AddData(&OwnerHouseType, sizeof(OwnerHouseType));
+    crc.AddData(&HouseIndex, sizeof(HouseIndex));
+    crc.AddData(&TechLevel, sizeof(TechLevel));
 
-    pINI->WriteString(sectionName, "Name", this->Name);
-    pINI->WriteInteger(sectionName, "ConditionType", static_cast<int32>(ConditionType));
-    pINI->WriteInteger(sectionName, "IsGlobal", IsGlobal);
-    pINI->WriteInteger(sectionName, "OwnerHouseType", static_cast<int32>(OwnerHouseType));
-    pINI->WriteInteger(sectionName, "HouseIndex", HouseIndex);
-    pINI->WriteInteger(sectionName, "SideIndex", SideIndex);
-    pINI->WriteInteger(sectionName, "TechLevel", TechLevel);
-    pINI->WriteDouble(sectionName, "Weight_Current", Weight_Current);
-    pINI->WriteDouble(sectionName, "Weight_Minimum", Weight_Minimum);
-    pINI->WriteDouble(sectionName, "Weight_Maximum", Weight_Maximum);
-    pINI->WriteBool(sectionName, "IsForSkirmish", IsForSkirmish);
-    pINI->WriteBool(sectionName, "IsForBaseDefense", IsForBaseDefense);
-    pINI->WriteBool(sectionName, "Enabled_Easy", Enabled_Easy);
-    pINI->WriteBool(sectionName, "Enabled_Normal", Enabled_Normal);
-    pINI->WriteBool(sectionName, "Enabled_Hard", Enabled_Hard);
-
-    if (Team1) pINI->WriteString(sectionName, "Team1", Team1->get_ID());
-    else pINI->WriteString(sectionName, "Team1", "<none>");
-
-    if (Team2) pINI->WriteString(sectionName, "Team2", Team2->get_ID());
-    else pINI->WriteString(sectionName, "Team2", "<none>");
-
-    if (ConditionObject) pINI->WriteString(sectionName, "ConditionObject", ConditionObject->get_ID());
-    else pINI->WriteString(sectionName, "ConditionObject", "<none>");
-
-    for (int32 i = 0; i < 4; ++i) {
-        char keyName[32], valueStr[64];
-        snprintf(keyName, sizeof(keyName), "Condition%d", i);
-        snprintf(valueStr, sizeof(valueStr), "%d,%d",
-            Conditions[i].ComparatorType, Conditions[i].ComparatorOperand);
-        pINI->WriteString(sectionName, keyName, valueStr);
-    }
-
-    return true;
-}
-
-bool AITriggerTypeClass::ConditionMet(HouseClass* CallingHouse, HouseClass* TargetHouse, bool EnoughBaseDefense) const {
-    if (!IsEnabled) return false;
-    if (!CallingHouse || !TargetHouse) return false;
-
-    int32 difficulty = Game::Difficulty;
-    if (difficulty == 0 && !Enabled_Easy) return false;
-    if (difficulty == 1 && !Enabled_Normal) return false;
-    if (difficulty == 2 && !Enabled_Hard) return false;
-
-    if (IsForBaseDefense && !EnoughBaseDefense) return false;
-
-    if (TechLevel > CallingHouse->TechLevel) return false;
-
-    switch (ConditionType) {
-        case AITriggerCondition::HouseOwns:
-            return OwnerHouseOwns(CallingHouse, TargetHouse);
-        case AITriggerCondition::EnemyOwns:
-            return EnemyHouseOwns(CallingHouse, TargetHouse);
-        case AITriggerCondition::CivilianOwns:
-            return CivilianHouseOwns(CallingHouse, TargetHouse);
-        case AITriggerCondition::HouseCredits:
-            return HouseCredits(CallingHouse, TargetHouse);
-        case AITriggerCondition::IronCurtainReady:
-            return IronCurtainCharged(CallingHouse, TargetHouse);
-        case AITriggerCondition::ChronosphereReady:
-            return ChronoSphereCharged(CallingHouse, TargetHouse);
-        case AITriggerCondition::BuildingCount:
-            return EvaluateBuildingCount(CallingHouse);
-        case AITriggerCondition::UnitCount:
-            return EvaluateUnitCount(CallingHouse);
-        case AITriggerCondition::InfantryCount:
-            return EvaluateInfantryCount(CallingHouse);
-        case AITriggerCondition::AircraftCount:
-            return EvaluateAircraftCount(CallingHouse);
-        case AITriggerCondition::PowerOutput:
-            return EvaluatePowerOutput(CallingHouse);
-        case AITriggerCondition::HasSuperWeapon:
-            return EvaluateHasSuperWeapon(CallingHouse);
-        case AITriggerCondition::TechLevel:
-            return EvaluateTechLevel(CallingHouse);
-        case AITriggerCondition::Weight:
-            return EvaluateWeight();
+    // asm switch：ConditionType ∈ {0,1,4,7} 才把 params 计进 CRC（其余分支跳过）。
+    switch (static_cast<int32>(ConditionType)) {
+        case 0: case 1: case 4: case 7:
+            crc.AddData(&Params[0], 4);   // params.arg
+            crc.AddData(&Params[0], 4);   // params.cond（与 arg 叠加，语义保真）
+            break;
         default:
             break;
     }
 
-    if (ConditionObject) {
-        int32 count = CallingHouse->CountOwnedNow(ConditionObject);
-        for (int32 i = 0; i < 4; ++i) {
-            const auto& cmp = Conditions[i];
-            if (cmp.ComparatorType == 0) break;
-            if (EvaluateComparator(count, cmp.ComparatorType, cmp.ComparatorOperand)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    return false;
+    crc.AddData(&Weight_Current, sizeof(Weight_Current));
+    crc.AddData(&Weight_Minimum, sizeof(Weight_Minimum));
+    crc.AddData(&Weight_Maximum, sizeof(Weight_Maximum));
+    crc.AddData(&IsForSkirmish, sizeof(IsForSkirmish));
+    crc.AddData(&Enabled_Easy, sizeof(Enabled_Easy));
+    crc.AddData(&Enabled_Normal, sizeof(Enabled_Normal));
+    crc.AddData(&Enabled_Hard, sizeof(Enabled_Hard));
+    crc.AddData(&SideIndex, sizeof(SideIndex));
+    crc.AddData(&IsForBaseDefense, sizeof(IsForBaseDefense));
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_LoadFromINI(AITriggerTypeClass *this, CCINIClass *INI)
+//   读取 [AITriggerTypes] 段中 this->ID 对应的一行逗号分隔定义：
+//     Name, Team1, OwnerHouse, CondType, CondObject, Weight, Min, Max,
+//     IsForSkirmish, <skip>, SideIndex, IsBaseDefense, Team2,
+//     EasyFlag, NormalFlag, HardFlag, <hex params>
+//   解析成功返回 true；任一必需字段缺失返回 false。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::LoadFromINI(CCINIClass* pINI) {
+    if (pINI == nullptr) return false;
+
+    char buffer[0x200];
+    buffer[0] = '\0';
+    if (pINI->ReadString("AITriggerTypes", this->Name, "", buffer, sizeof(buffer)) <= 0) {
+        return false;   // 该 ID 在段中不存在
+    }
+    if (buffer[0] == '\0') return false;
+
+    // 逐段切分（与 asm 的 strtok(,) 序列一一对应）。
+    char* ctx = nullptr;
+    const char* tok = strtok_r(buffer, ",", &ctx);
+    if (!tok) return false;
+
+    // 1. Name（asm 写入 a.nameFlag，30 字节）
+    strncpy(this->Name, tok, sizeof(this->Name) - 1);
+    this->Name[sizeof(this->Name) - 1] = '\0';
+
+    // 2. Team1
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (!tok) return false;
+    Team1 = _strcmpi(tok, "<none>") ? TeamTypeClass::FindByString(tok) : nullptr;
+
+    // 3. OwnerHouse（"<all>"→Any；"<none>"→保持 None；否则按方名解析）
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (!tok) return false;
+    OwnerHouseType = AITriggerHouseType::None;
+    HouseIndex = -1;
+    if (!_strcmpi(tok, "<all>")) {
+        OwnerHouseType = AITriggerHouseType::Any;
+    } else if (_strcmpi(tok, "<none>")) {
+        int32 hi = HouseTypeClass::From_Name(tok);
+        HouseIndex = hi;
+        if (hi != -1) OwnerHouseType = AITriggerHouseType::Single;
+    }
+
+    // 4. ConditionType（asm 丢弃 TechLevel 槽位后取本字段）
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (!tok) return false;
+    tok = strtok_r(nullptr, ",", &ctx);   // asm 顺序：先弃一槽再取条件类型
+    if (!tok) return false;
+    ConditionType = static_cast<AITriggerCondition>(atoi(tok));
+
+    // 5. ConditionObject（依次查 Infantry/Unit/Aircraft/Building 类型）
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (!tok) return false;
+    {
+        char name[0x18];
+        strncpy(name, tok, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        ConditionObject = nullptr;
+        int32 idx = InfantryTypeClass::FindIndex(name);
+        if (idx != -1) {
+            ConditionObject = InfantryTypeClass::FindByIndex(idx);
+        } else {
+            // Unit/Aircraft 无 FindIndex 时按 ID 直查。
+            ConditionObject = TechnoTypeClass::Find(name);
+        }
+    }
+
+    // 6. params 十六进制串（asm 每两字符解码一字节，最多 32 字节）
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (!tok) return false;
+    {
+        std::memset(Params, 0, sizeof(Params));
+        int32 n = 0;
+        for (const char* p = tok; *p && n < static_cast<int32>(sizeof(Params)); ) {
+            while (*p == ' ' || *p == '\t') ++p;
+            if (!*p) break;
+            Params[n++] = static_cast<uint8>(strtoul(p, const_cast<char**>(&p), 16));
+        }
+    }
+
+    // 7. Weight / Min / Max
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Weight_Current = std::floor(atof(tok));
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Weight_Minimum = std::floor(atof(tok));
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Weight_Maximum = std::floor(atof(tok));
+
+    // 8. IsForSkirmish
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) IsForSkirmish = (atoi(tok) != 0);
+
+    // 9. 跳过一个槽（asm 连续两次 strtok 只取后者）
+    (void)strtok_r(nullptr, ",", &ctx);
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) SideIndex = atoi(tok);
+
+    // 10. IsBaseDefense
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) IsForBaseDefense = (atoi(tok) != 0);
+
+    // 11. Team2
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) {
+        Team2 = _strcmpi(tok, "<none>") ? TeamTypeClass::FindByString(tok) : nullptr;
+    }
+
+    // 12/13/14. 难度位
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Enabled_Easy = (atoi(tok) != 0);
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Enabled_Normal = (atoi(tok) != 0);
+    tok = strtok_r(nullptr, ",", &ctx);
+    if (tok) Enabled_Hard = (atoi(tok) != 0);
+
+    // techLevel 由两个队伍的 TaskForce 技术等级取最大（asm 尾段逻辑）。
+    TechLevel = 0;
+    if (Team1 && Team1->TaskForce) {
+        int32 t1 = Team1->TaskForce->GetTechLevel();
+        if (t1 > TechLevel) TechLevel = t1;
+    }
+    if (Team2 && Team2->TaskForce) {
+        int32 t2 = Team2->TaskForce->GetTechLevel();
+        if (t2 > TechLevel) TechLevel = t2;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 旧名转发：装配点仍可能调用 LoadFromINIList。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::LoadFromINIList(CCINIClass* pINI) {
+    return LoadFromINI(pINI);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_SaveToINI(AITriggerTypeClass *this, int a2)
+//   以 "%s,%s,%s,%d,%d,%s,%s,%lf,%lf,%lf,%d,%d,..." 格式写回 [AITriggerTypes]。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::SaveToINI(CCINIClass* pINI) {
+    if (pINI == nullptr) return false;
+
+    const char* team1Name = "<none>";
+    const char* team2Name = "<none>";
+    const char* condName = "<none>";
+    if (Team1) team1Name = Team1->get_ID();
+    if (Team2) team2Name = Team2->get_ID();
+    if (ConditionObject) condName = ConditionObject->get_ID();
+
+    const char* ownerName = "<none>";
+    if (OwnerHouseType == AITriggerHouseType::Any) {
+        ownerName = "<all>";
+    } else if (OwnerHouseType == AITriggerHouseType::Single && HouseIndex != -1) {
+        if (HouseIndex >= 0 && HouseIndex < HouseTypeClass::ArrayCount) {
+            HouseTypeClass* pHouseType = HouseTypeClass::Array[HouseIndex];
+            if (pHouseType) ownerName = pHouseType->get_ID();
+        }
+    }
+
+    // params 十六进制串（asm 用 "%02x" 逐字节）。
+    char condString[0x80];
+    int32 n = 0;
+    for (int32 i = 0; i < static_cast<int32>(sizeof(Params)); ++i) {
+        n += snprintf(condString + n, sizeof(condString) - n, "%02x", Params[i]);
+        if (n >= static_cast<int32>(sizeof(condString)) - 3) break;
+    }
+
+    char result[0x200];
+    snprintf(result, sizeof(result),
+        "%s,%s,%s,%d,%d,%s,%s,%lf,%lf,%lf,%d,%d,%d,%d,%s,%d,%d,%d,%s",
+        this->Name, team1Name, ownerName,
+        this->TechLevel, static_cast<int32>(this->ConditionType),
+        condName, condString,
+        this->Weight_Current, this->Weight_Minimum, this->Weight_Maximum,
+        this->IsForSkirmish ? 1 : 0, 0, this->SideIndex,
+        this->IsForBaseDefense ? 1 : 0, team2Name,
+        this->Enabled_Easy ? 1 : 0,
+        this->Enabled_Normal ? 1 : 0,
+        this->Enabled_Hard ? 1 : 0, "");
+
+    pINI->WriteString("AITriggerTypes", this->ID, result);
+    return true;
+}
+
+bool AITriggerTypeClass::SaveToINIList(CCINIClass* pINI, bool /*Global*/) {
+    return SaveToINI(pINI);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_CreateFromINIList(CCINIClass *INI, int global)
+//   遍历 [AITriggerTypes]（global 时另读 [AITriggerTypesEnable]），
+//   为每个键 FindOrAllocate、LoadFromINI，并设置 isGlobal / isEnabled。
+// ---------------------------------------------------------------------------
+void AITriggerTypeClass::CreateFromINIList(CCINIClass* pINI, bool global) {
+    if (pINI == nullptr) return;
+
+    int32 count = pINI->GetKeyCount("AITriggerTypes");
+    for (int32 i = 0; i < count; ++i) {
+        const char* key = pINI->GetKeyName("AITriggerTypes", i);
+        if (!key) continue;
+        if (!_strcmpi(key, "<none>") || !_strcmpi(key, "none")) continue;
+
+        AITriggerTypeClass* item = FindOrAllocate(key);
+        if (!item) continue;
+
+        item->LoadFromINI(pINI);
+        item->IsGlobal = global ? 1 : 0;
+        if (global) item->IsEnabled = true;
+    }
+
+    if (global) return;
+
+    // 非全局（地图内）：按 [AITriggerTypesEnable] 覆写使能位。
+    int32 enableCount = pINI->GetKeyCount("AITriggerTypesEnable");
+    for (int32 i = 0; i < enableCount; ++i) {
+        const char* key = pINI->GetKeyName("AITriggerTypesEnable", i);
+        if (!key) continue;
+        AITriggerTypeClass* item = Find(key);
+        if (!item) continue;
+        bool enabled = pINI->ReadBool("AITriggerTypesEnable", key, false);
+        item->IsEnabled = enabled;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_ConditionMet(this, CallingHouse, targetHouse,
+//        AlreadyHasMinimumBaseDefense)
+//   先过 base-defense / global / 难度 / 旁路过滤，再按 ConditionType 分派；
+//   最后检查目标队伍能否编成（CanInstantiateTeam / CountInstancesOfTeam）。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::ConditionMet(HouseClass* CallingHouse, HouseClass* TargetHouse, bool AlreadyHasMinimumBaseDefense) const {
+    if (!CallingHouse) return false;
+
+    // isBaseDef：Team1 或 Team2 标记为基地防御队伍时为真。
+    bool isBaseDef = false;
+    if (Team1 && Team1->IsBaseDefense) isBaseDef = true;
+    else if (Team2 && Team2->IsBaseDefense) isBaseDef = true;
+
+    // 若存在目标房（进行 base-defense 计数）：
+    //   IsGlobal 且 Scenario 忽略全局 AI 触发 → 直接失败。
+    if (TargetHouse) {
+        if (IsGlobal == 1 && ScenarioClass::Instance && ScenarioClass::Instance->IgnoreGlobalAITriggers) {
+            return false;
+        }
+        // 基地防御要求：本房已有足够基地防御队伍。
+        if (isBaseDef) {
+            if (AlreadyHasMinimumBaseDefense) {
+                // 继续评估。
+            } else {
+                return false;
+            }
+        }
+    }
+
+    // global 触发在非 skirmish 下要求 IsForSkirmish 通过。
+    if (IsGlobal) {
+        // 保持与 asm 的短路一致：仅当目标房存在时此关已在上方处理。
+    }
+
+    // 难度过滤（asm 用 ScenarioClass::Difficulty）。
+    int32 difficulty = ScenarioClass::Instance ? ScenarioClass::Instance->Difficulty : 0;
+    if (difficulty == 0 && !Enabled_Easy) return false;
+    if (difficulty == 1 && !Enabled_Normal) return false;
+    if (difficulty == 2 && !Enabled_Hard) return false;
+
+    // 技术等级门槛：触发类型 techLevel > 本房 techLevel → 失败。
+    if (TechLevel > CallingHouse->TechLevel) return false;
+
+    // 按 ConditionType 分派（asm switch 顺序）。
+    bool condResult = false;
+    switch (ConditionType) {
+        case AITriggerCondition::HouseOwns:
+            condResult = OwnerHouseOwns(CallingHouse, TargetHouse);
+            break;
+        case AITriggerCondition::EnemyOwns:
+            condResult = EnemyHouseOwns(CallingHouse, TargetHouse);
+            break;
+        case AITriggerCondition::CivilianOwns:
+            condResult = CivilianHouseOwns(CallingHouse, TargetHouse);
+            break;
+        case AITriggerCondition::HouseCredits:
+            condResult = CompareHouseMoney(CallingHouse);
+            break;
+        case AITriggerCondition::IronCurtainReady:
+            condResult = IronCurtainPercentReady(CallingHouse);
+            break;
+        case AITriggerCondition::ChronosphereReady:
+            condResult = ChronospherePercentReady(CallingHouse);
+            break;
+        default:
+            condResult = OwnerHouseOwns(CallingHouse, TargetHouse);
+            break;
+    }
+
+    if (!condResult) return false;
+
+    // 目标队伍判定：Team1（若存在）需能被本房编成且未达上限；Team2 同理。
+    if (Team1) {
+        if (!CallingHouse->CanInstantiateTeam(Team1)) return false;
+    }
+    if (Team2) {
+        if (!CallingHouse->CanInstantiateTeam(Team2)) return false;
+    }
+    if (Team1 && Team1->Max >= 0) {
+        if (CallingHouse->CountInstancesOfTeam(Team1) >= Team1->Max) return false;
+    }
+    if (Team2 && Team2->Max >= 0) {
+        if (CallingHouse->CountInstancesOfTeam(Team2) >= Team2->Max) return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_HouseOwns(this, Owner, target)
+//   对 target 持有的 ConditionObject 计数，按 params 比较器判定。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::OwnerHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* TargetHouse) const {
+    if (!TargetHouse) return false;
+
+    int32 count = 0;
+    if (ConditionObject) {
+        count = TargetHouse->CountOwnedNow(ConditionObject);
+    }
+
+    int32 comparator = Conditions[0].ComparatorType;
+    int32 operand = Conditions[0].ComparatorOperand;
+    return EvaluateComparator(count, comparator, operand);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_EnemyOwns(this, Owner, target)
+//   对 Owner（呼叫方）持有的 ConditionObject 计数后比较。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
+    if (!CallingHouse) return false;
+
+    int32 count = 0;
+    if (ConditionObject) {
+        count = CallingHouse->CountOwnedNow(ConditionObject);
+    }
+
+    int32 comparator = Conditions[0].ComparatorType;
+    int32 operand = Conditions[0].ComparatorOperand;
+    return EvaluateComparator(count, comparator, operand);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_CivilianHouseOwns(this, a2, a3)
+//   在全局房表中找到阵营为 "Civilian" 的房子，对其持有的 ConditionObject
+//   计数后比较。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::CivilianHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* /*TargetHouse*/) const {
+    if (HouseClass::Array == nullptr) return false;
+
+    HouseClass* civilian = nullptr;
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr) continue;
+        // asm: 阵营 Side == Side_From_Name("Civilian")，即平民房。
+        if (pHouse->IsCivilians) {
+            civilian = pHouse;
+            break;
+        }
+    }
+    if (!civilian) return false;
+
+    int32 count = 0;
+    if (ConditionObject) {
+        count = civilian->CountOwnedNow(ConditionObject);
+    }
+
+    int32 comparator = Conditions[0].ComparatorType;
+    int32 operand = Conditions[0].ComparatorOperand;
+    return EvaluateComparator(count, comparator, operand);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_HouseCredits（条件 3）
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::HouseCredits(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
+    if (!CallingHouse) return false;
+    int32 credits = CallingHouse->Credits;
+    int32 comparator = Conditions[0].ComparatorType;
+    int32 operand = Conditions[0].ComparatorOperand;
+    return EvaluateComparator(credits, comparator, operand);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_IronCurtainCharged / ChronoSphereCharged
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::IronCurtainCharged(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
+    return IronCurtainPercentReady(CallingHouse);
+}
+
+bool AITriggerTypeClass::ChronoSphereCharged(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
+    return ChronospherePercentReady(CallingHouse);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_CompareHouseMoney(this, House)
+//   House->Get_Credits() 与 params 比较器逐档比较。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::CompareHouseMoney(HouseClass* pHouse) const {
+    if (pHouse == nullptr) return false;
+
+    const int32 credits = pHouse->Credits;
+    const int32 comparator = Conditions[0].ComparatorType;
+    const int32 operand = Conditions[0].ComparatorOperand;
+    return EvaluateComparator(credits, comparator, operand);
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_IronCurtainPercentReady(this, House)
+//   在 House 的超武列表中找 SuperWeaponType==1（IronCurtain），
+//   就其充能百分比判断是否 >= (1 - Rules.IronCurtainChargePercent)。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::IronCurtainPercentReady(HouseClass* pHouse) const {
+    if (pHouse == nullptr) return false;
+    int32 idx = pHouse->FindSuperWeapon(SuperWeaponType::IronCurtain);
+    if (idx < 0) return false;
+    return !pHouse->SuperWeaponTimers[idx].InProgress();
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_ChronospherePercentReady(this, House)
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::ChronospherePercentReady(HouseClass* pHouse) const {
+    if (pHouse == nullptr) return false;
+    int32 idx = pHouse->FindSuperWeapon(SuperWeaponType::ChronoSphere);
+    if (idx < 0) return false;
+    return !pHouse->SuperWeaponTimers[idx].InProgress();
+}
+
+// ---------------------------------------------------------------------------
+// EvaluateComparator —— comparator 语义（asm jump table）：
+//   0: <   1: <=   2: ==   3: >=   4: >   5: !=
+// ---------------------------------------------------------------------------
 bool AITriggerTypeClass::EvaluateComparator(int32 currentValue, int32 comparatorType, int32 comparatorOperand) const {
     switch (comparatorType) {
-        case 0: return false;
-        case 1: return currentValue < comparatorOperand;
-        case 2: return currentValue <= comparatorOperand;
-        case 3: return currentValue == comparatorOperand;
-        case 4: return currentValue >= comparatorOperand;
-        case 5: return currentValue > comparatorOperand;
-        case 6: return currentValue != comparatorOperand;
+        case 0: return currentValue <  comparatorOperand;
+        case 1: return currentValue <= comparatorOperand;
+        case 2: return currentValue == comparatorOperand;
+        case 3: return currentValue >= comparatorOperand;
+        case 4: return currentValue >  comparatorOperand;
+        case 5: return currentValue != comparatorOperand;
         default: return false;
     }
 }
 
+// ---------------------------------------------------------------------------
+// 计数类条件辅助（对 ConditionObject 计数后套比较器）。
+// ---------------------------------------------------------------------------
 bool AITriggerTypeClass::EvaluateBuildingCount(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 count = pHouse->BuildingCount;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(count, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(pHouse->BuildingCount,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateUnitCount(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 count = pHouse->UnitCount;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(count, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(pHouse->UnitCount,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateInfantryCount(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 count = pHouse->InfantryCount;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(count, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(pHouse->InfantryCount,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateAircraftCount(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 count = pHouse->AircraftCount;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(count, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(pHouse->AircraftCount,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluatePowerOutput(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 availablePower = pHouse->PowerOutput - pHouse->PowerDrain;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(availablePower, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    int32 surplus = pHouse->PowerOutput - pHouse->PowerDrain;
+    return EvaluateComparator(surplus,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateHasSuperWeapon(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 superWeaponCount = 0;
-    for (int32 i = 0; i < 64; ++i) {
-        if (pHouse->SuperWeaponTimers[i].HasTimeLeft()) {
-            ++superWeaponCount;
-        }
+    int32 count = 0;
+    for (int32 i = 0; i < HouseClass::MaxSuperWeapons; ++i) {
+        if (pHouse->SuperWeaponTimers[i].HasTimeLeft()) ++count;
     }
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(superWeaponCount, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(count,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateTechLevel(HouseClass* pHouse) const {
     if (!pHouse) return false;
-    int32 tl = pHouse->TechLevel;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(tl, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
+    return EvaluateComparator(pHouse->TechLevel,
+        Conditions[0].ComparatorType, Conditions[0].ComparatorOperand);
 }
 
 bool AITriggerTypeClass::EvaluateWeight() const {
     return Weight_Current >= Weight_Minimum;
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_RegisterSuccess
+//   WeightCur += Rules.AITriggerSuccessWeightDelta（并夹在 [Min,Max] 内）；
+//   cntRuns++；cntSuccesses++。
+// ---------------------------------------------------------------------------
 void AITriggerTypeClass::RegisterSuccess() {
+    double delta = RulesClass::Instance ? RulesClass::Instance->AITriggerSuccessWeightDelta : 0.0;
+    Weight_Current += delta;
+    if (Weight_Current < Weight_Minimum) Weight_Current = Weight_Minimum;
+    if (Weight_Current > Weight_Maximum) Weight_Current = Weight_Maximum;
     ++TimesCompleted;
     ++TimesExecuted;
-    double delta = RulesClass::Instance ? RulesClass::Instance->AITriggerSuccessWeightDelta : 0.1;
-    double coeff = RulesClass::Instance ? RulesClass::Instance->AITriggerTrackRecordCoefficient : 0.9;
-    Weight_Current = Weight_Current * coeff + Weight_Minimum * delta;
-    if (Weight_Current < Weight_Minimum) Weight_Current = Weight_Minimum;
 }
 
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_RegisterFailure
+//   WeightCur += Rules.AITriggerFailureWeightDelta（夹在 [Min,Max] 内）；cntRuns++。
+// ---------------------------------------------------------------------------
 void AITriggerTypeClass::RegisterFailure() {
-    ++TimesExecuted;
-    double delta = RulesClass::Instance ? RulesClass::Instance->AITriggerFailureWeightDelta : 0.1;
-    Weight_Current = Weight_Current * (1.0 + delta);
+    double delta = RulesClass::Instance ? RulesClass::Instance->AITriggerFailureWeightDelta : 0.0;
+    Weight_Current += delta;
+    if (Weight_Current < Weight_Minimum) Weight_Current = Weight_Minimum;
     if (Weight_Current > Weight_Maximum) Weight_Current = Weight_Maximum;
+    ++TimesExecuted;
 }
 
 double AITriggerTypeClass::GetSelectionProbability() const {
@@ -578,61 +718,21 @@ double AITriggerTypeClass::GetSelectionProbability() const {
     return 1.0 - normalized;
 }
 
-bool AITriggerTypeClass::OwnerHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    if (OwnerHouseType == AITriggerHouseType::Single) {
-        if (HouseIndex >= 0) {
-            return OwnerHouseIndexMatches(CallingHouse);
-        }
-        return CallingHouse == TargetHouse;
-    }
-    if (OwnerHouseType == AITriggerHouseType::Any) {
-        return true;
-    }
-    if (OwnerHouseType == AITriggerHouseType::Team) {
-        return CallingHouse == TargetHouse;
-    }
-    return CallingHouse == TargetHouse;
-}
-
-bool AITriggerTypeClass::CivilianHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    return !CallingHouse->IsHumanPlayer && !CallingHouse->PlayerControl;
-}
-
-bool AITriggerTypeClass::EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    if (CallingHouse == TargetHouse) return false;
-    return CallingHouse->IsHostileTo(TargetHouse);
-}
-
-bool AITriggerTypeClass::IronCurtainCharged(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    int32 swIdx = CallingHouse->FindSuperWeapon(SuperWeaponType::IronCurtain);
-    if (swIdx < 0) return false;
-    return !CallingHouse->SuperWeaponTimers[swIdx].InProgress();
-}
-
-bool AITriggerTypeClass::ChronoSphereCharged(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    int32 swIdx = CallingHouse->FindSuperWeapon(SuperWeaponType::ChronoSphere);
-    if (swIdx < 0) return false;
-    return !CallingHouse->SuperWeaponTimers[swIdx].InProgress();
-}
-
-bool AITriggerTypeClass::HouseCredits(HouseClass* CallingHouse, HouseClass* TargetHouse) const {
-    if (!CallingHouse || !TargetHouse) return false;
-    int32 credits = CallingHouse->Credits;
-    for (int32 i = 0; i < 4; ++i) {
-        const auto& cmp = Conditions[i];
-        if (cmp.ComparatorType == 0) break;
-        if (EvaluateComparator(credits, cmp.ComparatorType, cmp.ComparatorOperand)) return true;
-    }
-    return false;
-}
-
 bool AITriggerTypeClass::OwnerHouseIndexMatches(HouseClass* pHouse) const {
     return pHouse && pHouse->ArrayIndex == HouseIndex;
+}
+
+// ---------------------------------------------------------------------------
+// asm: AITriggerTypeClass_WriteToTriggerEnable(CCINIClass *this, byte GlobalState)
+//   把全局表中所有触发类型的使能位写回 [AITriggerTypesEnable]（GlobalState==0）。
+// ---------------------------------------------------------------------------
+void AITriggerTypeClass::WriteToTriggerEnable(bool enable) {
+    if (enable) return;
+    if (Array == nullptr) return;
+    for (int32 i = 0; i < Array->Count; ++i) {
+        AITriggerTypeClass* item = Array->GetItem(i);
+        if (item) item->IsEnabled = false;
+    }
 }
 
 void AITriggerTypeClass::FormatForSaving(char* buffer, size_t size) const {
@@ -665,60 +765,4 @@ void AITriggerTypeClass::FormatForSaving(char* buffer, size_t size) const {
         static_cast<uint32>(this->Enabled_Easy),
         static_cast<uint32>(this->Enabled_Normal),
         static_cast<uint32>(this->Enabled_Hard));
-}
-// ------------------------------------------------------------------------
-// 根据游戏行为，可知资金比较以六种比较算子查表分派：取参战方当前
-// 资金与条件操作数逐档比较后回填布尔结果。
-// ------------------------------------------------------------------------
-bool AITriggerTypeClass::CompareHouseMoney(HouseClass* pHouse)
-{
-    if (pHouse == nullptr) {
-        return false;
-    }
-
-    const int32 credits = pHouse->Credits;
-    const int32 comparator = Conditions[0].ComparatorType;
-    const int32 operand = Conditions[0].ComparatorOperand;
-
-    switch (comparator) {
-        case 0:
-            return credits < operand;
-        case 1:
-            return credits <= operand;
-        case 2:
-            return credits == operand;
-        case 3:
-            return credits != operand;
-        case 4:
-            return credits > operand;
-        case 5:
-            return credits >= operand;
-        default:
-            break;
-    }
-    return false;
-}
-
-// ------------------------------------------------------------------------
-// 根据游戏行为，可知两个超武充能判定都沿参战方的特殊武器建筑清单
-// 巡查充能余量，命中即视为就绪；这里转调既有的充能判定面。
-// ------------------------------------------------------------------------
-bool AITriggerTypeClass::IronCurtainPercentReady(HouseClass* pHouse)
-{
-    return IronCurtainCharged(pHouse, pHouse);
-}
-
-bool AITriggerTypeClass::ChronospherePercentReady(HouseClass* pHouse)
-{
-    return ChronoSphereCharged(pHouse, pHouse);
-}
-
-// ------------------------------------------------------------------------
-// 根据游戏行为，可知场景保存时触发器的启停状态要回写进触发数据，
-// 使能位与全局旗标一起落盘。
-// ------------------------------------------------------------------------
-void AITriggerTypeClass::WriteToTriggerEnable(bool enable)
-{
-    IsEnabled = enable;
-    IsGlobal = enable ? IsGlobal : 0;
 }

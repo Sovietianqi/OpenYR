@@ -475,6 +475,59 @@ enum class MovementZone : int32 {
     Count = 13
 };
 
+// =============================================================================
+// eAbilities —— asm: enum eAbilities, mappedto_65   (asm:41080)
+//
+//   TechnoTypeClass::VeteranAbilities / EliteAbilities 的数组下标；
+//   TechnoClass::HasAbility(idx) 读这两个数组。
+//
+// asm 权威定义（逐项对齐，勿改数值）：
+//     FASTER=0 STRONGER=1 FIREPOWER=2 SCATTER=3 ROF=4 SIGHT=5 CLOAK=6
+//     TIBERIUM_PROOF=7 VEIN_PROOF=8 SELF_HEAL=9 EXPLODES=0Ah
+//     RADAR_INVISIBLE=0Bh SENSORS=0Ch FEARLESS=0Dh C4=0Eh
+//     TIBERIUM_HEAL=0Fh GUARD_AREA=10h CRUSHER=11h
+// =============================================================================
+enum Abilities : int32 {
+    ABILITY_FASTER          = 0x00,   // asm: FASTER
+    ABILITY_STRONGER        = 0x01,   // asm: STRONGER
+    ABILITY_FIREPOWER       = 0x02,   // asm: FIREPOWER
+    ABILITY_SCATTER         = 0x03,   // asm: SCATTER
+    ABILITY_ROF             = 0x04,   // asm: ROF
+    ABILITY_SIGHT           = 0x05,   // asm: SIGHT
+    ABILITY_CLOAK           = 0x06,   // asm: CLOAK
+    ABILITY_TIBERIUM_PROOF  = 0x07,   // asm: TIBERIUM_PROOF
+    ABILITY_VEIN_PROOF      = 0x08,   // asm: VEIN_PROOF
+    ABILITY_SELF_HEAL       = 0x09,   // asm: SELF_HEAL
+    ABILITY_EXPLODES        = 0x0A,   // asm: EXPLODES
+    ABILITY_RADAR_INVISIBLE = 0x0B,   // asm: RADAR_INVISIBLE
+    ABILITY_SENSORS         = 0x0C,   // asm: SENSORS
+    ABILITY_FEARLESS        = 0x0D,   // asm: FEARLESS
+    ABILITY_C4              = 0x0E,   // asm: C4      （FootClass_Mi_Capture 用）
+    ABILITY_TIBERIUM_HEAL   = 0x0F,   // asm: TIBERIUM_HEAL
+    ABILITY_GUARD_AREA      = 0x10,   // asm: GUARD_AREA
+    ABILITY_CRUSHER         = 0x11,   // asm: CRUSHER
+};
+
+// =============================================================================
+// eActions —— asm: enum eActions, mappedto_66   (asm:41098)
+//   DisplayClass/TacticalClass 的点击动作码（ClickedMission 返回它）。
+// =============================================================================
+enum Actions : int32 {
+    ACTION_None           = 0x00,
+    ACTION_Move           = 0x01,
+    ACTION_NoMove         = 0x02,
+    ACTION_Enter          = 0x03,
+    ACTION_Self_Deploy    = 0x04,
+    ACTION_Attack         = 0x05,
+    ACTION_Harvest        = 0x06,
+    ACTION_Select         = 0x07,
+    ACTION_ToggleSelect   = 0x08,
+    ACTION_Capture        = 0x09,
+    ACTION_Eaten          = 0x0A,
+    ACTION_Repair         = 0x0B,
+    ACTION_Sell           = 0x0C,
+};
+
 // Number of external units a single structure may power (asm BuildingTypeClass
 // slots at +0xF8C, each 0x44 bytes wide).
 static constexpr int32 BUILDING_POWERED_UNIT_COUNT = 3;
@@ -585,6 +638,12 @@ class WeaponTypeClass;
 struct WeaponStruct {
     WeaponTypeClass* WeaponType;  // resolved WeaponTypeClass for this slot (null if unset)
     int32 dummy;
+    // asm: TechnoClass_GetFLH 从 GetWeapon(idx) 的返回值读 +4/+8/+0Ch —— 即每槽
+    //  独立的炮口偏移 FLH（Forward/Lateral/Height）。同一结构在 TechnoClass_Fire
+    //  中只用到 +0（WeaponType*），故此处补全三分量。
+    int32 FLH_X;                  // 前向偏移
+    int32 FLH_Y;                  // 侧向偏移
+    int32 FLH_Z;                  // 高度偏移
 };
 class IStream;
 class IPersistStream;

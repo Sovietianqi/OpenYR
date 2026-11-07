@@ -53,63 +53,15 @@ void LocomotionClass::LinkToObject(FootClass* pFoot)
 }
 
 // ============================================================================
-// Process - Main movement loop. Called each game frame.
-// In the base class, this handles the core movement logic:
-// accumulating speed toward the destination with terrain-aware checks.
-// Derived classes override this for specific movement patterns.
+// Process - 每帧驱动的基类默认槽位。
+// asm: LocomotionClass_ILocomotion_Process   (asm:750656)
+//   `mov al,1; retn 4`——基类不推进任何东西，只报告"仍在活动"，恒返回 true。
+//   真正的逐帧移动由各派生移动器覆写（Walk/Drive/Teleport/Rocket/Jumpjet…）。
 // ============================================================================
 
 bool LocomotionClass::Process()
 {
-    if (!IsMoving) {
-        return false;
-    }
-
-    if (!Powered) {
-        IsMoving = false;
-        return false;
-    }
-
-    int32 effectiveSpeed = static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage);
-    if (effectiveSpeed <= 0) {
-        effectiveSpeed = 1;
-    }
-
-    SpeedAccum += effectiveSpeed;
-
-    int32 stepThreshold = 256;
-    if (SpeedAccum < stepThreshold) {
-        return true;
-    }
-
-    while (SpeedAccum >= stepThreshold && IsMoving) {
-        SpeedAccum -= stepThreshold;
-
-        CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
-        CellStruct destCell = CoordMath::CoordToCell(Dest);
-
-        if (Can_Enter_Cell(destCell) == Move::No) {
-            CoordStruct nearest = GetClosestOkCell(Dest);
-            if (nearest == CoordStruct(0, 0, 0)) {
-                IsMoving = false;
-                return false;
-            }
-            Dest = nearest;
-            destCell = CoordMath::CoordToCell(nearest);
-        }
-
-        int32 totalDist = CoordMath::CoordDistance(CurrentCoord, Dest);
-        if (totalDist <= effectiveSpeed) {
-            CurrentCoord = Dest;
-            IsMoving = false;
-            SpeedAccum = 0;
-            return false;
-        }
-
-        CurrentCoord = VectorMath::MoveTowards(CurrentCoord, Dest, effectiveSpeed);
-    }
-
-    return IsMoving;
+    return true;
 }
 
 // ============================================================================
@@ -139,30 +91,24 @@ void LocomotionClass::Move_To(AbstractClass* target)
 }
 
 // ============================================================================
-// Stop_Moving - Halts all movement immediately.
+// Stop_Moving - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_StopMoving   (asm:750632)  `retn 4`
+//   基类不持有可停状态；Walk 由 ILocomotion_StopMoving 覆写，Rocket 亦自有实现。
 // ============================================================================
 
 void LocomotionClass::Stop_Moving()
 {
-    IsMoving = false;
-    SpeedAccum = 0;
 }
 
 // ============================================================================
-// Do_Turn - Handles body rotation toward a facing direction.
-// Base implementation is a no-op; derived classes handle rotation.
+// Do_Turn - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_DoTurn   (asm:750620)  `retn 8`
+//   基类不驱动转身；Walk/Drive/Teleport/Rocket/Jumpjet 各自覆写。
 // ============================================================================
 
 void LocomotionClass::Do_Turn(DirStruct coord)
 {
-    // Base implementation: store the requested facing on the owner so
-    // that derived classes which track body rotation (Drive, Walk, Ship)
-    // can interpolate from the current value. The base class performs an
-    // immediate snap rather than a gradual turn; derived classes override
-    // this to apply turn-rate-limited rotation.
-    if (Owner) {
-        Owner->SetFacing(coord);
-    }
+    (void)coord;
 }
 
 // ============================================================================
@@ -205,12 +151,14 @@ CoordStruct LocomotionClass::Destination_Coord() const
 }
 
 // ============================================================================
-// Head_To_Coord - Returns the coordinate the unit is heading toward.
+// Head_To_Coord (const) - 与接口槽位同义。
+// asm: LocomotionClass_ILocomotion_HeadToCoord   (asm:750696)
+//   基类返回载体现行坐标（ObjectClass +0x9C 缓存绘制点）。
 // ============================================================================
 
 CoordStruct LocomotionClass::Head_To_Coord() const
 {
-    return Dest;
+    return Owner ? Owner->CachedLocation : CoordStruct(0, 0, 0);
 }
 
 // ============================================================================
@@ -268,15 +216,14 @@ CoordStruct LocomotionClass::GetClosestOkCell(CoordStruct coord)
 }
 
 // ============================================================================
-// Can_Enter_Cell - Checks if a cell is passable. Base returns always OK.
-// Derived classes override with terrain/occupancy checks.
+// Can_Enter_Cell - 基类槽位恒报告可进入。
+// asm: LocomotionClass_ILocomotion_CanEnterCell   (asm:750571)  `xor eax,eax`
+//   返回 0 = Move::OK。边界/地形判定由 Walk/Drive/Ship/Tunnel 各自覆写。
 // ============================================================================
 
 Move LocomotionClass::Can_Enter_Cell(CellStruct cell)
 {
-    if (cell.X < 0 || cell.X >= 512 || cell.Y < 0 || cell.Y >= 512) {
-        return Move::No;
-    }
+    (void)cell;
     return Move::OK;
 }
 
@@ -321,6 +268,39 @@ int32 LocomotionClass::Get_Speed() const
 }
 
 // ============================================================================
+// Set_Coord - 写实坐标并同步给载体。
+// ============================================================================
+
+void LocomotionClass::Set_Coord(CoordStruct coord)
+{
+    CurrentCoord = coord;
+    if (Owner) {
+        Owner->SetCoords(coord);
+    }
+}
+
+// ============================================================================
+// Get_Height - 载体的离地高度（TechnoClass::GetHeight）；无载体时用坐标 Z。
+// ============================================================================
+
+int32 LocomotionClass::Get_Height() const
+{
+    if (Owner) {
+        return Owner->GetHeight();
+    }
+    return CurrentCoord.Z;
+}
+
+// ============================================================================
+// Get_Unit_Type - 载体的技术类型（TechnoType）；无载体给空。
+// ============================================================================
+
+TechnoTypeClass* LocomotionClass::Get_Unit_Type() const
+{
+    return Owner ? Owner->GetType() : nullptr;
+}
+
+// ============================================================================
 // Appear_At - Teleports the unit to a coordinate instantly.
 // ============================================================================
 
@@ -337,50 +317,14 @@ void LocomotionClass::Appear_At(CoordStruct coord)
 }
 
 // ============================================================================
-// Mark_All_Occupation_Bits - Marks or clears occupation bits for the
-// unit's footprint on the map. Used for pathfinding and collision.
+// Mark_All_Occupation_Bits - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_MarkAllOccupationBits   (asm:411580)  `retn 8`
+//   占用位标记由真正落地的移动器覆写（Walk/Drive 等）。
 // ============================================================================
 
 void LocomotionClass::Mark_All_Occupation_Bits(MarkType mark)
 {
-    if (!Owner) {
-        return;
-    }
-
-    CellStruct cell = CoordMath::CoordToCell(CurrentCoord);
-    if (mark == MarkType::Up) {
-        MapClass::Instance->MarkCellOccupied(cell, true);
-
-        for (int32 dx = -1; dx <= 1; ++dx) {
-            for (int32 dy = -1; dy <= 1; ++dy) {
-                if (dx == 0 && dy == 0) {
-                    continue;
-                }
-                CellStruct adj;
-                adj.X = static_cast<int16>(static_cast<int32>(cell.X) + dx);
-                adj.Y = static_cast<int16>(static_cast<int32>(cell.Y) + dy);
-                if (adj.X >= 0 && adj.X < 512 && adj.Y >= 0 && adj.Y < 512) {
-                    MapClass::Instance->MarkCellOccupied(adj, true);
-                }
-            }
-        }
-    } else {
-        MapClass::Instance->MarkCellOccupied(cell, false);
-
-        for (int32 dx = -1; dx <= 1; ++dx) {
-            for (int32 dy = -1; dy <= 1; ++dy) {
-                if (dx == 0 && dy == 0) {
-                    continue;
-                }
-                CellStruct adj;
-                adj.X = static_cast<int16>(static_cast<int32>(cell.X) + dx);
-                adj.Y = static_cast<int16>(static_cast<int32>(cell.Y) + dy);
-                if (adj.X >= 0 && adj.X < 512 && adj.Y >= 0 && adj.Y < 512) {
-                    MapClass::Instance->MarkCellOccupied(adj, false);
-                }
-            }
-        }
-    }
+    (void)mark;
 }
 
 // ============================================================================
@@ -407,12 +351,12 @@ void LocomotionClass::Limbo()
 }
 
 // ============================================================================
-// Unlimbo - Restores the unit from limbo state.
+// Unlimbo - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_Unlimbo   (asm:750608)  `retn 4`
 // ============================================================================
 
 void LocomotionClass::Unlimbo()
 {
-    Mark_All_Occupation_Bits(MarkType::Up);
 }
 
 // ============================================================================
@@ -638,86 +582,48 @@ bool LocomotionClass::Is_To_Have_Moving_Anim() const
 }
 
 // ============================================================================
-// Push - Attempts to push the unit in a direction (for physics collisions).
+// Push - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_Push   (asm:750462)  `xor al,al; retn 8`
 // ============================================================================
 
 bool LocomotionClass::Push(DirStruct dir)
 {
-    if (!Owner) {
-        return false;
-    }
-
-    auto delta = Facing::GetMovementDelta(dir);
-    CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
-    CellStruct targetCell;
-    targetCell.X = static_cast<int16>(static_cast<int32>(currentCell.X) + delta.first);
-    targetCell.Y = static_cast<int16>(static_cast<int32>(currentCell.Y) + delta.second);
-
-    if (Can_Enter_Cell(targetCell) == Move::OK) {
-        CoordStruct newCoord = CoordMath::CellToCoord(targetCell);
-        CurrentCoord = newCoord;
-        if (Owner) {
-            Owner->SetCoords(newCoord);
-        }
-        return true;
-    }
-
+    (void)dir;
     return false;
 }
 
 // ============================================================================
-// Shove - Stronger push that ignores some terrain restrictions.
+// Shove - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_Shove   (asm:750475)  `xor al,al; retn 8`
 // ============================================================================
 
 bool LocomotionClass::Shove(DirStruct dir)
 {
-    if (!Owner) {
-        return false;
-    }
-
-    auto delta = Facing::GetMovementDelta(dir);
-    CellStruct currentCell = CoordMath::CoordToCell(CurrentCoord);
-    CellStruct targetCell;
-    targetCell.X = static_cast<int16>(static_cast<int32>(currentCell.X) + delta.first * 2);
-    targetCell.Y = static_cast<int16>(static_cast<int32>(currentCell.Y) + delta.second * 2);
-
-    if (targetCell.X >= 0 && targetCell.X < 512 && targetCell.Y >= 0 && targetCell.Y < 512) {
-        CoordStruct newCoord = CoordMath::CellToCoord(targetCell);
-        CurrentCoord = newCoord;
-        if (Owner) {
-            Owner->SetCoords(newCoord);
-        }
-        return true;
-    }
-
+    (void)dir;
     return false;
 }
 
 // ============================================================================
-// Force_Track - Forces the unit onto a specific track at a coordinate.
+// Force_Track - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_ForceTrack   (asm:750596)  `retn 14h`
+//   轨道约束仅对 Drive 有意义，由 DriveLocomotionClass 覆写。
 // ============================================================================
 
 void LocomotionClass::Force_Track(int32 track, CoordStruct coord)
 {
-    Dest = coord;
-    IsMoving = true;
-    SpeedAccum = 0;
+    (void)track;
+    (void)coord;
 }
 
 // ============================================================================
-// Force_Immediate_Destination - Instantly sets and snaps to destination.
+// Force_Immediate_Destination - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_ForceImmediateDestination   (asm:750584)  `retn 10h`
+//   立即落点由 Walk 等各自覆写。
 // ============================================================================
 
 void LocomotionClass::Force_Immediate_Destination(CoordStruct coord)
 {
-    Dest = coord;
-    CurrentCoord = coord;
-    IsMoving = false;
-    SpeedAccum = 0;
-
-    if (Owner) {
-        Owner->SetCoords(coord);
-    }
+    (void)coord;
 }
 
 // ============================================================================
@@ -740,116 +646,62 @@ void LocomotionClass::Force_New_Slope(int32 ramp)
 }
 
 // ============================================================================
-// Apparent_Speed - Returns the speed as it appears to the game logic.
+// Apparent_Speed - 表观速度（来自载体的现行移动速度）。
+// asm: LocomotionClass_ILocomotion_ApparentSpeed   (asm:2168)
+//   `mov ecx,[eax+8]; mov edx,[ecx]; call [edx+538h]`——直接把载体的
+//   GetCurrentSpeed（+0x538 槽）作为表观速度回传；无载体时回落到
+//   自身 Speed * SpeedPercentage。
 // ============================================================================
 
 int32 LocomotionClass::Apparent_Speed() const
 {
+    if (Owner) {
+        const int32 ownerSpeed = Owner->GetCurrentSpeed();
+        if (ownerSpeed > 0) {
+            return ownerSpeed;
+        }
+    }
     return static_cast<int32>(static_cast<float>(Speed) * SpeedPercentage);
 }
 
 // ============================================================================
-// Drawing_Code - Returns the drawing code for the locomotion type.
-// The code controls which render state the voxel/shape drawer uses:
-//   0 = static (idle, no movement)
-//   1 = moving (translating toward a destination)
-//   2 = turning (rotating in place without translation)
-// The base class only tracks the IsMoving flag, so it can distinguish
-// between static and moving. Turning (code 2) is reported by derived
-// classes that track body rotation (e.g. DriveLocomotionClass::IsRotating);
-// the base class has no turn state and therefore never reports 2.
+// Drawing_Code - 基类槽位恒返回 0。
+// asm: LocomotionClass_ILocomotion_DrawingCode   (asm:750753)  `xor eax,eax; retn 4`
 // ============================================================================
 
 int32 LocomotionClass::Drawing_Code() const
 {
-    if (!Powered) {
-        return 0;
-    }
-
-    if (IsMoving) {
-        return 1;
-    }
-
     return 0;
 }
 
 // ============================================================================
-// Can_Fire - Checks if the unit can fire while moving.
+// Can_Fire - 基类槽位恒返回可开火。
+// asm: LocomotionClass_ILocomotion_CanFire   (asm:750766)  `xor eax,eax; retn 4`
+//   0 = FireError::OK。
 // ============================================================================
 
 FireError LocomotionClass::Can_Fire() const
 {
-    if (!Powered) {
-        return FireError::Ill;
-    }
     return FireError::OK;
 }
 
 // ============================================================================
-// Get_Status - Returns the movement/status code for display.
+// Get_Status - 基类槽位恒返回 0。
+// asm: LocomotionClass_ILocomotion_GetStatus   (asm:408048)  `xor eax,eax; retn 4`
 // ============================================================================
 
 int32 LocomotionClass::Get_Status() const
 {
-    if (!Powered) {
-        return static_cast<int32>(Sequence::Ready);
-    }
-    if (IsMoving) {
-        return static_cast<int32>(Sequence::Walk);
-    }
-    return static_cast<int32>(Sequence::Ready);
+    return 0;
 }
 
 // ============================================================================
-// Acquire_Hunter_Seeker_Target - AI targeting for hunter-seeker behavior.
+// Acquire_Hunter_Seeker_Target - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_AcquireHunterSeekerTarget   (asm:408061)  `retn 4`
 // ============================================================================
 
 void LocomotionClass::Acquire_Hunter_Seeker_Target()
 {
-    if (!Owner) {
-        return;
-    }
-
-    HouseClass* ownerHouse = Owner->GetOwningHouse();
-    if (!ownerHouse) {
-        return;
-    }
-
-    CoordStruct bestTarget = CurrentCoord;
-    int64 bestDistSq = 0;
-    bool found = false;
-
-    for (int32 h = 0; h < MAX_HOUSES; ++h) {
-        HouseClass* enemyHouse = HouseClass::GetHouseByIndex(h);
-        if (!enemyHouse || enemyHouse == ownerHouse || enemyHouse->IsAlliedWith(ownerHouse)) {
-            continue;
-        }
-
-        DynamicVectorClass<TechnoClass*>* enemyUnits = enemyHouse->GetTechnos();
-        if (!enemyUnits) {
-            continue;
-        }
-
-        for (int32 i = 0; i < enemyUnits->Count; ++i) {
-            TechnoClass* enemy = (*enemyUnits)[i];
-            if (!enemy || !enemy->IsActive() || enemy->IsInAir()) {
-                continue;
-            }
-
-            CoordStruct enemyPos = enemy->GetCoords();
-            int64 distSq = CurrentCoord.DistanceSquaredFrom(enemyPos);
-
-            if (!found || distSq < bestDistSq) {
-                bestDistSq = distSq;
-                bestTarget = enemyPos;
-                found = true;
-            }
-        }
-    }
-
-    if (found) {
-        Move_To(bestTarget);
-    }
 }
 
 // ============================================================================
@@ -923,31 +775,21 @@ void LocomotionClass::Stop_Movement_Animation()
 }
 
 // ============================================================================
-// Lock - Locks the unit in place.
+// Lock - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_Lock   (asm:408098)  `retn 4`
 // ============================================================================
 
 void LocomotionClass::Lock()
 {
-    IsMoving = false;
-    SpeedAccum = 0;
 }
 
 // ============================================================================
-// Unlock - Unlocks the unit, allowing movement to resume.
+// Unlock - 基类槽位为空操作。
+// asm: LocomotionClass_ILocomotion_Unlock   (asm:411618)  `retn 4`
 // ============================================================================
 
 void LocomotionClass::Unlock()
 {
-    // Reverse the effect of Lock(): reset the speed accumulator and
-    // resume movement toward the pending destination if the unit has
-    // not yet reached it. If the unit is already at its destination
-    // (or has no destination), it remains stationary.
-    SpeedAccum = 0;
-
-    int32 distance = CoordMath::CoordDistance(CurrentCoord, Dest);
-    if (distance > 0 && Powered) {
-        IsMoving = true;
-    }
 }
 
 // ============================================================================
@@ -998,12 +840,13 @@ int32 LocomotionClass::Get_Track_Index() const
 }
 
 // ============================================================================
-// Get_Speed_Accum - Returns the speed accumulator value.
+// Get_Speed_Accum - 基类槽位恒返回 -1。
+// asm: LocomotionClass_ILocomotion_GetSpeedAccum   (asm:411655)  `or eax,-1; retn 4`
 // ============================================================================
 
 int32 LocomotionClass::Get_Speed_Accum() const
 {
-    return SpeedAccum;
+    return -1;
 }
 
 // ============================================================================
@@ -1139,7 +982,7 @@ int32 LocomotionClass::Get_Speed_Accum()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 HandItOver 负责下面这段逻辑。
+ // asm: void __thiscall LocomotionClass_HandItOver(LocomotionClass **this, LocomotionClass *a2)   (asm:638993)
 //
 //  Swaps the locomotion COM pointer held at `*pSlot` for `pNew`.  The binary
 //  compares the two, releases the incumbent through its Release slot
@@ -1167,7 +1010,7 @@ ILocomotion** LocomotionClass::HandItOver(ILocomotion** pSlot, ILocomotion* pNew
 }
 
 // ============================================================================
-// 根据游戏行为，可知下面这组 ILocomotion_* 入口是接口转发面板：调用者以
+// asm: LocomotionClass_ILocomotion_QueryInterface
 // 接口名访问，这里原样转到本类同义实现。转发层不携带额外状态，任何
 // 派生移动器只需重写实现本身，接口行为随之正确。
 // ============================================================================
@@ -1384,7 +1227,7 @@ void LocomotionClass::ILocomotion_DoTurn(DirStruct dir)
 }
 
 // ============================================================================
-// 根据游戏行为，可知下面一组是接口侧的绘制与投影访问器：影子矩阵在需要
+// asm: LocomotionClass_ILocomotion_ShadowMatrix
 // 影子时给出单位到落点的投影变换，影子落点把屏幕点沿投影方向摊平到地面，
 // 高度梯度取前后两格的地面高差，Z 微调直接改动当前坐标的高度分量，
 // 视觉特征描述绘制层应如何表现该移动器，绘制入口把矩阵与屏幕点交给
@@ -1393,7 +1236,7 @@ void LocomotionClass::ILocomotion_DoTurn(DirStruct dir)
 
 Matrix3D* LocomotionClass::ILocomotion_ShadowMatrix()
 {
-    // 根据游戏行为，可知不要影子的移动器一律返回空，绘制层据此跳过投影。
+    // asm: LocomotionClass_ILocomotion_ShadowPoint
     if (!Is_To_Have_Shadow()) {
         return nullptr;
     }
@@ -1402,7 +1245,7 @@ Matrix3D* LocomotionClass::ILocomotion_ShadowMatrix()
 
 Point2D LocomotionClass::ILocomotion_ShadowPoint(const Point2D& point)
 {
-    // 根据游戏行为，可知影子落点与本体屏幕点同横同纵：投影沿铅直方向
+    // asm: LocomotionClass_ILocomotion_ZGradient
     // 摊平，倾斜造成的偏移由绘制层按地面高程自行处理。
     (void)point;
     return Point2D(0, 0);
@@ -1410,46 +1253,41 @@ Point2D LocomotionClass::ILocomotion_ShadowPoint(const Point2D& point)
 
 int32 LocomotionClass::ILocomotion_ZGradient()
 {
-    // 根据游戏行为，可知坡度感来自下一格与本格的地面高差。
-    CellStruct here = CellClass::Coord2Cell(CurrentCoord);
-    CellStruct next = CellStruct(here.X + 1, here.Y);
-    CellClass* pHere = TheMap->GetCellAt(here.X, here.Y);
-    CellClass* pNext = TheMap->GetCellAt(next.X, next.Y);
-    if (!pHere || !pNext) {
-        return 0;
-    }
-    return pNext->Get_Ground_Height() - pHere->Get_Ground_Height();
+    // asm: LocomotionClass_ILocomotion_ZGradient   (asm:750514)
+    //   `mov eax,2; retn 4`——基类恒报告 2（退化的高度梯度）。
+    return 2;
 }
 
 void LocomotionClass::ILocomotion_ZAdjust(int32 z)
 {
-    // 根据游戏行为，可知 Z 微调只动高度分量，水平位置保持不变。
-    CurrentCoord.Z += z;
+    // asm: LocomotionClass_ILocomotion_ZAdjust   (asm:750500)
+    //   `xor eax,eax; retn 4`——基类不做任何高度微调。
+    (void)z;
 }
 
 int32 LocomotionClass::ILocomotion_VisualCharacter()
 {
-    // 根据游戏行为，可知移动器默认以正常视觉特征呈现，潜地、隐形等
+    // asm: LocomotionClass_ILocomotion_DrawMatrix
     // 特殊形态由派生类覆写。
     return 0;
 }
 
 void LocomotionClass::ILocomotion_DrawMatrix(const RectangleStruct& rect)
 {
-    // 根据游戏行为，可知绘制入口把裁剪区域记录到脏区，等待绘制层统一消费。
+    // asm: LocomotionClass_ILocomotion_DrawPoint
     (void)rect;
     Dirty = true;
 }
 
 void LocomotionClass::ILocomotion_DrawPoint(const Point2D& point)
 {
-    // 根据游戏行为，可知屏幕点落到脏区即可，具体着色由绘制层负责。
+    // asm: int __thiscall LocomotionClass_CreateInstance(LocomotionClass **ppv, CLSID *rclsid, LPUNKNOWN pUnkOuter, int)   (asm:103082)
     (void)point;
     Dirty = true;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 CreateInstance 按类别号挑选拿手移动器：未知类别
+// asm: int __thiscall LocomotionClass_CreateInstance(LocomotionClass **ppv, CLSID *rclsid, LPUNKNOWN pUnkOuter, int)   (asm:103082)
 // 造不出来，返回空。类别常量与序列化用的编号一一对应。
 // ============================================================================
 LocomotionClass* LocomotionClass::CreateInstance(int32 clsid)
@@ -1472,7 +1310,7 @@ LocomotionClass* LocomotionClass::CreateInstance(int32 clsid)
 
 bool LocomotionClass::AssureExists(int32 clsid)
 {
-    // 根据游戏行为，可知登记检查就是看该类别能否被创建：能创建即已登记。
+    // asm: LocomotionClass_FillVar
     switch (clsid) {
     case CLSIDs::Drive:
     case CLSIDs::Tunnel:
@@ -1491,7 +1329,7 @@ bool LocomotionClass::AssureExists(int32 clsid)
 
 HRESULT LocomotionClass::FillVar(IStream* pStm)
 {
-    // 根据游戏行为，可知序列化把公共运动状态按固定顺序写进流：
+    // asm: vt_LocomotionClass.GetMaxSize   (asm:?)
     // 先速度，再速度累积，最后目的地。
     if (!pStm) {
         return E_POINTER;
@@ -1519,7 +1357,7 @@ ULONG LocomotionClass::ppv_AddRef()
 
 ULONG LocomotionClass::ppv_AddRef2()
 {
-    // 根据游戏行为，可知第二槽位与第一槽位共用同一份计数。
+    // asm: LocomotionClass_ILocomotion_4B6690
     return ++RefCount;
 }
 

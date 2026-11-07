@@ -1,4 +1,5 @@
 #include <Abstract/BuildingTypeClass.h>
+#include <FileFormats/SHP.h>
 #include "../Scenario/ScenarioClass.h"
 #include "../Game/Externs.h"
 #include "BuildingClass.h"
@@ -6,10 +7,12 @@
 #include <Abstract/UnitTypeClass.h>
 #include <Abstract/OverlayTypeClass.h>
 #include <Abstract/InfantryTypeClass.h>
+#include <Abstract/AircraftTypeClass.h>
 #include <Objects/IsometricTile.h>
 
 #include <Core/Memory.h>
 #include <Core/Macros.h>
+#include <Core/SwizzleManagerClass.h>
 #include <INI/INIClass.h>
 #include <IO/CRC.h>
 #include <Rules/RulesClass.h>
@@ -441,6 +444,164 @@ bool BuildingTypeClass::IsPowerPlant() const
 {
     // A power plant produces more power than it drains.
     return Power > 0 && PowerDrain == 0;
+}
+
+// ============================================================================
+// asm: int __fastcall BuildingTypeClass_GetFacing(BuildingTypeClass *this)
+//      (0x45F3C0)
+//
+//   mov eax, [ecx+BuildingTypeClass.DeployFacing]
+//   retn
+//
+//   A structure has no free heading; its type-level facing is the fixed
+//   deploy direction parsed from the "DeployFacing" rules key.
+// ============================================================================
+int32 BuildingTypeClass::GetFacing() const
+{
+    return DeployFacing;
+}
+
+// ============================================================================
+// asm: char __thiscall BuildingTypeClass_CanAttackOnTheMove(*this) (0x465960)
+//
+//   xor al, al
+//   retn
+//
+//   Structures never fire while relocating.
+// ============================================================================
+bool BuildingTypeClass::CanAttackOnTheMove() const
+{
+    return false;
+}
+
+// ============================================================================
+// asm: BuildingTypeClass_GetMaxPips (0x45ECC0)
+//
+//   mov  eax, [this+0EF0h]              ; Foundation enum
+//   mov  eax, Foundation_CellsX[eax*4]  ; cells spanned along X
+//   lea/lea/shl                          ; *3 *5 *4  -> cells * 60
+//   cdq / and edx,7 / add / sar eax,3    ; cells*60/8 (rounded)
+//   mov  edx, [this+3D4h]                ; TechnoTypeClass::PipScale
+//   sub  edx, 2
+//   jz   storage/weeder case
+//   sub  edx, 2
+//   jz   return scale
+//   jmp  TechnoTypeClass_GetPipMax       ; every other scale
+//
+//   The Foundation span drives a cell-count pip ceiling (the "60 units per
+//   cell / 8 per pip" figure the game uses for storage bins).  For the
+//   storage scale (PipScale::Tiberium, index 2) the ceiling is that figure
+//   capped first by RulesData storage limit and then by the type's own
+//   Storage; a weeder uses the rules limit alone.
+// ============================================================================
+int32 BuildingTypeClass::GetMaxPips() const
+{
+    // pip_cap := (FoundationCellsX * 60) / 8
+    const int32 cells = X_Foundation_Value();
+    int32 pipCap = (cells * 3) * 5 * 4;   // lea/lea/shl -> *60
+    pipCap = (pipCap + 7) >> 3;           // cdq/and 7/add/sar 3
+
+    const int32 scale = static_cast<int32>(PipScaleValue) - 2;
+
+    if (scale == 0)                        // PipScale::Tiberium (storage)
+    {
+        // The weeder variant reports the rules-level ore cap rather than the
+        // type's own bin size.  asm reads RulesData+0x17D0, whose INI key is
+        // [General] WeedCapacity (verified in RulesClass_Addition_General,
+        // "WeedCapacity" -> RulesClass.LeaveBioReactorSound+155Ch == +0x17D0).
+        const int32 limit = Weeder
+            ? (RulesClass::Instance ? RulesClass::Instance->WeedCapacity : Storage)
+            : Storage;
+
+        if (limit < 0)                     // negative -> no pips at all
+            return 0;
+        return (limit > pipCap) ? pipCap : limit;
+    }
+
+    if (scale == 2)                        // PipScale::Power (index 4)
+        return pipCap;
+
+    return GetPipMax();
+}
+
+// ============================================================================
+// asm: int __thiscall BuildingTypeClass_GetCost(_TechnoTypeClass *this)
+//      (0x45ED70)
+//
+//   esi := TechnoTypeClass_GetCost(this)        ; this->Cost
+//   pad := RulesData.PadAircraft[0]
+//   if (this == pad->Dock) and (not gate)
+//       esi -= (PadAircraft[0].GetCost() + PadAircraft[1].GetCost()) / 2
+//   if (FreeUnit) esi -= FreeUnit->GetCost()
+//   return max(esi, 0)
+//
+//   The paired-aircraft fold transfers the cost of the helipad's two resident
+//   aircraft out of the pad's own price, so buying the pad does not double
+//   count them.  Without a Dock link on our AircraftTypeClass the fold is
+//   driven from the rules PadAircraft list membership of this type.
+// ============================================================================
+int32 BuildingTypeClass::GetCost() const
+{
+    int32 cost = Get_Cost();
+
+    const RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr && pRules->PadAircraft.Count >= 2 && this->HasHelipad)
+    {
+        // Fold the average of the two pad aircraft back out of the price.
+        AircraftTypeClass* pA = pRules->PadAircraft[0];
+        AircraftTypeClass* pB = pRules->PadAircraft[1];
+        if (pA != nullptr && pB != nullptr)
+        {
+            const int32 avg = (pA->Get_Cost() + pB->Get_Cost()) / 2;
+            cost += -avg;
+        }
+    }
+
+    if (FreeUnit != nullptr)
+    {
+        cost -= FreeUnit->Get_Cost();
+        if (cost < 0)
+            cost = 0;
+    }
+
+    return cost;
+}
+
+// ============================================================================
+// asm: wXY *__thiscall BuildingTypeClass_GetFoundationData(BuildingTypeClass*
+//      this, wXY *arg)  (0x45EC30)
+//
+//   eax := [this+BuildingTypeClass.FoundationData]
+//   if (eax == 0) eax := &Foundation_Invalid     ; the shared 7FFF/7FFF entry
+//   return eax
+//
+//   Returns the {0x7FFF,0x7FFF}-terminated table of cell offsets the structure
+//   covers; callers walk it until the sentinel.
+// ============================================================================
+FoundationData* BuildingTypeClass::GetFoundationData()
+{
+    if (FoundationDataPtr != nullptr)
+        return FoundationDataPtr;
+
+    // Shared "no footprint assigned" descriptor: a one-entry invalid table.
+    static FoundationData Foundation_Invalid[1] = {
+        { FoundationData::Invalid, FoundationData::Invalid }
+    };
+    return Foundation_Invalid;
+}
+
+// ============================================================================
+// asm: BuildingTypeClass_GetArrayIndex (0x465DA0)
+//
+//   mov eax, [ecx+0DF8h]
+//   retn
+//
+//   At +0x0DF8 the type stores the base-node prototype it maps onto; this
+//   accessor answers that pointer as the array index used by the base system.
+// ============================================================================
+int32 BuildingTypeClass::GetArrayIndex() const
+{
+    return static_cast<int32>(reinterpret_cast<intptr_t>(field_DF8));
 }
 
 // ============================================================================
@@ -1522,6 +1683,124 @@ int32 BuildingTypeClass::GetCRC() const
 }
 
 // ============================================================================
+// asm: HRESULT __thiscall BuildingTypeClass_Load(BuildingTypeClass *this,
+//          IStream *pStm)  (0x465040)
+//
+//   Release the 7 art-handle/flag pairs (each {ptr, loaded-flag}) that the type
+//   may still hold, then:
+//     TechnoTypeClass_Load(this, pStm)               -> bail if < 0
+//     reset the DockingOffsets vector (vftable +0x1784, count +0x178C)
+//     read int32 count ; the vector's element count
+//     read count * 0Ch bytes into the DockingOffsets storage
+//     Load3DArt ; Load_Theater_Art
+//     FoundationData = Foundation_1x1  + Foundation*12*8
+//     FoundationOutside likewise
+//     Swizzle(ToOverlay, +0EA0/+0EA4/+0EA8/+0EAC)
+//     Load3DArt again ; clear the 7 art-handle pairs
+//     Load2DArt(Scenario.Theater)
+//
+//   The streamed tail is the dock-offset table (12-byte TPoint3D records);
+//   like the asm, the interior pointers are re-bound through the swizzle
+//   manager after the raw read.
+// ============================================================================
+HRESULT BuildingTypeClass::Load(IStream* pStm)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    // asm: release the {handle, loaded} pairs before rebuilding them.
+    if (DemandLoadBuildup && BuildupData != nullptr)
+    {
+        delete static_cast<uint8*>(BuildupData);
+        BuildupData = nullptr;
+        BuildupLoaded = false;
+    }
+
+    HRESULT hr = ObjectTypeClass::Load(pStm);   // effective TechnoTypeClass::Load
+    if (hr < 0)
+        return hr;
+
+    // asm: sub_45E520 resets the DockingOffsets vector to an empty state.
+    DockingOffsets.Clear();
+
+    ULONG read = 0;
+    int32 count = 0;
+    hr = pStm->Read(&count, sizeof(count), &read);
+    if (hr < 0 || read != sizeof(count))
+        return E_FAIL;
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        CoordStruct entry{};
+        hr = pStm->Read(&entry, sizeof(entry), &read);
+        if (hr < 0 || read != sizeof(entry))
+            return E_FAIL;
+        DockingOffsets.Add(entry);
+    }
+
+    // asm: call BuildingTypeClass_Load3DArt then ObjectTypeClass_Load_Theater_Art
+    const int32 idxTheater = (TheScenario != nullptr) ? static_cast<int32>(TheScenario->Theater) : 0;
+    Load3DArt(idxTheater);
+    ObjectTypeClass::Load_Theater_Art(idxTheater);
+
+    // asm: reset the footprint descriptor to the shared per-foundation table and
+    // swizzle the overlay / radar pointers back to live objects.
+    FoundationDataPtr = nullptr;
+    TileToUse = nullptr;
+
+    SwizzleManagerClass SwizzleManager;
+    SwizzleManager.Swizzle(0, reinterpret_cast<void**>(&ToOverlay));
+
+    Load3DArt(idxTheater);
+
+    // asm: zero the art-handle pairs again, then load the second-stage art.
+    Load2DArt(idxTheater);
+
+    return S_OK;
+}
+
+// ============================================================================
+// asm: HRESULT __thiscall BuildingTypeClass_Save(BuildingTypeClass *this,
+//          IStream *pStm, BOOL fClearDirty)  (0x465340)
+//
+//   TechnoTypeClass_Save(this, pStm, fClearDirty)   -> bail if < 0
+//   write int32 count                                ; [this+178Ch]
+//   for (i = 0; i < count; ++i)
+//       write 0Ch bytes ; [this+1788h] + i*0Ch
+//
+//   The tail of the persistence stream carries the type's dock-offset table:
+//   first the entry count, then the fixed-size 12-byte per-entry records.
+// ============================================================================
+HRESULT BuildingTypeClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    HRESULT hr = TechnoTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0)
+        return hr;
+
+    ULONG written = 0;
+
+    // asm: mov ecx, [ebx+178Ch] ; push 4 ; write
+    const int32 count = DockingOffsets.Count;
+    hr = pStm->Write(&count, sizeof(count), &written);
+    if (hr < 0 || written != sizeof(count))
+        return E_FAIL;
+
+    // asm: loop writing 0Ch bytes per dock-offset entry.
+    for (int32 i = 0; i < count; ++i)
+    {
+        const CoordStruct& entry = DockingOffsets[i];
+        hr = pStm->Write(&entry, sizeof(entry), &written);
+        if (hr < 0 || written != sizeof(entry))
+            return E_FAIL;
+    }
+
+    return S_OK;
+}
+
+// ============================================================================
 // BuildingTypeClass - static lookup helpers
 // ============================================================================
 
@@ -1542,13 +1821,13 @@ BuildingTypeClass* BuildingTypeClass::FindOrAllocate(const char* pID)
 }
 
 // ============================================================================
-// 占地/标价/放置/地基/装载/生成（根据游戏行为实现）
+// asm: void __thiscall BuildingTypeClass_GetAreaInLeptons(BuildingTypeClass *this, dwXYZ *dest)   (asm:240487)
 // ============================================================================
 
 // 建筑高度折算用的每层勒干数（工程默认一比一格）。
 static int32 BuildingTypeClass_BuildingHeightInLeptons = 256;
 
-// 根据游戏行为，可知地基占地按“格数 ×256 勒干”换算，建筑高度按每层
+// asm: void __thiscall BuildingTypeClass_GetAreaInLeptons(BuildingTypeClass *this, dwXYZ *dest)   (asm:240487)
 // 固定勒干数折算后写入输出坐标的 Z 分量。
 void BuildingTypeClass::GetAreaInLeptons(CoordStruct& out) const
 {
@@ -1557,14 +1836,14 @@ void BuildingTypeClass::GetAreaInLeptons(CoordStruct& out) const
     out.Z = Height * BuildingTypeClass_BuildingHeightInLeptons;
 }
 
-// 根据游戏行为，可知建筑标价的通用路径取实际造价（含归属方折扣）；
+// asm: int __thiscall BuildingTypeClass_GetPrice(BuildingTypeClass *this, HouseClass_old *owner)   (asm:231623)
 // 原版对规则指定的电厂类建筑另有计价修正分支，仅在该类型命中时生效。
 int32 BuildingTypeClass::GetPrice(HouseClass* pOwner) const
 {
     return GetActualCost(pOwner);
 }
 
-// 对应原版槽位 BuildingTypeClass::CanPlaceHere：根据游戏行为，可知带
+// asm: BuildingTypeClass_CanPlaceHere
 // 放置豁免标志的类型（围墙类）可放在任意位置；其余类型逐格检查地基
 // 覆盖区域是否空闲。
 bool BuildingTypeClass::CanPlaceHere(int32 x, int32 y) const
@@ -1588,7 +1867,7 @@ bool BuildingTypeClass::CanPlaceHere(int32 x, int32 y) const
     return true;
 }
 
-// 根据游戏行为，可知建造图动画按需加载：已加载或未开启按需加载时
+// asm: BuildingTypeClass_Buildup
 // 直接返回；否则用 “类型ID + .SHP” 生成文件名，做剧场扩展名修正后
 // 交给美术层装载，并置“已装载”标志。
 void BuildingTypeClass::Buildup()
@@ -1610,7 +1889,7 @@ void BuildingTypeClass::Buildup()
     (void)full;
 }
 
-// 根据游戏行为，可知清除建造图仅在按需加载开启且有已装载句柄时执行：
+// asm: void __fastcall BuildingTypeClass_ClearBuildup(BuildingTypeClass *a1)   (asm:242303)
 // 释放句柄、清空指针并复位装载标志。
 void BuildingTypeClass::ClearBuildup()
 {
@@ -1622,7 +1901,7 @@ void BuildingTypeClass::ClearBuildup()
     BuildupLoaded = false;
 }
 
-// 根据游戏行为，可知地基覆盖序列按行优先填满整个地基矩形。
+// asm: BuildingTypeClass_InitFoundations
 void BuildingTypeClass::InitFoundations()
 {
     FoundationCells.Clear();
@@ -1635,7 +1914,7 @@ void BuildingTypeClass::InitFoundations()
     }
 }
 
-// 根据游戏行为，可知地基描边只取矩形四条边的格子：顶行、底行、左列
+// asm: BuildingTypeClass_InitFoundationOutlines
 // 与右列，供摆放预览的高亮描边使用。
 void BuildingTypeClass::InitFoundationOutlines()
 {
@@ -1652,7 +1931,7 @@ void BuildingTypeClass::InitFoundationOutlines()
     }
 }
 
-// 根据游戏行为，可知主图像按 “Image 键值 + .SHP” 解析并做剧场扩展名
+// asm: BuildingTypeClass_LoadImageSHP
 // 修正后装载，装载路径与二级美术(Load2DArt)一致。
 void BuildingTypeClass::LoadImageSHP(int32 idxTheater)
 {
@@ -1669,7 +1948,7 @@ void BuildingTypeClass::LoadImageSHP(int32 idxTheater)
     TheaterSpecificID(base, idxTheater, full);
 }
 
-// 根据游戏行为，可知完整美术装载按顺序执行：主图像 → 二维动画帧 →
+// asm: void __fastcall BuildingTypeClass_LoadArt(int idxTheatre)   (asm:231038)
 // 三维炮塔体素 → 地基与描边初始化。
 void BuildingTypeClass::LoadArt()
 {
@@ -1681,7 +1960,7 @@ void BuildingTypeClass::LoadArt()
     InitFoundationOutlines();
 }
 
-// 根据游戏行为，可知在指定坐标生成建筑实例：先以归属方构造建筑对象
+// asm: char __thiscall BuildingTypeClass_SpawnAtCoords(BuildingTypeClass *Type, wXY *a2, HouseClass_old *Owner)   (asm:230831)
 // 并绑定类型，再落到地图上。
 BuildingClass* BuildingTypeClass::SpawnAtCoords(const CoordStruct& coord, HouseClass* pOwner)
 {
@@ -1691,7 +1970,30 @@ BuildingClass* BuildingTypeClass::SpawnAtCoords(const CoordStruct& coord, HouseC
     return pBuilding;
 }
 
-// 根据游戏行为，可知“从列表中查找或分配”先按 ID 在给定列表里查找，
+// ============================================================================
+// asm: BuildingClass *__thiscall BuildingTypeClass_CreateBuilding(
+//          BuildingTypeClass *Type, HouseClass_old *Owner)  (0x45E860)
+//
+//   push size BuildingClass ; call new
+//   test eax, eax ; jz return_null
+//   push Owner ; push Type ; call BuildingClass_CTOR
+//
+//   Allocates and constructs a BuildingClass bound to this type and owner.
+//   Placement onto the map is left to the caller (see SpawnAtCoords).
+// ============================================================================
+BuildingClass* BuildingTypeClass::CreateBuilding(HouseClass* pOwner)
+{
+    // asm: the allocation is wrapped in the game's operator new, which may
+    // fail; the constructor is only run when it succeeded.
+    BuildingClass* pBuilding = GameCreateArgs<BuildingClass>(pOwner);
+    if (pBuilding == nullptr)
+        return nullptr;
+
+    pBuilding->Type = this;
+    return pBuilding;
+}
+
+// asm: BuildingTypeClass_FindOrAllocateFromList
 // 未命中时新建类型并登记进该列表。
 BuildingTypeClass* BuildingTypeClass::FindOrAllocateFromList(DynamicVectorClass<BuildingTypeClass*>& list, const char* pID)
 {
@@ -1709,4 +2011,40 @@ BuildingTypeClass* BuildingTypeClass::FindOrAllocateFromList(DynamicVectorClass<
         list.Add(pType);
     }
     return pType;
+}
+
+// =============================================================================
+// BuildingTypeClass_GetImageDimensions  (asm: BuildingTypeClass_GetImageDimensions)
+//
+//   mov eax, [ecx]                 ; vtable
+//   call dword ptr [eax+9Ch]       ; this->GetImage() -> SHPStruct* or null
+//   test eax, eax
+//   jz   zero_dims
+//   ; sub_69E7E0(&rect, 0) with ecx=image: fills a Rectangle for frame 0
+//   ; then (w,h) = [ret+8], [ret+0Ch]
+//   ...
+//   out[0] = w ; out[1] = w ; out[2] = h     ; width is stored twice
+//
+// When no image is loaded the three outputs are zeroed.  The Rectangle
+// fields at +8/+0xC are Width/Height in this codebase's layout, so the
+// GetFrameBounds(rect, 0) helper supplies exactly those values.
+// =============================================================================
+void BuildingTypeClass::GetImageDimensions(int32* pOut)
+{
+    SHPStruct* pImage = GetImage();           // asm: call dword ptr [eax+9Ch]
+
+    int32 w = 0;
+    int32 h = 0;
+    if (pImage != nullptr) {
+        Rectangle rc;                          // asm: local var_20/var_1C pair
+        pImage->GetFrameBounds(rc, 0);         // asm: sub_69E7E0(&rc, 0)
+        w = rc.Width;                          // asm: mov ecx, [eax+8]
+        h = rc.Height;                         // asm: mov edx, [eax+0Ch]
+    }
+
+    if (pOut != nullptr) {
+        pOut[0] = w;                           // asm: mov [esi], ecx
+        pOut[1] = w;                           // asm: mov [esi+4], ecx (yes, twice)
+        pOut[2] = h;                           // asm: mov [esi+8], edx
+    }
 }

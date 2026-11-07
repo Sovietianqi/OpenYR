@@ -4,10 +4,12 @@
 #include "../Core/Macros.h"
 #include "../Core/Memory.h"
 #include "../Math/CoordStruct.h"
-#include "../Abstract/AbstractClass.h"
+#include "../Abstract/ObjectTypeClass.h"
 #include "../Special/AlphaShapeClass.h"
 
 class INIClass;
+class CCINIClass;
+class CRCEngine;
 
 enum class EmitShapeType : int32 {
     Point = 0,
@@ -51,8 +53,21 @@ struct FloatKey {
     float Value;
 };
 
-class ParticleTypeClass {
+// ============================================================================
+// ParticleTypeClass - single particle *type* definition (fire/smoke/spark...)
+//
+//  asm: ParticleTypeClass_CTOR begins with `call ObjectTypeClass_CTOR` and the
+//  object carries the ParticleTypeClass / IRTTITypeInfo / INoticeSink /
+//  INoticeSource vtables; it is therefore an ObjectTypeClass derivative (as
+//  opposed to the standalone design an earlier revision assumed).  Its identity
+//  string lives in the inherited AbstractTypeClass::ID slot (asm uses
+//  `[this+0x24]` as the INI section), and GetAbstractDerivationID returns 0x17
+//  (AbstractType::ParticleType).
+// ============================================================================
+class NOVTABLE ParticleTypeClass : public ObjectTypeClass {
 public:
+    static const AbstractType AbsID = AbstractType::ParticleType;
+
     static DynamicVectorClass<ParticleTypeClass*>* Array;
 
     static ParticleTypeClass* Find(const char* pID);
@@ -64,9 +79,42 @@ public:
     static int32 BehavesLikeFromName(const char* pName);
     static const char* BehavesLikeToName(int32 nIndex);
 
-    ParticleTypeClass();
-    ~ParticleTypeClass();
+    ParticleTypeClass() noexcept;
+    explicit ParticleTypeClass(const char* pID) noexcept;
+    explicit ParticleTypeClass(noinit_t) noexcept : ObjectTypeClass(noinit) {}
+    virtual ~ParticleTypeClass();
 
+    // ------------------------------------------------------------------------
+    // IPersistStream / vtable contract (asm vftable slots).
+    // ------------------------------------------------------------------------
+    virtual HRESULT GetClassID(CLSID* pClassID) override;
+    virtual HRESULT Load(IStream* pStm) override;
+    virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
+
+    virtual AbstractType WhatAmI() const override;
+    virtual int32 Size() const override;
+    virtual void ComputeCRC(CRCEngine& crc) const override;
+    int32 GetCRC() const;
+
+    // asm: ParticleTypeClass_GetAbstractDerivationID: mov eax,17h.
+    // AbstractClass has no such virtual, so (as with ParticleClass/BulletClass)
+    // it is supplied here as a fresh virtual whose value matches the asm.
+    virtual AbstractType GetAbstractDerivationID() const;
+
+    // ------------------------------------------------------------------------
+    // asm: ParticleTypeClass_PointerGotInvalid (retn 8): clears Warhead if the
+    // invalidated pointer is it.  Unified project signature (see briefing §3).
+    // ------------------------------------------------------------------------
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
+
+    // ------------------------------------------------------------------------
+    // [Particles] INI entry parser.  asm takes a single CCINIClass* and derives
+    // the section from the object's ID (set by the constructor).
+    // ------------------------------------------------------------------------
+    virtual bool LoadFromINI(CCINIClass* pINI) override;
+
+    // Legacy two-argument entry kept for callers that pass the section name
+    // explicitly; forwards to the asm-shaped overload semantics.
     bool ReadFromINI(INIClass* ini, const char* section);
 
     ColorStruct CalculateColor(float lifetimeT) const;
@@ -100,7 +148,7 @@ public:
     int32 GetEmissionRate() const;
     bool IsEnabledType() const;
 
-    char Name[32];
+    // Identity string: inherited AbstractTypeClass::ID (asm [this+0x24]).
     int32 MaxLifetime;
     int32 MaxSystemLifetime;
     int32 EmissionRate;

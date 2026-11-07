@@ -38,6 +38,7 @@
 #include <Abstract/UnitClass.h>
 #include <Abstract/AircraftClass.h>
 #include <Abstract/BuildingClass.h>
+#include <Abstract/BuildingLightClass.h>
 #include <Abstract/VoxelAnimClass.h>
 #include <Abstract/TerrainClass.h>
 #include <Abstract/SmudgeClass.h>
@@ -55,6 +56,7 @@
 #include <AI/AITriggerClass.h>
 #include <Special/WaveClass.h>
 #include <Special/RadSiteClass.h>
+#include <Game/LogicClass.h>
 
 // ── Forward declarations ──────────────────────────────────────────────────
 
@@ -135,6 +137,11 @@ extern ConvertClass*     TheConvert;
 extern NetworkingClass*  TheNetworking;
 extern SessionClass*     TheSession;
 
+// asm: Session / dword_A8DAB8 / dword_A8DB30
+extern int32             g_Session;
+extern int32             g_SessionReadyFlag;
+extern int32             g_HostSlotIndex;
+
 // ── Audio systems ─────────────────────────────────────────────────────────
 
 extern VocClass*         TheVoc;
@@ -173,6 +180,13 @@ extern int               g_ParticleCount;
 extern int               g_TerrainCount;
 extern int               g_SmudgeCount;
 extern int               g_OverlayCount;
+
+// ── Global object tables ──────────────────────────────────────────────────
+//
+//  asm: vec_Logics (L28156) —— 每帧 Update 的唯一主表。
+//  定义在 Game/Globals.cpp，维护入口见 Game/LogicClass.h。
+
+extern DynamicVectorClass<LogicClass*>* vec_Logics;
 
 // ── Global timers ─────────────────────────────────────────────────────────
 

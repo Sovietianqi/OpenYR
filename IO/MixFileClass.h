@@ -107,6 +107,31 @@ public:
     static DynamicVectorClass<MixFileClass*>& GetMovies();
 
     //========================================================================
+    // Static constructors of the three DynamicVectorClass registries
+    //========================================================================
+    //
+    // asm: MixFileClass_SCTOR2 (asm:71204) / _SCTOR3 (asm:71256) /
+    //      _SCTOR4 (asm:71308)
+    //
+    //   Original 局部（.data）各挂一个 DynamicVectorClass<MixFileClass*>
+    //   全局：vec_MixFiles / vec_MAPS_MIX / vec_Movies_MIX。每个都由一段
+    //   静态构造函数铺底，逐字段：
+    //     [data]=0  [count]=0  [IsInitialized]=1  [IsAllocated]=0
+    //     [vtable]=DynamicVectorClass<MixFileClass*>::`vftable'
+    //     [incrementAmount]=0Ah  [length]=0
+    //   随后 atexit(loc_40D400/…80/…00) 注册析构：析构把 vtable 回落成
+    //   VectorClass<MixFileClass*>，若 IsAllocated 则 delete data，并把
+    //   data / IsAllocated / count 清零。
+    //
+    //   本工程以函数内静态对象表达同一语义：首次调用构造（等价 SCTOR 铺底），
+    //   进程退出按注册顺序析构（等价 atexit）。GetMixArray/GetMaps/GetMovies
+    //   与这三个 sctor 同源，保证注册表只有一份。
+    //========================================================================
+    static DynamicVectorClass<MixFileClass*>& sctor2();   // asm: vec_MixFiles
+    static DynamicVectorClass<MixFileClass*>& sctor3();   // asm: vec_MAPS_MIX
+    static DynamicVectorClass<MixFileClass*>& sctor4();   // asm: vec_Movies_MIX
+
+    //========================================================================
     // Construction / Destruction
     //========================================================================
 
@@ -147,6 +172,21 @@ public:
     // Get a file's data by CRC32 hash
     void* GetFile(uint32 crc, int32* pOutSize = nullptr) const;
 
+    // ------------------------------------------------------------------------
+    // asm: MixFileClass CTOR's runtime dispatch over the whole registry.  The
+    // lookup walks the loaded-archive list, CRC-hashes the requested name and
+    // binary-searches each archive's (CRC-sorted) index table.  On a hit the
+    // owning archive, the entry, the byte offset within the MIX body and the
+    // entry length are handed back to the caller.
+    //
+    // The retail entry point takes the three out-parameters directly; the
+    // convenience overload below keeps the historical return-the-archive form
+    // used elsewhere in the tree while forwarding the same search.
+    // ------------------------------------------------------------------------
+    static MixFileClass* FindFileByName(const char* pName,
+                                        int32* pOutLength = nullptr,
+                                        int32* pOutOffset = nullptr);
+
     // Get the index entry for a file (returns nullptr if not found)
     const MixIndexEntry* GetIndexEntry(const char* pFileName) const;
 
@@ -159,6 +199,11 @@ public:
 
     // Find a file in all loaded MIX archives
     static void* Retrieve(const char* pFileName, bool forceShapeCache = false);
+
+    // Same search, but also reports the byte size. Asset loaders (SHP/VXL/HVA)
+    // need the length to bounds-check the header before parsing. The returned
+    // block is owned by the caller and must be released with YRMemory::Deallocate.
+    static void* RetrieveSized(const char* pFileName, int32* pOutSize);
 
     // Find a file's offset within a MIX archive
     static bool Offset(const char* pFileName, void*& pData,
@@ -220,6 +265,15 @@ public:
     MixIndexEntry* Headers;
     int32 field_24;
 
+    // asm: the physical size of the leading header block (10 bytes for the
+    // RA2 flag-word flavour, 6 for the plain flavour).  Kept so the body start
+    // offset and the cached-index pointer can be recomputed without re-parsing.
+    int32 HeaderSize;
+
+    // The archive encryption key handed to the two-argument CTOR (borrowed,
+    // not owned).  Only consulted while the encrypted path is active.
+    const char* stashedKey;
+
     // Internal file handle
     CCFileClass* FileHandle;
 
@@ -232,10 +286,16 @@ public:
     static bool CRCTableInitialized;
 
 public:
-    // ------------------------------------------------------------------------
-    // 根据游戏行为，可知 MIX 注册表按名字检索文件，命中返回登记项。
-    // ------------------------------------------------------------------------
-    static MixFileClass* FindFileByName(const char* pName);
+    // asm: MixFileClass CTOR tail - register this archive in every live
+    // registry (list_MixFiles + vec_MixFiles + vec_MixFiles_0).  Every later
+    // lookup walks these, so the archive must be inserted exactly once, after
+    // the index has been parsed.
+    void AddFile();
+
+    // asm: MixFileClass CTOR lookup - fetch one member as a freshly allocated
+    // block owned by the caller (mirrors the global Retrieve but scoped to
+    // this archive).
+    void* RetrieveFile(const char* pFileName, int32* pOutSize = nullptr);
 
 private:
     DISABLE_COPY_AND_MOVE(MixFileClass)

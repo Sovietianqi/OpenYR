@@ -6,6 +6,13 @@
 #include "../Map/MapClass.h"
 #include "../IO/CCFileClass.h"
 #include "../INI/INIClass.h"
+#include "../Game/LoadProgressMgr.h"
+#include "../Game/MainLoop.h"
+#include "../Game/Game.h"
+#include "MPModes.h"
+#include "ConnectionClass.h"
+#include "../Math/Timer.h"
+#include "../Game/Externs.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -19,7 +26,7 @@
 static SessionClass* g_SessionInstance = nullptr;
 
 SessionClass::SessionClass()
-    : SessionID(0), GameState(GameSessionState::Lobby)
+    : SessionID(0), SessionType(0), Field_284C(0), GameState(GameSessionState::Lobby)
     , PlayerCount(0), MaxPlayerCount(8), MapName{}
     , GameSpeed(2), Credits(10000), UnitCount(0)
     , TechLevel(10), SuperWeapons(true), ShortGame(false)
@@ -65,6 +72,14 @@ SessionClass::~SessionClass() {
     DestroySession();
 }
 
+// ----------------------------------------------------------------------------
+// asm: GameClass_CTOR_ (0x5C9A10 区域) —— 静态初始化器，不挂在任何类上
+//   mov ecx, offset Session / call SessionClass::SessionClass
+//   push offset ~SessionClass / call _atexit
+// 即"进程启动就构造唯一的 Session 对象，退出时析构"。
+// 本工程把这一步交给 GetInstance 的懒构造（进程内唯一实例，与 asm 的
+// Session 全局一一对应）；_atexit 那半段由 C++ 运行期代替。
+// ----------------------------------------------------------------------------
 SessionClass* SessionClass::GetInstance() {
     if (!g_SessionInstance) {
         g_SessionInstance = new SessionClass();
@@ -1004,4 +1019,135 @@ void SessionClass::ReadSyncBugSettings()
     SyncBugPrintCRC = ini.ReadInteger(SECTION, "PrintCRC", 0x7FFFFFFF);
 
     CCINIClass::UnloadINIFile(pINI);
+}
+
+// ============================================================================
+// asm: SessionClass_Progess_5EF930 (0x5EF930, thiscall, retn 4: pos)
+//
+//   al = Debug_Map ; test ; jnz loc_69B14E（直接返回）
+//   a3 = pos ; if (Scenario.IsRandom) a3 = pos/2      ; cdq/sub/sar 1
+//   cur = ProgressScreen.Get_Progress(0) * 100        ; sub_643E90 + fmul num_100
+//   if (cur < a3) ProgressScreen.Set_Progress(0, a3, -1)  ; sub_643C50
+//   if ([esi+284Ch] == 1) return
+//   startTick = WinTimerClass::Get_System_Tick_Count() ; budget = 0F0h
+//   switch ([esi] - 1) {                              ; off_69B15C 四路跳表
+//     case 2,3 : loc_69AF45 —— IPX 广播"保证进度"包
+//     default  : goto loc_69B148（Call_Back）
+//     case 0,1 : loc_69B08C —— 连接对话框推进
+//   }
+// ============================================================================
+void SessionClass::Progress(int32 pos)
+{
+    // asm: mov al, Debug_Map / test / jnz —— 调试地图下不推进进度。
+    // 本树的 Debug_Map 只以文件内开关存在于 RadarClass.cpp（内部链接），
+    // 故取全局调试开关 g_bDebugMode（Game/Externs.h）等价承载。
+    if (g_bDebugMode)
+        return;                              // asm: loc_69B14E
+
+    int32 target = pos;                      // asm: a3 = pos
+    if (ScenarioClass::Instance != nullptr &&
+        ScenarioClass::Instance->IsRandom)   // asm: ScenarioClass.IsRandom
+        target = (pos - (pos < 0 ? 1 : 0)) >> 1;   // asm: cdq/sub/sar 1
+
+    const double targetD = static_cast<double>(target);
+
+    const double cur = ProgressScreen.Get_Progress(0) * 100.0;   // fmul num_100
+    // asm: fcomp a3 / fnstsw / test ah,1 / jz skip —— st0 < pos 时才推进
+    if (cur < targetD) {
+        // 推参：(0, target, -1.0)（-1 的位模式是 FFFFFFFFFFFFFFFFh）
+        ProgressScreen.Set_Progress(0, targetD, -1.0);
+    }
+
+    if (Field_284C == 1)                     // asm: cmp [esi+284Ch],1 / jz exit
+        return;
+
+    const int32 startTick = SystemTimer::GetTime();   // WinTimerClass::Get_System_Tick_Count
+    int32 budget = 0xF0;                     // asm: var_1D4 = 0F0h
+
+    const int32 modeIdx = SessionType - 1;   // asm: mov eax,[esi] / dec eax
+    if (static_cast<uint32>(modeIdx) > 3) {  // asm: cmp eax,3 / ja default
+        Call_Back();                         // asm: loc_69B148
+        return;
+    }
+
+    if (modeIdx >= 2) {
+        // ---- 会话类型 3/4（asm loc_69AF45）：IPX 广播保证进度包 ----------
+        // 降级点：本树没有 IPXManagerClass 实体（Core/Definitions.h 只有前置
+        //   声明），0x33 类型包的分发与 IPXManager 的 service 轮询无法直调，
+        //   故保留 asm 的预算/心跳循环骨架，发包与轮询在管理器为空时跳过。
+        uint8 buf[0x1C7];                    // var_1C8 .. rep 71h/stosw/stosb
+        std::memset(buf, 0, sizeof(buf));
+        *reinterpret_cast<int32*>(buf) = 0xF;                 // 包长字段
+        const double pct = ProgressScreen.Get_Progress(0) * 100.0;
+        const int32 n = static_cast<int32>(pct);              // Float_To_Int_Floor
+        // asm: MP_ReadNthPlayerName(NameNodeTypes.data[0])
+        const char* pName = MP::ReadNthPlayerName(MP::PlayerNames[0]);
+        if (pName != nullptr) {
+            int32 len = 0;                    // asm: repne scasb + rep movsd
+            while (pName[len]) ++len;
+            std::memcpy(buf + 4, pName, static_cast<size_t>(len));   // var_1C4
+            buf[4 + len] = 0;
+        }
+        (void)n;                              // asm 把 n 存进 var_199 后不再读
+
+        Call_Back();
+        for (;;) {                            // asm: loc_69B033
+            int32 remaining = budget;
+            if (startTick != -1) {            // asm: cmp eax,ebp / jz skip
+                const int32 elapsed = SystemTimer::GetTime() - startTick;
+                if (elapsed >= budget)        // asm: jge loc_69B148
+                    break;
+                remaining = budget - elapsed;
+            }
+            if (remaining <= 0)               // asm: test esi,esi / jle
+                break;
+            Game::Game_Sleep(20);             // asm: push 14h / call Sleep
+            Call_Back();                      // asm: sub_5D4D50 + Call_Back
+        }
+        Call_Back();                          // asm: loc_69B148
+        return;
+    }
+
+    // ---- 会话类型 1/2（asm loc_69B08C）：连接对话框推进 -------------------
+    ConnectionClass* pConn = ConnectionManager::GetInstance() != nullptr
+                           ? ConnectionManager::GetInstance()->GetConnection(0)
+                           : nullptr;          // asm: dword_A8EA70（主连接）
+    uint8 buf[0xFA];                           // rep 3Eh stosd + stosw
+    std::memset(buf, 0, sizeof(buf));
+    *reinterpret_cast<int32*>(buf) = 0x6C;     // 包长字段
+    const double pct = ProgressScreen.Get_Progress(0) * 100.0;
+    const int32 n = static_cast<int32>(pct);   // var_1AF（存了但不再读）
+    (void)n;                                   // asm quirk
+    // asm: var_1B0 = byte_A8DB30（连接标志字节）
+    // 降级点：本树无该全局，按 0 落位。
+    buf[0x18] = 0;
+    if (pConn != nullptr)
+        pConn->SendPacket(buf, 0xFA);          // asm: sub_5F1BF0
+    if (pConn != nullptr)
+        pConn->Service_Send_Queue();           // asm: sub_5F1C60
+
+    // asm: sub_5F1EA0 返回本次服务到的报文数，> 5 表示"还有活干"；
+    //   本树 Service_Receive_Queue 只回 bool，故 true 记作 6。
+    if (pConn == nullptr || !pConn->Service_Receive_Queue()) {
+        Call_Back();                           // asm: loc_69B148
+        return;
+    }
+    for (;;) {                                 // asm: loc_69B0FD
+        int32 remaining = budget;
+        if (startTick != -1) {
+            const int32 elapsed = SystemTimer::GetTime() - startTick;
+            if (elapsed >= budget)
+                break;
+            remaining = budget - elapsed;
+        }
+        if (remaining <= 0)
+            break;
+        Game::Game_Sleep(20);                  // asm: push 14h
+        // asm: mov ecx,Keyboard / call sub_54F000 —— 键盘抽头（泵消息）
+        // 降级点：本树 KeyboardClass 没有该抽头入口（无消息循环可泵），略。
+        pConn->Service_Send_Queue();           // asm: sub_5F1C60
+        if (!pConn->Service_Receive_Queue())   // asm: sub_5F1EA0 / cmp 5
+            break;
+    }
+    Call_Back();                               // asm: loc_69B148
 }

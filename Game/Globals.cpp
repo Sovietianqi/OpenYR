@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "Game/Externs.h"
 
 #include "Core/Definitions.h"
@@ -74,6 +75,14 @@ ConvertClass*     TheConvert          = nullptr;
 NetworkingClass*  TheNetworking       = nullptr;
 SessionClass*     TheSession          = nullptr;
 
+// asm: Session —— 会话类型全局（0 无 / 1 单机 / 2 战役 / 3、4 多人）。
+// Call_Back 用它决定是否走事件队列与多人心跳两条支路。
+int32             g_Session           = 0;
+// asm: dword_A8DAB8 bit0 —— Session==1 时才检查的"会话就绪"位。
+int32             g_SessionReadyFlag  = 0;
+// asm: dword_A8DB30 —— 房主槽位号（用于过滤自己发出的进度包）。
+int32             g_HostSlotIndex     = 0;
+
 // ── House / Player globals ────────────────────────────────────────────────
 
 int               ThePlayerIndex      = 0;
@@ -81,7 +90,7 @@ int               TheHouseCount       = 0;
 
 // ── Misc globals ──────────────────────────────────────────────────────────
 
-bool              g_bDebugMode        = false;
+bool              g_bDebugMode        = (std::getenv("OPENYR_DEBUG") != nullptr);
 bool              g_bNoMusic          = false;
 bool              g_bNoSound          = false;
 bool              g_bFullScreen       = true;
@@ -115,10 +124,20 @@ DynamicVectorClass<TiberiumClass*>*        TiberiumClass::Array        = nullptr
 // ── Object instance arrays ────────────────────────────────────────────────
 
 DynamicVectorClass<BulletClass*>*      BulletClass::Array      = nullptr;
+// asm: v_BuildingLight —— 建筑光源对象表（func_55B8F0_obsolete 逐表扫描之一）
+DynamicVectorClass<BuildingLightClass*>* BuildingLightClass::Array = nullptr;
 DynamicVectorClass<ParticleSystemClass*>* ParticleSystemClass::Array = nullptr;
 DynamicVectorClass<ScriptClass*>*      ScriptClass::Array      = nullptr;
 DynamicVectorClass<WaveClass*>*        WaveClass::Array        = nullptr;
 DynamicVectorClass<RadSiteClass*>*     RadSiteClass::Array     = nullptr;
+
+// ── Global object tables ──────────────────────────────────────────────────
+
+// asm: vec_Logics (L28156) —— VectorClass<ObjectClass*> 的逐帧主表。
+//   建立于 L69914-69920，由 ObjectClass::Unlimbo（L1049805）Add、
+//   ObjectClass_DTOR（L1047348）/ Remove0（L1049520）Remove。
+//   LogicClass 是 ObjectClass 在 OpenYR 里的抽象基类（无数据成员）。
+DynamicVectorClass<LogicClass*>* vec_Logics = nullptr;
 
 // ── House arrays ──────────────────────────────────────────────────────────
 
@@ -389,7 +408,8 @@ void InitGlobals()
     TheHouseCount  = 0;
 
     // Debug / display flags.
-    g_bDebugMode       = false;
+    // 冒烟测试：OPENYR_DEBUG=1 时打开逐阶段日志（与 asm 的 g_bDebugMode 语义一致）。
+    g_bDebugMode       = (std::getenv("OPENYR_DEBUG") != nullptr);
     g_bNoMusic         = false;
     g_bNoSound         = false;
     g_bFullScreen      = true;

@@ -1,4 +1,5 @@
 #include <Abstract/InfantryTypeClass.h>
+#include <Abstract/InfantryClass.h>
 #include <Combat/WeaponTypeClass.h>
 #include <Audio/VocClass.h>
 #include <Animations/AnimTypeClass.h>
@@ -9,6 +10,9 @@
 #include <IO/CRC.h>
 #include <Rules/RulesClass.h>
 #include <FileFormats/SHP.h>
+#include <Map/MapClass.h>
+#include <Map/CellClass.h>
+#include <Houses/HouseClass.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -94,6 +98,29 @@ InfantryTypeClass* InfantryTypeClass::FindByIndex(int32 index)
     if (index < 0 || index >= Array->Count)
         return nullptr;
     return Array->Items[index];
+}
+
+// asm: signed int __fastcall InfantryTypeClass_FindIndex(char *arg)   (0x523C90)
+//   "<none>" / "none" both map to -1, otherwise a case-insensitive scan of the
+//   InfantryTypes vector; the matching entry's index is returned, or -1.
+int32 InfantryTypeClass::FindIndex(const char* pID)
+{
+    if (pID == nullptr)
+        return -1;
+    if (!_strcmpi(pID, "<none>") || !_strcmpi(pID, "none"))
+        return -1;
+    if (Array == nullptr)
+        return -1;
+
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        InfantryTypeClass* item = Array->Items[i];
+        if (item == nullptr)
+            continue;
+        if (!_strcmpi(item->ID, pID))
+            return i;
+    }
+    return -1;
 }
 
 int32 InfantryTypeClass::GetCount()
@@ -231,6 +258,198 @@ InfantryTypeClass::InfantryTypeClass() noexcept
 InfantryTypeClass::~InfantryTypeClass()
 {
     // SHP references are owned by the art system.
+}
+
+// ============================================================================
+// asm: InfantryTypeClass_Load (0x524960) / InfantryTypeClass_Save (0x524B60)
+//
+//   Both chain into the techno-type serializer first, then persist the
+//   infantry-only tail in the asm order:
+//     [0E98h] VoiceComment 音效计数 + [0E8Ch] 的 dword 数组
+//     [0E60h] DeadBodies 计数 + [0E54h] 的槽位
+//     [0E7Ch] DeathAnims 计数 + [0E70h] 的槽位
+//     0x5E8 字节 SequenceClass 区
+//   本实现的 SequenceData 是内联 42×0x24 数组，整块读写与 asm 等长；两个动画
+//   列表在原版是 VectorClass<AnimTypeClass*>，此处以"计数 + AnimType 下标"
+//   的 4 字节槽位落盘，既保持字节宽度，又避免把裸指针写进存档。
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// asm: INIClass_Get_Vector_Voc_525430 (0x525430)
+//
+//   GetString("VoiceComment") → strtok(",") → 每个非空 token 先 VocClass_Find
+//   （未命中则丢弃）再 VocClass_FindIndex，把下标追加进 TypeList<int>。
+//   本实现用 VocClass::FindIndex 一步完成"查找 + 取下标"（未命中返回 -1）。
+// ----------------------------------------------------------------------------
+static void Parse_VoiceComment_Sounds(const char* pText, DynamicVectorClass<int32>& out)
+{
+    out.Clear();
+    if (pText == nullptr)
+        return;
+
+    const char* p = pText;
+    while (*p != '\0')
+    {
+        while (*p == ',')          // strtok 会合并连续分隔符
+            ++p;
+        if (*p == '\0')
+            break;
+
+        const char* pBegin = p;
+        while (*p != '\0' && *p != ',')
+            ++p;
+
+        char name[0x40];
+        size_t len = static_cast<size_t>(p - pBegin);
+        if (len >= sizeof(name))
+            len = sizeof(name) - 1;
+        std::memcpy(name, pBegin, len);
+        name[len] = '\0';
+
+        const int32 index = VocClass::FindIndex(name);
+        if (index >= 0)
+            out.Add(index);
+    }
+}
+
+HRESULT InfantryTypeClass::Load(IStream* pStm)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    HRESULT hr = ObjectTypeClass::Load(pStm);
+    if (hr < 0)
+        return hr;
+
+    ULONG read = 0;
+
+    // asm: [this+0E98h] count, then [this+0E8Ch] dwords  (VoiceComment 音效表).
+    {
+        int32 intCount = 0;
+        hr = pStm->Read(&intCount, sizeof(intCount), &read);
+        if (hr < 0 || read != sizeof(intCount))
+            return E_FAIL;
+        if (intCount < 0)
+            return E_FAIL;
+        VoiceCommentSounds.Clear();
+        for (int32 i = 0; i < intCount; ++i)
+        {
+            int32 value = 0;
+            hr = pStm->Read(&value, sizeof(value), &read);
+            if (hr < 0 || read != sizeof(value))
+                return E_FAIL;
+            VoiceCommentSounds.Add(value);
+        }
+    }
+
+    // asm: [this+0E60h] count, then [this+0E54h] anim slots (DeadBodies).
+    // 指针槽在存档里改写为 AnimTypeClass 的数组下标，避免跨进程裸指针。
+    {
+        int32 count = 0;
+        hr = pStm->Read(&count, sizeof(count), &read);
+        if (hr < 0 || read != sizeof(count))
+            return E_FAIL;
+        if (count < 0)
+            return E_FAIL;
+        DeadBodies = nullptr;
+        for (int32 i = 0; i < count; ++i)
+        {
+            int32 index = -1;
+            hr = pStm->Read(&index, sizeof(index), &read);
+            if (hr < 0 || read != sizeof(index))
+                return E_FAIL;
+            if (DeadBodies == nullptr && index >= 0)
+                DeadBodies = AnimTypeClass::FindByIndex(index);
+        }
+    }
+
+    // asm: [this+0E7Ch] count, then [this+0E70h] anim slots (DeathAnims).
+    {
+        int32 count = 0;
+        hr = pStm->Read(&count, sizeof(count), &read);
+        if (hr < 0 || read != sizeof(count))
+            return E_FAIL;
+        if (count < 0)
+            return E_FAIL;
+        DeathAnims = nullptr;
+        for (int32 i = 0; i < count; ++i)
+        {
+            int32 index = -1;
+            hr = pStm->Read(&index, sizeof(index), &read);
+            if (hr < 0 || read != sizeof(index))
+                return E_FAIL;
+            if (DeathAnims == nullptr && index >= 0)
+                DeathAnims = AnimTypeClass::FindByIndex(index);
+        }
+    }
+
+    // asm: 读 0x5E8 字节整块填进 Sequence 区（此处为内联 SequenceData）。
+    hr = pStm->Read(SequenceData, static_cast<ULONG>(sizeof(SequenceData)), &read);
+    if (hr < 0 || read != sizeof(SequenceData))
+        return E_FAIL;
+
+    return S_OK;
+}
+
+HRESULT InfantryTypeClass::Save(IStream* pStm, BOOL fClearDirty)
+{
+    if (pStm == nullptr)
+        return E_POINTER;
+
+    // asm: call TechnoTypeClass_Save first and bail on a negative status.
+    HRESULT hr = ObjectTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0)
+        return hr;
+
+    ULONG written = 0;
+
+    // asm: [0E98h] count，随后逐条写 [0E8Ch] 的 dword。
+    const int32 intCount = VoiceCommentSounds.Count;
+    hr = pStm->Write(&intCount, sizeof(intCount), &written);
+    if (hr < 0 || written != sizeof(intCount))
+        return E_FAIL;
+    for (int32 i = 0; i < intCount; ++i)
+    {
+        int32 value = VoiceCommentSounds.GetItem(i);
+        hr = pStm->Write(&value, sizeof(value), &written);
+        if (hr < 0 || written != sizeof(value))
+            return E_FAIL;
+    }
+
+    // asm: DeadBodies 列表 - 计数 + 每条一个 4 字节槽位（存 AnimType 下标）。
+    const int32 deadIndex = (DeadBodies != nullptr && DeadBodies->get_ID() != nullptr)
+                          ? AnimTypeClass::FindIndex(DeadBodies->get_ID()) : -1;
+    const int32 deadCount = (deadIndex >= 0) ? 1 : 0;
+    hr = pStm->Write(&deadCount, sizeof(deadCount), &written);
+    if (hr < 0 || written != sizeof(deadCount))
+        return E_FAIL;
+    if (deadCount != 0)
+    {
+        hr = pStm->Write(&deadIndex, sizeof(deadIndex), &written);
+        if (hr < 0 || written != sizeof(deadIndex))
+            return E_FAIL;
+    }
+
+    // asm: DeathAnims 列表 - 同构。
+    const int32 deathIndex = (DeathAnims != nullptr && DeathAnims->get_ID() != nullptr)
+                           ? AnimTypeClass::FindIndex(DeathAnims->get_ID()) : -1;
+    const int32 deathCount = (deathIndex >= 0) ? 1 : 0;
+    hr = pStm->Write(&deathCount, sizeof(deathCount), &written);
+    if (hr < 0 || written != sizeof(deathCount))
+        return E_FAIL;
+    if (deathCount != 0)
+    {
+        hr = pStm->Write(&deathIndex, sizeof(deathIndex), &written);
+        if (hr < 0 || written != sizeof(deathIndex))
+            return E_FAIL;
+    }
+
+    // asm: 从 [0E3Ch] 写 0x5E8 字节 Sequence 区。
+    hr = pStm->Write(SequenceData, static_cast<ULONG>(sizeof(SequenceData)), &written);
+    if (hr < 0 || written != sizeof(SequenceData))
+        return E_FAIL;
+
+    return S_OK;
 }
 
 // ============================================================================
@@ -592,6 +811,8 @@ bool InfantryTypeClass::LoadFromINI(CCINIClass* pINI)
     { char _buf[0x40]; if (pINI->ReadString(section, "OccupyWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) OccupyWeapon = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "EliteOccupyWeapon", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) EliteOccupyWeapon = _p; } }
     pINI->ReadString(section, "VoiceComment", VoiceComment, VoiceComment, sizeof(VoiceComment));
+    // asm: [0E88h] = INIClass_Get_Vector_Voc_525430(section, "VoiceComment")
+    Parse_VoiceComment_Sounds(VoiceComment, VoiceCommentSounds);
     { char _buf[0x40]; if (pINI->ReadString(section, "DeadBodies", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DeadBodies = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "DeathAnims", "", _buf, sizeof(_buf)) > 0) { AnimTypeClass* _p = AnimTypeClass::FindOrAllocate(_buf); if (_p) DeathAnims = _p; } }
     Cyborg = pINI->ReadBool(section, "Cyborg", Cyborg);
@@ -874,6 +1095,53 @@ int32 InfantryTypeClass::GetSequenceNameCount()
 }
 
 // ============================================================================
+// InfantryTypeClass::GetSequenceRecordIndex
+//
+//   把项目的 Sequence 枚举翻成原版 Sequences 表的记录下标（0..41），
+//   该下标同时是 artmd.ini 解析时的写入顺序，也是 sub_518D80 取
+//   StartFrame/FrameCount/FramesPerDirection 的下标。
+//   原版表里独有、项目枚举没有对应项的名字（Up / Tread / WetAttack /
+//   Hover / Cheer / Panic / Shovel / Carry / AirDeath* / Secondary*）由
+//   artmd.ini 直接按记录下标写入，不需要从这里映射。
+// ============================================================================
+int32 InfantryTypeClass::GetSequenceRecordIndex(Sequence seq)
+{
+    switch (seq)
+    {
+        case Sequence::Ready:         return 0;
+        case Sequence::Guard:         return 1;
+        case Sequence::Prone:         return 2;
+        case Sequence::Walk:          return 3;
+        case Sequence::FireUp:        return 4;
+        case Sequence::Down:          return 5;
+        case Sequence::Crawl:         return 6;
+        case Sequence::FireProne:     return 8;
+        case Sequence::Idle1:         return 9;
+        case Sequence::Idle2:         return 10;
+        case Sequence::Die1:          return 11;
+        case Sequence::Die2:          return 12;
+        case Sequence::Die3:          return 13;
+        case Sequence::Die4:          return 14;
+        case Sequence::Die5:          return 15;
+        case Sequence::Swim:          return 17;
+        case Sequence::WetIdle1:      return 18;
+        case Sequence::WetIdle2:      return 19;
+        case Sequence::WetDie1:       return 20;
+        case Sequence::WetDie2:       return 21;
+        case Sequence::Fly:           return 24;
+        case Sequence::Tumble:        return 25;
+        case Sequence::FireFly:       return 26;
+        case Sequence::Deploy:        return 27;
+        case Sequence::Deployed:      return 28;
+        case Sequence::DeployedFire:  return 29;
+        case Sequence::DeployedIdle:  return 30;
+        case Sequence::Undeploy:      return 31;
+        case Sequence::Paradrop:      return 33;
+        default:                      return 1;   // Guard
+    }
+}
+
+// ============================================================================
  // InfantryTypeClass_ParseSequence -
 //
 //   artmd.ini's section for this infantry is scanned twice per sequence.  The
@@ -917,19 +1185,17 @@ void InfantryTypeClass::ParseSequence()
             continue;
         }
 
-        // "%d,%d,%d,%s" -> StartFrame, FrameCount, unused, facing token.
-        int32 first = 0;
-        int32 second = 0;
+        // asm: sscanf(value, "%d,%d,%d,%s",
+        //             &rec[+00], &rec[+04], &rec[+08], facing)
         char facing[0x20];
         facing[0] = '\0';
-        if (std::sscanf(value, "%d,%d,%d,%s", &first, &data.FrameCount,
-                        &second, facing) < 4) {
+        if (std::sscanf(value, "%d,%d,%d,%s", &data.StartFrame,
+                        &data.FrameCount, &data.FramesPerDirection,
+                        facing) < 4) {
             continue;
         }
 
         data.Facing = FacingFromName(facing);
-        data.Frames[0].StartFrame = first;
-        data.Frames[0].FrameCount = second;
 
         char key[0x40];
         std::sprintf(key, "%sSounds", g_SequenceNames[seqIndex]);
@@ -954,12 +1220,89 @@ void InfantryTypeClass::ParseSequence()
             const int32 sound = VocClass::FindIndexOfName(pToken);
             if (sound != -1 && slot < 2)
             {
-                data.Sounds[slot].Frame = frame;
-                data.Sounds[slot].SoundIndex = sound;
+                // asm: slot 取 rec[+10]（已填槽数），帧号写 +14/+1C、
+                //      Voc 索引写 +18/+20；填完 slot++ 回写 +10。
+                data.SoundFrame[slot] = frame;
+                data.SoundIndex[slot] = sound;
                 ++slot;
+                data.SoundCount = slot;
             }
 
             pToken = std::strtok(nullptr, " ,\t");
         }
     }
+}
+
+// =============================================================================
+// InfantryTypeClass_CreateInfantry
+// Allocate an InfantryClass for this type and bind its Type back-pointer.
+// Returns nullptr if the allocation failed.
+// =============================================================================
+InfantryClass* InfantryTypeClass::CreateInfantry(HouseClass* pOwner) const
+{
+    InfantryClass* pInf = new InfantryClass(pOwner);
+    if (pInf) {
+        pInf->Type = const_cast<InfantryTypeClass*>(this);
+    }
+    return pInf;
+}
+
+// ============================================================================
+// InfantryTypeClass_GetRepairStep (0x524730)
+//   mov eax, RulesData ; mov eax, [eax+(RulesClass.CreateInfantrySound+155Ch)]
+//   The "IRepairStep" General key, i.e. the infantry repair step.
+// ============================================================================
+int32 InfantryTypeClass::GetRepairStep() const
+{
+    return RulesClass::Instance->IRepairStep;
+}
+
+// ============================================================================
+// InfantryTypeClass_GetRepairStepCost (0x524740)
+//   xor eax, eax ; retn
+//   Infantry never charge a per-step repair cost.
+// ============================================================================
+int32 InfantryTypeClass::GetRepairStepCost() const
+{
+    return 0;
+}
+
+// ============================================================================
+// InfantryTypeClass_SpawnAtCoords (0x523B40)
+//   new InfantryClass(this, Owner) ; pick a free sublocation inside the target
+//   cell ; if the sublocation differs from the default one, move the fresh
+//   infantry there, otherwise drop it at the cell centre.  Returns the spawned
+//   infantry, or nullptr when the allocation failed.
+// ============================================================================
+InfantryClass* InfantryTypeClass::SpawnAtCoords(const CoordStruct& coord, HouseClass* pOwner)
+{
+    InfantryClass* pInf = new InfantryClass(pOwner);
+    if (pInf == nullptr)
+        return nullptr;
+
+    pInf->Type = this;
+
+    if (TheMap == nullptr)
+        return pInf;
+
+    // asm: convert the passed cell into leptons and locate the map cell.
+    const CellStruct cell = CellStruct(static_cast<int16>(coord.X >> 8),
+                                       static_cast<int16>(coord.Y >> 8));
+    CellClass* pCell = TheMap->GetCellAt(cell);
+    if (pCell == nullptr)
+        return pInf;
+
+    CoordStruct sub = coord;
+    if (pCell->PickInfantrySublocation(&sub, coord, 0, 0, 0))
+    {
+        // asm: vtable[0D8h] - place the object at the chosen sublocation.
+        pInf->SetLocation(sub);
+    }
+    else
+    {
+        // asm: fall back to the cell centre (the default coords path).
+        pInf->SetLocation(coord);
+    }
+
+    return pInf;
 }

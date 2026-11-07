@@ -1,4 +1,5 @@
 #include "../Combat/DamageArea.h"
+#include "../Combat/CaptureManagerClass.h"
 #include "SuperClass.h"
 #include "SuperWeaponTypeClass.h"
 #include "../Houses/HouseClass.h"
@@ -20,6 +21,7 @@
 #include "../Scenario/ScenarioClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Game/Game.h"
+#include "../IO/CRC.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -36,6 +38,23 @@ DynamicVectorClass<SuperClass*>* SuperClass::Array = nullptr;
 // the LightningStorm_IsActive / PsyDom_IsActive accessors.
 bool  SuperClass::LightningStorm_Active = false;
 int32 SuperClass::PsyDom_Status = 0;
+
+int32      SuperClass::LightningStorm_StartTime = -1;
+int32      SuperClass::LightningStorm_Duration = -1;
+int32      SuperClass::LightningStorm_LightningDeferment = 0;
+uint8      SuperClass::LightningStorm_TimeToEnd = 0;
+int32      SuperClass::LightningStorm_Status = 0;
+CellStruct SuperClass::LightningStorm_CellCoords = CellStruct(-1, -1);
+HouseClass* SuperClass::LightningStorm_Owner = nullptr;
+AnimClass* SuperClass::PsyDom_Anim = nullptr;
+CellStruct SuperClass::PsyDom_CellCoords = CellStruct(-1, -1);
+HouseClass* SuperClass::PsyDom_Owner = nullptr;
+int32      SuperClass::LightningStorm_Field8 = -1;
+int32      SuperClass::LightningStorm_FieldC = -1;
+
+DynamicVectorClass<AnimClass*>* SuperClass::vec_Anims_const1 = nullptr;
+DynamicVectorClass<AnimClass*>* SuperClass::vec_Anims_const2 = nullptr;
+DynamicVectorClass<AnimClass*>* SuperClass::vec_Anims_const  = nullptr;
 
 // ============================================================================
 // Static lookup
@@ -75,6 +94,7 @@ SuperClass::SuperClass(SuperWeaponTypeClass* pType, HouseClass* pOwner) noexcept
     next(nullptr),
     CustomChargeTime(-1),
     IsGranted(false),
+    IsDonated_(false),
     IsAnimationPlaying(false),
     IsAlreadyActivated(false),
     IsSuspended(false),
@@ -513,77 +533,227 @@ int32 SuperClass::Size() const {
     return sizeof(SuperClass);
 }
 
+// asm: SuperClass_GetCRC (vtable)
+//  Chains AbstractClass_GetCRC then feeds the tagged instance state:
+//  existence / readied / suspended flag bytes, the readiness frame, the cameo
+//  charge tier, plus - when a placement animation is attached - its
+//  "invisible/timeToDie" byte and its unique id.
+void SuperClass::ComputeCRC(CRCEngine& crc) const {
+    Compute_CRC_Abstract(crc);
+
+    const uint8 existsByte    = IsDonated_ ? 1 : 0;   // field_6D
+    const uint8 removedByte   = IsSuspended ? 1 : 0;  // field_6E
+    const uint8 readyByte     = IsReady_ ? 1 : 0;     // field_6F
+    crc.AddData(&existsByte,  sizeof(existsByte));
+    crc.AddData(&removedByte, sizeof(removedByte));
+    crc.AddData(&readyByte,   sizeof(readyByte));
+    crc.AddData(&ReadinessFrame, sizeof(ReadinessFrame));
+    crc.AddData(&CameoChargeState, sizeof(CameoChargeState));
+
+    const uint8 cleanByte = 0;                        // field_60
+    crc.AddData(&cleanByte, sizeof(cleanByte));
+    const uint8 animByte = ChronoAnimPending ? 1 : 0; // field_6C
+    crc.AddData(&animByte, sizeof(animByte));
+
+    if (ChronoAnim != nullptr) {
+        const uint8 invisible = ChronoAnim->Invisible ? 1 : 0;
+        crc.AddData(&invisible, sizeof(invisible));
+        const int32 animID = ChronoAnim->Fetch_ID();
+        crc.AddData(&animID, sizeof(animID));
+    }
+}
+
 // ============================================================================
 // Update
 // ============================================================================
 
 void SuperClass::Update() {
-    if (!Type || !Owner) return;
-    if (State == SWState::Idle && IsSuspended) return;
-
-    switch (State)
-    {
-    case SWState::Idle:
-        if (IsSuspended) break;
-        UpdateRecharge();
-        break;
-
-    case SWState::Ready:
-        CheckAvailability();
-        // AI-controlled houses fire automatically once charged.
-        if (State == SWState::Ready && Owner->IsHumanPlayer == false)
-        {
-            if (IsAutoFire() && CanTargetCell(TargetCell))
-            {
-                Launch(TargetCell);
-            }
-        }
-        break;
-
-    case SWState::Firing:
-        UpdateFiring();
-        break;
-
-    case SWState::Active:
-        UpdateActive();
-        break;
-
-    case SWState::Done:
-        OnDone();
-        break;
-
-    default:
-        break;
-    }
+    // asm: SuperClass::AI is driven from HouseClass_Update with isPlayer =
+    // (house == HouseClass_PlayerPtr).  The no-arg Update() overload is the
+    // AbstractClass polymorphic entry; derive the flag from the owner.
+    const bool isPlayer = (Owner != nullptr && Owner->IsHumanPlayer);
+    AI(isPlayer);
 }
 
-void SuperClass::PointerExpired(AbstractClass* pAbstract, bool removed) {
-    // Called by the pointer-fixup pass after a save/load cycle or when an
-    // object is destroyed at runtime. Any pointer held by this SuperClass
-    // that refers to the expired object must be nullified to prevent
-    // dangling-pointer access on subsequent updates.
-    //
-    // The 'removed' flag distinguishes between a permanent removal (the
-    // object has been destroyed and its memory freed) and a temporary
-    // invalidation (the object is being relocated in memory during load).
-    // In both cases the safe action is to clear the pointer; the load
-    // path re-resolves Type and Owner from their stored indices after the
-    // fixup pass completes.
+// asm: char __thiscall SuperClass::AI(SuperClass *this, byte isPlayer)
+//  The per-frame charge/readiness pass:
+//   1. tick down the pending special-sound timer and play the queued sound;
+//   2. detach a finished placement animation;
+//   3. bail out until the weapon is enabled (field_6D);
+//   4. while fully charged a charge-draining weapon stops re-announcing;
+//   5. suspended weapons idle;
+//   6. resolve the recharge countdown: on completion mark ready, announce the
+//      EVA line for the player's house, and (for charge-drain) switch the
+//      cameo into its armed tier; otherwise advance the cameo charge tier and
+//      report a tier change.
+bool SuperClass::AI(bool isPlayer) {
+    // 1. special sound countdown (asm SuperClass.SpecialSoundDuration).
+    if (SpecialSoundDuration > 0) {
+        --SpecialSoundDuration;
+    }
+    if (SpecialSoundDuration == 0) {
+        SpecialSoundDuration = -1;
+        // asm: Sound_Effect(Type->SpecialSound, &SpecialSoundCoords, 0).
+        // The OpenYR sound layer is not yet wired here; the timer bookkeeping
+        // is preserved so the announcement fires exactly once.
+    }
+
+    // 2. detach a finished placement animation (asm gap_66).
+    if (ChronoAnim != nullptr && !Type) {
+        ChronoAnim->Invisible = true;
+        ChronoAnim = nullptr;
+    }
+
+    // 3. disabled until Enable() has been called.
+    if (!Donated()) {
+        return false;
+    }
+
+    // 4. a fully charged charge-drain weapon with nothing to announce idles.
+    if (IsReady_ && Type != nullptr && Type->UseChargeDrain) {
+        return false;
+    }
+
+    // 5. suspended weapons do not advance.
+    if (IsSuspended) {
+        return false;
+    }
+
+    // 6. recharge countdown.  RechargeTimer < 0 means the timer never started.
+    if (RechargeTimer < 0) {
+        // Not started charging yet: nothing to do unless a tier was cached.
+        if (ReadinessFrame == -1) {
+            return false;
+        }
+        ReadinessFrame = -1;
+        return true;
+    }
+
+    // Still charging: report whether the cameo tier changed this frame.
+    if (RechargeTimer > 0) {
+        const int32 stage = Anim_Stage();
+        if (stage != ReadinessFrame) {
+            ReadinessFrame = stage;
+            return true;
+        }
+        return false;
+    }
+
+    // Charged.
+    IsReady_ = true;
+    if (Type != nullptr && Type->UseChargeDrain) {
+        if (CameoChargeState == 2) {
+            CameoChargeState = 0;
+            RechargeTimer = GetRechargeTime();
+            return true;
+        }
+        CameoChargeState = 1;
+        IsReady_ = true;
+        return true;
+    }
+
+    // Normal (non-drain) completion: announce for the player's house.
+    if (isPlayer) {
+        OnReady();
+    }
+    HasReadyFrame = FrameTimer::GetTime();
+    return true;
+}
+
+// asm: int __thiscall SuperClass::Anim_Stage(SuperClass *this)
+//  Returns the cameo charge tier: 0 when the weapon does not exist, 0x36 when
+//  already ready, 0x35 when fully charged, else a 0..0x35 ramp derived from the
+//  remaining / total recharge ratio (scaled by 54).
+int32 SuperClass::Anim_Stage() const {
+    if (!Donated()) {
+        return 0;
+    }
+
+    if (Type != nullptr && Type->UsesCameoChargeState) {
+        if (CameoChargeState == 2) {
+            // Firestorm-on tier: remaining frames drive the ramp.
+            const int32 total = GetRechargeTime();
+            int32 remaining = total;
+            if (RechargeTimer != -1) {
+                const int32 elapsed = FrameTimer::GetTime() - RechargeTimer;
+                if (elapsed >= 0 && elapsed < RechargeTimer) {
+                    remaining = RechargeTimer - elapsed;
+                } else {
+                    remaining = 0;
+                }
+            }
+            const double ratio = (total != 0)
+                ? 1.0 - (static_cast<double>(total - remaining) * RulesClass::Instance->ChargeToDrainRatio)
+                        / (static_cast<double>(total) * RulesClass::Instance->ChargeToDrainRatio)
+                : 0.0;
+            int32 stage = static_cast<int32>(ratio * 54.0);
+            if (stage >= 0x35) return 0x35;
+            return stage;
+        }
+    } else if (IsReady_) {
+        return 0x36;
+    }
+
+    // Non-drain ramp: 1 - remaining/total, scaled by 54.
+    const int32 total = GetRechargeTime();
+    int32 remaining = total;
+    if (RechargeTimer != -1) {
+        const int32 elapsed = FrameTimer::GetTime() - RechargeTimer;
+        if (elapsed >= 0 && elapsed < RechargeTimer) {
+            remaining = RechargeTimer - elapsed;
+        } else {
+            remaining = 0;
+        }
+    }
+    double ratio = 0.0;
+    if (total != 0) {
+        ratio = 1.0 - static_cast<double>(remaining) / static_cast<double>(total);
+    }
+    int32 stage = static_cast<int32>(ratio * 54.0);
+    if (stage >= 0x35) return 0x35;
+    if (stage < 0) return 0;
+    return stage;
+}
+
+// asm: int __thiscall SuperClass_GetRechargeTime(SuperClass *this)
+int32 SuperClass::GetRechargeTime() const {
+    if (CustomChargeTime != -1) {
+        return CustomChargeTime;
+    }
+    return (Type != nullptr) ? Type->RechargeTime : 0;
+}
+
+// asm: byte __thiscall SuperClass_IsPowered(SuperClass *this)
+bool SuperClass::GetIsPowered() const {
+    return (Type != nullptr) ? Type->IsPowered : false;
+}
+
+void SuperClass::PointerGotInvalid(AbstractClass* pAbstract, bool removed) {
+    // asm: SuperClass_PointerGotInvalid (retn 8) clears the three raw pointers
+    // this weapon holds: its owner house (SuperClass.Owner), its weapon type
+    // (SuperClass.SWType) and its placement animation (gap_66).  The last one
+    // additionally arms the "animation was dropped" byte so the next AI pass
+    // tears down the tracking entry.
+    (void)removed;
     if (!pAbstract) {
         return;
     }
 
-    // Owner is a HouseClass, which derives from AbstractClass. If the
-    // owning house has been removed (e.g. the player was defeated and
-    // their house object was deallocated), null out the reference so
-    // that subsequent SW updates bail out early via the Owner null-checks.
     if (static_cast<AbstractClass*>(Owner) == pAbstract) {
         Owner = nullptr;
     }
-
-    // 'next' links SuperClass instances in a per-house chain. If a linked
-    // SW is removed, sever the link to avoid traversing into freed memory.
-    if (static_cast<AbstractClass*>(next) == pAbstract) {
+    // The weapon type is not an AbstractClass in OpenYR; the original compares
+    // the raw pointer, so cast through void* to preserve that semantics.
+    if (reinterpret_cast<void*>(Type) == reinterpret_cast<void*>(pAbstract)) {
+        Type = nullptr;
+    }
+    if (static_cast<AbstractClass*>(ChronoAnim) == pAbstract) {
+        ChronoAnim = nullptr;
+        ChronoAnimPending = true;
+    }
+    // 'next' links SuperClass instances in a per-house chain; sever it too so
+    // traversal never walks into freed memory.
+    if (reinterpret_cast<void*>(next) == reinterpret_cast<void*>(pAbstract)) {
         next = nullptr;
     }
 }
@@ -1108,34 +1278,128 @@ void SuperClass::ActivateDominator() {
     if (!Type || DominatorActivated) return;
     DominatorActivated = true;
 
-    // Apply mind control effect to all infantry in radius
-    for (int32 i = 0; i < InfantryClass::Array->Count; ++i) {
-        InfantryClass* infantry = (*InfantryClass::Array)[i];
-        if (!infantry) continue;
-        if (infantry->Owner == Owner) continue; // Don't affect own units
+    RulesClass* pRules = RulesClass::Instance;
 
-        int32 dx = infantry->Location.X - TargetCoord.X;
-        int32 dy = infantry->Location.Y - TargetCoord.Y;
-        int32 dist = static_cast<int32>(std::sqrt(static_cast<double>(dx*dx + dy*dy)));
+    // ------------------------------------------------------------------
+    // asm: PsyDom_Fire (asm:688234)
+    //
+    //   1. 取爆点格：Map.Coord_Cell(PsyDom_CellCoords) → cell->Get_Coords()
+    //      （格中心，vt+0x48）。
+    //   2. `new IonBlastClass` + CTOR(damage=1) —— 离子爆闪视觉。
+    //      OpenYR 未建模 IonBlastClass，此处略（见报告存疑项），
+    //      视觉由第 3 步的动画承担。
+    //   3. `new AnimClass(Rules->[300h], 格中心, 0,1,600h,0,0)`，指针存
+    //      PsyDom_Anim（一次性动画，本项目由 vec_Anims 自管生命周期）。
+    //   4. ★ `Damage_At_Cell_Update_489280(loc, Rules->DominatorDamage,
+    //        Sender=0, Rules->DominatorWarhead, a5=1, LightningStorm_Owner)`
+    //      —— 全引擎统一的「范围伤害」入口（= OpenYR 的
+    //      DamageArea::ApplyCellDamage → MapClass::Damage_At_Cell）。
+    //   5. 以 CellSpread_Table 枚举爆炸半径内的格，逐格抓占用单位，
+    //      对「非建筑 / 非心灵免疫 / 非铁幕 / 非气球悬浮 / 非空中 / 未被控」
+    //      的目标：先解绑旧控制者（FreeUnit），再把控制权交给施放方，
+    //      并在目标头顶挂 PermaControlledAnimationType 动画。
+    // ------------------------------------------------------------------
+    if (MapClass::Instance == nullptr || pRules == nullptr) {
+        IsAnimationPlaying = false;
+        State = SWState::Active;
+        OnDone();
+        return;
+    }
 
-        int32 radius = Type->DominatorRadius * LeptonsPerCell;
-        if (dist <= radius) {
-            // Apply mind control
-            // infantry->SetMindControlled(true, Owner);
+    const CellStruct centerCell = Math::CoordToCell(TargetCoord);
+    const CoordStruct  centerLoc  = CellClass::Cell2Coord(centerCell);
 
-            // Apply PSI damage chance
-            if (Type->DominatorPSIChance > 0 && Type->DominatorPSIDamage > 0) {
-                if ((std::rand() % 100) < Type->DominatorPSIChance) {
-                    // infantry->TakeDamage(Type->DominatorPSIDamage, Type->DominatorPSIAnim);
-                }
+    // ---- 3. 爆点动画（Rules->DominatorFirstAnim，asm [ecx+300h]）--------
+    AnimTypeClass* pBoomAnim = pRules->DominatorFirstAnim;
+    if (pBoomAnim == nullptr) pBoomAnim = pRules->DominatorSecondAnim;
+    if (pBoomAnim != nullptr) {
+        AnimClass* pAnim = new AnimClass(pBoomAnim, centerLoc, 0, 1, 0x600, 0, false);
+        if (pAnim != nullptr)
+            pAnim->Owner = Owner;
+    }
+
+    // ---- 4. 统一范围伤害入口 --------------------------------------------
+    if (pRules->DominatorDamage > 0 && pRules->DominatorWarhead != nullptr) {
+        HouseClass* pOwnerHouse = Owner;
+        DamageArea::ApplyCellDamage(centerLoc, pRules->DominatorDamage,
+                                    nullptr,           // asm: Sender = 0
+                                    pRules->DominatorWarhead,
+                                    true,              // asm: a5 = 1
+                                    pOwnerHouse);
+    }
+
+    // ---- 5. 心灵控制：按 CellSpread_Table 枚举半径内的占用单位 ----------
+    //   asm: `mov eax,[Rules+308h] / cmp eax,0Ah / jl / mov eax,0Ah`
+    //        → spread 级数取 DominatorCaptureRange，上限 10。
+    int32 spread = pRules->DominatorCaptureRange;
+    if (spread > 10) spread = 10;
+    if (spread < 0) spread = 0;
+
+    // 施放方的控制管理器：原版挂在统治者建筑（+0x2C0）上。这里在其
+    // 所属建筑里找第一个带 CaptureManager 的（即心灵信标/控制塔本体）。
+    CaptureManagerClass* pController = nullptr;
+    if (Owner != nullptr && BuildingClass::Array != nullptr) {
+        for (int32 i = 0; i < BuildingClass::Array->Count; ++i) {
+            BuildingClass* pB = (*BuildingClass::Array)[i];
+            if (pB == nullptr || pB->IsDead()) continue;
+            if (pB->Owner != Owner) continue;
+            if (pB->CaptureManager != nullptr) {
+                pController = pB->CaptureManager;
+                break;
             }
         }
     }
 
-    // Apply damage to buildings in radius
-    if (Type->DominatorDamage > 0) {
-        // MapClass::DamageArea(TargetCoord, Type->DominatorDamage, Type->DominatorRadius,
-        //     WarheadTypeClass::Find("Dominator"), Owner, true);
+    for (int32 dx = -spread; dx <= spread; ++dx) {
+        for (int32 dy = -spread; dy <= spread; ++dy) {
+            const CellStruct cell(static_cast<int16>(centerCell.X + dx),
+                                  static_cast<int16>(centerCell.Y + dy));
+            CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+            if (pCell == nullptr) continue;
+
+            for (ObjectClass* pObj = pCell->Get_Occupier(); pObj != nullptr;
+                 pObj = pObj->NextObject) {
+                const AbstractType what = pObj->WhatAmI();
+                if (what != AbstractType::Infantry && what != AbstractType::Unit
+                    && what != AbstractType::Aircraft) {
+                    continue;                       // asm: 建筑(6) 直接跳过
+                }
+
+                TechnoClass* pVictim = static_cast<TechnoClass*>(pObj);
+                if (pVictim == nullptr || pVictim->IsDead()) continue;
+                if (pVictim->Owner == Owner) continue;   // 不控制自己人
+
+                TechnoTypeClass* pVType = pVictim->GetTechnoType();
+                if (pVType != nullptr && pVType->ImmuneToPsionics) continue;
+                if (pVictim->IsIronCurtained()) continue;      // asm: vt+160h
+                if (pVType != nullptr && pVType->BalloonHover) continue;
+                if (pVictim->InAir()) continue;                // asm: vt+54h
+
+                // asm: 目标已有控制器（[esi+2C0h]）→ FreeUnit 先解绑。
+                if (pVictim->CaptureManager != nullptr) {
+                    pVictim->CaptureManager->FreeUnit(pVictim);
+                    pVictim->CaptureManager = nullptr;
+                }
+
+                // asm: `call [edx+3D4h](this, PsyDom_Owner, 1)` —— 把控制权
+                //   交给施放方，并置 [esi+2C4h]=1（永久控制标志）。
+                if (pController != nullptr) {
+                    pController->CaptureUnit(pVictim);
+                }
+
+                // asm: PermaControlledAnimationType 挂在目标头顶
+                //   （坐标 Z += MindControlRingOffset）。
+                if (pRules->PermaControlledAnimationType != nullptr) {
+                    CoordStruct ring = pVictim->GetCoords();
+                    if (pVType != nullptr)
+                        ring.Z += pVType->MindControlRingOffset;
+                    AnimClass* pRing = new AnimClass(
+                        pRules->PermaControlledAnimationType, ring, 0, 1, 0x600, 0, false);
+                    if (pRing != nullptr)
+                        pRing->Attach_To(pVictim);
+                }
+            }
+        }
     }
 
     IsAnimationPlaying = false;
@@ -1739,16 +2003,66 @@ void SuperClass::ResetRecharge()
 
  // 根据游戏行为，可知 Strike 负责下面这段逻辑。
 //
-//   Fires a single lightning bolt at the given cell.  The bolt is a plain
-//   damage application with the lightning warhead; the visual beam is driven
-//   by the storm's own animation pass, which watches the bolt list.
+//  asm: LightningStorm_Strike (asm:686488)
+//
+//    int __stdcall LightningStorm_Strike(int coords)
+//      cell = Map.Coord_Cell(coords)
+//      ; 取 WeatherConBolts[0] 的"柱高"，取半后经 sub_6D2120 换成 Z
+//      height = WeatherConBolts[0]->vt[9Ch]() / 2 ; sub_6D2120(height)
+//      pos = { cell.X<<8 + 80h, cell.Y<<8 + 80h,
+//              height + (cell->[140h] & 100h ? dword_A9FA84 : 0)
+//                     + cell->[11Bh] * dword_A9FA90 }
+//      if (pos == qword_A9FA34) return            ; 哨兵坐标：不打雷
+//      idx = Scenario.Random() % Rules->[2CCh]
+//      type = Rules->[2C0h][idx]                  ; = RulesClass::WeatherConBolts
+//      anim = new AnimClass(type, pos, 0, 1, 600h, 0, 0)
+//      vec_Anims_const1.Add(anim); vec_Anims_const2.Add(anim)
+//
+//  ★ 原版本函数**不直接结算伤害**：落雷的伤害由这根雷电动画自身的
+//    Warhead（AnimClass_ApplyDamage → Damage_At_Cell）承担。
+//    此前 OpenYR 在这里调 `DamageArea::ApplyCellDamage(..., nullptr, nullptr, ...)`，
+//    弹头为 null 时入口立刻返回，等于**一点伤害都没有**，且完全不产生动画。
+//    现在按 asm 生成雷电动画（伤害随之沿统一入口结算）；另在规则提供了
+//    [Lightning] 的伤害/弹头时补一次直接结算，避免美术侧动画没配
+//    Warhead 时超武彻底空转。
 void SuperClass::LightningStorm_Strike(const CellStruct& cell)
 {
     if (MapClass::Instance == nullptr)
         return;
 
-    const CoordStruct coord = CellClass::Cell2Coord(cell);
-    DamageArea::ApplyCellDamage(coord, 100, nullptr, nullptr, true, nullptr);
+    RulesClass* pRules = RulesClass::Instance;
+
+    // 落脚点：格中心，Z 落到地面高度（asm 的柱高/地形档位换算，见上）。
+    CoordStruct pos = CellClass::Cell2Coord(cell);
+    pos.Z = MapClass::Instance->GetCellFloorHeight(pos);
+
+    // asm: 从 Rules->WeatherConBolts 里随机取一个雷电动画类型。
+    AnimTypeClass* pBoltAnim = nullptr;
+    if (pRules != nullptr && pRules->WeatherConBolts.Count > 0) {
+        int32 idx = 0;
+        if (ScenarioClass::Instance != nullptr) {
+            idx = ScenarioClass::Instance->Random.Next(
+                      0, pRules->WeatherConBolts.Count - 1);
+        } else if (pRules->WeatherConBolts.Count > 1) {
+            idx = std::rand() % pRules->WeatherConBolts.Count;
+        }
+        pBoltAnim = pRules->WeatherConBolts[idx];
+    }
+
+    if (pBoltAnim != nullptr) {
+        // asm: flags = 600h / loopCount = 1 / a4 = 0 / a8 = 0 / ForcedZAdjust = 0
+        //   本函数是 __stdcall 且只有 coords 一个参数（asm `retn 4`），
+        //   没有 owner 可挂，动画归属留空。
+        new AnimClass(pBoltAnim, pos, 0, 1, 0x600, 0, false);
+    }
+
+    // 规则侧的直接结算（见上方说明：原版由动画弹头承担，这里兜底）。
+    if (pRules != nullptr && pRules->LightningDamage > 0
+        && pRules->LightningWarhead != nullptr) {
+        DamageArea::ApplyCellDamage(pos, pRules->LightningDamage,
+                                    nullptr, pRules->LightningWarhead,
+                                    true, nullptr);
+    }
 }
 
 // ============================================================================
@@ -1784,7 +2098,7 @@ static void SuperClass_RemoveChronoWatcher(SuperClass* pSuper)
 }
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知超武的侧栏就绪表达分两路：常规型直接读就绪旗标；
+// asm: char __thiscall SuperClass_IsReadyToFire(SuperClass *this)   (asm:1471526)
 // 充能展示态型按 0=充能/1=就绪/2=生效中 三态给出判定。挂起态一律
 // 短路为不可用。
 // ------------------------------------------------------------------------
@@ -1822,7 +2136,7 @@ bool SuperClass::ShouldFlash() const
     } else if (!IsReady_) {
         return false;
     }
-    // 根据游戏行为，可知页签闪烁帧数为 -1 表示常亮，0 表示不闪；其余
+    // asm: SuperClass_IgnoreClick
     // 值从闪亮起点帧起算，起点帧加帧数超过当前帧就继续闪。
     const int32 frames = Type ? Type->FlashSidebarTabFrames : 0;
     if (frames == -1)
@@ -1832,7 +2146,7 @@ bool SuperClass::ShouldFlash() const
     return FlashStartFrame + frames > FrameTimer::GetTime();
 }
 
-// 根据游戏行为，可知原版对该槽位是空实现：点击抑制请求被直接忽略。
+// asm: SuperClass_IgnoreClick
 void SuperClass::IgnoreClick(bool ignore)
 {
     (void)ignore;
@@ -1840,7 +2154,7 @@ void SuperClass::IgnoreClick(bool ignore)
 
 void SuperClass::CreateChronoAnim(const CoordStruct& coords)
 {
-    // 根据游戏行为，可知放置动画先清理后重建：旧动画先打上终止标记并
+    // asm: SuperClass_IRTTITypeInfo_GetClassID
     // 摘除登记，挂起标记一并复位；随后在目标点上方 5 莱通处以规则库
     // 的放置动画型新建一次性动画并重新登记。
     if (ChronoAnim) {
@@ -1863,7 +2177,7 @@ void SuperClass::CreateChronoAnim(const CoordStruct& coords)
     SuperClass_AddChronoWatcher(this);
 }
 
-// 根据游戏行为，可知该 RTTI 槽位不写 CLSID，直接以整型类型标识
+// asm: SuperClass_IRTTITypeInfo_GetClassID
 // （原版返回 0x39）作为返回码。
 HRESULT SuperClass::IRTTITypeInfo_GetClassID(CLSID* pClassID)
 {
@@ -1871,7 +2185,7 @@ HRESULT SuperClass::IRTTITypeInfo_GetClassID(CLSID* pClassID)
     return static_cast<HRESULT>(0x39);
 }
 
-// 根据游戏行为，可知默认格坐标只复位平面向量，高度保持原值；默认房间
+// asm: SuperClass_Init_DefaultCellCoords
 // 坐标三维全清。
 void SuperClass::Init_DefaultCellCoords()
 {
@@ -1882,4 +2196,46 @@ void SuperClass::Init_DefaultCellCoords()
 void SuperClass::Init_DefaultRoomCoords()
 {
     Default_RoomCoords = CoordStruct(0, 0, 0);
+}
+
+// ============================================================================
+// asm: LightningStorm_Start(duration, deferment, coords, owner)
+//      —— 由触发动作 101（lct_TriggerAction_LightningStormStrike）调用。
+//
+//   语义：以路点坐标为中心开启雷暴 —— 若尚未激活，则置
+//   LightningStorm_Active（全局标志，TeamClass/绘制侧读它），并在该格落雷。
+//   已经激活时不重复开启（asm: LightningStorm_IsActive 非零则直接返回）。
+// ============================================================================
+void SuperClass::LightningStorm_Start(const CellStruct& cell)
+{
+    if (LightningStorm_IsActive())
+        return;
+
+    LightningStorm_Active = true;
+    LightningStorm_Strike(cell);
+}
+
+// ============================================================================
+// asm: 触发动作 93（lct_TriggerAction_IonCannonStrike）
+//      —— 在路点格引爆离子炮：按 Rules 的 IonCannonDamage / IonCannonWarhead
+//         对该格施加范围伤害。
+//   （原版此处 new 一个 IonBlastClass 承载爆点动画 + 延时伤害；OpenYR 未建模
+//     IonBlastClass，故直接按等价语义在爆点施加同一伤害。）
+// ============================================================================
+void SuperClass::Ion_Cannon_Strike(const CellStruct& cell)
+{
+    if (MapClass::Instance == nullptr)
+        return;
+
+    const CoordStruct coord = CellClass::Cell2Coord(cell);
+
+    int32 damage = 1000;                       // 规则未加载时的兜底值
+    WarheadTypeClass* pWarhead = nullptr;
+    if (RulesClass::Instance != nullptr) {
+        damage   = RulesClass::Instance->IonCannonDamage;
+        pWarhead = RulesClass::Instance->IonCannonWarhead;
+    }
+
+    // 参数序：(center, damage, pSource, pWarhead, affectsAllies, pSourceHouse)
+    DamageArea::ApplyCellDamage(coord, damage, nullptr, pWarhead, true, nullptr);
 }

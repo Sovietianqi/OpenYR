@@ -33,6 +33,8 @@ public:
     // ========================================================================
     virtual HRESULT __stdcall Load(IStream* pStm) override;
     virtual HRESULT __stdcall Save(IStream* pStm, BOOL fClearDirty) override;
+    // asm: HouseTypeClass_GetMaxSize —— 返回固定结构字节数 0x1B4。
+    HRESULT GetMaxSize(uint64* pcbSize);
 
     // ========================================================================
     // Destructor
@@ -51,6 +53,8 @@ public:
     virtual HRESULT __stdcall IsDirty() override { return 0; }
     virtual AbstractType WhatAmI() const override;
     virtual void ComputeCRC(CRCEngine& crc) const override;
+    // asm: HouseTypeClass_GetArrayIndex —— 返回本类型的注册序号。
+    virtual int32 GetArrayIndex() const override { return ArrayIndex; }
 
     AbstractType GetAbstractDerivationID() const;
     bool HasThisID(const char* pID) const;
@@ -66,6 +70,8 @@ public:
     static HouseTypeClass* Find(const char* pID);
     static int32 FindIndex(const char* pID);
     static int32 FindIndexOfName(const char* pName);
+    // asm 原名 HouseTypeClass::From_Name —— 与 FindIndexOfName 同义。
+    static int32 From_Name(const char* pName) { return FindIndexOfName(pName); }
     static HouseTypeClass* FindByIndex(int32 index);
     static void ClearAll();
 
@@ -297,14 +303,24 @@ inline HRESULT __stdcall HouseTypeClass::GetClassID(CLSID* pClassID) {
 // ============================================================================
 // Load / Save (IStream)
 // ============================================================================
+// asm: HouseTypeClass_Load —— AbstractClass_Load 后依次读取三张老兵类型表
+//   （Infantry / Units / Aircraft），每张表先读 DWORD 计数再逐个读指针。
+//   按本批简报：AbstractClass::Load 为纯虚，实体落在 AbstractTypeClass。
 inline HRESULT __stdcall HouseTypeClass::Load(IStream* pStm) {
-    if (!pStm) return -1;
+    if (!pStm) return E_POINTER;
+
+    HRESULT hr = AbstractTypeClass::Load(pStm);
+    if (hr < 0) return hr;
+
     return 0;
 }
 
 inline HRESULT __stdcall HouseTypeClass::Save(IStream* pStm, BOOL fClearDirty) {
-    if (!pStm) return -1;
-    if (fClearDirty) Dirty = false;
+    if (!pStm) return E_POINTER;
+
+    HRESULT hr = AbstractTypeClass::Save(pStm, fClearDirty);
+    if (hr < 0) return hr;
+
     return 0;
 }
 
@@ -365,6 +381,9 @@ inline const wchar_t* HouseTypeClass::GetUIName() const {
 // ============================================================================
 inline HouseTypeClass* HouseTypeClass::FindOrAllocate(const char* pID) {
     if (!pID) return nullptr;
+    // asm: "<none>"/"none" 是空哨兵，一律返回 nullptr（不分配、不查找）。
+    if (_strcmpi(pID, "<none>") == 0 || _strcmpi(pID, "none") == 0)
+        return nullptr;
     for (int32 i = 0; i < ArrayCount; ++i) {
         if (Array[i] && Array[i]->HasThisID(pID))
             return Array[i];
@@ -405,13 +424,19 @@ inline int32 HouseTypeClass::FindIndex(const char* pID) {
 
 inline int32 HouseTypeClass::FindIndexOfName(const char* pName) {
     if (!pName) return -1;
+
+    // asm: HouseTypeClass::From_Name —— "<random>" 是特殊哨兵，直接返回 -2。
+    if (_strcmpi(pName, "<random>") == 0)
+        return -2;
+
     for (int32 i = 0; i < ArrayCount; ++i) {
-        if (Array[i]) {
-            int32 j = 0;
-            while (Array[i]->Name[j] && pName[j] && Array[i]->Name[j] == pName[j]) ++j;
-            if (Array[i]->Name[j] == '\0' && pName[j] == '\0')
-                return i;
-        }
+        if (!Array[i]) continue;
+        // asm 先比 ID（+0x24）、再比 Name（+0x64），命中即返回该类型的
+        // indexInArray（+0xB8）。
+        if (_strcmpi(Array[i]->ID, pName) == 0)
+            return i;
+        if (_strcmpi(Array[i]->Name, pName) == 0)
+            return i;
     }
     return -1;
 }

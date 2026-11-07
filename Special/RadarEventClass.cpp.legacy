@@ -1,0 +1,58 @@
+#include "RadarEventClass.h"
+
+#include "../Core/Memory.h"
+
+// ============================================================================
+// RadarEventClass.cpp
+//
+// asm: RadarEventClass_ClearVector (0x660B00)
+//
+// 原版用虚表 +0x10 的 FindIndex 定位条目自身下标，再压缩 + delete。本项目
+// 的 Array 是 DynamicVectorClass<RadarEventClass*>，其 index 语义与原版
+// FindIndex 等价（同一容器、同一线性查找约定），因此直接用循环下标 i，
+// 不再绕一层虚调用——语义等价，且省掉一份运行时绑定。
+//
+// 逐句映射见下方行内注释。
+// ============================================================================
+
+DynamicVectorClass<RadarEventClass*>* RadarEventClass::Array = nullptr;
+
+void RadarEventClass::Clear_Vector()
+{
+    // asm: mov eax,vec_RadarEvents.Count / lea edi,[eax-1] / test edi,edi / jl
+    if (Array == nullptr)
+        return;
+
+    // asm: lea edi,[eax-1]
+    for (int32 i = Array->Count - 1; i >= 0; --i)      // asm: loc_660B0F
+    {
+        // asm: mov esi,[ecx+edi*4] / test esi,esi / jz next
+        RadarEventClass* pItem = (*Array)[i];
+        if (pItem == nullptr)                          // asm: jz loc_660B6D
+            continue;
+
+        // asm: call [eax+10h]  -- FindIndex(&item)
+        // 本项目的容器与遍历下标即条目自身位置，等价于原版虚调用的返回值。
+        const int32 idx = i;
+
+        // asm: cmp eax,0FFFFFFFFh / jz delete
+        //      mov ecx,Count / cmp eax,ecx / jge delete
+        if (idx != -1 && idx < Array->Count)
+        {
+            --Array->Count;                            // asm: dec ecx
+
+            // asm: cmp eax,ecx / jge delete  -- idx 落在尾部就无需压缩
+            if (idx < Array->Count)
+            {
+                // asm: loc_660B4C  -- data[j-1] = data[j]，j = idx+1 .. Count
+                for (int32 j = idx + 1; j < Array->Count; ++j)
+                    (*Array)[j - 1] = (*Array)[j];
+            }
+        }
+
+        // asm: push esi / call delete
+        YRMemory::Deallocate(pItem);                   // asm: loc_660B64
+
+        // asm: loc_660B6D: dec edi / jns loc_660B0F
+    }
+}

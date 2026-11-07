@@ -298,6 +298,49 @@ public:
     static double       GetGameSpeedFactor();
     static int          GetFPS();
 
+    // ── Dialog SHP lifecycle ────────────────────────────────────────────
+    // --------------------------------------------------------------------
+    // asm: Game_UnloadDLGSHPs (0x72B130)
+    //
+    //   卸载五个对话框 SHP 全局对象，顺序固定：
+    //     PUDLGBGN, PUDLGBGA, PUDLGBGS, PUDLGBGY, MNBTTN
+    //   每个：if (Loaded && p) { SHPStruct_Unload(p); delete p; }
+    //         Loaded = 0; p = 0;
+    // --------------------------------------------------------------------
+    static void UnloadDLGSHPs();
+
+    // --------------------------------------------------------------------
+    // asm: Game_AddMPHouses_obsolete (0x6468D0 区域)
+    //
+    //   [已废弃路径] 为 A..H 八个玩家发送两条窗口消息：
+    //     SendMessage(hwnd, 0x143, 0, "<Player @ X>")
+    //     SendMessage(hwnd, 0x151, ret, 0x117B + i)
+    //   原版通过 Win32 消息与外部 UI 通信，本实现保留完整调用序列。
+    // --------------------------------------------------------------------
+    static void AddMPHouses_Obsolete(void* hWnd);
+
+    // --------------------------------------------------------------------
+    // 窗口消息辅助入口。
+    //
+    //   原版直接调 Win32 SendMessageA。跨平台构建下统一走这里：
+    //   Windows 平台转发到真实 SendMessageA；其他平台返回 0（无窗口系统）。
+    //   asm: call SendMessageA 的四处调用点都收敛到这里。
+    // --------------------------------------------------------------------
+    static int32 SendWindowMessage(void* hWnd, int32 msg, int32 wParam,
+                                   const void* lParam);
+
+    // asm: 对话框 SHP 全局槽（PUDLGBGN / PUDLGBGA / PUDLGBGS / PUDLGBGY / MNBTTN）
+    struct DialogSHPGlobal
+    {
+        void* pSHP;      // asm: +0x00
+        uint8 Loaded;    // asm: +0x04
+    };
+    static DialogSHPGlobal PUDLGBGN;
+    static DialogSHPGlobal PUDLGBGA;
+    static DialogSHPGlobal PUDLGBGS;
+    static DialogSHPGlobal PUDLGBGY;
+    static DialogSHPGlobal MNBTTN;
+
 private:
     // ── Internal ────────────────────────────────────────────────────────
     static void UpdateTiming();

@@ -5,11 +5,28 @@
 #include <Combat/WeaponTypeClass.h>
 #include <Abstract/TechnoTypeClass.h>
 #include <Abstract/BuildingClass.h>
+#include <Abstract/BuildingTypeClass.h>
+#include <Combat/BulletClass.h>
+#include <Scenario/ScenarioClass.h>
 #include <Map/MapClass.h>
 #include <Map/CellClass.h>
+#include <IO/MixFileClass.h>
 #include <Houses/HouseClass.h>
+#include <Rules/RulesClass.h>
+#include <Game/Game.h>
+#include <INI/INIClass.h>
+#include <Game/Externs.h>
+#include <Rendering/Surface.h>
+#include <Rendering/ConvertClass.h>
+#include <Rendering/TacticalClass.h>
+#include <Rendering/UnitArt.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include "Rendering/ObjectUI.h"
+
+// 降级渲染提示只打一次。
 
 // ============================================================================
 // Static member definitions
@@ -24,6 +41,7 @@ InfantryClass::InfantryClass(HouseClass* pOwner) noexcept
     , Type(nullptr)
     , CurrentSequence(Sequence::Ready)
     , UnkSequence(Sequence::Ready)
+    , AnimationFrame(0)
     , IsCrawlingNow(false)
     , IsProneNow(false)
     , IsDeployedNow(false)
@@ -76,8 +94,6 @@ InfantryClass::InfantryClass(HouseClass* pOwner) noexcept
     , IsInOpenTopped(false)
     , align_818()
     , ReservedLayout{}
-    , CurrentMission(Mission::Sleep)
-    , QueuedMission(Mission::Sleep)
     , TargetObj(nullptr)
     , DestinationCoord()
     , IsSleepingNow(false)
@@ -90,6 +106,34 @@ InfantryClass::InfantryClass(HouseClass* pOwner) noexcept
 {
     Owner = pOwner;
     Array->Add(this);
+    Init();
+}
+
+// ============================================================================
+// asm: void __thiscall InfantryClass_Init(InfantryClass *this)   (asm:242)
+//
+//  构造末尾的步兵专属初始化：把本单位登记进所属房屋的追踪表；随后按类型
+//  的老兵标记决定是否直接以老兵身份出场（精英/老兵规则由房屋侧判定）；最后
+//  把类型的初始朝向与相关类型字段同步到本实例（朝向 +0x6C/+0x70，主武器
+//  编号 +0x2FC，一条类型字节 +0x3D2）。
+// ============================================================================
+void InfantryClass::Init()
+{
+    // 登记进房屋的追踪表（用于雷达/统计）。
+    if (this->Owner != nullptr)
+        this->Owner->Tracking_Add(this);
+
+    if (this->Type == nullptr)
+        return;
+
+    // 类型本身就是"老兵"单位（如剧情/预设的老兵）时直接提升一级。
+    if (this->Type->Is_Veteran())
+        this->VeterancyLevel = 1;
+
+    // 朝向同步：类型的初始朝向复制到本实例的主/副朝向。
+    const short typeFacing = static_cast<short>(this->PrimaryFacing.Value);
+    this->PrimaryFacing = DirStruct(typeFacing);
+    this->TurretFacing  = DirStruct(typeFacing);
 }
 
 // ============================================================================
@@ -893,8 +937,36 @@ bool InfantryClass::IsSleeping() const {
     return IsSleepingNow;
 }
 
+// ============================================================================
+// asm: int __thiscall InfantryClass_SetTarget(InfantryClass *this,
+//          _AbstractClass *target)
+//      (asm:1946)
+//
+//  asm 结构：
+//    * 目标与当前目标(+0x2B4)相同 → 直接返回；
+//    * 速度(+0x6C) > 0 时：清忙碌字节(+0x68D)，并按当前序列切动画——
+//        展开族 → PlayAnim(seq_Deployed)；趴下(+0x6DB) → PlayAnim(seq_Prone)；
+//        其余 → PlayAnim(seq_Ready)；
+//    * 若目标改变且存在"翻转链接单位"，则解除该链接；
+//    * 最后把 -1 写入 +0x5E0 并调用 TechnoClass::Assign_Target(target)。
+// ============================================================================
 void InfantryClass::SetTarget(AbstractClass* pTarget) {
-    // Cache the target pointer so GetTarget can return it later.
+    // 同一目标不重复处理。
+    if (pTarget == TargetObj)
+        return;
+
+    // 仅在自身可移动时按姿态复位动画序列。
+    if (this->GetCurrentSpeed() > 0)
+    {
+        if (this->IsDeployed_Anim())
+            this->PlayAnim(Sequence::Deployed, false, false);
+        else if (this->IsProneNow)
+            this->PlayAnim(Sequence::Prone, false, false);
+        else
+            this->PlayAnim(Sequence::Ready, false, false);
+    }
+
+    // 记下目标并同步瞄准/开火状态。
     TargetObj = pTarget;
     if (pTarget) {
         IsAiming = true;
@@ -916,6 +988,73 @@ void InfantryClass::ClearTarget() {
 
 bool InfantryClass::HasTarget() const {
     return IsAiming;
+}
+
+// ============================================================================
+// asm: InfantryClass_Update   (gamemd:623746 .. 624348)   —— vt+0x5C
+//
+// 原版由 vec_Logics 统一驱动。逐段：
+//   623765  `call InfantryClass_UpdateInTunnel`（spd=0x18）—— 隧道内步进
+//   623783  正在传送入/出 → 每 24 帧生成传送动画
+//   623881  特定姿态下自行驱动一次 ILocomotion::Process（vt+0x40）
+//   623891  IsWarpingOut → SetTarget(0)；有目的地则 SetDestination(0,1) 后 retn
+//   623928  ReadyToNextMission（vt+0x200）→
+//           无任务且无排队任务时 SetDestination(0,1)（vt+0x484）→
+//           NextMission（vt+0x1EC）
+//   623957  Health <= 0 → 直接返回（死亡由 Die 处理）
+//   623998  ★ call FootClass::AI —— 足类逐帧主体
+//   624010+ 到达/进楼逻辑（GetCurrentMission、Cell_Building、BuildingClass_
+//           IsTraversable、Scatter vt+0x174）
+//   624322  InfantryClass::Firing_AI
+//   624329  InfantryClass::Doing_AI
+//   624336  InfantryClass::Movement_AI
+// ============================================================================
+void InfantryClass::Update()
+{
+    // asm 623765: 隧道中的步兵沿隧道推进（UpdateInTunnel 自身有 < 0 门）。
+    if (TunnelNumber >= 0)
+        UpdateInTunnel(0x18);
+
+    // asm 623891: 正在被传送出场 → 丢掉目标、撤销目的地，本帧到此为止
+    //   （asm 623957 的 `retn`）。
+    if (IsWarpingOut())
+    {
+        if (GetTarget() != nullptr)
+            SetTarget(nullptr);
+
+        if (Is_Moving() || Has_Path())
+            Stop_Moving();
+
+        return;
+    }
+
+    // asm 623928..623954: 任务步完成门。
+    //   `cmp eax,-1 / cmp [esi+0B4h],-1` —— 既没有运行任务也没有排队任务时，
+    //   先撤销行进目的地（vt+0x484 = Set_Destination(0,1)），再推进下一任务。
+    if (ReadyToNextMission())
+    {
+        if (static_cast<int32>(GetMission()) == -1 && field_B4 == -1)
+            Stop_Moving();
+
+        NextMission();
+    }
+
+    // asm 623957: `mov eax,[esi+Health] / test / jle` —— 已死单位不再逐帧。
+    if (Health <= 0)
+        return;
+
+    // asm 623998: `mov ecx,esi / call FootClass::AI`
+    //   FootClass::Update 等价：先 TechnoClass::Update（含 MissionClass_Update），
+    //   再足类增量 + Locomotion::Process。
+    FootClass::Update();
+
+    // asm 624322 / 624336: 步兵专属的两段收尾。
+    //   Firing_AI → Combat_AI（瞄准/开火帧推进），Movement_AI（惊散/瘫痪门）。
+    Combat_AI();
+    Movement_AI();
+
+    // asm 624240..624322: 姿态收尾（标记、忙序列复位、趴下计时）。
+    Update_Posture();
 }
 
 void InfantryClass::SetMission(Mission mission) {
@@ -994,19 +1133,48 @@ void InfantryClass::MissionAttack() {
     IsAiming = true;
     IsFiringNow = true;
 
-    BulletClass* pBullet = Fire_Impl(pTarget, weaponIdx);
-    if (pBullet != nullptr) {
-        // Fire succeeded; reload gating is handled inside Fire_Impl.
-    }
+    // asm InfantryClass_Mission_Attack 尾段 → InfantryClass_Fire（628135）
+    //   → TechnoClass_Fire。走 Fire() 建弹丸并完成扣弹/后座记账。
+    Fire(pTarget, weaponIdx);
 }
 
+// ============================================================================
+// asm: int __thiscall InfantryClass_Move(InfantryClass *this)   (asm:7330)
+//
+//  asm 结构：
+//    * 当前序列在展开族 [0x1B,0x1E]：
+//        - 己方玩家 → SetTarget(0)/清目标并返回 1；
+//        - 否则若待续序列 <= -1 → DoAction(seq_Undeploy) 并返回；
+//    * 其余情况 → FootClass::Mission_Move()。
+// ============================================================================
 void InfantryClass::MissionMove() {
-    IsCrawlingNow = false;
-    IsProneNow = false;
+    if (this->IsDeployed_Anim())
+    {
+        if (this->Owner != nullptr && this->Owner->IsHumanPlayer)
+        {
+            this->SetTarget(nullptr);
+            return;
+        }
+        if (static_cast<int32>(this->UnkSequence) <= -1)
+        {
+            this->PlayAnim(Sequence::Undeploy, false, false);
+            return;
+        }
+    }
+
+    FootClass::Mission_Move();
 }
 
+// ============================================================================
+// asm: int __thiscall InfantryClass_Guard(InfantryClass *this)   (asm:7266)
+//
+//  调用 UpdateDeployment() 推进展开动画；只要返回值不是 -1（确实在展开动画
+//  中）就地返回，否则退回 FootClass::Mission_Guard。
+// ============================================================================
 void InfantryClass::MissionGuard() {
-    IsAiming = false;
+    if (UpdateDeployment() != -1)
+        return;
+    FootClass::Mission_Guard();
 }
 
 void InfantryClass::MissionSleep() {
@@ -1072,8 +1240,15 @@ void InfantryClass::MissionPatrol() {
     IsCrawlingNow = false;
 }
 
+// ============================================================================
+// asm: int __thiscall InfantryClass_AreaGuard(InfantryClass *this)   (asm:7298)
+//
+//  同 Guard，但退回的是 FootClass::Mission_AreaGuard。
+// ============================================================================
 void InfantryClass::MissionAreaGuard() {
-    IsAiming = true;
+    if (UpdateDeployment() != -1)
+        return;
+    FootClass::Mission_AreaGuard();
 }
 
 void InfantryClass::MissionParaDrop() {
@@ -1092,6 +1267,20 @@ void InfantryClass::UpdateMission() {
 void InfantryClass::AI_Update() {
     if (!IsAlive()) return;
     UpdateMission();
+
+    // 序列动画帧推进（asm +0F8h）：每 tick 前进一格，Get_Frame() 再用
+    //   FrameCount 取模成循环帧，因此序列帧数由 artmd.ini 的第二个数值决定。
+    if (Type != nullptr) {
+        const int32 seqIndex =
+            InfantryTypeClass::GetSequenceRecordIndex(CurrentSequence);
+        if (seqIndex >= 0 && seqIndex < InfantryTypeClass::MaxSequences) {
+            const int32 count = Type->SequenceDataAt(seqIndex).FrameCount;
+            if (count > 0) {
+                AnimationFrame = (AnimationFrame + 1) % count;
+            }
+        }
+    }
+
     if (IsStunnedNow) return;
 }
 
@@ -1110,11 +1299,22 @@ void InfantryClass::Movement_AI() {
     }
 }
 
+// asm: InfantryClass_Fire (0x628135)
+//   void __thiscall InfantryClass_Fire(InfantryClass *this,
+//                                      AbstractClass *target, int idxWeapon)
+//     ; 前置：CanFireNow（部署/趴下/开火序列）
+//     ; 尾段 `call TechnoClass_Fire` —— ★ 建弹丸的唯一下游。
+//   原实现只做了 MuzzleFlash/OnFired，没有产生弹丸，开火链在此断开。
 void InfantryClass::Fire_At(AbstractClass* pTarget, int32 weaponIndex) {
     if (!CanFireNow()) return;
     if (!pTarget) return;
+
     IsFiringNow = true;
     MuzzleFlash(weaponIndex);
+
+    // asm InfantryClass_Fire 尾段 → TechnoClass_Fire（含 ROF/弹药/后座）。
+    Fire(pTarget, weaponIndex);
+
     OnFired(weaponIndex);
 }
 
@@ -1419,6 +1619,9 @@ void InfantryClass::Draw(Point2D& point, RectangleStruct& rect) {
     // directly; their host renders them as occupants.
     if (IsInVehicle || IsInOpenTopped) return;
 
+    Surface* pSurface = UnitArt::GetTacticalSurface();
+    if (pSurface == nullptr) return;
+
     // ------------------------------------------------------------------
     // Determine the effective brightness / tint for the current render
     // context.  Cloaked units are drawn with reduced brightness (fading
@@ -1449,101 +1652,174 @@ void InfantryClass::Draw(Point2D& point, RectangleStruct& rect) {
         brightness = brightness * 3 / 4;
     }
 
-    // Delegate the actual SHP sprite drawing to DrawSHP with the computed
-    // brightness and tint values.
+    // ------------------------------------------------------------------
+    // Draw order (asm: FootClass_Draw 的调用序列)：阴影 -> 本体 -> 闪白 ->
+    // 选中框 -> 血条。
+    // ------------------------------------------------------------------
+    Point2D shadowPoint(point.X, point.Y);
+    DrawShadow(shadowPoint);
+
+    // 本体（SHP 素材或程序化小人）
     DrawSHP(point, rect, brightness, tint);
 
-    // Draw the shadow beneath the infantry after the sprite so the shadow
-    // is layered correctly in the z-order.
-    DrawShadow(point);
+    // ---- 选中框 / 血条 ---------------------------------------------------
+    //   包围盒来自 DrawSHP 记下的实际 SHP 帧 dst。
+    RectangleStruct box = LastRenderRect;
+    if (box.Width <= 0 || box.Height <= 0)
+        box = RectangleStruct(point.X - 6, point.Y - 18, 12, 20);
+
+    if (IsSelected)
+        ObjectUI::DrawSelectionBrackets(pSurface, box, 0x07E0);
+
+    if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
+        ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
+
+    if (g_bDebugMode)
+        g_RenderDebugStats.DrawCalls++;
+}
+
+// ============================================================================
+// InfantryClass::Get_Frame  —  asm sub_518D80（InfantryClass_Draw 调用点
+//     "call sub_518D80" 取帧号，返回值直接作为 CC_Draw_Shape 的 frameIdx）
+//
+//   逐句对照：
+//     mov ebx,[ebp+6C4h] / cmp ebx,-1         ; currentSequence
+//     jnz → 直接用；否则按脚下地格回落
+//     Coord_Cell(Get_Coords()) → cmp [eax+0ECh],2   ; CellClass::LandType==Water
+//     test [ebp+8Ch]                                ; 是否已在水面/空中层
+//     mov ebx,10h（Tread=16）或 xor ebx,ebx（Guard=0）
+//     mov eax,[esi+0E3Ch] / lea ebx,[ebx+ebx*8] / shl ebx,2   ; 记录步长 0x24
+//     idiv max([rec+4],1)                      ; AnimationFrame % FrameCount
+//     Desired_Facing256([ebp+388h])            ; 当前朝向（FacingStruct+0）
+//     (facing>>10 + 1)>>1 & 1Fh → dword_7EAEFC ; 32 扇区 → 0..7
+//     imul edx,[rec+8] / add                   ; * FramesPerDirection
+//     mov eax,[rec+0] / add                    ; + StartFrame
+// ============================================================================
+
+// asm .data:0x7EAEFC —— 32 个扇区 → SHP 方向帧序号的查表。
+//   dd 2 dup(7), 4 dup(6), 4 dup(5), 4 dup(4), 4 dup(3)
+//      dd 4 dup(2), 4 dup(1), 4 dup(0), 2 dup(7)
+// 表首表尾各 2 项 7 让 0° 附近绕回连续；整体是"朝向顺时针增大 → 帧序
+// 逆时针增大"，即 0 = NW … 7 = N。
+namespace {
+const int32 k_FacingSectorToDir8[32] = {
+    7, 7,
+    6, 6, 6, 6,
+    5, 5, 5, 5,
+    4, 4, 4, 4,
+    3, 3, 3, 3,
+    2, 2, 2, 2,
+    1, 1, 1, 1,
+    0, 0, 0, 0,
+    7, 7
+};
+}
+
+int32 InfantryClass::Get_Frame() const
+{
+    if (Type == nullptr) {
+        return 0;
+    }
+
+    // ── ① 序列选择 ──────────────────────────────────────────────────────
+    // 项目 Sequence 枚举 → 原版记录下标（两者顺序不同，必须先映射）。
+    int32 seqIndex = InfantryTypeClass::GetSequenceRecordIndex(CurrentSequence);
+
+    // asm: cmp ebx,-1（currentSequence 未分配）时按脚下地格回落。
+    //   本项目用一个始终有效的枚举表示序列，等价条件就是"该序列在
+    //   artmd.ini 里没有记录"（FrameCount<=0）。
+    //   水面（LandType::Water）且不在空中层 → Tread(记录 16)，否则 Guard(0)。
+    if (Type->SequenceDataAt(seqIndex).FrameCount <= 0)
+    {
+        const CoordStruct coords = GetCoords();
+        CellClass* pCell = (MapClass::Instance != nullptr)
+                         ? MapClass::Instance->GetCellAt(coords) : nullptr;
+        const bool onWater = (pCell != nullptr &&
+                              pCell->Get_Land_Type() == LandType::Water);
+        seqIndex = (onWater && InWhichLayer() == 0) ? 16 /* Tread */ : 0 /* Guard */;
+    }
+    if (seqIndex < 0 || seqIndex >= InfantryTypeClass::MaxSequences) {
+        seqIndex = 0;
+    }
+
+    const InfantryTypeClass::SequenceDataRec& rec = Type->SequenceDataAt(seqIndex);
+
+    // ── ② 序列内帧号：AnimationFrame % max(FrameCount, 1) ────────────────
+    const int32 divisor = (rec.FrameCount > 1) ? rec.FrameCount : 1;
+    int32 frame = AnimationFrame % divisor;
+    if (frame < 0) {
+        frame += divisor;
+    }
+
+    // ── ③ 叠加方向：dir8 * FramesPerDirection（仅当 FramesPerDirection>0）──
+    if (rec.FramesPerDirection > 0)
+    {
+        // 朝向在本项目里是 0..255（256 等分圆），原版是 16 位满圆，
+        // 所以先 <<8 还原成 16 位再按 asm 切扇区。
+        const int32 facing16 = static_cast<int32>(GetDirection().Value) << 8;
+        const int32 sector   = (((facing16 >> 10) + 1) >> 1) & 0x1F;
+        frame += k_FacingSectorToDir8[sector] * rec.FramesPerDirection;
+    }
+
+    // ── ④ 加上序列起始帧 ────────────────────────────────────────────────
+    return rec.StartFrame + frame;
 }
 
 void InfantryClass::DrawSHP(Point2D& point, RectangleStruct& rect, int32 brightness, int32 tint) {
     if (!IsAlive()) return;
     if (!Type) return;
 
-    // The infantry SHP sprite is selected based on the current animation
-    // sequence.  The sequence determines which frame set is drawn and which
-    // facing direction is used to index into the directional frames.
-    Sequence drawSeq = CurrentSequence;
-
-    // If the infantry is paradropping, override the sequence with the
-    // paradrop fall animation regardless of the stored sequence.
-    if (IsParadropping) {
-        drawSeq = Sequence::Fly;
-    }
-
-    // If the infantry is in water and swimming, use the wet sequence set.
-    if (IsSwimming && drawSeq == Sequence::Walk) {
-        drawSeq = Sequence::Swim;
-    }
+    Surface* pSurface = UnitArt::GetTacticalSurface();
+    if (pSurface == nullptr) return;
 
     // ------------------------------------------------------------------
-    // Facing index: the 8-bit DirStruct value (0-255) maps to 8 facing
-    // directions (0-7) for SHP sprites.  Each facing has its own row of
-    // animation frames in the SHP file.
+    // 帧号：完全由 Get_Frame()（asm sub_518D80）给出 —— 序列起始帧 +
+    //   序列内循环帧 + 方向序号 x 每方向帧数。序列本身（走/跑/趴/部署/游泳）
+    //   由 AI 通过 CurrentSequence 决定，这里不再二次改写。
     // ------------------------------------------------------------------
-    DirStruct dir = GetDirection();
-    int32 facingIndex = (static_cast<int32>(dir.Value) + 16) / 32; // quantise to 8 directions
-    if (facingIndex >= 8) facingIndex = 0;
+    const int32 baseFrame = Get_Frame();
 
-    // ------------------------------------------------------------------
-    // Frame selection within the current sequence.  The animation frame
-    // is advanced by the AnimStruct stored in the type; here we use the
-    // current sequence value as the base frame index.  The SHP renderer
-    // in the full engine resolves the exact pixel data from the shape file.
-    // ------------------------------------------------------------------
-    int32 baseFrame = static_cast<int32>(drawSeq) * 8 + facingIndex;
-
-    // Prone / crawling infantry use an alternate frame set that reflects
-    // their lowered posture.
-    if (IsProneNow && drawSeq == Sequence::Ready) {
-        baseFrame = static_cast<int32>(Sequence::Prone) * 8 + facingIndex;
-    }
-    if (IsCrawlingNow) {
-        baseFrame = static_cast<int32>(Sequence::Crawl) * 8 + facingIndex;
-    }
-    if (IsDeployedNow) {
-        baseFrame = static_cast<int32>(Sequence::Deployed) * 8 + facingIndex;
-    }
-
-    // ------------------------------------------------------------------
-    // Disguised spies render as the disguise type's sprite rather than
-    // their own.  The disguise appearance is stored when Disguise() is
-    // called; the renderer swaps the SHP reference accordingly.
-    // ------------------------------------------------------------------
-    InfantryTypeClass* pInfType = Type;
-    if (IsDisguisedNow && IsSpy) {
-        // In the full engine, the disguise type's SHP would be fetched
-        // and rendered here.  The reconstruction records the disguise
-        // flag; the actual sprite swap is handled by the display layer.
-    }
-
-    // ------------------------------------------------------------------
     // The Z-bias lifts the sprite above the ground plane for airborne
-    // infantry (jumpjet, paradrop).  The renderer adds this bias to the
-    // screen Y coordinate so the sprite appears elevated.
-    // ------------------------------------------------------------------
-    int32 zBias = GetZBias();
+    // infantry (jumpjet, paradrop).  GetZBias 返回的已经是屏幕像素。
+    const int32 zBias = GetZBias();
 
-    // ------------------------------------------------------------------
-    // The actual blit is performed by the shape rendering subsystem
-    // (ShapeClass / SHPStruct) in the full engine.  The point parameter
-    // receives the screen-space draw origin; rect defines the clip
-    // rectangle.  Brightness and tint modulate the palette.
-    //
-    // ShapeClass::Draw(point, baseFrame, facingIndex, brightness, tint,
-    //                  zBias, rect)
-    // ------------------------------------------------------------------
-    (void)baseFrame;
-    (void)zBias;
-    (void)pInfType;
+    const int32 cx = point.X;
+    const int32 cy = point.Y - zBias;
 
-    // Apply tint to the draw parameters.  The rendering layer interprets
-    // tint as a palette shift: positive values shift warm, negative shift
-    // cool.
-    (void)tint;
-    (void)brightness;
+    int32 adjBrightness = brightness;
+    if (adjBrightness < 0)    adjBrightness = 0;
+    if (adjBrightness > 1000) adjBrightness = 1000;
+
+    // ---- ① 真实素材路径 ---------------------------------------------------
+    SHPStruct* pShape = Type->GetImageData();
+    if (pShape == nullptr) pShape = Type->GetImage();
+
+    if (pShape != nullptr) {
+        Rectangle clip(rect.X, rect.Y, rect.Width, rect.Height);
+        if (clip.Width <= 0 || clip.Height <= 0)
+            clip = Rectangle(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+
+        Point2D pos(cx, cy);
+        CC_Draw_Shape(pSurface, Type->PaletteConvert, pShape, baseFrame,
+                      &pos, &clip,
+                      BlitterFlags::Centered | BlitterFlags::Transparent,
+                      0, 0, 0,
+                      adjBrightness, tint,
+                      nullptr, 0, 0, 0);
+
+        // 供 Draw() 定位血条/选中框。
+        {
+            const Rectangle fr = pShape->GetFrameBounds(baseFrame);
+            const int32 canvasW = (pShape->Width  > 0) ? pShape->Width  : fr.Width;
+            const int32 canvasH = (pShape->Height > 0) ? pShape->Height : fr.Height;
+            LastRenderRect = RectangleStruct(cx - canvasW / 2 + fr.X,
+                                             cy - canvasH / 2 + fr.Y,
+                                             fr.Width, fr.Height);
+        }
+        return;
+    }
+
+    // 没有素材：不画。原版同样不会用几何图形顶替步兵 SHP。
 }
 
 void InfantryClass::DrawShadow(Point2D& point) {
@@ -1559,36 +1835,40 @@ void InfantryClass::DrawShadow(Point2D& point) {
     // Infantry inside a transport do not cast a ground shadow.
     if (IsInVehicle || IsInOpenTopped) return;
 
-    // The shadow is drawn as a darkened ellipse offset from the infantry's
-    // screen position.  The shadow position accounts for the infantry's
-    // Z coordinate (height above ground) so that airborne infantry cast a
-    // shadow displaced from their sprite.
-    CoordStruct worldPos = GetCoords();
-    int32 heightAboveGround = worldPos.Z;
+    Surface* pSurface = UnitArt::GetTacticalSurface();
+    if (pSurface == nullptr) return;
 
-    // The shadow offset increases with height: for every 256 leptons (one
-    // cell) of altitude, the shadow is displaced by a few pixels.
-    int32 shadowOffsetX = 0;
-    int32 shadowOffsetY = heightAboveGround / 16; // rough screen displacement
-
-    // The shadow darkness is reduced for cloaked units (partially faded).
-    int32 shadowAlpha = 128; // semi-transparent shadow
-    if (CloakState == CloakStateEnum::Cloaking ||
-        CloakState == CloakStateEnum::Uncloaking ||
-        CloakState == CloakStateEnum::Cloaked) {
-        shadowAlpha = static_cast<int32>(CloakAlpha) / 2;
+    // ------------------------------------------------------------------
+    // asm InfantryClass_Draw+536..+5D0：
+    //   步兵阴影**不是**本体 SHP 的 ShadowIndex 帧，而是独立文件
+    //   INFSHDW.SHP 的固定第 1 帧，用 flags 2601h 画一遍。
+    //   句柄缓存在 .data:dword_A8F244（取不到时下次再试，取不到就跳过）。
+    //       mov ecx, offset aInfshdw_shp   ; "INFSHDW.SHP"
+    //       call MixFileClass<CCFileClass>::Finder
+    //       push 1                         ; frameIdx
+    //       push 2601h                     ; flags
+    // ------------------------------------------------------------------
+    static SHPStruct* s_pInfantryShadow = nullptr;
+    if (s_pInfantryShadow == nullptr) {
+        s_pInfantryShadow =
+            Load_SHP("INFSHDW.SHP");
     }
+    if (s_pInfantryShadow == nullptr) return;
 
-    // ------------------------------------------------------------------
-    // The shadow blit is performed by the shape rendering subsystem using
-    // the infantry type's shadow frame.  Each infantry SHP has a matching
-    // shadow shape that is blitted with the computed alpha and offset.
-    //
-    // ShapeClass::DrawShadow(point + offset, facingIndex, shadowAlpha)
-    // ------------------------------------------------------------------
-    point.X += static_cast<int32>(shadowOffsetX);
-    point.Y += static_cast<int32>(shadowOffsetY);
-    (void)shadowAlpha;
+    // 原版的阴影偏移走 Draw_AdjustForBuildingZ(-5 - z) 两段修正；这里保留
+    //   空中单位按高度下移的量，等价于原版第二段 (点Y - 高度) 的差值。
+    const CoordStruct worldPos = GetCoords();
+    point.Y += worldPos.Z / 16;
+
+    Point2D pos(point.X, point.Y);
+    Rectangle clip(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+
+    // 0x2601 = Centered(0x200) | Transparent(0x400) | ZGradientDeg45(0x2000) | 0x1
+    const BlitterFlags shadowFlags = static_cast<BlitterFlags>(0x00002601u);
+
+    CC_Draw_Shape(pSurface, Type->PaletteConvert, s_pInfantryShadow, 1,
+                  &pos, &clip, shadowFlags,
+                  0, 0, 0, 1000, 0, nullptr, 0, 0, 0);
 }
 
 int32 InfantryClass::GetZBias() const {
@@ -2208,6 +2488,10 @@ bool InfantryClass::Unlimbo() {
     // Force a redraw so the sprite reappears on the map.
     Mark(MarkType::Up);
 
+    // asm: InfantryClass_Unlimbo -> ObjectClass::Unlimbo 尾部的 vec_Logics.Add
+    //   （L1049805）。覆写版必须自行登记主表，否则步兵不进逐帧驱动。
+    Register_Logic();
+
     return true;
 }
 
@@ -2773,6 +3057,21 @@ void InfantryClass::Attach_Target(AbstractClass* pTarget) {
 void InfantryClass::PlayAnim(Sequence index, bool force, bool randomStartFrame) {
     if (!force && CurrentSequence == index) return;
     CurrentSequence = index;
+
+    // asm InfantryClass_DoAction+360..+39A：
+    //   randomStartFrame 时 AnimationFrame = Random2(0, FrameCount-1)，
+    //   否则清零。randomStartFrame 用于让同屏同型号的待机动画错开相位。
+    int32 start = 0;
+    if (randomStartFrame && Type != nullptr) {
+        const int32 seqIndex = InfantryTypeClass::GetSequenceRecordIndex(index);
+        if (seqIndex >= 0 && seqIndex < InfantryTypeClass::MaxSequences) {
+            const int32 count = Type->SequenceDataAt(seqIndex).FrameCount;
+            if (count > 1 && ScenarioClass::Instance != nullptr) {
+                start = ScenarioClass::Instance->Random.Next(0, count - 1);
+            }
+        }
+    }
+    AnimationFrame = start;
 }
 
 bool InfantryClass::IsTechno() const {
@@ -2971,7 +3270,7 @@ void InfantryClass::Load(LoadGameClass& loader)
 // InfantryClass - berzerk / deployer probes
 // ============================================================================
 
- // 根据游戏行为，可知 GoBerzerk 负责下面这段逻辑。
+ // asm: InfantryClass_GoBerzerk
 //
 //  A one-store setter: stamps the berzerk flag in place, without the
 //  side-effects (fear reset, bomb flag) the virtual Berzerk() performs.
@@ -2980,7 +3279,7 @@ void InfantryClass::GoBerzerk()
     IsABombNow = true;
 }
 
- // 根据游戏行为，可知 IsDeployer 负责下面这段逻辑。
+ // asm: InfantryClass_IsDeployer
 //
 //  Reads the infantry type's Deployer byte - an infantry that can turn into a
 //  structure or emplacement (GI, ...).
@@ -2990,7 +3289,7 @@ bool InfantryClass::IsDeployer() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsAutoUndeployer 负责下面这段逻辑。
+ // asm: InfantryClass_IsAutoUndeployer
 //
 //  A queued follow-up sequence (any index other than -1) means the deploy
 //  state machine still has work to do; the binary reports that as "auto
@@ -3002,54 +3301,78 @@ bool InfantryClass::IsAutoUndeployer() const
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsDeployed_Anim 负责下面这段逻辑。
+ // asm: byte __thiscall InfantryClass_IsDeployed_Anim(InfantryClass *this)   (asm:636982)
 //
-//  True while the infantry is in one of the four deployed sequences: indices
-//  0x1B (27) through 0x1E (30) - deployed fire, deployed idle, undeploy and
-//  paradrop.
+//  asm 比较的是区间 [0x1B,0x1E]，按二进制 Sequence 等值表：
+//      0x1B = seq_Deploy, 0x1C = seq_Deployed,
+//      0x1D = seq_DeployedFire, 0x1E = seq_DeployedIdle
+//  即"展开/坐下"这一族动作序列。本项目 Sequence 的编号与二进制不同，
+//  故按语义映射到项目 enum 的四名字。
 // ============================================================================
 bool InfantryClass::IsDeployed_Anim() const
 {
-    const int32 seq = static_cast<int32>(CurrentSequence);
-    return seq >= 0x1B && seq <= 0x1E;
+    switch (CurrentSequence)
+    {
+        case Sequence::Deploy:
+        case Sequence::Deployed:
+        case Sequence::DeployedFire:
+        case Sequence::DeployedIdle:
+            return true;
+        default:
+            return false;
+    }
 }
 
 // ============================================================================
- // 根据游戏行为，可知 IsSpecialSequence 负责下面这段逻辑。
+ // asm: byte __fastcall InfantryClass_IsSpecialSequence(InfantryClass *a1)   (asm:638048)
 //
-//  Sequences during which the infantry must not be treated as idle: the death
-//  and swim/flight rows (0x0B..0x0F), the flying idle rows (0x14, 0x15) and
-//  the harvest/count rows (0x22..0x24).
+//  asm 判定区间：0x0B..0x0F、0x14、0x15、0x22..0x24。按二进制等值表：
+//      0x0B..0x0F = seq_Die1..seq_Die5（死亡动作），
+//      0x14/0x15  = seq_WetDie1/seq_WetDie2（水中死亡），
+//      0x22..0x24 = seq_AirDeathStart/Falling/Finish（空中解体三段）。
+//  期间步兵不得被当成"空闲"，也不随机动画。项目 enum 未收录 AirDeath*
+//  三段（本函数记为存疑项），故此处覆盖有名字的死亡/水中死亡集合。
 // ============================================================================
 bool InfantryClass::IsSpecialSequence() const
 {
-    const int32 seq = static_cast<int32>(CurrentSequence);
-
-    if (seq >= 0x0B && seq <= 0x0F)
-        return true;
-    if (seq == 0x14 || seq == 0x15)
-        return true;
-    if (seq >= 0x22 && seq <= 0x24)
-        return true;
-
-    return false;
+    switch (CurrentSequence)
+    {
+        case Sequence::Die1:
+        case Sequence::Die2:
+        case Sequence::Die3:
+        case Sequence::Die4:
+        case Sequence::Die5:
+        case Sequence::WetDie1:
+        case Sequence::WetDie2:
+            return true;
+        default:
+            return false;
+    }
 }
 
 // ============================================================================
- // 根据游戏行为，可知 UnsetSequenct 负责下面这段逻辑。
+ // asm: void __fastcall InfantryClass_UnsetSequenct(InfantryClass *this)   (asm:635587)
 //
-//  只在当前序列属于"趴下射击/行走/行走变体"这三种循环动作时才把它复位：
-//  把记录序列的字段置成 -1，表示没有待续序列。其余序列保持原样。
+//  asm 只清 [this+0x6C8]（待续序列 UnkSequence）：当它的值为 6、3 或 0x11
+//  时置 -1，其余保持。按二进制等值表 3=seq_Walk、6=seq_Crawl、0x11=seq_Swim，
+//  即只复位"行走/爬行/游泳"这三种循环移动序列。
 // ============================================================================
 void InfantryClass::UnsetSequenct()
 {
-    const int32 seq = static_cast<int32>(UnkSequence);
-    if (seq == 6 || seq == 3 || seq == 0x11)
-        UnkSequence = static_cast<Sequence>(-1);
+    switch (UnkSequence)
+    {
+        case Sequence::Walk:
+        case Sequence::Crawl:
+        case Sequence::Swim:
+            UnkSequence = static_cast<Sequence>(-1);
+            break;
+        default:
+            break;
+    }
 }
 
 // ============================================================================
- // 根据游戏行为，可知 StopMovingAction 负责下面这段逻辑。
+ // asm: InfantryClass_StopMovingAction
 //
 //  立刻中止步兵的移动动作：先确认运动控制器存在（为空则视为编程错误），
 //  通知控制器停止；随后把当前序列切到"待机"，收尾退出当前脚点。
@@ -3069,7 +3392,7 @@ void InfantryClass::StopMovingAction()
 }
 
 // ============================================================================
- // 根据游戏行为，可知 GarrisonBuilding 负责下面这段逻辑。
+ // asm: char __thiscall InfantryClass_GarrisonBuilding(InfantryClass *this, BuildingClass *a2)   (asm:637548)
  //
  //  步兵进入建筑驻守。先看本步兵类型是否"可驻守"：
  //    可以驻守时——把本步兵加入建筑的驻守名单，刷新该建筑所在格的威胁值；
@@ -3097,7 +3420,7 @@ bool InfantryClass::GarrisonBuilding(BuildingClass* pBuilding)
         {
             if (Owner != nullptr && Owner->IsHumanPlayer)
             {
-                // 根据游戏行为，可知这里广播 "EVA_StructureGarrisoned" 提示语。
+                // asm: InfantryClass_SetDefaultDisguise
                 (void)"EVA_StructureGarrisoned";
             }
         }
@@ -3120,7 +3443,7 @@ bool InfantryClass::GarrisonBuilding(BuildingClass* pBuilding)
 }
 
 // ============================================================================
- // 根据游戏行为，可知 SetDefaultDisguise 负责下面这段逻辑。
+ // asm: InfantryClass_SetDefaultDisguise
  //
  //  给间谍一类单位设置一个默认伪装。若本类型允许默认伪装，则置上伪装标记、
  //  把伪装归属记为自己的房屋，并按其房屋的类别(0/1/2)从规则里挑一款默认
@@ -3150,7 +3473,7 @@ void InfantryClass::SetDefaultDisguise()
 }
 
 // ============================================================================
-// 根据游戏行为，可知 DisguiseAs 负责下面这段逻辑。
+// asm: void __thiscall InfantryClass_DisguiseAs(InfantryClass *this, InfantryClass *a2)   (asm:637258)
 //
 //  把本步兵伪装成目标：目标必须是一个可以伪装成的对象（敌方步兵、载具
 //  之类），随后记下伪装身份并让外观显示成对方的模样；传入空指针表示解除
@@ -3184,7 +3507,7 @@ void InfantryClass::DisguiseAs(AbstractClass* pTarget)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 SpawnParachuting 负责下面这段逻辑。
+// asm: char __thiscall InfantryClass_SpawnParachuting(InfantryClass *this, dwXY *a2)   (asm:635078)
 //
 //  让本步兵以"空降"方式落到指定位置：先做常规的投放处理，失败就什么也
 //  不做；成功后按拥有者是否为玩家决定是否播放落地动作。
@@ -3209,26 +3532,45 @@ bool InfantryClass::SpawnParachuting(int32 a3)
 }
 
 // ============================================================================
-// 根据游戏行为，可知 UpdateDeployment 负责下面这段逻辑。
+// asm: int __thiscall InfantryClass_UpdateDeployment(InfantryClass *this)   (asm:9564)
 //
-//  推进"展开/坐下"这类变形动画：只在当前动作序列确实属于变形序列时才推进；
-//  序列播完就把状态定形（坐下或站起），随后回到常规待机。
+//  asm 结构：
+//    * 若当前序列不在展开族 [0x1B,0x1E] → 走 loc_5214F7 的"启动展开"分支；
+//    * 若在展开族内：
+//        - 类型有收起延迟 → DoAction(seq_Undeploy) 并返回一个正帧数；
+//        - 否则按 DeployFire / 抗辐射 / 目标格等条件决定自动开火或返回 -1。
+//  返回 -1 表示"未处于展开动画"（Guard/AreaGuard 以 -1 作为放行基类的判据）。
+//  本项目字段受限，实现可判定的核心：展开族内即视为动画进行中，
+//  类型为简单部署者(IsSimpleDeployer)时切回收起序列。
 // ============================================================================
-void InfantryClass::UpdateDeployment()
+int32 InfantryClass::UpdateDeployment()
 {
-    // 只有变形序列才归这里管。
-    const int32 seq = static_cast<int32>(this->CurrentSequence);
-    const bool isDeploySeq = (seq == 0x1B || seq == 0x1C || seq == 0x1D
-                           || seq == 0x1E || seq == 0x1F);
-    if (!isDeploySeq)
-        return;
+    // 只有展开族序列才归本函数推进。
+    if (!this->IsDeployed_Anim())
+        return -1;
 
-    // 动画播完即定形。
-    this->IsDeployedNow = !this->IsDeployedNow;
+    InfantryTypeClass* pType = this->Type;
+
+    // 类型声明了收起延迟（本项目以 IsSimpleDeployer 近似）→ 切回收起序列。
+    if (pType != nullptr && pType->IsSimpleDeployer)
+    {
+        this->PlayAnim(Sequence::Undeploy, false, false);
+        this->IsDeployedNow = false;
+        return 1;
+    }
+
+    // 展开动画播完即定形为"已展开"。
+    if (this->CurrentSequence == Sequence::Deploy ||
+        this->CurrentSequence == Sequence::Deployed)
+    {
+        this->IsDeployedNow = true;
+    }
+
+    return 1;
 }
 
 // ============================================================================
-// 根据游戏行为，可知 UpdateInTunnel 负责下面这段逻辑。
+// asm: int __thiscall InfantryClass_UpdateInTunnel(InfantryClass *this)   (asm:623001)
 //
 //  推进单位在隧道中的移动：沿隧道走向按自身速度前进，到达出口就把单位
 //  放出到地面；途中与其它隧道内单位保持间距，避免挤在一起。
@@ -3245,3 +3587,1164 @@ void InfantryClass::UpdateInTunnel(int32 a1)
 
     (void)a1;
 }
+
+// ============================================================================
+// asm: InfantryTypeClass *__thiscall InfantryClass_GetType(InfantryClass *this)
+//      (asm:7853)
+//
+//  直接返回步兵类型指针（字段 InfantryType，+0x6C0）。
+// ============================================================================
+TechnoTypeClass* InfantryClass::GetType() const
+{
+    return this->Type;
+}
+// ============================================================================
+// asm: SHPStruct *__thiscall InfantryClass_GetImage(InfantryClass *this)
+//      (asm:9898, thunk)
+//
+//  转发到 FootClass::GetImage —— 步兵的外形完全由基类的类型 SHP 决定。
+// ============================================================================
+SHPStruct* InfantryClass::GetImage() const
+{
+    return ObjectClass::GetImage();
+}
+
+// ============================================================================
+// asm: wchar_t *__thiscall InfantryClass_GetUIName(InfantryClass *this)
+//      (asm:6862)
+//
+//  技工标记（+0x6D9）置位时返回 TXT_TECHNICIAN；
+//  否则若本方为玩家且本单位已被敌方伪装，则返回伪装外观名；
+//  其余情况返回自身类型的界面名。
+// ============================================================================
+const wchar_t* InfantryClass::GetUIName() const
+{
+    // 技工：被改造过的步兵显示为"技工"。
+    if (this->IsTechnician)
+        return L"TXT_TECHNICIAN";
+
+    // 玩家方看到的敌方伪装单位显示其伪装外观名。
+    if (this->IsDisguised())
+    {
+        const int32 disguise = this->GetDisguise(1);
+        if (disguise >= 0)
+        {
+            InfantryTypeClass* pDisguiseType =
+                InfantryTypeClass::FindByIndex(disguise);
+            if (pDisguiseType != nullptr)
+                return pDisguiseType->GetUIName();
+        }
+    }
+
+    // 默认返回自身类型名。
+    return this->Type ? this->Type->GetUIName() : L"";
+}
+
+// ============================================================================
+// asm: int __fastcall InfantryClass_GetAbstractDerivationID(InfantryClass *this)
+//      (asm:12880)
+//
+//  返回 AbstractType::Infantry（原版常量 0x0F）。
+// ============================================================================
+AbstractType InfantryClass::GetAbstractDerivationID() const
+{
+    return AbstractType::Infantry;
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_GetCRC(InfantryClass *this, int *pCRC)
+//      (asm:10778)
+//
+//  先并入基类校验，再把步兵特有的当前序列与若干状态字节并入 CRC。
+// ============================================================================
+void InfantryClass::ComputeCRC(CRCEngine& crc) const
+{
+    // 基类（含 FootClass / TechnoClass / ObjectClass）的字段。
+    FootClass::ComputeCRC(crc);
+
+    // 当前序列。
+    const int32 seq = static_cast<int32>(this->CurrentSequence);
+    crc.AddData(&seq, sizeof(seq));
+
+    // 步兵特有的状态字节（与原版 +0x6D9..+0x6DD 对应的五个标志）。
+    const uint8 firing   = this->IsFiringNow   ? 1 : 0;
+    const uint8 prone    = this->IsProneNow    ? 1 : 0;
+    const uint8 crawling = this->IsCrawlingNow ? 1 : 0;
+    const uint8 deployed = this->IsDeployedNow ? 1 : 0;
+    const uint8 tech     = this->IsTechnician  ? 1 : 0;
+
+    crc.AddData(&firing,   sizeof(firing));
+    crc.AddData(&prone,    sizeof(prone));
+    crc.AddData(&crawling, sizeof(crawling));
+    crc.AddData(&deployed, sizeof(deployed));
+    crc.AddData(&tech,     sizeof(tech));
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_GetCurrentSpeed(InfantryClass *this)
+//      (asm:10931)
+//
+//  在基类速度之上按爬行状态加权：爬行中若本类型可爬行(Crawls)则 ×4/3，
+//  否则 ×3/2；非爬行则原样返回。
+// ============================================================================
+int32 InfantryClass::GetCurrentSpeed() const
+{
+    int32 speed = FootClass::GetCurrentSpeed();
+
+    if (this->IsCrawlingNow)
+    {
+        if (this->Type != nullptr && this->Type->Crawls)
+            speed += speed / 3;   // ×4/3
+        else
+            speed += speed / 2;   // ×3/2
+    }
+
+    return speed;
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_GetObjectActivityState(
+//          InfantryClass *this, _TechnoClass *target, int idxWeapon, int what)
+//      (asm:4032)
+//
+//  对应 asm 的分支：
+//    1. 当前序列落在特殊集合（0x0B..0x0F/0x14/0x15/0x22..0x24）→ 6；
+//    2. Combat_Damage(-1) < 0：仅当目标是步兵且血量低于规则阈值时才继续，
+//       否则报告 5（无法造成伤害）；
+//    3. 目标是 Unit 且本方类型为 Pushy 且目标被占用（非自身）→ 5；
+//    4. 其余交给开火判定：可开火且足够近 → 2，忽略接近判定 → 2，否则 0。
+// ============================================================================
+int32 InfantryClass::GetObjectActivityState(AbstractClass* pTarget, int32 idxWeapon,
+                                            int32 ignoreCloseEnough)
+{
+    // 1) 特殊序列一律报告 6。
+    if (this->IsSpecialSequence())
+        return 6;
+
+    // 2) 无法对本类目标造成伤害时提前返回。
+    const int32 dmg = this->Combat_Damage(-1);
+    if (dmg < 0)
+    {
+        bool targetIsSoftInfantry = false;
+        if (pTarget != nullptr && pTarget->WhatAmI() == AbstractType::Infantry)
+        {
+            InfantryClass* pInf = static_cast<InfantryClass*>(pTarget);
+            // asm 与 RulesData+0x16F8 阈值比较；本项目未收录该规则字段。
+            if (pInf->GetHealthRatio() < 0.5f)
+                targetIsSoftInfantry = true;
+        }
+
+        if (!targetIsSoftInfantry)
+            return 5;
+    }
+
+    // 3) Pushy 单位对被占用的载具目标报告 5。
+    if (pTarget != nullptr && pTarget->WhatAmI() == AbstractType::Unit &&
+        this->Type != nullptr && this->Type->Pushy)
+    {
+        ObjectClass* pObj = static_cast<ObjectClass*>(pTarget);
+        if (pObj != static_cast<ObjectClass*>(this) && pObj->IsSelected)
+            return 5;
+    }
+
+    // 4) 不能开火 → 1（保持原有约定）。
+    if (!this->CanFireNow())
+        return 1;
+
+    if (ignoreCloseEnough)
+        return 2;
+
+    if (this->IsCloseEnough(pTarget, idxWeapon))
+        return 2;
+
+    return 0;
+}
+
+// ============================================================================
+// asm: dwXYZ *__thiscall InfantryClass_GetFLH(InfantryClass *this,
+//          dwXYZ *buffer, int idxWeapon, dwXYZ *xyz)
+//      (asm:12766)
+//
+//  步兵搭乘载具且属于该载具的乘客时，炮口位置取载具的 FLH（乘客索引取负）；
+//  其余情况沿用基类的 FLH（自身类型的炮口偏移）。
+// ============================================================================
+CoordStruct InfantryClass::GetFLH(int32 idxWeapon, bool muzzle)
+{
+    // 若正被某载具运载，则由载具提供炮口位置。
+    if (this->Transporter != nullptr && this->InLimbo())
+    {
+        TechnoClass* pTransport = this->Transporter;
+        return pTransport->GetFLH(idxWeapon, muzzle);
+    }
+
+    return TechnoClass::GetFLH(idxWeapon, muzzle);
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_GetDisguise(InfantryClass *this, char a2)
+//      (asm:11709)
+//
+//  当本方与玩家同盟、且查询方要求"看真身"(a2==0) 时返回自身类型；
+//  否则返回伪装外观编号（未伪装时按规则里的默认伪装回退）。
+// ============================================================================
+int32 InfantryClass::GetDisguise(int32 a2) const
+{
+    HouseClass* pPlayer = HouseClass::Player;
+
+    // 同盟方且不要求伪装外观 -> 看到自己的真身。
+    if (this->Owner != nullptr && this->Owner->IsAlliedWith(pPlayer) &&
+        a2 == 0)
+    {
+        return (this->Type != nullptr) ? this->Type->ArrayIndex : -1;
+    }
+
+    // 未记下伪装身份时回退到规则里的默认伪装外观。
+    if (this->DisguiseTypeId < 0)
+    {
+        if (RulesClass::Instance != nullptr && pPlayer != nullptr &&
+            RulesClass::Instance->Technician != nullptr)
+        {
+            return RulesClass::Instance->Technician->ArrayIndex;
+        }
+        return -1;
+    }
+
+    return this->DisguiseTypeId;
+}
+
+// ============================================================================
+// asm: HouseClass *__thiscall InfantryClass_GetDisguiseHouse(
+//          InfantryClass *this, char a2)
+//      (asm:11775)
+//
+//  同盟方且不要求伪装外观时返回自己的房屋；否则返回伪装归属的房屋
+//  （未记下时回退为玩家房屋）。
+// ============================================================================
+HouseClass* InfantryClass::GetDisguiseHouse(int32 a2) const
+{
+    HouseClass* pPlayer = HouseClass::Player;
+
+    if (this->Owner != nullptr && this->Owner->IsAlliedWith(pPlayer) &&
+        a2 == 0)
+    {
+        return this->Owner;
+    }
+
+    if (this->DisguiseHouse != nullptr)
+        return this->DisguiseHouse;
+
+    return pPlayer;
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass_IsDisguisedAs(
+//          InfantryClass *this, _AbstractClass *target)
+//      (asm:11948)
+//
+//  未伪装直接为假；否则取目标的伪装身份（步兵取类型、载具取伪装编号），
+//  与本步兵的伪装身份比较是否一致。
+// ============================================================================
+bool InfantryClass::IsDisguisedAs(int32 a2) const
+{
+    // a2 是目标对象指针（以整型传递）；本项目按 ObjectClass 处理。
+    ObjectClass* pTarget = reinterpret_cast<ObjectClass*>(static_cast<intptr_t>(a2));
+    if (pTarget == nullptr)
+        return false;
+
+    // 本步兵必须处于伪装状态。
+    if (!this->IsDisguised())
+        return false;
+
+    const AbstractType what = pTarget->WhatAmI();
+
+    int32 targetDisguise = -1;
+    if (what == AbstractType::Infantry)
+    {
+        InfantryClass* pInf = static_cast<InfantryClass*>(pTarget);
+        targetDisguise = (pInf->Type != nullptr) ? pInf->Type->ArrayIndex : -1;
+    }
+    else if (what == AbstractType::Unit)
+    {
+        targetDisguise = pTarget->GetDisguise(1);
+    }
+    else
+    {
+        return false;
+    }
+
+    return this->GetDisguise(1) == targetDisguise;
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass_IdleAction(InfantryClass *this)
+//      (asm:4549)
+//
+//  空闲计时到达后，按规则里的"空闲动作频率"在 450..1800 帧之间随机重置
+//  空闲计时器；对 Fraidycat 类步兵（非人类玩家控制且恐慌度较高）触发一次
+//  散开；对"牛"类步兵随机挑选一套特殊空闲动作。返回是否执行了空闲动作。
+// ============================================================================
+bool InfantryClass::IdleAction()
+{
+    // asm 首先调用 TechnoClass::TimeToIdle() 判定空闲计时是否到达；本项目
+    // 未实现该基类方法，以 Is_Ready_To_Random_Animate() 的等价就绪判定近似。
+    if (!this->Is_Ready_To_Random_Animate())
+        return false;
+
+    // 依据规则的空闲动作频率在 450..1800 帧之间随机重置空闲计时（asm 把结果
+    // 写进 TechnoClass::IdleActionTimer；本项目无该字段，复用 PanicTimer 作
+    // 为步兵的空闲计时载体）。
+    double freq = 1.0;
+    if (RulesClass::Instance != nullptr)
+        freq = RulesClass::Instance->IdleActionFrequency;
+
+    const int32 minDelay = static_cast<int32>(freq * 450.0);
+    const int32 maxDelay = static_cast<int32>(freq * 1800.0);
+    int32 delay = minDelay;
+    if (maxDelay > minDelay)
+        delay = minDelay + (rand() % (maxDelay - minDelay + 1));
+
+    this->PanicTimerVal = delay;
+    this->PanicTimer.Start(delay);
+
+    // Fraidycat 类步兵（非人类玩家控制且恐慌度 > 0x32）自动散开。
+    if (this->Type != nullptr && this->Type->Fraidycat)
+    {
+        if (this->Owner != nullptr && !this->Owner->IsHumanPlayer &&
+            this->FearLevel > 0x32)
+        {
+            this->Scatter(CoordStruct{0, 0, 0}, true, false);
+            return true;
+        }
+    }
+
+    // asm: 先掷一个 0..10（Random2Class(0,10)）；"COW" 类步兵再掷一次，
+    // 有 1/2 概率把动作强制成 8。
+    int32 pick = rand() % 11;
+    if (this->HasThisID("COW") && (rand() % 10) < 5)
+        pick = 8;
+
+    // asm 跳转表 off_51D0A8（以 pick-1 为下标）：
+    //   pick 3,4,5 -> seq_Idle1
+    //   pick 1,2,7 -> seq_Idle2（并可能触发语音）
+    //   pick 6,8,9,10 -> 随机八方向转身（6/8 条件散开）
+    //   pick 0 -> 什么都不做
+    if (pick >= 3 && pick <= 5)
+    {
+        this->PlayIdleAnim(0);
+        return true;
+    }
+
+    if (pick == 1 || pick == 2 || pick == 7)
+    {
+        this->PlayIdleAnim(1);
+        return true;
+    }
+
+    if (pick == 6 || pick == 8 || pick == 9 || pick == 10)
+    {
+        // 随机选一个八方向朝向（asm 用 FacingStruct_SetFacing 写朝向）。
+        const int32 dir = (rand() % 8) * 32;
+        this->SetDirection(DirStruct(static_cast<uint8>(dir)));
+
+        // case 8：非 COW 且（非人类玩家，或 Fraidycat）时散开；
+        // case 6：无条件散开。
+        if (pick == 6)
+        {
+            this->Scatter(CoordStruct{0, 0, 0}, true, false);
+        }
+        else if (this->Owner != nullptr && !this->Owner->IsHumanPlayer)
+        {
+            if (this->Type != nullptr && this->Type->Fraidycat)
+                this->Scatter(CoordStruct{0, 0, 0}, true, false);
+        }
+        return true;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// asm: void __thiscall InfantryClass_PlayIdleAnim(InfantryClass *this, int a2)
+//      (asm:10736)
+//
+//  asm: a2-1==0（即 a2==1）时 DoAction(seq_Idle2)，否则 DoAction(seq_Idle1)。
+// ============================================================================
+void InfantryClass::PlayIdleAnim(int32 a2)
+{
+    if (a2 == 1)
+        this->PlayAnim(Sequence::Idle2, false, false);
+    else
+        this->PlayAnim(Sequence::Idle1, false, false);
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass::Is_Ready_To_Random_Animate(
+//          InfantryClass *this)
+//      (asm:9925)
+//
+//  asm 逻辑（逐条对应）：
+//    1. 先取基类判定 TechnoClass::Is_Ready_To_Random_Animate()，假则返回假；
+//    2. 运动控制器 [this+0x674] 非空（空则 RaiseError），其 Is_Moving 为真→假；
+//    3. 忙碌字节 [this+0x6DB] 非 0 →假；
+//    4. 忙碌字节 [this+0x68D] 非 0 →假；
+//    5. 当前序列落在展开族 [0x1B,0x1E] →假；
+//    6. 当前序列必须是 0、1 或 0x10（seq_Ready / seq_Guard / seq_Tread）→真，
+//       否则假。项目 enum 未收录 seq_Tread，故白名单为 Ready / Guard。
+// ============================================================================
+bool InfantryClass::Is_Ready_To_Random_Animate() const
+{
+    // 1) 基类就绪条件（本项目无对应基类实现，以其语义等价项近似：
+    //    存活 + 未被运输）。
+    if (!this->IsAlive())
+        return false;
+    if (this->Transporter != nullptr)
+        return false;
+
+    // 2) 运动控制器忙碌时不随机动画。
+    if (this->Is_Moving())
+        return false;
+
+    // 3) 正在开火时不随机动画（as 6DB 忙碌字节）。
+    if (this->IsFiringNow)
+        return false;
+
+    // 4) 6D 忙碌字节：趴下/下蹲进行中。
+    if (this->IsProneNow)
+        return false;
+
+    // 5) 展开族序列内不随机动画。
+    if (this->IsDeployed_Anim())
+        return false;
+
+    // 6) 仅 Ready / Guard（二进制另含 seq_Tread）可随机动画。
+    switch (this->CurrentSequence)
+    {
+        case Sequence::Ready:
+        case Sequence::Guard:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass_ClickedMission(InfantryClass *this,
+//          int act, _AbstractClass *target, int a4)
+//      (asm:6687)
+//
+//  把被点击对象的当前动作映射为步兵可执行的动作码，然后交给基类处理；
+//  自点自身且动作为攻击、或本单位正被禁用时直接忽略。
+// ============================================================================
+bool InfantryClass::ClickedMission(int32 act, ObjectClass* pTarget, int32 a4) const
+{
+    // 被点击对象的动作码由目标的动作接口给出。
+    int32 targetAct = act;
+
+    // 原版跳转表：动作 8、27、28 -> 9（占领）；26、56 -> 5（攻击）。
+    switch (act)
+    {
+        case 8:
+        case 27:
+        case 28:
+            targetAct = 9;
+            break;
+        case 26:
+        case 56:
+            targetAct = 5;
+            break;
+        default:
+            break;
+    }
+
+    // 自己点击自己且结果动作为攻击 -> 忽略。
+    if (pTarget == this && targetAct == 5)
+        return false;
+
+    // 被禁用（EMP/眩晕）时忽略点击。
+    if (this->IsStunnedNow)
+        return false;
+
+    return FootClass::ClickedMission(targetAct,
+        static_cast<int32>(reinterpret_cast<intptr_t>(pTarget)), a4);
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_GetCursorOverCell(InfantryClass *this,
+//          dwXYZ *coords, int a3, wXY *loc)
+//      (asm:7536)
+//
+//  只有己方玩家才给出单元格光标（Owner->Is_Player() 为假直接返回 0）；随后
+//  在基类的单元格光标判定之上做两处修正：
+//    * Combat_Damage(-1) < 0（无有效武器对地）且光标为"可移动"(5) → 0x1A；
+//    * 类型可部署(Deployer)且处于展开族时，按主武器射程把攻/移动光标细分。
+//  asm 中另有隧道/特殊地形分支，本项目按可得字段保留核心两项。
+// ============================================================================
+int32 InfantryClass::GetCursorOverCell(const CellStruct& cell, bool a3, bool a4) const
+{
+    // 非己方玩家无光标。
+    if (this->Owner == nullptr || !this->Owner->IsHumanPlayer)
+        return 0;
+
+    InfantryClass* pThis = const_cast<InfantryClass*>(this);
+
+    // 基类的单元格光标判定（鼠标悬停格）。
+    int32 action = pThis->GetCursor_MouseOverCell(cell, a3, a4);
+
+    // 无有效对地武器时，把"可移动"光标改成 0x1A。
+    if (pThis->Combat_Damage(-1) < 0 && action == 5)
+        action = 0x1A;
+
+    // 可部署单位在展开族序列内，把攻/移动光标按主武器射程细分。
+    if (this->Type != nullptr && this->Type->Deployer && this->IsDeployed_Anim())
+    {
+        if (action == 1 || action == 5)
+            action = 2;
+    }
+
+    return action;
+}
+
+// ============================================================================
+// asm: void __thiscall InfantryClass_PointerGotInvalid(InfantryClass *this,
+//          _AbstractClass *gone, char removed)
+//      (asm:1177)
+//
+//  先交给基类清理；若失效指针正是自身的类型，则把类型清空。
+// ============================================================================
+void InfantryClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
+{
+    TechnoClass::PointerGotInvalid(pInvalid, removed);
+
+    if (reinterpret_cast<AbstractClass*>(this->Type) == pInvalid)
+        this->Type = nullptr;
+
+    (void)removed;
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass_Put(InfantryClass *this,
+//          dwXY *a2, int where)
+//      (asm:6270)
+//
+//  把步兵放到地图上：贴合地面高度、挑选本格内的子位置，随后走基类的放置
+//  流程；成功后按类型是否可载人刷新放置标记并把状态定格为"已放置"。
+// ============================================================================
+bool InfantryClass::Put(const CoordStruct& coords, int32 a2)
+{
+    if (MapClass::Instance == nullptr)
+        return false;
+
+    // 贴合地面高度。
+    CoordStruct place = coords;
+    const int32 floorZ = MapClass::Instance->GetCellFloorHeight(place);
+    place.Z = floorZ;
+
+    // 放置到指定坐标并挂上地图：原版 Put 走 FootClass::Put，其净效果是
+    // 写入坐标后 Unlimbo（占格登记 + vec_Logics 注册）。只写坐标会让
+    // 步兵永远不进 Logics 表，主循环也就永远不会 Update 它。
+    Location  = place;
+    IsInLimbo = true;
+    if (!Unlimbo())
+        return false;
+
+    // 类型不可载人时清掉"可被进入"标记。
+    if (this->Type != nullptr && !this->Type->IsCanBeOccupied())
+        this->IsOccupying = false;
+
+    // 放置后状态定格为"未部署"（原版写入状态字 +0x6E8 = 2）。
+    this->IsDeployedNow = false;
+
+    (void)a2;
+    return true;
+}
+
+// ============================================================================
+// asm: char __thiscall InfantryClass_MoveTo(InfantryClass *this, dwXY *a2)
+//      (asm:5853)
+//
+//  朝目标坐标规划移动：先换算成格子并记录移动起点，再调用寻路把路径压入
+//  运动控制器的路径，成功返回真。
+// ============================================================================
+bool InfantryClass::MoveTo(const CoordStruct& where)
+{
+    // 目标格可进入才继续。
+    const CellStruct destCell = CellClass::Coord2Cell(where);
+    if (!this->Can_Enter_Cell(destCell))
+        return false;
+
+    // 交给运动控制器规划一条通往目的地的路径。
+    this->Set_Destination(where);
+    return true;
+}
+
+// ============================================================================
+// asm: int __thiscall InfantryClass_Unload(InfantryClass *this)   (asm:7405)
+//
+//  asm 结构：
+//    * 类型不是可部署者(Deployer,+0xEC8) → 退回 FootClass_Unload；
+//    * 当前序列在展开族 [0x1B,0x1E]：
+//        - 没有待续序列(<= -1) → PlayAnim(seq_Undeploy, force=1, rand=0)；
+//    * 否则 → PlayAnim(seq_Deploy, force=1, rand=0)，并按武器(AreaFire)、
+//      "DESO" 等条件处理部署开火目标格；
+//    * 收尾统一：强制 Guard 任务 + 清空目的地，返回序列号（-1 → 退回基类）。
+//  本项目无 FootClass::Unload，故非部署者直接返回。
+// ============================================================================
+void InfantryClass::Unload()
+{
+    if (this->Type == nullptr || !this->Type->Deployer)
+        return;
+
+    const int32 seq = static_cast<int32>(this->CurrentSequence);
+
+    // asm 用 DoAction(seq, force=1, rand=0)（vtable+558）设置序列。
+    if (this->IsDeployed_Anim())
+    {
+        // 没有待续序列 → 播放"收起"。
+        if (static_cast<int32>(this->UnkSequence) <= -1)
+            this->PlayAnim(Sequence::Undeploy, true, false);
+    }
+    else
+    {
+        // 否则播放"展开"序列。
+        this->PlayAnim(Sequence::Deploy, true, false);
+    }
+
+    // 收尾：强制 Guard 任务并清空目的地（asm 的 ForceMission(mi_Guard)
+    // + SetDestination(0,1)）。
+    this->SetDestination(CoordStruct{0, 0, 0});
+
+    (void)seq;
+}
+
+// ============================================================================
+// asm: void __thiscall InfantryClass_AreaGuard(InfantryClass *this)   (asm:7298)
+//
+//  先调用 UpdateDeployment() 推进展开动画；只要它返回的不是 -1（即确实
+//  正在展开动画中），就地返回，不进入基类区域防守；否则退回
+//  FootClass::Mission_AreaGuard。
+// ============================================================================
+void InfantryClass::AreaGuard()
+{
+    // 推进部署动画；-1 以外的返回值表示动画进行中。
+    if (this->UpdateDeployment() != -1)
+        return;
+
+    FootClass::Mission_AreaGuard();
+}
+
+// ============================================================================
+// asm: int __fastcall InfantryClass_SaveToMapINIList(CCINIClass *INI)
+//      (asm:8216)
+//
+//  写 [Infantry] 段：遍历全局步兵数组，跳过处于 limbo 的单位，逐个写下
+//  "所有者,类型,血量%,X,Y,朝向,任务,..." 一行。
+// ============================================================================
+void InfantryClass::SaveToMapINIList(INIClass* pINI)
+{
+    if (pINI == nullptr || Array == nullptr)
+        return;
+
+    // 先写出段落头。
+    pINI->WriteString("Infantry", nullptr, nullptr);
+
+    char key[32];
+    int32 idx = 0;
+    for (int32 i = 0; i < Array->Count; ++i)
+    {
+        InfantryClass* pInf = (*Array)[i];
+        if (pInf == nullptr)
+            continue;
+
+        // 处于 limbo（未放到地图上）的单位不写出。
+        if (pInf->IsInLimbo)
+            continue;
+
+        // 生成段内键名（用序号）。
+        snprintf(key, sizeof(key), "%d", idx++);
+
+        // 所有者名。
+        const char* ownerName =
+            (pInf->Owner != nullptr) ? pInf->Owner->InitialName : "None";
+
+        // 类型名。
+        const char* typeName =
+            (pInf->Type != nullptr) ? pInf->Type->get_ID() : "None";
+
+        // 血量百分比（0..256）。
+        int32 health = static_cast<int32>(pInf->GetHealthRatio() * 256.0f);
+
+        // 位置与朝向。
+        CoordStruct pos = pInf->GetCoords();
+        const int32 facing =
+            ((static_cast<int32>(pInf->GetFacing().Value) + 1) / 2) & 0xFF;
+
+        char value[256];
+        snprintf(value, sizeof(value),
+            "%s,%s,%d,%d,%d,%d,%d",
+            ownerName, typeName, health,
+            pos.X, pos.Y, pos.Z, facing);
+
+        pINI->WriteString("Infantry", key, value);
+    }
+}
+
+// ============================================================================
+// asm: int __fastcall InfantryClass_CreateFromINIList(CCINIClass *INI)
+//      (asm:7859)
+//
+//  读 [Infantry] 段逐行重建步兵：解析所有者名、类型名、血量、坐标与朝向，
+//  实例化后放回地图并应用朝向。
+// ============================================================================
+void InfantryClass::CreateFromINIList(INIClass* pINI)
+{
+    if (pINI == nullptr)
+        return;
+
+    const int32 count = pINI->GetKeyCount("Infantry");
+    for (int32 i = 0; i < count; ++i)
+    {
+        const char* key = pINI->GetKeyName("Infantry", i);
+        if (key == nullptr)
+            continue;
+
+        char buf[256];
+        pINI->GetString("Infantry", key, buf, sizeof(buf));
+
+        // CSV：owner,type,health,X,Y,Z,facing
+        char* tok = std::strtok(buf, ",");
+        if (tok == nullptr) continue;
+        const char* ownerName = tok;
+
+        tok = std::strtok(nullptr, ",");
+        if (tok == nullptr) continue;
+        const char* typeName = tok;
+
+        // 所有者。
+        HouseClass* pOwner = nullptr;
+        const int32 ownerIdx = HouseClass::FindIndexByName(ownerName);
+        if (ownerIdx >= 0)
+            pOwner = HouseClass::GetHouseByIndex(ownerIdx);
+        if (pOwner == nullptr) continue;
+
+        //  infantry 类型。
+        InfantryTypeClass* pType = InfantryTypeClass::Find(typeName);
+        if (pType == nullptr) continue;
+
+        InfantryClass* pInf = pType->CreateInfantry(pOwner);
+        if (pInf == nullptr) continue;
+
+        tok = std::strtok(nullptr, ",");
+        int32 health = tok ? std::atoi(tok) : 256;
+
+        tok = std::strtok(nullptr, ",");
+        int32 x = tok ? std::atoi(tok) : 0;
+        tok = std::strtok(nullptr, ",");
+        int32 y = tok ? std::atoi(tok) : 0;
+        tok = std::strtok(nullptr, ",");
+        int32 z = tok ? std::atoi(tok) : 0;
+        tok = std::strtok(nullptr, ",");
+        int32 facing = tok ? std::atoi(tok) : 0;
+
+        // 放回地图。
+        pInf->Put(CoordStruct(x, y, z), 0);
+
+        // 应用血量（原版以 0..256 的比例存储）。
+        if (health > 0)
+        {
+            const int32 maxHp = pInf->GetMaxHealth();
+            pInf->Health = static_cast<int32>(
+                (static_cast<int64>(maxHp) * health) / 256);
+        }
+
+        // 应用朝向（0..255 的对合值）。
+        pInf->SetFacing(DirStruct(static_cast<short>(facing * 2)));
+    }
+}
+
+// ============================================================================
+// 开火入口 / 任务处理器（asm: InfantryClass_Fire 6196 / _Attack 7019 /
+//   _Guard 7266 / _Hunt 7165 / _Move 7330 / _Unload 7405）
+//
+//  步兵的任务语义与载具差别最大：展开/收起的姿态位会改写整条任务走向，
+//  工程师与 C4 兵种会把 Attack 直接改写成占领/爆破。下面按 asm 的控制流
+//  逐段复刻，姿态判定复用本类已有的 IsDeployed_Anim / UnkSequence。
+// ============================================================================
+namespace {
+
+// 任务表里的"本步耗时"：floor(Rate * 900) + Random2(0, 2)。
+int32 InfantryMissionStep(const MissionClass* pMission)
+{
+    double rate = 0.0;
+    if (pMission != nullptr)
+        rate = const_cast<MissionClass*>(pMission)->GetMissionRate();
+
+    int32 step = static_cast<int32>(std::floor(rate * 900.0));
+    if (step < 0)
+        step = 0;
+
+    if (ScenarioClass::Instance != nullptr)
+        step += ScenarioClass::Instance->Random.Next(0, 2);
+
+    return step;
+}
+
+// 目标是否是可以被 C4 / 驻扎的建筑。
+bool IsLiveBuilding(AbstractClass* pTarget)
+{
+    if (pTarget == nullptr)
+        return false;
+    if (pTarget->WhatAmI() != AbstractType::Building)
+        return false;
+
+    BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+    if (pBldg->Type == nullptr || pBldg->IsInLimbo)
+        return false;
+
+    return true;
+}
+
+} // namespace
+
+// ----------------------------------------------------------------------------
+// asm: BulletClass *__thiscall InfantryClass_Fire(InfantryClass *this,
+//          AbstractClass *dest, int idxWeapon)   (asm:6196, retn 8)
+//
+//  1) 先清掉"本帧已在忙"的序列标记（+0x68D）；
+//  2) 转交 TechnoClass_Fire；
+//  3) 没打出弹丸 → 直接返回；
+//  4) 胆小的兵种（Fraidycat）、且不是从载具里开火、且没有锁死目标时，
+//     开一次火就把逃跑计时器拉到 300 帧；如果当前任务是 Attack(1) 或
+//     Hunt(15)，顺手排队 Guard(5) 让它先缩回去。
+// ----------------------------------------------------------------------------
+BulletClass* InfantryClass::Fire(AbstractClass* pTarget, int32 nWeaponIndex)
+{
+    // asm: `mov byte ptr [esi+68Dh],0` —— 开火打断"忙"序列。
+    IsFiringNow = false;
+
+    BulletClass* pBullet = TechnoClass::Fire(pTarget, nWeaponIndex);
+    if (pBullet == nullptr)
+        return nullptr;
+
+    if (Type != nullptr && Type->Fraidycat
+        && !IsFiringFromVehicle && TargetObj == nullptr)
+    {
+        // asm: `mov dword ptr [esi+6D4h],12Ch` —— 300 帧的怯战计时。
+        PanicTimerVal = 0x12C;
+
+        if (GetMission() == Mission::Attack || GetMission() == Mission::Hunt)
+            QueueMission(Mission::Guard);
+    }
+
+    return pBullet;
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Attack(InfantryClass *this)   (asm:7019)
+//
+//  1) C4 兵种（类型带 C4）且目标是可爆破建筑 → 贴上去改成 Sabotage(17)；
+//  2) 非玩家所有、目标是建筑、且自己是工程师/驻扎兵种 → 贴上去改 Capture(8)；
+//  3) 玩家所有且正处于展开姿态 → 推进展开动画，返回任务步进；
+//  4) 其余退回 MissionClass::Mission_Attack。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Attack()
+{
+    AbstractClass* pTarget = GetTarget();
+
+    // ---- 1) C4 爆破 ------------------------------------------------------
+    if (pTarget != nullptr && Type != nullptr && Type->C4 && IsLiveBuilding(pTarget))
+    {
+        BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+        if (pBldg->Type->CanC4 && !pBldg->Type->InvisibleInGame)
+        {
+            SetDestination(pBldg->GetCoords());
+            QueueMission(Mission::Sabotage);
+            return 1;
+        }
+    }
+
+    // ---- 2) AI 工程师/驻扎兵抢楼 -----------------------------------------
+    if (Owner != nullptr && !Owner->Is_Human()
+        && pTarget != nullptr && Type != nullptr
+        && (Type->Engineer || Type->Occupier || Type->Assaulter)
+        && IsLiveBuilding(pTarget))
+    {
+        BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+        if (pBldg->CanBeOccupied(this))
+        {
+            SetDestination(pBldg->GetCoords());
+            ForceMission(Mission::Capture);
+            return 1;
+        }
+    }
+
+    // ---- 3) 展开姿态下的玩家步兵 -----------------------------------------
+    if (Owner != nullptr && Owner->Is_Human() && IsDeployed_Anim())
+    {
+        UpdateDeployment();
+        return InfantryMissionStep(this);
+    }
+
+    // ---- 4) 通用攻击 -----------------------------------------------------
+    return MissionClass::Mission_Attack();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Move(InfantryClass *this)   (asm:7330)
+//
+//  展开姿态下的移动请求先被改写成"收起"：
+//    - 玩家所有的展开步兵：撤销目的地（它得先收起，不动）；
+//    - 否则若后续序列 <= -1（没有排队的后续动作）→ 播 Undeploy 并返回
+//      该序列的首帧耗时；
+//  其余情况退回 FootClass::Mission_Move。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Move()
+{
+    if (IsDeployed_Anim())
+    {
+        if (Owner != nullptr && Owner->Is_Human())
+        {
+            SetTarget(nullptr);
+            return 1;
+        }
+
+        if (static_cast<int32>(UnkSequence) <= -1)
+        {
+            PlayAnim(Sequence::Undeploy, false, false);
+            // asm: 播收起动作后把动画的首帧耗时返回给任务层。
+            const int32 deploy = UpdateDeployment();
+            return (deploy != -1) ? deploy : 1;
+        }
+    }
+
+    return FootClass::Mission_Move();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Guard(InfantryClass *this)   (asm:7266)
+//
+//  先推进展开动画；只要还在展开过程中（UpdateDeployment != -1）就地返回，
+//  否则交给 FootClass::Mission_Guard。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Guard()
+{
+    // asm: `call UpdateDeployment / cmp eax,-1 / jnz retn` —— 展开动画没结束
+    //   时直接把它的返回值（剩余帧/步进）交回任务层。
+    const int32 deploy = UpdateDeployment();
+    if (deploy != -1)
+        return deploy;
+
+    return FootClass::Mission_Guard();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Hunt(InfantryClass *this)   (asm:7165)
+//
+//  1) 非玩家所有、目标是可驻扎建筑、且自己能驻扎 → 改成 Capture(8)；
+//  2) 非玩家所有、处于展开姿态、且没有目标 → 播 Undeploy，返回 1；
+//  3) 其余交给 MissionClass::Mission_Hunt。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Hunt()
+{
+    AbstractClass* pTarget = GetTarget();
+
+    if (Owner != nullptr && !Owner->Is_Human()
+        && pTarget != nullptr && Type != nullptr
+        && (Type->Engineer || Type->Occupier || Type->Assaulter)
+        && IsLiveBuilding(pTarget))
+    {
+        BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+        if (pBldg->CanBeOccupied(this))
+        {
+            SetDestination(pBldg->GetCoords());
+            ForceMission(Mission::Capture);
+            return 1;
+        }
+    }
+
+    if (Owner != nullptr && !Owner->Is_Human() && IsDeployed_Anim() && pTarget == nullptr)
+    {
+        PlayAnim(Sequence::Undeploy, false, false);
+        return 1;
+    }
+
+    return MissionClass::Mission_Hunt();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Return(InfantryClass *this)
+//
+//  返航：正在爬行/趴着的先站起来，再交给基类的返航处理。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Return()
+{
+    IsCrawlingNow = false;
+
+    if (IsProneNow)
+        StandUp();
+
+    return MissionClass::Mission_Return();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Enter(InfantryClass *this)
+//
+//  进楼：目标是建筑且自己能驻扎 → 走 GarrisonBuilding；否则交给基类
+//  （运输载具的上车由 FootClass::Mission_Enter 负责）。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Enter()
+{
+    AbstractClass* pTarget = GetTarget();
+
+    if (pTarget != nullptr && pTarget->WhatAmI() == AbstractType::Building)
+    {
+        BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+        if (GarrisonBuilding(pBldg))
+            return 1;
+    }
+
+    return FootClass::Mission_Enter();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Unload(InfantryClass *this)   (asm:7405)
+//
+//  只有"可展开"的兵种处理卸载，其余直接退回 FootClass_Unload：
+//    - 已处于展开姿态：后续序列为空时播 Undeploy；
+//    - 未展开：播 Deploy，若该兵种带面杀伤武器则把落点定在本格；
+//    - 之后一律 ForceMission(Guard)、撤销目的地；仍在变形动画中就把
+//      剩余步进返回给任务层。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Unload()
+{
+    if (Type != nullptr && Type->Deployer)
+    {
+        int32 step = -1;
+
+        if (IsDeployed_Anim())
+        {
+            if (static_cast<int32>(UnkSequence) <= -1)
+                PlayAnim(Sequence::Undeploy, true, false);
+        }
+        else
+        {
+            PlayAnim(Sequence::Deploy, true, false);
+
+            // asm: 取部署武器，若带 AreaFire（辐射兵一类）则把落点定在本格。
+            if (IsDeployedFire)
+                SetDestination(GetCoords());
+        }
+
+        // asm: 变形后仍排着后续序列 → 把它的首帧耗时作为本步。
+        if (static_cast<int32>(UnkSequence) > -1)
+            step = static_cast<int32>(UnkSequence);
+
+        ForceMission(Mission::Guard);
+        Stop_Moving();
+
+        if (step > -1)
+            return step;
+    }
+
+    return FootClass::Mission_Unload();
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall InfantryClass_Mission_Capture(InfantryClass *this)
+//
+//  占领/驻扎：目标是建筑时交给 GarrisonBuilding（与 Mission_Enter 同一
+//  入口，区别只在于任务名），否则退回基类。
+// ----------------------------------------------------------------------------
+int32 InfantryClass::Mission_Capture()
+{
+    AbstractClass* pTarget = GetTarget();
+
+    if (pTarget != nullptr && pTarget->WhatAmI() == AbstractType::Building)
+    {
+        BuildingClass* pBldg = static_cast<BuildingClass*>(pTarget);
+        if (GarrisonBuilding(pBldg))
+            return 1;
+    }
+
+    return MissionClass::Mission_Capture();
+}
+
+// ----------------------------------------------------------------------------
+// asm: char __thiscall InfantryClass_GuardBuildingCheck   (asm:624010 段)
+//
+//  警戒中的步兵会检查脚下建筑：
+//    - 不可见/激光栅栏/火焰墙/闸门一类，只要能穿越或本来就不挡路，就不算
+//      "有建筑"；
+//    - 真正的可驻扎建筑：自己人就不动；敌方且自己能驻扎 → 贴上去。
+// ----------------------------------------------------------------------------
+bool InfantryClass::TryEnterBuilding()
+{
+    if (MapClass::Instance == nullptr)
+        return false;
+
+    const CellStruct here = Math::CoordToCell(GetCoords());
+    CellClass* pCell = MapClass::Instance->GetCellAt(here);
+    if (pCell == nullptr)
+        return false;
+
+    BuildingClass* pBldg = pCell->Cell_Building();
+    if (pBldg == nullptr || pBldg->Type == nullptr)
+        return false;
+
+    // asm: InvisibleInGame / 激光栅栏 / 火焰墙 / 闸门 一律不算可进驻目标。
+    if (pBldg->Type->InvisibleInGame)
+        return false;
+    if (pBldg->Type->LaserFence)
+        return false;
+    if (pBldg->Type->FirestormWall)
+        return false;
+    if (pBldg->Type->Gate && pBldg->IsTraversable())
+        return false;
+
+    // 自己人的楼不进。
+    if (Owner != nullptr && pBldg->Owner == Owner)
+        return false;
+
+    // 能驻扎才贴上去。
+    if (!pBldg->CanBeOccupied(this))
+        return false;
+
+    SetDestination(pBldg->GetCoords());
+    ForceMission(Mission::Enter);
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// asm: InfantryClass_Update 的 624240..624322 段
+//
+//  姿态收尾三件事：
+//    1) 活动状态不是"正在进入建筑"(2) 时，把对象标记成 MarkType::Up；
+//    2) "忙"序列（+0x68D）且当前没有动画在播 → 清标记；展开族序列改回
+//       DeployedIdle，其余改回 Ready；
+//    3) 趴下计时器（+6C8 起点 / +6D0 时长）到期 → 清掉"保持趴下"标记。
+// ----------------------------------------------------------------------------
+void InfantryClass::Update_Posture()
+{
+    // ---- 1) 标记 ---------------------------------------------------------
+    if (GetObjectActivityState(GetTarget(), 0, 0) != 2)
+        Mark(MarkType::Up);
+
+    // ---- 2) 忙序列收尾 ---------------------------------------------------
+    if (IsFiringNow && CurrentSequence != Sequence::Count)
+    {
+        IsFiringNow = false;
+
+        if (IsDeployed_Anim())
+            PlayAnim(Sequence::DeployedIdle, false, false);
+        else
+            PlayAnim(Sequence::Ready, false, false);
+    }
+
+    // ---- 3) 趴下计时 -----------------------------------------------------
+    if (IsProneNow)
+    {
+        const int32 start = static_cast<int32>(PanicTimerVal);
+        if (start > 0 && --PanicTimerVal <= 0)
+            StandUp();
+    }
+}
+

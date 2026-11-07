@@ -4,10 +4,17 @@
 #include "Rendering/SidebarClass.h"
 #include "Rendering/MouseClass.h"
 #include "Rendering/RadarClass.h"
+#include "Rendering/ScreenOutput.h"
 #include "Core/Memory.h"
 
 #include <cstring>
 #include <cmath>
+#include <cstdio>
+
+// 冒烟测试开关，定义在 Game/Globals.cpp（OPENYR_DEBUG=1）。与
+// Rendering/Surface.cpp 一样在本地做 extern 声明，避免把 Game/Externs.h
+// 整包拖进渲染层。
+extern bool g_bDebugMode;
 
 // ============================================================================
 // Static members
@@ -104,6 +111,10 @@ GScreenClass::GScreenClass()
 
 GScreenClass::~GScreenClass()
 {
+    // 先释放宿主呈现后端（SDL 窗口/纹理、关闭 BMP 导出），再销毁表面，
+    // 避免后端仍持有 FullscreenSurface 的指针。
+    ScreenOutput::Shutdown();
+
     Destroy();
     if (Instance == this)
         Instance = nullptr;
@@ -432,9 +443,32 @@ void GScreenClass::Flip()
 
 void GScreenClass::BlitToScreen()
 {
-    // Direct blit from back buffer to screen
-    // This is the same as Flip but may use hardware acceleration
+    // 原版呈现路径是 GScreenClass::Do_Blit (asm 0x4F47xx)：拿 DirectDraw
+    // 主面(Primary)的宽高（vtable [edx+7Ch]/[eax+80h]）后做 Blt/BltFast，
+    // 最后等 Flip。本项目把"后台面 -> 全屏面"这段用 CPU 拷贝的 Flip() 等价
+    // 实现（BackBuffer -> FullscreenSurface），再把全屏面交给宿主呈现后端
+    // ScreenOutput::Present()。Present 是新增的宿主/调试输出，
+    // 不改变原版 DirectDraw 语义。
     Flip();
+
+    ScreenOutput::Present(FullscreenSurface);
+
+    // 每 60 帧一行调试输出（OPENYR_DEBUG=1 时）。
+    const int32 frames = ScreenOutput::FramesPresented();
+    if (g_bDebugMode && frames > 0 && (frames % 60) == 0)
+    {
+        int32 bpp = 0;
+        const int32 width = FullscreenSurface ? FullscreenSurface->Width : 0;
+        const int32 height = FullscreenSurface ? FullscreenSurface->Height : 0;
+        if (FullscreenSurface && FullscreenSurface->Width > 0 && FullscreenSurface->Pitch > 0)
+            bpp = FullscreenSurface->Pitch / FullscreenSurface->Width;
+
+        std::fprintf(stderr,
+                     "[PRESENT] frames=%d size=%dx%d bpp=%d bmp=%d\n",
+                     static_cast<int>(frames), static_cast<int>(width),
+                     static_cast<int>(height), static_cast<int>(bpp),
+                     static_cast<int>(ScreenOutput::FramesDumped()));
+    }
 }
 
 void GScreenClass::SetVideoMode(int32 width, int32 height, int32 bpp)

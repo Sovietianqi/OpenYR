@@ -36,6 +36,36 @@ public:
     void PatrolArea(CoordStruct toLocation);
     void HandleMemberDeath(TechnoClass* pTechno);
     bool DoesTeamStillExist() const;
+
+    // ------------------------------------------------------------------------
+    // asm: TeamClass::Took_Damage (asm 0x6EB3xx), retn 0Ch = 3 params.
+    //  FootClass_ReceiveDamage calls this when one of the team's units is hit.
+    //  The team reacts by re-establishing an anchor (spawnCell / target) so the
+    //  members regroup around wherever the fighting is: the very first hit
+    //  (before the first member ever took damage) simply clears the spawn cell
+    //  and flags the team as having taken fire; afterwards, if the attacker is
+    //  not a member, is hostile, and is not already the current target building,
+    //  the team anchors on it (when the type allows retargeting) and the leader
+    //  is told to fire back at the attacker.
+    // ------------------------------------------------------------------------
+    void Took_Damage(TechnoClass* pObject, int32 damageState, TechnoClass* pAttacker);
+
+    // ------------------------------------------------------------------------
+    // asm: TeamClass::Is_Leaving_Map (asm 0x6EC2xx), retn (no args).
+    //  True only once the team has actually started running: it must have begun
+    //  formation (+0x7F), the script must not be on its last action, and the
+    //  current script line must be a "move to waypoint" whose waypoint lies
+    //  outside the player's radar view (i.e. the team is marching off-screen).
+    // ------------------------------------------------------------------------
+    bool Is_Leaving_Map() const;
+
+    // ------------------------------------------------------------------------
+    // asm: TeamClass::Has_Entered_Map (asm 0x6EC3xx), retn (no args).
+    //  True when every member of the team has actually been placed on the map
+    //  (the "produced/spawned" byte is set on each unit).  An empty team counts
+    //  as having entered.
+    // ------------------------------------------------------------------------
+    bool Has_Entered_Map() const;
     bool CanRecruit() const;
     int32 GetTotalStrength() const;
     bool IsTeamFull() const;
@@ -51,6 +81,10 @@ private:
     void CleanupDeadMembers();
     void DoDisappear();
     CoordStruct ComputeFormationCenter();
+    // asm: AITeamClass_FindUnitToFollow (asm 0x6EB7xx): 为队伍确定一个"跟随锚点"
+    //  ——优先取距离队伍锚点（spawnCell）最近、且仍在场上的成员；找不到就取
+    //  第一个成员。结果分别写入 SpawnCell（若为空）与 FollowAnchor。
+    void FindUnitToFollow();
 
 public:
     // ========================================================================
@@ -259,7 +293,10 @@ public:
 
     // 根据游戏行为，可知脚本闪烁需求记在队伍上，绘制层按队伍消费。
     bool IsFlashing = false;
-    AbstractClass* ITarget;
+    AbstractClass* ITarget;      // +0x3C  当前队伍目标（原 TargetBuilding）
+    AbstractClass* PrevTarget;   // +0x40  上一个目标，切换时保留一帧
+    AbstractClass* SpawnCell;    // +0x34  队伍的锚点/出生点（可以是任意地图对象）
+    AbstractClass* FollowAnchor; // +0x38  队伍跟随锚点（FindUnitToFollow 的产物）
     TeamClass* NextTeam;
     TeamClass* PrevTeam;
     int32 GuardAreaTimer;
@@ -296,11 +333,23 @@ public:
     bool TimeToDissapear;
     bool WantsToDelete;
 
-    // 根据游戏行为，可知 TeamSuspended / SuspendFrame 是挂起机制的两半：
-    // 前者是"本队当前被暂停"的开关，后者是恢复行动的目标帧号。基地遇袭时
-    // 优先度不足的队伍会被打上暂停并写下到期帧，到期帧之前它不参与行动。
+    // 根据游戏行为，可知 TeamSuspended / SuspendFrame / SuspendDuration 是
+    // 挂起机制的三半（asm +0x74/+0x64/+0x6C 那组计时器）：
+    //   前者是"本队当前被暂停"的开关；
+    //   SuspendFrame 是开始挂起的帧号（asm 用 0xFFFFFFFF 表示"尚未挂起"）；
+    //   SuspendDuration 是要挂起的时长（帧）。
+    // 基地遇袭时优先度不足的队伍会被打上暂停并写下起始帧与时长，等
+    // Frame - SuspendFrame >= SuspendDuration 才解除，在此之前不参与行动。
     bool TeamSuspended;
     int32 SuspendFrame;
+    int32 SuspendDuration;
+
+    // asm +0x7F: "队伍已开始编队/出动"的开关。Update 首次发现队伍就绪时置 1，
+    // 之后只在真正编队时才推进脚本；散开/集结辅助逻辑也会复位它。
+    bool IsForming;
+
+    // asm +0x75: "本队已经挨过打"的开关。Took_Damage 首次被击中且尚未编队时置 1。
+    bool HasTakenDamage;
 
     // Per-task-force-slot unit counters (asm +0x88, six dwords: cntObjects).
     // RecruitUnit bumps the slot the new member filled; the AI uses these to

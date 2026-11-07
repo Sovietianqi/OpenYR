@@ -13,6 +13,7 @@
 #include <Audio/VocClass.h>
 #include <INI/INIClass.h>
 #include <Game/Externs.h>
+#include <Game/LogicClass.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -218,6 +219,11 @@ void Init_Game_First()
         HouseClass::Observer = new HouseClass(nullptr);
         HouseClass::Observer->IsObserver = true;
     }
+
+    // asm: L69914-69920 —— 建立全局对象表 vec_Logics（逐帧驱动主表）
+    //   与 vec_VisibleObjects（每帧末清死对象）。必须在任何对象 Unlimbo
+    //   之前完成；Init_Game 里的对象生成全部发生在本函数之后。
+    LogicClass_Init();
 
     g_GameObjectsInitialized = true;
 }
@@ -662,13 +668,18 @@ void Init_Buildings()
 
 void Init_Houses()
 {
-    // Clear all house arrays
-    for (int32 i = 0; i < HouseClass::MaxHouses; ++i) {
-        HouseClass::Array[i] = nullptr;
+    // asm: Init_Houses 属于"类型数据装载"那一批（Init_Animations ..
+    //   Init_Houses .. Init_Base 全是 XXTypeClass::One_Time / 从 rules 读表），
+    //   它**不负责**清空房屋实例表 —— 那是 ScenarioClass::Clear 的职责。
+    //
+    //   本树此前在这里把 HouseClass::Array / ArrayCount / Player 全清零，
+    //   而 Init_Scenario（Step 10）已经先把玩家与敌军两家房建好并注册过，
+    //   于是 Step 13 一跑，房屋表变空、Player 变 nullptr：UI 读不到资金、
+    //   AI 找不到房、雷达上没有任何阵营色。清空动作移到
+    //   Init_Game_First（新游戏的起点）之前，这里只做类型表与观察者。
+    if (HouseTypeClass::ArrayCount == 0) {
+        HouseTypeClass::Init_Defaults();
     }
-    HouseClass::ArrayCount = 0;
-    HouseClass::pCurrentPlayer = nullptr;
-    HouseClass::Player = nullptr;
 
     // The observer is already created in Init_Game_First
     if (!HouseClass::Observer) {

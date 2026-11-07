@@ -66,6 +66,11 @@ public:
     void Set_Color(int32 index, const RGBClass& color);
     void Set_Color(int32 index, uint8 r, uint8 g, uint8 b);
 
+    // asm: Palette_FillWith (0x626000)
+    // Zero-fills all 256 RGB triplets and then copies the single `fill`
+    // triplet across every entry -- a uniform-color palette sweep.
+    void FillWith(const RGBClass& fill);
+
     // ----------------------------------------------------------------------
     // Bulk palette data access
     // ----------------------------------------------------------------------
@@ -137,6 +142,38 @@ public:
     // ----------------------------------------------------------------------
     // Utility
     // ----------------------------------------------------------------------
+
+    // asm: Palette_FillBuffer (0x4BBAC0)
+    //
+    //   ; void __fastcall Palette_FillBuffer(WORD *a1, int len, Palette *source)
+    //   ecx = a1 (目标 16bpp 缓冲) ; edx = len (要填的调色板组数)
+    //   arg_0 = source (const uint8*，8bit RGB 三元组流)，retn 4
+    //
+    //   调用者：ConvertClass::ConvertClass+411 —— 构造时把 N 份 16bpp
+    //   调色板一次铺出来，第 g 份整体按 16.16 定点因子
+    //   g*2/(len-1) 缩放（len <= 1 时因子取 0x10000，即不缩放）：
+    //     for (g = 0 ; g < len ; ++g):
+    //       f = (len > 1) ? g*0x20000/(len-1) : 0x10000
+    //       for (i = 0 ; i < 0x100 ; ++i):
+    //         p = source + (g*0x100 + i)*3
+    //         R = min((p[0]*f) >> 16, 0xFF)
+    //         G = min((p[1]*f) >> 16, 0xFF)
+    //         B = min((p[2]*f) >> 16, 0xFF)
+    //         out[i] = ((R >> col_R_SHR_3) << col_R_SHL_11)
+    //                | ((G >> col_G_SHR_2) << col_G_SHL_5)
+    //                | ((B >> col_B_SHR_3) << col_B_SHL_0)
+    //   源缓冲按 0x100*3 字节步进，定点因子按 0x20000 递增。
+    //
+    //   注 1：asm 里 source 是 Palette*（0x300 字节），但逐字节取的是
+    //         RGB 三元组，与本题的 const uint8* 视角等价。
+    //   注 2：col_*_SHR_/SHL_ 是运行期全局量（SetVideoMode 按色深设置，
+    //         见 sub_4BBC30/sub_4BBC40 一对 getter）。本项目统一按
+    //         RGB565 处理（红 >>3<<11、绿 >>2<<5、蓝 >>3<<0），
+    //         与 Surface.h 已有的打包约定一致。
+    //   注 3：原版用 sar（算术右移）取整除；三个分量都非负，<<16 后的
+    //         中间量也非负，故 /65536 与之等价。
+    // ----------------------------------------------------------------------
+    static void FillBuffer(uint16* pDest, int32 count, const uint8* pSource);
 
     // Reset all entries to black.
     void Clear();

@@ -6,6 +6,8 @@
 #include "../Core/Memory.h"
 #include "../Math/Timer.h"
 
+struct RocketStruct;
+
 class RocketLocomotionClass : public LocomotionClass {
 public:
     static constexpr int32 LocoID = LocomotionClass::CLSIDs::Rocket;
@@ -17,6 +19,7 @@ public:
 
     virtual Layer In_Which_Layer() override { return Layer::Air; }
     virtual bool Is_Moving() override;
+    virtual bool Is_Moving_Now() override;
     virtual CoordStruct Destination() override;
     virtual bool Process() override;
     virtual void Move_To(CoordStruct to) override;
@@ -30,13 +33,28 @@ public:
 
     void Accelerate();
     void Decelerate();
-    void ProcessAcceleration();
-    void ProcessDeceleration();
-    void ProcessCruise();
     void UpdateTrajectory();
     void GetTargetTracking(CoordStruct targetPos);
     void CalculateBallisticTrajectory(CoordStruct target);
     bool CheckImpact();
+    // asm: Process 开头的取规则段（按载体类型在 V3Rocket/DMisl/CMisl 三者中
+    //   选定一枚火箭参数）。
+    const RocketStruct* GetMissionRocket() const;
+    // asm: Process 的跳转表 off_663010 —— 任务态 0..6 的逐帧处理体。
+    bool ProcessIdle();
+    bool ProcessPauseRaise();
+    bool ProcessIgnite();
+    bool ProcessTrack();
+    bool ProcessTerminal();
+    void ProcessImpact();
+    // asm: 速度上限夹取（状态 2/3 都把速度夹到载体类型上限，VehicleType+0x678）。
+    void ClampSpeedToMax(const RocketStruct* rocket);
+    // asm: 发射者的老兵判定（Veterancy_IsElite）决定用普通/精英弹头与伤害。
+    void ResolveSpawnerElite();
+    // asm: 巡航/追踪段按 (dz, 水平距离) 的 arctan 推俯仰（arctanfoo 段）。
+    void UpdatePitchToTarget();
+    // asm: RocketLocomotionClass_DoStuff   (asm:299) —— 抵达引爆。
+    void Detonate();
     void SetThrust(double thrust, double maxSpeed, double accel);
     double GetCurrentSpeed() const;
     float GetPitch() const;

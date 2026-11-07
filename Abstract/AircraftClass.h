@@ -5,6 +5,8 @@
 
 // Forward declarations
 class TargetClass;
+class INIClass;
+class BuildingTypeClass;
 
 // ============================================================================
 // AircraftClass - base for all aircraft units
@@ -103,6 +105,32 @@ public:
     virtual Mission GetMission() const;
     virtual void QueueMission(Mission mission);
     virtual Mission GetQueuedMission() const;
+
+    // ========================================================================
+    // 开火入口 / 任务跳表覆写（asm: AircraftClass::Fire_At 3306 /
+    //   Mi_Attack / Mi_Move / Mi_Guard / Mi_Hunt / Mi_Retreat / Mi_Enter /
+    //   Mi_Unload）
+    //
+    //  飞机的任务跳表与地面单位共用同一批槽位，但每个槽位都换成 Mi_*
+    //  系列的"先选空域、再决定悬停/掠过"的实现。这组覆写就是 asm 里
+    //  vftable 指向 Mi_* 的那几个槽位本身。
+    // ========================================================================
+    virtual BulletClass* Fire(AbstractClass* pTarget, int32 nWeaponIndex) override;
+    virtual int32 Mission_Attack() override;
+    virtual int32 Mission_Move() override;
+    virtual int32 Mission_Guard() override;
+    virtual int32 Mission_Hunt() override;
+    virtual int32 Mission_Return() override;
+    virtual int32 Mission_Enter() override;
+    virtual int32 Mission_Unload() override;
+    virtual int32 Mission_Capture() override;
+
+    // ------------------------------------------------------------------------
+    // asm: __thiscall AircraftClass_UpdateTurret(AircraftClass *this,
+    //          AbstractClass *target)
+    //  机载炮塔逐帧：求目标方向的期望朝向，按机体转向率限速靠拢。
+    // ------------------------------------------------------------------------
+    void Update_Turret(AbstractClass* pTarget);
     virtual void MissionAttack();
     virtual void MissionMove();
     virtual void MissionGuard();
@@ -302,6 +330,91 @@ public:
     virtual bool IsSleeping() const;
 
     // ========================================================================
+    // 反射 / 类型信息（asm: AircraftClass_GetType / _GetSize /
+    // _GetAbstractDerivationID / _GetClassID / _GetUIName）
+    //
+    //  GetType 直接返回机体类型；Size 返回原版 AircraftClass 的结构体字节数
+    //  (0x6D8)；GetAbstractDerivationID 返回 AbstractType::Aircraft（2）；
+    //  GetClassID 把本类的 CLSID 写进出参并返回 S_OK；GetUIName 取类型名。
+    // ========================================================================
+    virtual TechnoTypeClass* GetType() const override;
+    virtual AircraftTypeClass* Get_Aircraft_Type() const;
+    virtual int32 Size() const override;
+    virtual AbstractType GetAbstractDerivationID() const;
+    virtual HRESULT GetClassID(CLSID* pClassID) override;
+    virtual const wchar_t* GetUIName() const;
+
+    // ========================================================================
+    // 地面/空中判定覆写（asm: AircraftClass_InAir / _OnFloor / _IsGroundUnit）
+    //
+    //  当机体类型属于"机场绑定/悬停"两类时，改由 IFlyControl 载荷查询决定
+    //  是否在空中；否则退回 FootClass / TechnoClass 的基础判定。
+    // ========================================================================
+    bool InAir() const;
+    bool OnFloor() const;
+    virtual bool IsGroundUnit_Impl() const;
+
+    // ========================================================================
+    // 通用生命周期（asm: AircraftClass_Init / _GetCRC / _PointerGotInvalid /
+    // _StartMission / _ReceivedRadioCommand / _ReceiveDamage / _Put /
+    // _KickOutUnit / _ClickedMission / _See / _Draw / _Update）
+    // ========================================================================
+    virtual void Init() override;
+    virtual void Update() override;
+    virtual void Draw(int32 a2, int32 a3, int32 a4) override;
+
+    int32 GetCRC(int32* pCRC) const;
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool bRemoved) override;
+    bool StartMission();
+    int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4);
+    int32 ReceiveDamage(int32* pDamage, int32 typeSource,
+                        WarheadTypeClass* pWarhead, int32 target,
+                        int32 ignoreDefenses, int32 arg10,
+                        HouseClass* pSourceHouse);
+    virtual bool Put(const CoordStruct& coords, int32 a2) override;
+    bool KickOutUnit(FootClass* pUnit) const;
+    bool ClickedMission(int32 a2, int32 a3, int32 a4) const;
+    void See(int32 a2, int32 a3) const;
+
+    // ========================================================================
+    // 光标 / 活动状态（asm: AircraftClass_GetCursorOverObject / _OverCell /
+    // _GetObjectActivityState）
+    // ========================================================================
+    int32 GetCursorOverObject(int32 currentCursor, bool a3) const;
+    int32 GetCursorOverCell(const CellStruct& cell, bool a3, bool a4) const;
+    int32 GetObjectActivityState(AbstractClass* pTarget, int32 idxWeapon,
+                                 int32 ignoreCloseEnough);
+
+    // ========================================================================
+    // 飞行落点与装载（asm: AircraftClass::New_LZ /
+    // ::Cell_Seems_Ok / ::Desired_Load_Dir / ::Fire_Direction /
+    // ::Find_Docking_Bay / ::Drop_Off_Cargo /
+    // ::Do_Mission_Move_Carryall）
+    // ========================================================================
+    AbstractClass* New_LZ(FootClass* pTarget);
+    bool Cell_Seems_Ok(const CellStruct& coords, bool a3) const;
+    bool Desired_Load_Dir(TechnoClass* pUnit, CoordStruct* pOutCoords) const;
+    DirStruct Fire_Direction() const;
+    BuildingClass* Find_Docking_Bay(
+        const DynamicVectorClass<BuildingTypeClass*>& types, int32 a3, int32 a4);
+    bool Drop_Off_Cargo();
+    int32 Do_Mission_Move_Carryall();
+
+    // ========================================================================
+    // 场景 INI 读写（asm: AircraftClass_SaveToMapINIList /
+    // _CreateFromINIList）
+    // ========================================================================
+    static void SaveToMapINIList(INIClass* pINI);
+    static void CreateFromINIList(INIClass* pINI);
+
+    // ========================================================================
+    // 飞行状态机阶段（asm: AircraftClass 的飞行 AI 状态字，落在 +0x7F4 偏移）。
+    //   各类飞行行为（起飞/巡航/进近/着陆/停靠/掠过/神风/空投/坠毁）通过该
+    //   入口把当前阶段写回机体，供 Update_AI 的飞行状态机读取。
+    // ========================================================================
+    static void SetFlightPhase(AircraftClass* pAircraft, int32 phase);
+
+    // ========================================================================
     // Constructor
     // ========================================================================
     AircraftClass(HouseClass* pOwner) noexcept;
@@ -348,8 +461,7 @@ public:
     DWORD unknown_808;
     DWORD unknown_80C;
     DWORD unknown_810;
-    Mission CurrentMission;
-    int32 MissionStatus;
+    // ★ 任务状态由基类 MissionClass 持有（原版 +0xA8/+0xB8）。
 
     // Per-instance serialization for the save-game stream (base + derived).
     void Save(class SaveGameClass& saver) const;
@@ -459,4 +571,7 @@ public:
     DWORD unknown_9B4;
     DWORD unknown_9B8;
     DWORD unknown_9BC;
+
+    // 最近一次本体绘制的屏幕包围盒（SHP 帧 dst），供血条/选中框定位。
+    RectangleStruct LastRenderRect;
 };

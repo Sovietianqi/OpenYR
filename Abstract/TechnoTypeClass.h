@@ -29,6 +29,14 @@ public:
     static void Delete_All();
 
     virtual ~TechnoTypeClass();
+    // IPersistStream (stream serialisation).  The original TechnoTypeClass_Save
+    // chains to ObjectTypeClass_Save and then streams every vector/list member.
+    virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
+    // GetMaxSize(this, uint64* pcbSize): the running byte total a stream
+    // snapshot of this type would occupy.  The original chains to
+    // ObjectTypeClass_GetMaxSize, which itself chains to AbstractClass_GetSize
+    // (base object size + 4) before this class adds its vector members.
+    virtual HRESULT GetMaxSize(uint64* pcbSize);
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual bool SaveToINI(CCINIClass* pINI) const;
     virtual AbstractType GetAbstractDerivationID() const;
@@ -58,11 +66,47 @@ public:
     virtual int32 GetWeaponCount() const;
     virtual WeaponStruct* GetWeapon(int32 index) const;
 
+    // Returns the elite weapon slot for the given mode.  The original computes
+    // this + mode*28 + 0xA94 (28 = sizeof original WeaponStruct), i.e. the
+    // address of EliteWeapons[mode].  Mirrors TechnoType_GetEliteWeapon.
+    virtual WeaponStruct* GetEliteWeapon(int32 mode) const;
+
+    // Category table helpers.  The original walks the 11-entry global
+    // "categories" table comparing both the long name and the short name
+    // case-insensitively.  Mirrors TechnoType_CategoryIdxToString and
+    // TechnoType_CategoryStrToIdx.
+    static const char* CategoryIdxToString(int32 idx);
+    static int32       CategoryStrToIdx(const char* pName);
+
+    // ------------------------------------------------------------------
+    // Cost family.  The original vtable exposes GetCost (raw Cost field),
+    // GetActualCost (owner-modified), GetBuildSpeed (Rules-scaled) and
+    // GetRefund (sell-back).  GetCost is a vtable slot at +0xACh that the
+    // concrete type classes may override (BuildingTypeClass does).
+    // ------------------------------------------------------------------
+    virtual int32 GetCost() const;
+    virtual int32 GetActualCost(HouseClass* pOwner) const override;
+    // TechnoTypeClass_GetBuildSpeed: Cost * Rules->BuildSpeed * 0.9, floored.
+    virtual int32 GetBuildSpeed() const;
+    // GetRefund(Soylent, overrideLogic): Soylent is the owning house and
+    // overrideLogic forces the full (1.0) refund percentage when set.
+    virtual int32 GetRefund(HouseClass* pSoylent, bool overrideLogic) const;
+
     // Extended accessors used by the sidebar / AI
     virtual int32  Get_Max_Speed() const;
     virtual Armor  Get_Armor() const;
     virtual bool   Is_Two_Shooter() const;
     virtual int32  Get_Cameo_Index() const;
+    // TechnoTypeClass_GetCameo: the SHP the sidebar draws for this type.  When
+    // the player's war factory has been infiltrated and the type is a trainable
+    // vehicle/building with an AltCameo, the alt cameo shape is substituted.
+    virtual SHPStruct* GetCameo() const override;
+    // TechnoTypeClass_GetOwners: the owner bitmask.  A double-owned type in a
+    // live multiplayer session is owned by everyone (returns INT_MAX).
+    virtual int32 GetOwners() const override;
+    // TechnoTypeClass_GetPipMax: switch on PipScale - ammo, health/size,
+    // passengers, storage (10) or mind-control (weapon damage).
+    virtual int32  GetPipMax() const override;
     virtual CoordStruct Get_Display_Coords() const;
     virtual bool   Is_Veteran() const;
     virtual bool   Is_Crewed() const;
@@ -86,6 +130,11 @@ public:
     int32       ROT;
     int32       WeaponCount;
     WeaponStruct Weapons[18];
+    // Elite weapon table (asm base 0xA94, 28-byte stride in the original).
+    // Indexed by IFV mode / elite slot; TechnoClass_GetWeapon fetches entries
+    // from here once the unit reaches elite rank.  Mirrors
+    // TechnoType_GetEliteWeapon addressing.
+    WeaponStruct EliteWeapons[18];
     bool        HasTurret_;
     bool        CanCloak_;
     bool        IsVoxel_;

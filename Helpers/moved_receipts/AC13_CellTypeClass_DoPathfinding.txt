@@ -1,0 +1,5 @@
+file=Helpers/AsmComplex13.cpp
+start=1364
+end=1668
+symbol=CellTypeClass_DoPathfinding
+target=Terrain/CellTypeClass.cpp

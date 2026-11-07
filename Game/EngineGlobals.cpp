@@ -1,5 +1,7 @@
 #include "EngineGlobals.h"
 
+#include "../UI/MonoScreenClass.h"
+
 // ============================================================================
 // EngineGlobals
 // ============================================================================
@@ -39,10 +41,15 @@ const char* EngineGlobals::Get_String(const char* pKey)
     return pKey ? pKey : "";
 }
 
-void* EngineGlobals::Mono_ScreenPtr_5BC450()
+void* EngineGlobals::Mono_ScreenPtr_5BC450(int32 index)
 {
-    // 根据游戏行为，可知单色调试屏是全局登记的唯一实例。
-    return nullptr;
+    // asm: Get_Mono_ScreenPtr_5BC450 (0x5BC450)
+    //   mov eax, dword_ABF168[ecx*4] / retn
+    //
+    // 单色调试屏是一张 5 项的全局指针表（dword_ABF168 dd 5 dup(?)）。
+    // 表的实体由 MonoScreenClass 持有（同一张表只此一份），这里按索引转发，
+    // 越界同样返回空。
+    return static_cast<void*>(MonoScreenClass::Get(index));
 }
 
 bool EngineGlobals::Audio_Thread_State()

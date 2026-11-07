@@ -1,11 +1,19 @@
 #include "EMPulseClass.h"
 #include "../Map/MapClass.h"
+#include "../Map/CellClass.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Rendering/Blitter.h"
 #include "../Rendering/Surface.h"
 #include "../Abstract/ObjectClass.h"
 #include "../Abstract/TechnoClass.h"
+#include "../Abstract/AircraftClass.h"
+#include "../Abstract/UnitClass.h"
+#include "../Abstract/InfantryClass.h"
+#include "../Abstract/BuildingClass.h"
+#include "../Animations/AnimClass.h"
+#include "../Rules/RulesClass.h"
+#include "../Math/Timer.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -21,7 +29,8 @@ EMPulseClass::EMPulseClass()
     , PulseColor(64, 128, 255), PulseAlpha(128), FlashAlpha(255)
     , RingThickness(16), PulseCount(0), MaxPulses(3)
     , PulseInterval(60), PulseTimer(0), CurrentPulse(0)
-    , DamageAmount(0), DisableDuration(300), OwnerHouse(-1) {
+    , DamageAmount(0), DisableDuration(300), OwnerHouse(-1)
+    , CreateFrame(0) {
 }
 
 EMPulseClass::~EMPulseClass() {
@@ -44,16 +53,33 @@ void EMPulseClass::Initialize(const CoordStruct& pos, int32 radius, int32 durati
     HasExpanded = false;
     PulseTimer = 0;
     CurrentPulse = 0;
+
+    // asm: EMPulseClass_CTOR `mov edx, Frame ; mov [esi+2Ch], edx`
+    //      —— 记录创建帧，供 UpdateAll / ApplyEffects 判过期。
+    CreateFrame = FrameTimer::GetTime();
 }
 
+// ============================================================================
+// asm: EMPulseClass_UpdateAll (0x4C54A0) 的逐事件部分
+//
+//   原版不是逐帧动画，而是在 UpdateAll 里对每个事件判：
+//     if (Frame < CreateFrame + Duration) 跳过；否则 vt[+20h](1) 销毁。
+//   OpenYR 把"是否过期"折叠进本 Update（返回前若过期则置 IsActive=false），
+//   视觉推进（脉冲环光栅）由渲染后端驱动。
+// ============================================================================
 void EMPulseClass::Update() {
     if (!IsActive) return;
 
-    ++CurrentDuration;
-    if (CurrentDuration >= MaxDuration) {
+    // asm: mov edx,[ecx+30h] (Duration) ; mov eax,[ecx+2Ch] (CreateFrame)
+    //      add edx,eax ; mov eax,Frame (global) ; cmp eax,edx ; jl loc_4C54D2
+    const int32 expiry = CreateFrame + Duration;
+    if (FrameTimer::GetTime() >= expiry) {
+        // asm: vt[+20h](1) —— 标量删除；此处标记为不活跃（由管理器回收）。
         IsActive = false;
         return;
     }
+
+    ++CurrentDuration;
 
     if (IsExpanding && !HasExpanded) {
         CurrentRadius += ExpandSpeed;
@@ -1165,3 +1191,326 @@ EMPStatistic ComputeEMPulseStatistics(EMPulseClass* pulse)
 }
 
 } // end anonymous namespace
+
+// ============================================================================
+// asm: EMPulseClass_EndEffect (0x4C58B0)
+//
+//   void __thiscall EMPulseClass_EndEffect(EMPulseClass *this)
+//
+//   脉冲结束时清场：以中心为原点在半径 r 的方形邻域内扫描，凡落在
+//   [0, 0x200) 网格内、且平方距离 <= r² 的格子，清掉 cfEMP 标志。
+//
+//   asm 逐段：
+//     eax = [esi+28h] (Radius) / ebx = -eax / ebp = imul eax,eax
+//     loc_4C58DD  outer: bx 从 -r 到 r
+//     loc_4C58E9  inner: di 从 -r 到 r
+//       ax = [esi+24h] + di   ; 中心 X (int16)
+//       cx = [esi+26h] + bx   ; 中心 Y (int16)
+//       test ax,ax / jl skip ; cmp ax,200h / jge skip
+//       test cx,cx / jl skip ; cmp cx,200h / jge skip
+//         call MapClass_CellExists / test al,al / jz skip
+//         edx = (ax-cx0)^2 + (cx-cy0)^2 / cmp edx,ebp / jg skip
+//           and dword ptr [cell+140h], not cfEMP
+// ============================================================================
+void EMPulseClass::End_Effect(int16 centerX, int16 centerY, int32 radius)
+{
+    // asm: mov eax,[esi+28h] / neg ebx / imul ebp,eax
+    const int32 negRadius = -radius;
+    const int32 radiusSq  = radius * radius;
+
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr)
+        return;
+
+    // asm: loc_4C58DD
+    for (int32 gy = negRadius; gy <= radius; ++gy)
+    {
+        // asm: loc_4C58E9
+        for (int32 gx = negRadius; gx <= radius; ++gx)
+        {
+            // asm: mov ax,[esi+24h] / add ax,di / mov cx,[esi+26h] / add cx,bx
+            //  注意 asm 用的是 int16 环绕，这里保持同样语义。
+            const int32 x = static_cast<int16>(centerX + static_cast<int16>(gx));
+            const int32 y = static_cast<int16>(centerY + static_cast<int16>(gy));
+
+            // asm: test ax,ax / jl skip ; cmp ax,200h / jge skip
+            if (x < 0 || x >= 0x200)
+                continue;
+            // asm: test cx,cx / jl skip ; cmp cx,200h / jge skip
+            if (y < 0 || y >= 0x200)
+                continue;
+
+            const CellStruct cell(static_cast<int16>(x), static_cast<int16>(y));
+
+            // asm: call MapClass_CellExists / test al,al / jz skip
+            if (!pMap->CellExists(cell))
+                continue;
+
+            // asm: edx = (coords.X - centerX)^2 + (coords.Y - centerY)^2
+            const int32 dx = x - centerX;
+            const int32 dy = y - centerY;
+            const int32 distSq = dx * dx + dy * dy;
+
+            // asm: cmp edx,ebp / jg skip
+            if (distSq > radiusSq)
+                continue;
+
+            // asm: and dword ptr [eax+140h], not cfEMP
+            CellClass* pCell = pMap->GetCellAt(x, y);
+            if (pCell != nullptr)
+                pCell->SetFlag(CellFlags::EMPPresent, false);
+        }
+    }
+}
+
+// ============================================================================
+// asm 补全件（EMPulseClass_* 一族；见各函数头注释）
+// ============================================================================
+namespace {
+
+// asm: CRC_WORD / CRC_DWORD 之上的一层简单 CRC-32 累加器。
+//   原版经 IRTTITypeInfo 的 CRC 对象累积；此处以标准 CRC-32 表驱动等价，
+//   保证同一脉冲状态产生稳定摘要（用于存档一致性校验）。
+uint32 EMPCRCStep(uint32 crc, const void* data, int32 len)
+{
+    const uint8* p = static_cast<const uint8*>(data);
+    uint32 c = ~crc;
+    for (int32 i = 0; i < len; ++i)
+    {
+        c ^= p[i];
+        for (int32 k = 0; k < 8; ++k)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+// asm: EMPulseClass_Default_CellCoords（wXY）/ Default_X/Y/Z —— 静态默认值。
+int16 g_EmpDefaultCellX = 0;
+int16 g_EmpDefaultCellY = 0;
+int32 g_EmpDefaultRoomX = 0;
+int32 g_EmpDefaultRoomY = 0;
+int32 g_EmpDefaultRoomZ = 0;
+
+} // namespace
+
+// ============================================================================
+// asm: EMPulseClass_Init_CellCoords —— 清零默认格坐标。
+//   xor eax,eax ; mov word [Default_CellCoords], ax ; mov word [+2], ax
+// ============================================================================
+void EMPulseClass::Init_CellCoords()
+{
+    g_EmpDefaultCellX = 0;
+    g_EmpDefaultCellY = 0;
+}
+
+// ============================================================================
+// asm: EMPulseClass_Init_RoomCoords —— 清零默认三维坐标。
+//   xor eax,eax ; mov Default_X, eax ; Y ; Z
+// ============================================================================
+void EMPulseClass::Init_RoomCoords()
+{
+    g_EmpDefaultRoomX = 0;
+    g_EmpDefaultRoomY = 0;
+    g_EmpDefaultRoomZ = 0;
+}
+
+// ============================================================================
+// asm: EMPulseClass_Delete —— 归零位置/半径/时长/帧戳（重放用）。
+//   call AbstractClass_CTOR
+//   [24h] = EMPulseClass_Default_CellCoords  ; 位置默认格坐标
+//   [28h] = 0 ; [2Ch] = 0 ; [30h] = 0        ; radius / createFrame / duration
+// ============================================================================
+void EMPulseClass::Delete()
+{
+    Position = CoordStruct(g_EmpDefaultRoomX, g_EmpDefaultRoomY, g_EmpDefaultRoomZ);
+    Radius = 0;
+    MaxRadius = 0;
+    CurrentRadius = 0;
+    Duration = 0;
+    CurrentDuration = 0;
+    CreateFrame = 0;
+    IsActive = false;
+    IsExpanding = false;
+    HasExpanded = false;
+    PulseCount = 0;
+    CurrentPulse = 0;
+    PulseTimer = 0;
+}
+
+// ============================================================================
+// asm: EMPulseClass_GetCRC (retn 4)
+//   AbstractClass_GetCRC(a2) ; CRC_WORD([24h]) ; CRC_WORD([26h]) ;
+//   CRC_DWORD([28h]) ; CRC_DWORD([2Ch]) ; CRC_DWORD([30h])
+// ============================================================================
+uint32 EMPulseClass::GetCRC(uint32 crc) const
+{
+    uint32 c = crc;
+    // [24h]/[26h]：位置格坐标的两个 int16（Position→int16 环绕）。
+    int16 cx = static_cast<int16>(Position.X);
+    int16 cy = static_cast<int16>(Position.Y);
+    c = EMPCRCStep(c, &cx, sizeof(cx));          // asm: CRC_WORD([24h])
+    c = EMPCRCStep(c, &cy, sizeof(cy));          // asm: CRC_WORD([26h])
+    c = EMPCRCStep(c, &Radius, sizeof(Radius));  // asm: CRC_DWORD([28h])
+    c = EMPCRCStep(c, &CreateFrame, sizeof(CreateFrame)); // asm: CRC_DWORD([2Ch])
+    c = EMPCRCStep(c, &Duration, sizeof(Duration));       // asm: CRC_DWORD([30h])
+    return c;
+}
+
+// asm: EMPulseClass_GetSize —— mov eax,34h ; retn
+int32 EMPulseClass::GetSize() const
+{
+    return 0x34;
+}
+
+// asm: EMPulseClass_GetAbstractDerivationID —— mov eax,37h ; retn
+int32 EMPulseClass::GetAbstractDerivationID() const
+{
+    return 0x37;
+}
+
+// ============================================================================
+// asm: EMPulseClass_UpdateAll (0x4C54A0)
+//   逆序遍历 vec_EMPulses：if (Frame >= [ecx+30h] + [ecx+2Ch]) vt[+20h](1) 销毁。
+//   OpenYR 以管理器池等价：过期者标记不活跃并释放。
+// ============================================================================
+void EMPulseClass::UpdateAll()
+{
+    EMPulseManagerClass* mgr = EMPulseManagerClass::GetInstance();
+    if (mgr == nullptr)
+        return;
+
+    const int32 now = FrameTimer::GetTime();
+    for (int32 i = MAX_EMPULSES - 1; i >= 0; --i)
+    {
+        EMPulseClass* p = mgr->Pulses[i];
+        if (p == nullptr || !p->IsActive)
+            continue;
+
+        // asm: edx = [ecx+30h](Duration) + [ecx+2Ch](CreateFrame) ; cmp Frame,edx
+        const int32 expiry = p->CreateFrame + p->Duration;
+        if (now >= expiry)
+            mgr->RemoveEMPulse(i);       // asm: vt[+20h](1) 标量删除
+    }
+}
+
+// ============================================================================
+// asm: EMPulseClass_DeleteAll (0x4C5470)
+//   while (vec_EMPulses.length) { p = data[0] ; if (p) vt[+20h](1) }
+// ============================================================================
+void EMPulseClass::DeleteAll()
+{
+    EMPulseManagerClass* mgr = EMPulseManagerClass::GetInstance();
+    if (mgr != nullptr)
+        mgr->RemoveAllPulses();
+}
+
+// ============================================================================
+// asm: EMPulseClass_Initialize (0x4C5560, retn 4) —— 施加 EMP 的例程（非逐帧动画）。
+//
+//   if (Frame < CreateFrame + Duration) {          ; 未过期才处理
+//      r2 = Radius²
+//      A) 遍历 vec_Aircrafts：空中 && !returning && 高度>0 &&
+//         距离(中心格*256+128) < r*256 -> AircraftClass::EMPulse(a2)
+//      B) 以中心格为原点扫描 [-r,r]²：
+//           格在 [0,0x200) && CellExists && (dx²+dy² <= r²)：
+//             有建筑 -> 写 EMPDuration / IonBlast 动画
+//             否则找 techno -> Unit/Infantry 且非 EMP 免疫 -> 施加 EMP
+//   }
+//   ★ BuildingClass EMPDuration / IonBlast 动画与 Techno EMP 具体入口在本模块
+//     未全部建模，故按已有最接近语义落地（Aircraft 走 AircraftClass::EMPulse；
+//     格面走 ApplyEMPToCell），其余按语义等价落空并注释。
+// ============================================================================
+void EMPulseClass::ApplyEffects(int32 a2)
+{
+    // asm: mov eax,[ebx+2Ch] ; mov edx,[ebx+30h] ; add eax,edx ; cmp eax,Frame
+    //      jle loc_4C58AF (return)
+    if (FrameTimer::GetTime() >= CreateFrame + Duration)
+        return;
+
+    const int32 r = Radius;
+    const int32 r2 = r * r;   // asm: imul [esp+var_28]
+
+    // ---- A) 飞机扫掠 ----
+    // asm: for (i in vec_Aircrafts) { if ([esi+74h] && ![esi+81h] &&
+    //      ![+54h]() && [esi+6Ch] > 0) { dist < r*256 -> vt[+3DCh](a2) } }
+    if (AircraftClass::Array != nullptr)
+    {
+        CellStruct center = CellClass::Coord2Cell(Position);
+        const int32 cxLept = static_cast<int32>(center.X) * LeptonsPerCell + LeptonsPerCell / 2;
+        const int32 cyLept = static_cast<int32>(center.Y) * LeptonsPerCell + LeptonsPerCell / 2;
+        const int32 rangeLept = r * LeptonsPerCell;
+
+        for (int32 i = 0; i < AircraftClass::Array->Count; ++i)
+        {
+            AircraftClass* ac = (*AircraftClass::Array)[i];
+            if (ac == nullptr)
+                continue;
+            // asm: [esi+74h] 空中标记；[esi+81h] returning；vt[+54h] 可跳过判定。
+            if (!ac->IsInAir())
+                continue;
+            if (ac->IsEMPed())          // asm: 已 EMP 的跳过（[esi+6Ch] 语义近似）
+                continue;
+
+            CoordStruct c = ac->GetCoords();
+            const int32 dx = c.X - cxLept;
+            const int32 dy = c.Y - cyLept;
+            const double dist = std::sqrt(static_cast<double>(dx) * dx + static_cast<double>(dy) * dy);
+            if (dist < static_cast<double>(rangeLept))
+                ac->EMPulse();          // asm: vt[+3DCh](a2)
+        }
+    }
+
+    // ---- B) 格面扫掠 ----
+    // asm: outer bx 从 -r 到 r（int16），inner di 从 -r 到 r；
+    //      ax=[24h]+di ; cx=[26h]+bx ; 边界/存在/距离过滤后施加。
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr)
+        return;
+
+    const CellStruct centerCell = CellClass::Coord2Cell(Position);
+
+    for (int32 gy = -r; gy <= r; ++gy)
+    {
+        for (int32 gx = -r; gx <= r; ++gx)
+        {
+            const int32 x = static_cast<int16>(centerCell.X + static_cast<int16>(gx));
+            const int32 y = static_cast<int16>(centerCell.Y + static_cast<int16>(gy));
+
+            if (x < 0 || x >= 0x200)   // asm: cmp ax,200h / jge skip
+                continue;
+            if (y < 0 || y >= 0x200)
+                continue;
+
+            const int32 dx = x - centerCell.X;
+            const int32 dy = y - centerCell.Y;
+            if (dx * dx + dy * dy > r2) // asm: cmp edx,eax(r²) / jg skip
+                continue;
+
+            const CellStruct cell(static_cast<int16>(x), static_cast<int16>(y));
+            if (!pMap->CellExists(cell))
+                continue;
+
+            // asm: Cell_Building -> 有建筑走 EMPDuration/IonBlast；
+            //      否则找 techno，非免疫 -> 施加 EMP。两分支细节未建模 ->
+            //      统一以 ApplyEMPToCell（置 cfEMP 标志 + 按距离衰减伤害）等价。
+            const CoordStruct cellCenter = CellClass::Cell2Coord(cell);
+            const int32 ldx = cellCenter.X - Position.X;
+            const int32 ldy = cellCenter.Y - Position.Y;
+            const int32 dist = static_cast<int32>(std::sqrt(static_cast<float>(ldx * ldx + ldy * ldy)));
+            ApplyEMPToCell(cell, dist);
+        }
+    }
+
+    (void)a2;   // asm: a2 透传给 AircraftClass::EMPulse（此处以无参重载等价）
+}
+
+// ============================================================================
+// asm: EMPulseClass::ComputeCRC（vt+34h）—— 同步日志的 Em Pulse 段
+// ============================================================================
+
+// asm: EMPulseClass_GetCRC 的累积器形态已经存在（GetCRC(uint32)），
+//  vt+34h 只需把它接进 CRCEngine。
+void EMPulseClass::ComputeCRC(CRCEngine& crc) const
+{
+    crc.Value = GetCRC(crc.Value);
+}

@@ -9,15 +9,55 @@
 #include <IO/FileSystem.h>
 #include <IO/CRC.h>
 #include <Core/Definitions.h>
+#include <Core/SwizzleManagerClass.h>
+#include <Game/EngineGlobals.h>
+#include <Math/Timer.h>
 #include <Core/Memory.h>
 #include <Map/MapClass.h>
 #include <Houses/HouseClass.h>
 #include <Houses/HouseTypeClass.h>
+#include <UI/StartSpotClass.h>
+#include <Game/MPTeams.h>
+#include <Rules/RulesClass.h>
+#include <AI/TagClass.h>
+#include <AI/TagTypeClass.h>
+#include <AI/TriggerTypeClass.h>
+#include <Abstract/BuildingClass.h>
+#include <Abstract/TechnoClass.h>
+#include <Abstract/UnitClass.h>
+#include <Abstract/InfantryClass.h>
+#include <Abstract/UnitTypeClass.h>
+#include <Abstract/InfantryTypeClass.h>
+#include <Animations/AnimClass.h>
+#include <Particles/ParticleSystemClass.h>
+#include <Particles/ParticleSystemTypeClass.h>
+#include <Special/TiberiumClass.h>
+#include <Special/WaveClass.h>
+#include <Rendering/ConvertClass.h>
+#include <Rendering/DisplayClass.h>
+#include <Rendering/GScreenClass.h>
+#include <Rendering/TacticalClass.h>
+#include <Terrain/CellTypeClass.h>
+#include <Helpers/AsmUIHelpers.h>
+#include <Game/GameInit.h>
 
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdarg>
 #include <ctime>
+#include <vector>
+#include <cmath>
+
+// 引擎的调试输出通道。原版 Read_Scenario_INI 的两行提示走 WWDebugString
+// （asm 0x7C5B10）；这里沿用本树其它子系统的做法，落到 stderr。
+static void WWDebugString(const char* pFormat, ...)
+{
+    va_list args;
+    va_start(args, pFormat);
+    std::vfprintf(stderr, pFormat, args);
+    va_end(args);
+}
 
 // ============================================================================
 // ScenarioClass.cpp - Scenario class implementation
@@ -61,13 +101,13 @@ ScenarioClass::ScenarioClass()
     , MapTintG(0)
     , MapTintB(0)
     , Theater(TheaterType::Temperate)
-    , Intro(nullptr)
-    , Brief(nullptr)
-    , Win(nullptr)
-    , Lose(nullptr)
-    , Action(nullptr)
-    , PostScore(nullptr)
-    , PreMapSelect(nullptr)
+    , Intro(-1)
+    , Brief(-1)
+    , Win(-1)
+    , Lose(-1)
+    , Action(-1)
+    , PostScore(-1)
+    , PreMapSelect(-1)
     , ThemeIndex(0)
     , HumanPlayerHouseTypeIndex(-1)
     , CarryOverMoney(0.0)
@@ -171,6 +211,7 @@ ScenarioClass::ScenarioClass()
     UINameLoaded[0] = L'\0';
     Briefing[0] = L'\0';
     BriefingCSF[0] = '\0';
+    BriefingText = nullptr;      // asm: ScenarioClass+0x11F4
 
     // Initialize variables
     for (int32 i = 0; i < MaxGlobalVariables; ++i) {
@@ -217,37 +258,93 @@ ScenarioClass::~ScenarioClass()
 }
 
 // ============================================================================
+// asm: ScenarioClass_Pause(ScenarioClass* this)   (asm:698)
+//
+//   Freezes the scenario clock while paused: the accumulated elapsed count is
+//   folded in and the running timers are stopped.  The original also mutes
+//   audio, hides tooltips and re-issues the mouse pointer; those subsystems are
+//   outside this object and are handled by their own classes.
+// ============================================================================
+void ScenarioClass::Pause()
+{
+    ElapsedTimer.Stop();
+    PauseTimer.Start(0);
+    IsGamePaused = true;
+}
+
+// ============================================================================
+// asm: ScenarioClass_Resume(ScenarioClass* this)   (asm:797)
+//
+//   Restarts the scenario clock after a pause.
+// ============================================================================
+void ScenarioClass::Resume()
+{
+    PauseTimer.Stop();
+    ElapsedTimer.Start(0);
+    IsGamePaused = false;
+}
+
+// ============================================================================
 // Init - Initialize scenario state
 // ============================================================================
 
+// ============================================================================
+// asm: ScenarioClass_Init(ScenarioClass* this)   (asm:186)
+//
+//   Cold-start reset of the scenario singleton: re-seed the randomizer, stop
+//   every countdown timer, wipe all waypoints back to NullWaypoint and clear
+//   the 50 global / 100 local variable slots (firing the trigger-updated
+//   notifications when a slot actually changes, so triggers re-evaluate).
+// ============================================================================
 void ScenarioClass::Init()
 {
-    IsGamePaused = false;
-    EndOfGame = false;
-    FrameCount = 0;
-    Stage = 0;
-    ElapsedTimer.Start(0);
+    // asm: Random_Init(this+0x218, 0)
+    Random.Randomize();
+
+    // Timers: ElapsedFrame / Pause / MissionTimer / ShroudRegrow / TimerW(X,Z).
+    ElapsedTimer.Stop();
     PauseTimer.Stop();
     MissionTimer.Stop();
     ShroudRegrowTimer.Stop();
     FogTimer.Stop();
     IceTimer.Stop();
     AmbientTimer.Stop();
-    Random.Randomize();
+
+    // Waypoints -> NullWaypoint.
+    ClearWaypoints();
+
+    IsGamePaused = false;
+    EndOfGame = false;
+    FrameCount = 0;
+    Stage = 0;
     VariablesChanged = false;
     AmbientChanged = false;
     PickedUpAnyCrate = false;
     BridgeDestroyed = false;
     UserInputLocked = false;
-    InitTime = static_cast<int32>(time(nullptr));
 
-    // Reset variables
+    // Global variables: clear name + value, notifying on change.
     for (int32 i = 0; i < MaxGlobalVariables; ++i) {
-        GlobalVariables[i].Value = 0;
+        GlobalVariables[i].Name[0] = '\0';
+        if (GlobalVariables[i].Value != 0) {
+            GlobalVariables[i].Value = 0;
+            VariablesChanged = true;
+        }
     }
+    // Local variables: clear name + value, notifying on change.
     for (int32 i = 0; i < MaxLocalVariables; ++i) {
-        LocalVariables[i].Value = 0;
+        LocalVariables[i].Name[0] = '\0';
+        if (LocalVariables[i].Value != 0) {
+            LocalVariables[i].Value = 0;
+            VariablesChanged = true;
+        }
     }
+
+    // View rectangles.
+    View1 = CellStruct(0, 0);
+    View2 = CellStruct(0, 0);
+    View3 = CellStruct(0, 0);
+    View4 = CellStruct(0, 0);
 }
 
 // ============================================================================
@@ -330,63 +427,833 @@ bool ScenarioClass::LoadScenario(const char* pFileName)
 }
 
 // ============================================================================
-// AssignHouses - Assign houses to players based on scenario data
+// asm: Read_Scenario_INI
+//
+// 原版签名 char __thiscall Read_Scenario_INI(const char* filename)：
+// ecx = 文件名，无栈参，retn 0。调用点：
+//   lea ecx, [esp+248h+var_208] ; call Read_Scenario_INI   (asm 行 1324770)
+// AsmComplex6 批注的 (void* pScenario, const char* pFilename) 是错的
+// ——既不是两栈参，也没有 ScenarioClass 指针参数；原版函数体内走全局
+// 单例 Scenario，所以这里实现为成员函数、文件名走形参。
+//
+// 控制流（逐句对照 asm 行 1327995-1328099）：
+//   index = ForcedCDNumber
+//   if (!CD::ForceAvailable(index)) return 0
+//   就地构造 ccINI / ccFile（CCFileClass 以 filename 为源）
+//   WWDebugString("Read_Scenario_INI - Filename is %s\n", filename)
+//   if (!CCINIClass::Load(ccINI, ccFile, 1, 0)):
+//       WWDebugString("Scenario ini load failed!\n") ; 析构 ; return 0
+//   memcpy(Scenario->MapFileName, filename, strlen(filename) + 1)
+//   ok = INIClass_ReadScenario(ccINI)      ; IsRandom = 0
+//   析构 ccFile / ccINI ; return ok
+//
+// （原版 ccINI/ccFile 是栈上就地构造再手工析构；这里用局部对象让
+//   C++ 的析构顺序自然接管同一步骤，语义一致。）
 // ============================================================================
+
+bool ScenarioClass::Read_Scenario_INI(const char* pFilename)
+{
+    if (pFilename == nullptr) {
+        return false;
+    }
+
+    // asm: mov eax, ForcedCDNumber / push eax / call CD::ForceAvailable
+    //
+    // 注：本树把 CD 拆成了两处 —— IO/FileSystem.h 的 namespace CD 持有
+    // 强制选盘族（CD::Get_Volume / CD::Set_Volume / CD_ForceAvailable），
+    // Game/CD.h 的 class CD 持有 ForceAvailable 判定流程本身。两者不能
+    // 同时以 CD:: 限定名引入（CD 会被当成两种类型），原版此处读的正是
+    // 全局 ForcedCDNumber、调的正是卷扫描那一族的 ForceAvailable，
+    // 故走 IO/FileSystem.h 的 CD::Get_Volume() 与 CD_ForceAvailable()。
+    if (!CD_ForceAvailable(CD::Get_Volume())) {
+        return false;
+    }
+
+    // asm: CCFileClass_CTOR(&ccFile, filename)  —— 文件名作为构造函数源串
+    CCFileClass ccFile(pFilename);
+
+    // asm: WWDebugString("Read_Scenario_INI - Filename is %s\n", filename)
+    WWDebugString("Read_Scenario_INI - Filename is %s\n", pFilename);
+
+    // asm: CCINIClass::Load(&ccINI, &ccFile, 1, 0)
+    //      —— 本项目对应接口为 LoadFile(CCFileClass*)
+    CCINIClass ccINI;
+    if (!ccINI.LoadFile(&ccFile)) {
+        // asm: WWDebugString("Scenario ini load failed!\n") ; 析构 ; return 0
+        WWDebugString("Scenario ini load failed!\n");
+        return false;
+    }
+
+    // asm: repne scasb 求 strlen(filename)+1，再 rep movsd/rep movsb 拷入
+    //      Scenario->MapFileName。本项目对应字段是 ScenarioClass::FileName。
+    if (Instance != nullptr) {
+        const size_t len = std::strlen(pFilename);
+        const size_t copyLen = (len < sizeof(Instance->FileName) - 1)
+                                   ? len
+                                   : sizeof(Instance->FileName) - 1;
+        std::memcpy(Instance->FileName, pFilename, copyLen);
+        Instance->FileName[copyLen] = '\0';
+    }
+
+    // asm: INIClass_ReadScenario(&ccINI)  —— 第二个参数 IsRandom = 0
+    //      本项目对应接口为 ReadScenario(const char*)，内部自行开文件。
+    const bool ok = ccINI.ReadScenario(pFilename);
+
+    // ccFile / ccINI 在此按 C++ 规则析构，对应 asm 的两段手工析构。
+    return ok;
+}
+
+// ============================================================================
+// asm: Assign_Houses (0x687EE0, cdecl, retn)
+//
+//   Assign_Houses —— 场景读完后把"起始点记录（NameNodeTypes，VecStartSpot）"
+//   逐个变成 HouseClass：
+//
+//     第一段：先把 CountrySlot == -3 的记录 Set_Country(0)；
+//     第二段：按"未用记录里 [node+53h] 最小"的规则反复挑一条，建房；
+//             每轮建一幢，直到建满 NameNodeTypes.length 幢；
+//     第三段：AISlots 的八个槽（国家 -1/-3 为空）逐槽建房；
+//     第四段：Neutral / Special 两幢特殊房（都用 LightGrey = 0x35）。
+//
+//   全局 someHouse 记录 node+6Bh == -1 的那一幢（剧本主角房），
+//   PlayerPtr 记录第一轮挑中的那一幢（本地玩家）。
+// ============================================================================
+HouseClass* ScenarioClass::SomeHouse = nullptr;
+
+AISlotsClass          AISlots;
+// ParticleSystem_Gas lives in Particles/ParticleSystemClass.cpp (single owner).
 
 void ScenarioClass::AssignHouses()
 {
-    if (!Instance) return;
+    ScenarioClass* pScen = Instance;
+    if (pScen == nullptr)
+        return;
+    if (HouseTypeClass::Array == nullptr)
+        return;                                    // asm: vec_HouseTypes.data
 
-    // Map house indices to starting positions
-    // House indices are set up based on the scenario file
-    for (int32 i = 0; i < Instance->NumberStartingPoints; ++i) {
-        if (i >= 0x10) break;
-        // Each starting point gets a house
-        if (Instance->HouseIndices[i] < 0) {
-            // Find an available house
-            for (int32 j = 0; j < 0x10; ++j) {
-                bool used = false;
-                for (int32 k = 0; k < i; ++k) {
-                    if (Instance->HouseIndices[k] == j) {
-                        used = true;
-                        break;
+    // asm: edi = NameNodeTypes.length ; esi = NameNodeTypes.data
+    StartSpotClass** ppNodes =
+        reinterpret_cast<StartSpotClass**>(NameNodeTypes_Data());
+    const int32 nnCount = NameNodeTypes_Length();
+
+    // asm: gMoney / gTechLevel / gAIPlayers —— 会话设置里的三项全局。
+    SessionClass* pSession = SessionClass::GetInstance();
+    const int32 gMoney     = (pSession != nullptr) ? pSession->GetCredits()   : 0;
+    const int32 gTechLevel = (pSession != nullptr) ? pSession->GetTechLevel() : 0;
+    const int32 gAIPlayers = (pSession != nullptr) ? pSession->AIPlayers      : 0;
+    // asm: 全局 `Session` —— 会话类型（0 = 单人；4 = 联机/合作报文）。
+    const int32 sessionType = (pSession != nullptr) ? pSession->SessionType   : 0;
+
+    // ------------------------------------------------------------------
+    // Phase 0 (687F25)：CountrySlot == -3 的记录先复位成 0。
+    // ------------------------------------------------------------------
+    for (int32 i = 0; i < nnCount; ++i) {
+        if (ppNodes != nullptr && ppNodes[i] != nullptr &&
+            ppNodes[i]->CountrySlot == -3) {
+            ppNodes[i]->Set_Country(0);            // asm: sub_696F90(node, 0)
+        }
+    }
+
+    // asm: someHouse = 0
+    SomeHouse = nullptr;
+
+    if (nnCount > 0 && ppNodes != nullptr) {
+        // --------------------------------------------------------------
+        // Phase 1 (687F5D)：反复挑"未用记录里 [node+53h] 最小"的一条建房。
+        // 原版只把 8 个字节的 used 标记清零（var_38/var_34）；
+        // 这里按记录数分配，避免超过 8 条时越界。
+        // --------------------------------------------------------------
+        std::vector<uint8> used(static_cast<size_t>(nnCount), 0);
+
+        int32 curAIPlayer = nnCount;               // asm: curAIPlayer = edi
+        do {
+            int32 best = -1;                       // asm: var_4C
+            int32 best53 = -1;                     // asm: edx
+            for (int32 i = 0; i < nnCount; ++i) {  // asm: loc_687F72
+                if (used[static_cast<size_t>(i)] != 0)
+                    continue;
+                StartSpotClass* pNode = ppNodes[i];
+                if (pNode == nullptr)
+                    continue;
+                const int32 v53 = pNode->ColourSlot;      // asm: [node+53h]
+                if (best53 != -1 && v53 >= best53)
+                    continue;                      // asm: cmp/jge 687F8F
+                best = i;
+                best53 = v53;
+            }
+
+            // asm 3187-3190: node = data[var_4C] ; var_38[var_4C] = 1
+            StartSpotClass* pNode =
+                (best >= 0 && best < nnCount) ? ppNodes[best] : nullptr;
+            if (best >= 0 && best < nnCount)
+                used[static_cast<size_t>(best)] = 1;
+
+            // asm: new HouseClass_old ; HouseClass_CTOR(type = vec_HouseTypes[country])
+            HouseClass* pHouse = nullptr;
+            const int32 country = (pNode != nullptr) ? pNode->CountrySlot : -1;
+            HouseTypeClass* pType = nullptr;
+            if (country >= 0 && country < HouseTypeClass::ArrayCount)
+                pType = HouseTypeClass::Array[country];   // asm: vec_HouseTypes
+            if (pType != nullptr)
+                pHouse = new HouseClass(pType);           // asm: HouseClass_CTOR
+            if (pHouse == nullptr)
+                continue;
+
+            // asm 3200-3300: Session == 4 时用起始点记录上的宽字符名，
+            // 否则写死 "<human player>"。原版那条
+            // Unicode_AssignString → sub_7B7F90 → strdelete2 → sub_7B5400
+            // → strncpy(0x14) 的链，净效果就是把记录名截成 20 字节窄名。
+            if (sessionType == 4) {                // asm: cmp Session,4
+                int32 n = 0;
+                if (pNode != nullptr) {
+                    for (; n < 20 && pNode->CSFName[n] != 0; ++n)
+                        pHouse->InitialName[n] =
+                            static_cast<char>(pNode->CSFName[n] & 0x7F);
+                }
+                pHouse->InitialName[n] = 0;        // asm: mov [var_1C],0
+            } else {
+                std::memset(pHouse->InitialName, 0, sizeof(pHouse->InitialName));
+                std::memcpy(pHouse->InitialName, "<human player>", 14);
+            }
+
+            // asm 3308-3315: wcsncpy(house+1602Ah, node, 0x15) ;
+            //               word [house+16052h] = 0
+            for (int32 i = 0; i < 20; ++i)
+                pHouse->CSFName[i] = (pNode != nullptr) ? pNode->CSFName[i] : 0;
+            pHouse->CSFName[20] = 0;
+
+            pHouse->IsHumanPlayer = true;          // asm: byte [ebp+1ECh],1
+
+            // asm: Init_Data(Colour = node+53h, Side = node+4Bh, Money = gMoney)
+            pHouse->Init_Data((pNode != nullptr) ? pNode->ColourSlot : 0,
+                              country, gMoney);
+
+            // asm: Session->Get_PlayerColorType(node+53h) -> [ebp+16054h]
+            const int32 colourIdx = (pNode != nullptr) ? pNode->ColourSlot : 0;
+            int32 pc = colourIdx;
+            if (pSession != nullptr)
+                pc = pSession->GetPlayerColor(colourIdx);
+            pHouse->ColorSchemeIndex =
+                HouseClass::PlayerColorType_Convert_(pc);   // asm: _Convert_
+            pHouse->Recalc_Color_Vector();                  // asm: 50BA00
+
+            // asm: [ebp+16058h] = StartingSpotClass_GetStartSlot(node)
+            pHouse->StartingSlot = (pNode != nullptr) ? pNode->Get_Start_Slot() : -2;
+            // asm: [ebp+1605Ch] = [node+63h]
+            pHouse->TeamIndex = (pNode != nullptr) ? pNode->ReservedA : 0;
+
+            if (best == 0) {                       // asm: var_4C == 0
+                HouseClass::Player = pHouse;       // asm: HouseClass_PlayerPtr
+                pHouse->PlayerControl = true;      // asm: IsPlayer = 1
+            }
+            // asm: cmp [node+6Bh],-1 -> someHouse = ebp
+            if (pNode != nullptr && pNode->field_6B == -1)
+                SomeHouse = pHouse;
+
+            pHouse->TechLevel = gTechLevel;        // asm: [ebp+1D4h]
+            pHouse->Assign_Handicap(1);            // asm: Assign_Handicap(house,1)
+
+            // asm: [node+6Fh] = house->ArrayIndex
+            if (pNode != nullptr)
+                pNode->HouseIndex = pHouse->ArrayIndex;
+
+        } while (--curAIPlayer != 0);              // asm: dec/jnz 687F5D
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 (68814C)：AI 槽。ebx 从 AISlots.StartingSpots 走到
+    // AISlots.Colours（步长 4，共 8 槽）；[ebx]=国家，[ebx+20h]=颜色，
+    // [ebx+40h]=起始格，[ebx+60h]=队伍号；gAIPlayers 限制建房数量。
+    // ------------------------------------------------------------------
+    {
+        int32 used = 0;                            // asm: eax
+        const int32 aiMax = gAIPlayers;            // asm: curAIPlayer
+        for (int32 slot = 0; slot < 8; ++slot) {
+            if (used >= aiMax)                     // asm: cmp eax,curAIPlayer
+                break;                             // asm: jge 6882C2
+            const int32 country = AISlots.StartingSpots[slot];
+            if (country == -1 || country == -3)    // asm: -1 / -3 空槽
+                continue;
+            const int32 colour = AISlots.Colours[slot];   // asm: [ebx+20h]
+            ++used;                                // asm: inc eax
+
+            HouseTypeClass* pType = nullptr;
+            if (country >= 0 && country < HouseTypeClass::ArrayCount)
+                pType = HouseTypeClass::Array[country];
+            HouseClass* pHouse = (pType != nullptr) ? new HouseClass(pType)
+                                                   : nullptr;
+            if (pHouse == nullptr)
+                continue;                          // asm: new/CTOR null path
+
+            pHouse->IsHumanPlayer = false;         // asm: byte [ebp+1ECh],0
+            pHouse->TechLevel = gTechLevel;        // asm: [ebp+1D4h]
+            pHouse->Init_Data(colour, country, gMoney);
+
+            int32 pc = colour;
+            if (pSession != nullptr)
+                pc = pSession->GetPlayerColor(colour);
+            pHouse->ColorSchemeIndex = HouseClass::PlayerColorType_Convert_(pc);
+            pHouse->Recalc_Color_Vector();
+
+            pHouse->StartingSlot = AISlots.StartSlots[slot];   // asm: [ebx+40h]
+            const int32 team = AISlots.Teams[slot];           // asm: [ebx+60h]
+            pHouse->TeamIndex = team;
+            if (team != -1)                        // asm: cmp eax,-1 / jz
+                pScen->TeamsPresent = true;        // asm: byte [Scenario+11E0h],1
+
+            // asm 3450-3480: "Computer" -> house->InitialName（21 字节）
+            std::memset(pHouse->InitialName, 0, sizeof(pHouse->InitialName));
+            std::memcpy(pHouse->InitialName, "Computer", 8);
+
+            // asm 3483-3493: wcscpy(house->CSFName, Get_String("TXT_COMPUTER",
+            //                 0, "D:\\ra2mdpost\\Scenario.CPP", 0xFC0))
+            {
+                const char* pText = EngineGlobals::Get_String("TXT_COMPUTER");
+                int32 i = 0;
+                for (; i < 20 && pText != nullptr && pText[i] != '\0'; ++i)
+                    pHouse->CSFName[i] = static_cast<wchar_t>(
+                        static_cast<unsigned char>(pText[i]));
+                pHouse->CSFName[i] = 0;
+            }
+
+            if (sessionType != 0) {                // asm: test Session / jz
+                RulesClass* pRules = RulesClass::Instance;
+                if (pRules != nullptr)
+                    pHouse->IQLevel2 = pRules->MaxIQLevels;  // asm: [ecx+1434h]
+            }
+
+            // asm 3505-3525: handicap = [ebx-20h]
+            //   ebx = &AISlots.StartingSpots[slot]，减 0x20 正好落到紧邻其前
+            //   的 AISlots.AIDifficulties[slot]；规则开关
+            //   LetsDoTheTimeWarpInAgain 置位且记录多于一条时再减一。
+            {
+                int32 diff = AISlots.AIDifficulties[slot];
+                if (nnCount > 1) {
+                    RulesClass* pRules = RulesClass::Instance;
+                    if (pRules != nullptr && pRules->LetsDoTheTimeWarpInAgain != 0 &&
+                        diff > 0) {
+                        --diff;                    // asm: dec eax
                     }
                 }
-                if (!used) {
-                    Instance->HouseIndices[i] = j;
-                    break;
-                }
+                pHouse->Assign_Handicap(diff);
             }
         }
     }
-}
 
-// ============================================================================
-// CreateUnits - Create starting units for the scenario
-// ============================================================================
+    // ------------------------------------------------------------------
+    // Phase 3 (3535-3571)：Neutral 房，颜色 LightGrey(0x35)。
+    // ------------------------------------------------------------------
+    {
+        const int32 idxType = HouseTypeClass::FindIndexOfName("Neutral");
+        HouseTypeClass* pType = (idxType >= 0 && idxType < HouseTypeClass::ArrayCount)
+                                    ? HouseTypeClass::Array[idxType] : nullptr;
+        HouseClass* pHouse = (pType != nullptr) ? new HouseClass(pType) : nullptr;
+        if (pHouse != nullptr) {
+            const int32 ci = ColorScheme::FindIndex("LightGrey", 0x35);
+            pHouse->ColorSchemeIndex = ci;               // asm: [esi+16054h]
+            // asm 3565-3570: mov ecx, esi / call HouseClass_PlayerColorType_Convert_
+            // （Neutral/Special 只走颜色转换，不调 50BA00 颜色向量重算）
+            pHouse->ColorSchemeIndex =
+                HouseClass::PlayerColorType_Convert_(pHouse->ColorSchemeIndex);
+        }
+    }
 
-void ScenarioClass::CreateUnits()
-{
-    if (!Instance) return;
-
-    // Create harvesters for each house
-    for (int32 i = 0; i < Instance->NumberStartingPoints; ++i) {
-        int32 houseIdx = Instance->HouseIndices[i];
-        if (houseIdx < 0 || houseIdx >= 32) continue;
-
-        HouseClass* pHouse = HouseClass::Array[houseIdx];
-        if (!pHouse) continue;
-
-        // Place starting units at the starting point
-        CellStruct startCell = Instance->HouseHomeCells[i];
-        if (startCell.X == 0 && startCell.Y == 0 && i > 0) {
-            startCell = CellStruct(
-                Instance->StartingPoints[i].X,
-                Instance->StartingPoints[i].Y
-            );
+    // ------------------------------------------------------------------
+    // Phase 4 (3573-3607)：Special 房，颜色 LightGrey(0x35)。
+    // ------------------------------------------------------------------
+    {
+        const int32 idxType = HouseTypeClass::FindIndexOfName("Special");
+        HouseTypeClass* pType = (idxType >= 0 && idxType < HouseTypeClass::ArrayCount)
+                                    ? HouseTypeClass::Array[idxType] : nullptr;
+        HouseClass* pHouse = (pType != nullptr) ? new HouseClass(pType) : nullptr;
+        if (pHouse != nullptr) {
+            const int32 ci = ColorScheme::FindIndex("LightGrey", 0x35);
+            pHouse->ColorSchemeIndex = ci;
+            pHouse->ColorSchemeIndex =
+                HouseClass::PlayerColorType_Convert_(pHouse->ColorSchemeIndex);
         }
     }
 }
+
+// ============================================================================
+// GetStartingLocations
+//
+//  asm: Get_Starting_Locations (0x6882D0, __thiscall)
+//
+//   ① 先数前 8 个航点里从 0 开始连续非空（不是 NullWaypoint(0,0)）的个数；
+//   ② 目标格数 = (vec_Houses 长度 - 未分配国家的房数) + gAIPlayers；
+//      取二者较大者 max；
+//   ③ 前 max 个航点里非空的直接收进候选表，并逐条打印
+//      "Multiplayer start waypoint found at cell %d,%d"；
+//   ④ 候选不足 max 时打印 deficiency，再按地图范围随机掷格，交给
+//      MapClass::Nearby_Location 找合法落点，直到补满。
+//
+//   原版把结果填进栈上就地构造的 DynamicVectorClass<Cell>，这里同样通过
+//   出参返回（CellStruct 即原版的 wXY）。
+// ============================================================================
+void ScenarioClass::GetStartingLocations(DynamicVectorClass<CellStruct>& out)
+{
+    out.Clear();
+
+    RulesClass* pRules = RulesClass::Instance;
+
+    // ---- ① 前 8 个已定义航点 ----
+    int32 waypointCount = 0;
+    for (int32 i = 0; i < 8; ++i)
+    {
+        if (i < 0 || i >= MaxWaypoints)
+            break;
+        const CellStruct& wp = Waypoints[i];
+        if (wp.X == 0 && wp.Y == 0)      // asm: NullWaypoint.X / .Y
+            break;
+        ++waypointCount;
+    }
+
+    // ---- ② 目标格数 ----
+    int32 unassignedHouses = 0;
+    for (int32 i = 0; i < HouseClass::ArrayCount; ++i)
+    {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr)
+            continue;
+        // asm: cmp dword ptr [house+6Bh], -1 —— 未分配国家的空槽。
+        if (pHouse->Type == nullptr)
+            ++unassignedHouses;
+    }
+
+    int32 wanted = HouseClass::ArrayCount - unassignedHouses;
+    if (pRules != nullptr)
+        wanted += pRules->AIPlayers;     // asm: gAIPlayers
+
+    const int32 maxCount = (waypointCount > wanted) ? waypointCount : wanted;
+
+    // ---- ③ 收航点 ----
+    for (int32 i = 0; i < maxCount && i < 8; ++i)
+    {
+        const CellStruct wp = Waypoints[i];
+        if (wp.X == 0 && wp.Y == 0)
+            continue;
+
+        out.Add(wp);
+        WWDebugString("Multiplayer start waypoint found at cell %d,%d\n",
+                      static_cast<int32>(wp.X), static_cast<int32>(wp.Y));
+    }
+
+    // ---- ④ 不足则随机补足 ----
+    MapClass* pMap = MapClass::Instance;
+    if (out.Count >= maxCount || pMap == nullptr)
+        return;
+
+    WWDebugString("Multiplayer start waypoint deficiency - "
+                  "looking for more start positions\n");
+
+    const int32 left   = 0;                     // dword_87F90C
+    const int32 top    = 0;                     // dword_87F910
+    const int32 width  = pMap->MapWidth;        // dword_87F914
+    const int32 height = pMap->MapHeight;       // dword_87F918
+
+    int32 guard = 0;
+    while (out.Count < maxCount && guard < 0x400)
+    {
+        ++guard;
+
+        // asm: X = left + Random(10, width-10)
+        //      Y = top  + Random(0,  height-10) + 10
+        const int32 rx = Random.Next(10, width - 10);
+        const int32 ry = Random.Next(0, height - 10) + 10;
+        const CellStruct seed(left + rx, top + ry);
+
+        const CellStruct found = pMap->Nearby_Location(
+            seed, 1 /*SpeedType::Track*/, -1, MovementZone::Normal,
+            false, 8, 8, 0, false, false, true, false, false);
+
+        if (found.X == 0 && found.Y == 0)       // asm: NullWaypoint -> 重掷
+            continue;
+
+        out.Add(found);
+        WWDebugString("Random multiplayer start waypoint added at cell %d,%d\n",
+                      static_cast<int32>(found.X), static_cast<int32>(found.Y));
+    }
+}
+
+// ============================================================================
+// CreateUnits
+//
+//  asm: char __thiscall Create_Units(byte x)   (0x688690, 943 行)
+//   x 落在 [esp+..+a1+3] 后立刻被 imul 覆盖（死读），故形参没有语义。
+//
+//  流程：
+//    1. gUnitCount / gBases → HouseThis（有基地则减 1）；
+//    2. 对「允许开局出场」且不在 Rules.[BaseUnit] 里的载具/步兵做成本普查，
+//       得平均成本 × HouseThis = 每个 AI 房的总预算；
+//    3. Get_Starting_Locations 取候选出生格；
+//    4. 逐房（跳过真人房）：
+//         按 TechLevel / Owners / BaseUnit 过滤出该房可用的载具与步兵类型；
+//         选一个尚未占用的出生格（首个随机，其后取「离已选格最远」者）；
+//         落基地车（Rules.BaseUnit 中本房可用的第一个类型）；
+//         CTF 模式下把旗挂到基地车上；
+//         按预算（2/3 平均成本）随机买单位/步兵，Scan_Place_Object 落位，
+//         InitialVeteran 时升精英，AI 房下 AreaGuard 任务、真人房下 Guard。
+// ============================================================================
+void ScenarioClass::CreateUnits()
+{
+    RulesClass* pRules = RulesClass::Instance;
+
+    // asm: gUnitCount / gBases —— Init_Rules 从 Rules+1494h/+14ACh 抄来的
+    //   多人开局默认值；进入会话后由大厅写回同一对全局。
+    const int32 gUnitCount = (TheSession != nullptr)
+        ? TheSession->UnitCount
+        : ((pRules != nullptr) ? pRules->UnitCount : 0);
+    const bool gBases = (TheSession != nullptr)
+        ? TheSession->Bases
+        : ((pRules != nullptr) ? pRules->Bases : false);
+
+    // vec_Tech：本房已落位的技术对象（仅用于生命周期，落位后即清空）。
+    DynamicVectorClass<TechnoClass*> vecTech;
+
+    int32 houseThis = gUnitCount;
+    if (gBases)
+        --houseThis;
+
+    WWDebugString("Creating %d units - Random seed is %08x", houseThis, 0);
+    WWDebugString("UniqueID is %08x\n", UniqueID);
+
+    // ---------------------------------------------------------------
+    // 2. 成本普查（AllowedToStartInMultiplayer 且不在 BaseUnit 内）
+    // ---------------------------------------------------------------
+    auto inBaseUnit = [pRules](TechnoTypeClass* pType) -> bool
+    {
+        if (pRules == nullptr || pType == nullptr)
+            return false;
+        for (int32 j = 0; j < pRules->BaseUnit.Count; ++j)
+        {
+            if (static_cast<TechnoTypeClass*>(pRules->BaseUnit[j]) == pType)
+                return true;
+        }
+        return false;
+    };
+
+    int32 totalCost  = 0;
+    int32 costedCount = 0;
+
+    if (UnitTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < UnitTypeClass::Array->Count; ++i)
+        {
+            TechnoTypeClass* pType = (*UnitTypeClass::Array)[i];
+            if (pType == nullptr)
+                continue;
+            if (!pType->AllowedToStartInMultiplayer)   // asm: +0x6D5
+                continue;
+            if (inBaseUnit(pType))
+                continue;
+            totalCost += pType->GetCost();
+            ++costedCount;
+        }
+    }
+
+    if (InfantryTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < InfantryTypeClass::Array->Count; ++i)
+        {
+            TechnoTypeClass* pType = (*InfantryTypeClass::Array)[i];
+            if (pType == nullptr)
+                continue;
+            if (!pType->AllowedToStartInMultiplayer)   // asm: 字面 +6D5h
+                continue;
+            totalCost += pType->GetCost();
+            ++costedCount;
+        }
+    }
+
+    // asm: cdq / idiv ebp / imul HouseThis（无可用类型时原版除零，此处取 0）
+    int32 recountedCost = 0;
+    if (costedCount != 0)
+        recountedCost = (totalCost / costedCount) * houseThis;
+
+    // ---------------------------------------------------------------
+    // 3. 候选出生格
+    // ---------------------------------------------------------------
+    DynamicVectorClass<CellStruct> vectCellDistances;
+    GetStartingLocations(vectCellDistances);
+
+    const int32 cellCount = vectCellDistances.Count;
+    std::vector<uint8_t> selected(cellCount > 0 ? cellCount : 1, 0);
+    int32 basesPlaced = 0;
+
+    // ---------------------------------------------------------------
+    // 4. 逐房
+    // ---------------------------------------------------------------
+    for (int32 hi = 0; hi < HouseClass::ArrayCount; ++hi)
+    {
+        HouseClass* pHouse = HouseClass::Array[hi];
+        if (pHouse == nullptr)
+            continue;
+
+        // asm: [house->Country + humanControlled] —— 真人房不参与自动生成。
+        if (pHouse->Is_Human())
+            continue;
+
+        const char* pHouseName = (pHouse->Type != nullptr)
+            ? pHouse->Type->get_Name() : "";
+        WWDebugString("Generating units for house %d (%s)\n", hi, pHouseName);
+
+        DynamicVectorClass<UnitTypeClass*>     vectUnitType;
+        DynamicVectorClass<InfantryTypeClass*> vectInfType;
+
+        // asm: the house's own TechLevel gates what it may start with.  A
+        // house built before the rule set was published carries 0; fall back
+        // to the rule-level value instead of filtering every type away.
+        if (pHouse->TechLevel <= 0 && pRules != nullptr)
+            pHouse->TechLevel = pRules->TechLevel;
+        const int32 houseTech = pHouse->TechLevel;
+
+        // asm: ebx = 1 << (HouseType->idxCountry & 1F) -- the country index is
+        //   the type's own registration slot, not a lookup by parent-country
+        //   name (ParentCountry can be empty for the fallback country set,
+        //   which turned the shift into 1 << 31).
+        const int32 ownerBit = (pHouse->Type != nullptr)
+            ? (1 << (pHouse->Type->GetArrayIndex() & 0x1F))
+            : 0;
+
+        // 载具候选
+        if (UnitTypeClass::Array != nullptr)
+        {
+            for (int32 i = 0; i < UnitTypeClass::Array->Count; ++i)
+            {
+                UnitTypeClass* pType = (*UnitTypeClass::Array)[i];
+                if (pType == nullptr)
+                    continue;
+                if (!pType->AllowedToStartInMultiplayer)
+                    continue;
+                if (pType->TechLevel > houseTech)
+                    continue;
+                if ((pType->GetOwners() & ownerBit) == 0)
+                    continue;
+                if (inBaseUnit(pType))
+                    continue;
+                vectUnitType.Add(pType);
+            }
+        }
+
+        // 步兵候选
+        if (InfantryTypeClass::Array != nullptr)
+        {
+            for (int32 i = 0; i < InfantryTypeClass::Array->Count; ++i)
+            {
+                InfantryTypeClass* pType = (*InfantryTypeClass::Array)[i];
+                if (pType == nullptr)
+                    continue;
+                if (!pType->AllowedToStartInMultiplayer)
+                    continue;
+                if (pType->TechLevel > houseTech)
+                    continue;
+                if ((pType->GetOwners() & ownerBit) == 0)
+                    continue;
+                if (inBaseUnit(pType))
+                    continue;
+                vectInfType.Add(pType);
+            }
+        }
+
+        // ---- 选出生格 ----
+        CellStruct where(0, 0);
+
+        if (cellCount <= 0)
+        {
+            where = CellStruct(0, 0);
+        }
+        else if (basesPlaced == 0)
+        {
+            // 首个：随机一格。
+            const int32 idx = Random.Next(0, cellCount - 1);
+            if (idx >= 0 && idx < cellCount)
+                selected[idx] = 1;
+            basesPlaced = 1;
+            where = vectCellDistances[idx];
+        }
+        else
+        {
+            // 其后：取「到所有已选格距离之和最大」的那一格（最大化散布）。
+            std::vector<int32> matrix(cellCount, 0);
+
+            for (int32 b = 0; b < cellCount; ++b)
+            {
+                if (selected[b] != 0)
+                    continue;
+                for (int32 d = 0; d < cellCount; ++d)
+                {
+                    if (selected[d] == 0)
+                        continue;
+
+                    const int32 dx = static_cast<int16>(
+                        vectCellDistances[b].X - vectCellDistances[d].X);
+                    const int32 dy = static_cast<int16>(
+                        vectCellDistances[b].Y - vectCellDistances[d].Y);
+
+                    const double sq = std::sqrt(
+                        static_cast<double>(dx) * static_cast<double>(dx) +
+                        static_cast<double>(dy) * static_cast<double>(dy));
+                    matrix[b] += static_cast<int16>(static_cast<int32>(sq));
+                }
+            }
+
+            int32 best    = 0;   // asm: edx
+            int32 bestIdx = 0;   // asm: edi
+            for (int32 i = 0; i < cellCount; ++i)
+            {
+                const int32 v = matrix[i];
+                if (v > best || best == 0)
+                {
+                    best = v;
+                    bestIdx = i;
+                }
+            }
+
+            selected[bestIdx] = 1;
+            where = vectCellDistances[bestIdx];
+            ++basesPlaced;
+        }
+
+        // asm: HouseClass_SetBaseSpawnCell
+        pHouse->Set_Base_Spawn_Cell(where);
+
+        // ---- 基地车 ----
+        UnitClass* baseUnit = nullptr;
+
+        if (gBases && pRules != nullptr)
+        {
+            UnitClass* pNewUnit = new UnitClass(pHouse);
+            if (pNewUnit != nullptr)
+            {
+                TechnoTypeClass* pFound = pHouse->FindFirstAccessibleTechnoTypeFromArray(
+                    reinterpret_cast<DynamicVectorClass<TechnoTypeClass*>*>(
+                        &pRules->BaseUnit));
+
+                if (pFound != nullptr)
+                {
+                    UnitTypeClass* pBaseType = static_cast<UnitTypeClass*>(pFound);
+                    pNewUnit->Type       = pBaseType;
+                    pNewUnit->TechnoType = pBaseType;
+                    pNewUnit->Health     = pBaseType->Strength;
+                    pNewUnit->MaxHealth  = pBaseType->Strength;
+                    baseUnit = pNewUnit;
+                }
+                else
+                {
+                    delete pNewUnit;
+                }
+            }
+        }
+
+        // asm 14452-14488: 先按格心 lepton 直接 Put，失败再 Scan_Place_Object(1)。
+        if (baseUnit != nullptr)
+        {
+            const int32 cx = (static_cast<int32>(where.X) << 8) + 0x80;
+            const int32 cy = (static_cast<int32>(where.Y) << 8) + 0x80;
+            const CoordStruct coord(cx, cy, 0);
+
+            if (!baseUnit->Put(coord, 0))
+            {
+                if (!baseUnit->Scan_Place_Object(where, 1))
+                {
+                    delete baseUnit;
+                    baseUnit = nullptr;
+                }
+            }
+        }
+
+        // asm 14492-14508: 旗标记账 + CTF 挂旗。
+        if (baseUnit != nullptr)
+        {
+            pHouse->ObjectWithOurFlag = nullptr;
+            pHouse->FlagCoords        = CellStruct(0, 0);   // asm: NullWaypoint
+            if (SpecialFlags.CTFMode())                     // asm: test byte [Scenario],10h
+                pHouse->Flag_Attach(baseUnit, 1);
+        }
+
+        // asm 14516-14539: 本房的 vec_Tech 复位。
+        vecTech.Clear();
+
+        // ---- 按预算生成 ----
+        if (recountedCost > 0)
+        {
+            const int32 edgeCost = (recountedCost * 2) / 3;   // asm: 0x55555556
+            int32 spent = 0;
+
+            for (;;)
+            {
+                TechnoTypeClass* pSel = nullptr;
+                UnitTypeClass*     pUnitType = nullptr;
+                InfantryTypeClass* pInfType  = nullptr;
+
+                // asm: pick from the vehicle table while the budget allows,
+                //   else from the infantry table.  The table the entry came
+                //   from is also what decides the constructor -- going through
+                //   WhatAmI() here is unreliable because the type classes do
+                //   not override it with the retail ordinals.
+                if (spent < edgeCost && vectUnitType.Count > 0)
+                {
+                    const int32 idx = Random.Next(0, vectUnitType.Count - 1);
+                    pUnitType = vectUnitType[idx];
+                    pSel      = pUnitType;
+                }
+                else if (vectInfType.Count > 0)
+                {
+                    const int32 idx = Random.Next(0, vectInfType.Count - 1);
+                    pInfType = vectInfType[idx];
+                    pSel     = pInfType;
+                }
+
+                // asm: 两个候选表都空时 esi=0，原版此处会解引用空指针。
+                if (pSel == nullptr)
+                    break;
+
+                TechnoClass* pObj = nullptr;
+                if (pUnitType != nullptr)
+                    pObj = pUnitType->CreateUnit(pHouse);
+                else if (pInfType != nullptr)
+                    pObj = pInfType->CreateInfantry(pHouse);
+
+                if (pObj == nullptr)
+                    break;
+
+                pObj->TechnoType = pSel;
+                pObj->Health     = pSel->Strength;
+                pObj->MaxHealth  = pSel->Strength;
+
+                if (!pObj->Scan_Place_Object(where, 4))   // asm: mode 4
+                {
+                    delete pObj;                          // asm: vt+20h(this, 1)
+                }
+                else
+                {
+                    WWDebugString("House %s deployed object %s\n",
+                                  pHouseName, pSel->get_Name());
+
+                    spent += pSel->GetCost();             // asm: vt+0ACh
+                    vecTech.Add(pObj);
+
+                    if (SpecialFlags.InitialVeteran())    // asm: test ah, 2
+                        pObj->VeterancyLevel = 2;         // asm: Veterancy_SetElite
+
+                    if (pHouse->Is_Human())
+                        pObj->ForceMission(Mission::Guard);      // asm: 5
+                    else
+                        pObj->ForceMission(Mission::AreaGuard);  // asm: 0Bh
+                }
+
+                if (spent >= recountedCost)
+                    break;
+            }
+        }
+    }
+
+    // asm 14789-14798: 收尾调试行（随机 0..0FFFF）。
+    const int32 roll = Random.Next(0, 0xFFFF);
+    WWDebugString("Finished unit generation. Random number is %d\n", roll);
+}
+
 
 // ============================================================================
 // EndGame - End the current game
@@ -554,8 +1421,7 @@ void ScenarioClass::ScenarioLighting(int32* r, int32* g, int32* b)
 bool ScenarioClass::IsDefinedWaypoint(int32 idx) const
 {
     if (idx < 0 || idx >= MaxWaypoints) return false;
-    // Waypoint 0 is always defined
-    if (idx == 0) return true;
+    // asm: a waypoint is defined iff it differs from NullWaypoint (0,0).
     return !(Waypoints[idx].X == 0 && Waypoints[idx].Y == 0);
 }
 
@@ -575,270 +1441,185 @@ void ScenarioClass::SetWaypointCoords(int32 idx, const CellStruct& cell)
 }
 
 // ============================================================================
-// ReadStartPoints - Read [Waypoints] section from scenario INI
+// asm: Scenario_ReadLightingAndBasic(CCINIClass* INI)   (asm:1334477)
+//
+//  The scenario-file reader.  Structure, key-for-key and section-for-section,
+//  follows the original: it reads [Header], [Basic], [Ranking] and [Lighting].
+//  Every value is read with the current field as its fallback, so a partial
+//  file keeps whatever the scenario object already declared.  The three
+//  lighting colour groups are stored pre-scaled: the on-disk value is a fixed-
+//  point fraction, multiplied by 100 (colours/ambient) or 1000 (ground/level)
+//  and truncated, matching the `fmul 100.0 / fmul 1000.0 + 0.01 / floor`
+//  sequence in the original.
+//
+//  NOTE: this method corresponds to the original global INI dispatch of
+//  INIClass_ReadScenario (Scenario_ReadLightingAndBasic); the name here keeps
+//  the older project name ReadStartPoints because external callers use it.
 // ============================================================================
-
 void ScenarioClass::ReadStartPoints(CCINIClass& ini)
 {
-    // Read waypoints
-    const char* section = "Waypoints";
-    for (int32 i = 0; i < MaxWaypoints; ++i) {
-        char key[32];
-        // Format: "0", "1", "2", ..., "701"
-        int32 len = 0;
-        int32 temp = i;
-        if (temp == 0) {
-            key[0] = '0';
-            key[1] = '\0';
-        } else {
-            char rev[32];
-            int32 revLen = 0;
-            while (temp > 0) {
-                rev[revLen++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            for (int32 j = revLen - 1; j >= 0; --j) {
-                key[len++] = rev[j];
-            }
-            key[len] = '\0';
-        }
-
-        // Read waypoint coordinate as "X,Y"
-        int32 vals[2] = {0, 0};
-        ini.Read2Integers(vals, section, key, vals);
-        Waypoints[i].X = static_cast<int16>(vals[0]);
-        Waypoints[i].Y = static_cast<int16>(vals[1]);
-    }
-
-    // Read basic section
-    section = "Basic";
-    char buffer[256];
-
-    if (ini.ReadString(section, "Name", "", buffer, sizeof(buffer))) {
-        int32 j = 0;
-        while (buffer[j] && j < 0x2C) {
-            Name[j] = static_cast<wchar_t>(buffer[j]);
-            ++j;
-        }
-        Name[j] = L'\0';
-    }
-
-    if (ini.ReadString(section, "NextScenario", "", buffer, sizeof(buffer))) {
-        int32 j = 0;
-        while (buffer[j] && j < 0x103) {
-            NextScenario[j] = buffer[j];
-            ++j;
-        }
-        NextScenario[j] = '\0';
-    }
-
-    if (ini.ReadString(section, "AltNextScenario", "", buffer, sizeof(buffer))) {
-        int32 j = 0;
-        while (buffer[j] && j < 0x103) {
-            AltNextScenario[j] = buffer[j];
-            ++j;
-        }
-        AltNextScenario[j] = '\0';
-    }
-
-    // Read map dimensions
-    StartX = ini.ReadInteger(section, "X", 0);
-    StartY = ini.ReadInteger(section, "Y", 0);
-    Width = ini.ReadInteger(section, "Width", 0);
-    Height = ini.ReadInteger(section, "Height", 0);
-    MapWidth = Width;
-    MapHeight = Height;
-
-    // Read theater
-    int32 theaterVal = ini.ReadInteger(section, "Theater", 0);
-    switch (theaterVal) {
-        case 0: Theater = TheaterType::Temperate; break;
-        case 1: Theater = TheaterType::Snow; break;
-        case 2: Theater = TheaterType::Urban; break;
-        case 3: Theater = TheaterType::Desert; break;
-        case 4: Theater = TheaterType::Lunar; break;
-        case 5: Theater = TheaterType::NewUrban; break;
-        default: Theater = TheaterType::Temperate; break;
-    }
-
-    // Read carryover
-    CarryOverMoney = ini.ReadDouble(section, "CarryOverMoney", 0.0);
-    CarryOverCap = ini.ReadInteger(section, "CarryOverCap", 0);
-    Percent = ini.ReadInteger(section, "Percent", 100);
-
-    // Read intro/brief/win/lose/action movies
-    ini.ReadString(section, "Intro", "", buffer, sizeof(buffer));
-    // Store movie references
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        Intro = p;
-    }
+    // asm: ScenarioClass_GetGlobalFlags(this, INI)  —— SpecialFlags first.
+    // (The original's preceding `INIClass_Reset` only zeroes the freshly
+    //  default-constructed INI's section-pointer fields; it is the C++
+    //  default-ctor equivalent, not a reset of a loaded file, so it must
+    //  NOT be re-run here or it would drop every parsed section.)
+    GetGlobalFlags(&ini);
 
     // ------------------------------------------------------------------
-    // [Basic] - remaining keys
-    // ------------------------------------------------------------------
-    ini.ReadString(section, "Brief", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        Brief = p;
-    }
-
-    ini.ReadString(section, "Win", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        Win = p;
-    }
-
-    ini.ReadString(section, "Lose", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        Lose = p;
-    }
-
-    ini.ReadString(section, "Action", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        Action = p;
-    }
-
-    ini.ReadString(section, "PostScore", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        PostScore = p;
-    }
-
-    ini.ReadString(section, "PreMapSelect", "", buffer, sizeof(buffer));
-    if (buffer[0]) {
-        char* p = new char[strlen(buffer) + 1];
-        strcpy(p, buffer);
-        PreMapSelect = p;
-    }
-
-    MultiplayerOnly = ini.ReadBool(section, "MultiplayerOnly", MultiplayerOnly);
-    TimerInherit    = ini.ReadBool(section, "TimerInherit",    TimerInherit);
-    EndOfGame       = ini.ReadBool(section, "EndOfGame",       EndOfGame);
-
-    ThemeIndex = ini.ReadInteger(section, "Theme", ThemeIndex);
-
-    // Read flags
-    FreeRadar = ini.ReadBool(section, "FreeRadar", false);
-    TrainCrate = ini.ReadBool(section, "TrainCrate", false);
-    PlayerSideIndex = ini.ReadInteger(section, "Player", -1);
-    ThemeIndex = ini.ReadInteger(section, "Theme", 0);
-
-    // ------------------------------------------------------------------
-    // [Header] - starting point span and the coop start-spot count.
+    // [Header] - map dimensions, starting-point span and coop start spots.
     // ------------------------------------------------------------------
     StartX = ini.ReadInteger("Header", "StartX", StartX);
     StartY = ini.ReadInteger("Header", "StartY", StartY);
     Width  = ini.ReadInteger("Header", "Width",  Width);
     Height = ini.ReadInteger("Header", "Height", Height);
-    NumberStartingPoints     = ini.ReadInteger("Header", "NumberStartingPoints",     NumberStartingPoints);
-    NumCoopHumanStartSpots   = ini.ReadInteger("Header", "NumCoopHumanStartSpots",   NumCoopHumanStartSpots);
+    NumberStartingPoints   = ini.ReadInteger("Header", "NumberStartingPoints",   NumberStartingPoints);
+    NumCoopHumanStartSpots = ini.ReadInteger("Header", "NumCoopHumanStartSpots", NumCoopHumanStartSpots);
+
+    // asm: for (i = 1; i <= NumberStartingPoints; ++i) sprintf("Waypoint%d")
+    //      Get2Integers("Header", "Waypoint%d", fallback = StartingPoints[i-1])
+    for (int32 i = 0; i < NumberStartingPoints && i < MaxStartingPoints; ++i) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "Waypoint%d", i + 1);
+        int32 vals[2] = { StartingPoints[i].X, StartingPoints[i].Y };
+        ini.Read2Integers(vals, "Header", key, vals);
+        StartingPoints[i].X = vals[0];
+        StartingPoints[i].Y = vals[1];
+    }
 
     // ------------------------------------------------------------------
-    // [Briefing] - the loading-screen text and its backdrops.
+    // [Basic] - strings, movies, flags and money.
     // ------------------------------------------------------------------
-    ini.ReadString("Briefing", "LSLoadMessage", "", LSLoadMessage, sizeof(LSLoadMessage));
-    ini.ReadString("Briefing", "LSLoadBriefing", "", LSBrief, sizeof(LSBrief));
-    LS640BriefLocX  = ini.ReadInteger("Briefing", "LS640BriefLocX",  LS640BriefLocX);
-    LS640BriefLocY  = ini.ReadInteger("Briefing", "LS640BriefLocY",  LS640BriefLocY);
-    LS800BriefLocX  = ini.ReadInteger("Briefing", "LS800BriefLocX",  LS800BriefLocX);
-    LS800BriefLocY  = ini.ReadInteger("Briefing", "LS800BriefLocY",  LS800BriefLocY);
-    ini.ReadString("Briefing", "LS640BkgdName", "", LS640BkgdName, sizeof(LS640BkgdName));
-    ini.ReadString("Briefing", "LS800BkgdName", "", LS800BkgdName, sizeof(LS800BkgdName));
-    ini.ReadString("Briefing", "LS800BkgdPal",  "", LS800BkgdPal,  sizeof(LS800BkgdPal));
+    ini.ReadString("Basic", "NextScenario", NextScenario, NextScenario, sizeof(NextScenario));
+    ini.ReadString("Basic", "AltNextScenario", AltNextScenario, AltNextScenario, sizeof(AltNextScenario));
 
-    // ------------------------------------------------------------------
-    // [VariableNames] - the free-form list of global variable names.
-    // ------------------------------------------------------------------
+    Intro       = ini.FindMovieIndex("Basic", "Intro",       Intro);
+    Brief       = ini.FindMovieIndex("Basic", "Brief",       Brief);
+    Win         = ini.FindMovieIndex("Basic", "Win",         Win);
+    Lose        = ini.FindMovieIndex("Basic", "Lose",        Lose);
+    Action      = ini.FindMovieIndex("Basic", "Action",      Action);
+    PostScore   = ini.FindMovieIndex("Basic", "PostScore",   PostScore);
+    PreMapSelect= ini.FindMovieIndex("Basic", "PreMapSelect",PreMapSelect);
+
+    MultiplayerOnly = ini.ReadBool("Basic", "MultiplayerOnly", MultiplayerOnly);
+    TimerInherit    = ini.ReadBool("Basic", "TimerInherit",    TimerInherit);
+    EndOfGame       = ini.ReadBool("Basic", "EndOfGame",       EndOfGame);
+
+    ThemeIndex = ini.GetTheme("Basic", "Theme", ThemeIndex);
+
+    ini.ReadInteger("Basic", "NewINIFormat", 0);   // global NewINIFormat, not stored here
+
+    // CarryOverMoney: read as fixed-point; any value < 1.0 clamps to 1.0
+    // (asm: fcomp 1.0 / if below, replace with 1.0).
     {
-        const int32 varCount = ini.GetKeyCount("VariableNames");
-        for (int32 i = 0; i < varCount && i < MaxGlobalVariables; ++i) {
-            const char* pVarName = ini.GetKeyName("VariableNames", i);
-            if (pVarName == nullptr)
-                continue;
-            std::strncpy(GlobalVariables[i].Name, pVarName,
-                         sizeof(GlobalVariables[i].Name) - 1);
-            GlobalVariables[i].Name[sizeof(GlobalVariables[i].Name) - 1] = '\0';
+        double money = ini.ReadFixed("Basic", "CarryOverMoney", CarryOverMoney);
+        CarryOverMoney = (money < 1.0) ? 1.0 : money;
+    }
+    CarryOverCap = ini.ReadInteger("Basic", "CarryOverCap", CarryOverCap);
+
+    SkipScore    = ini.ReadBool("Basic", "SkipScore",    SkipScore);
+    OneTimeOnly  = ini.ReadBool("Basic", "OneTimeOnly",  OneTimeOnly);
+    SkipMapSelect= ini.ReadBool("Basic", "SkipMapSelect",SkipMapSelect);
+    TruckCrate   = ini.ReadBool("Basic", "TruckCrate",   TruckCrate);
+    TrainCrate   = ini.ReadBool("Basic", "TrainCrate",   TrainCrate);
+    FillSilos    = ini.ReadBool("Basic", "FillSilos",    FillSilos);
+    IgnoreGlobalAITriggers = ini.ReadBool("Basic", "IgnoreGlobalAITriggers", IgnoreGlobalAITriggers);
+    Percent      = ini.ReadInteger("Basic", "Percent",   Percent);
+    StartingDropships = ini.ReadInteger("Basic", "StartingDropships", StartingDropships);
+
+    // AllowableUnits / AllowableUnitMaximums.  The original reads the two
+    // lists out of [Basic]; the unit list holds TechnoType names resolved via
+    // the global type table (asm sub_4764F0 -> TechnoTypeClass::Find).
+    {
+        AllowableUnitMaximums.Clear();
+        char buf[0x800];
+        if (ini.ReadString("Basic", "AllowableUnitMaximums", "", buf, sizeof(buf)) > 0) {
+            char* tok = std::strtok(buf, ",");
+            while (tok != nullptr) {
+                AllowableUnitMaximums.Add(std::atoi(tok));
+                tok = std::strtok(nullptr, ",");
+            }
+        }
+
+        AllowableUnits.Clear();
+        if (ini.ReadString("Basic", "AllowableUnits", "", buf, sizeof(buf)) > 0) {
+            char* tok = std::strtok(buf, ",");
+            while (tok != nullptr) {
+                if (TechnoTypeClass* pType = TechnoTypeClass::Find(tok)) {
+                    AllowableUnits.Add(pType);
+                }
+                tok = std::strtok(nullptr, ",");
+            }
         }
     }
 
-    // Read map-specific flags
-    section = "Map";
-    TiberiumGrowthEnabled = ini.ReadBool(section, "TiberiumGrowth", true);
-    VeinGrowthEnabled = ini.ReadBool(section, "VeinGrowth", false);
-    IceGrowthEnabled = ini.ReadBool(section, "IceGrowth", false);
-    FillSilos = ini.ReadBool(section, "FillSilos", false);
-    TiberiumDeathToVisceroid = ini.ReadBool(section, "TiberiumDeathToVisceroid", false);
-    IgnoreGlobalAITriggers = ini.ReadBool(section, "IgnoreGlobalAITriggers", false);
-    MultiplayerOnly = ini.ReadBool(section, "MultiplayerOnly", false);
-    IsMultiplayer = MultiplayerOnly;
+    TiberiumGrowthEnabled = ini.ReadBool("Basic", "TiberiumGrowthEnabled", TiberiumGrowthEnabled);
+    VeinGrowthEnabled     = ini.ReadBool("Basic", "VeinGrowthEnabled",     VeinGrowthEnabled);
+    IceGrowthEnabled      = ini.ReadBool("Basic", "IceGrowthEnabled",      IceGrowthEnabled);
+    TiberiumDeathToVisceroid = ini.ReadBool("Basic", "TiberiumDeathToVisceroid", TiberiumDeathToVisceroid);
 
-    // Read lighting
-    section = "Lighting";
-    AmbientOriginal = ini.ReadInteger(section, "Ambient", 0);
-    AmbientCurrent = AmbientOriginal;
-    AmbientTarget = AmbientOriginal;
+    FreeRadar = ini.ReadBool("Basic", "FreeRadar", FreeRadar);
 
-    NormalLighting.Tint.Red   = ini.ReadInteger(section, "Red", 0);
-    NormalLighting.Tint.Green = ini.ReadInteger(section, "Green", 0);
-    NormalLighting.Tint.Blue  = ini.ReadInteger(section, "Blue", 0);
-    NormalLighting.Ground   = ini.ReadInteger(section, "Ground", 0);
-    NormalLighting.Level    = ini.ReadInteger(section, "Level", 0);
+    HomeCell    = ini.ReadInteger("Basic", "HomeCell",    HomeCell);
+    AltHomeCell = ini.ReadInteger("Basic", "AltHomeCell", AltHomeCell);
+    ini.ReadBool("Basic", "CivEvac", false);   // parsed; unused here
 
-    IonAmbient = ini.ReadInteger(section, "IonAmbient", 0);
-    IonLighting.Tint.Red   = ini.ReadInteger(section, "IonRed", 0);
-    IonLighting.Tint.Green = ini.ReadInteger(section, "IonGreen", 0);
-    IonLighting.Tint.Blue  = ini.ReadInteger(section, "IonBlue", 0);
-
-    // Read special flags - one boolean key per bit.
-    GetGlobalFlags(&ini);
-
-    // [Ranking] - the par times and the under/over-par captions.
-    ReadRanking(&ini);
-
+    // ------------------------------------------------------------------
     // [VariableNames] - the local-variable table of the scenario.
+    // ------------------------------------------------------------------
     ReadLocalVariables(&ini);
 
-    // Read starting waypoints
-    for (int32 i = 0; i < MaxStartingPoints; ++i) {
-        char key[32];
-        int32 len = 0;
-        key[len++] = 'S';
-        key[len++] = 't';
-        key[len++] = 'a';
-        key[len++] = 'r';
-        key[len++] = 't';
-        if (i >= 10) {
-            key[len++] = '0' + (i / 10);
-        }
-        key[len++] = '0' + (i % 10);
-        key[len] = '\0';
+    // ------------------------------------------------------------------
+    // [Ranking] - par times and under/over-par captions.
+    // ------------------------------------------------------------------
+    ReadRanking(&ini);
 
-        int32 vals[2] = {0, 0};
-        ini.Read2Integers(vals, section, key, vals);
-        StartingPoints[i].X = static_cast<int32>(vals[0]);
-        StartingPoints[i].Y = static_cast<int32>(vals[1]);
-    }
+    // ------------------------------------------------------------------
+    // [Lighting] - normal, ion, nuke flash and dominator groups.
+    //
+    //  Each value is read as fixed-point and scaled: colours and ambients
+    //  by 100, ground and level by 1000; the +0.01 truncation bias matches
+    //  the original `fadd 0.01 / Float_To_Int_Floor`.
+    // ------------------------------------------------------------------
+    auto ParseFix100 = [&ini](const char* pKey, int32 iFallback) -> int32 {
+        const double raw = ini.ReadFixed("Lighting", pKey,
+                                         static_cast<double>(iFallback) * 0.01);
+        return static_cast<int32>(raw * 100.0 + 0.01);
+    };
+    auto ParseFix1000 = [&ini](const char* pKey, int32 iFallback) -> int32 {
+        const double raw = ini.ReadFixed("Lighting", pKey,
+                                         static_cast<double>(iFallback) * 0.01);
+        return static_cast<int32>(raw * 1000.0 + 0.01);
+    };
 
-    NumberStartingPoints = ini.ReadInteger(section, "NumberOfStartingPoints", 0);
+    AmbientOriginal = ParseFix100("Ambient", AmbientOriginal);
+    AmbientCurrent  = AmbientOriginal;
+    AmbientTarget   = AmbientOriginal;
 
-    // Parse difficulty
-    Difficulty = ini.ReadInteger(section, "Difficulty", 1);
+    NormalLighting.Tint.Red   = ParseFix100("Red",   NormalLighting.Tint.Red);
+    NormalLighting.Tint.Green = ParseFix100("Green", NormalLighting.Tint.Green);
+    NormalLighting.Tint.Blue  = ParseFix100("Blue",  NormalLighting.Tint.Blue);
+    NormalLighting.Ground     = ParseFix1000("Ground", NormalLighting.Ground);
+    NormalLighting.Level      = ParseFix1000("Level",  NormalLighting.Level);
 
-    // Read mission timer
-    section = "MissionTimer";
-    int32 timerVal = ini.ReadInteger(section, "MissionTimer", 0);
-    if (timerVal > 0) {
-        MissionTimer.Start(timerVal);
-    }
+    IonAmbient = ParseFix100("IonAmbient", IonAmbient);
+    IonLighting.Tint.Red   = ParseFix100("IonRed",   IonLighting.Tint.Red);
+    IonLighting.Tint.Green = ParseFix100("IonGreen", IonLighting.Tint.Green);
+    IonLighting.Tint.Blue  = ParseFix100("IonBlue",  IonLighting.Tint.Blue);
+    IonLighting.Ground     = ParseFix1000("IonGround", IonLighting.Ground);
+    IonLighting.Level      = ParseFix1000("IonLevel",  IonLighting.Level);
+
+    NukeAmbientChangeRate = static_cast<int32>(
+        ini.ReadFixed("Lighting", "NukeAmbientChangeRate",
+                      static_cast<double>(NukeAmbientChangeRate)) + 0.01);
+
+    DominatorAmbient = ParseFix100("DominatorAmbient", DominatorAmbient);
+    DominatorLighting.Tint.Red   = ParseFix100("DominatorRed",   DominatorLighting.Tint.Red);
+    DominatorLighting.Tint.Green = ParseFix100("DominatorGreen", DominatorLighting.Tint.Green);
+    DominatorLighting.Tint.Blue  = ParseFix100("DominatorBlue",  DominatorLighting.Tint.Blue);
+    DominatorLighting.Ground     = ParseFix1000("DominatorGround", DominatorLighting.Ground);
+    DominatorLighting.Level      = ParseFix1000("DominatorLevel",  DominatorLighting.Level);
+    DominatorAmbientChangeRate   = ParseFix1000("DominatorAmbientChangeRate",
+                                                DominatorAmbientChangeRate);
 }
 // ============================================================================
 // GetGlobalFlags - ScenarioClass_GetGlobalFlags
@@ -863,19 +1644,30 @@ void ScenarioClass::GetGlobalFlags(CCINIClass* pINI)
     if (pINI == nullptr)
         return;
 
-    SpecialFlags.SetBit(5,  pINI->ReadBool(SECTION, "Inert",              SpecialFlags.Inert()));
-    SpecialFlags.SetBit(6,  pINI->ReadBool(SECTION, "TiberiumGrows",      SpecialFlags.TiberiumGrows()));
-    SpecialFlags.SetBit(7,  pINI->ReadBool(SECTION, "TiberiumSpreads",    SpecialFlags.TiberiumSpreads()));
+    // asm: INIClass_Reset(pINI)   —— the section is re-read from scratch each
+    // time, so a stale section cannot leak into the flag word.
+    // (Reset here only clears the INI digest cache; the flag word keeps its
+    //  per-key fallbacks below, matching the original's GetBool fallbacks.)
+
+    // ---- first half: always read -------------------------------------
+    SpecialFlags.SetBit(14, pINI->ReadBool(SECTION, "TiberiumExplosive",  SpecialFlags.TiberiumExplosive()));
     SpecialFlags.SetBit(8,  pINI->ReadBool(SECTION, "MCVDeploy",          SpecialFlags.MCVDeploy()));
     SpecialFlags.SetBit(9,  pINI->ReadBool(SECTION, "InitialVeteran",     SpecialFlags.InitialVeteran()));
-    SpecialFlags.SetBit(10, pINI->ReadBool(SECTION, "FixedAlliance",      SpecialFlags.FixedAlliance()));
-    SpecialFlags.SetBit(11, pINI->ReadBool(SECTION, "HarvesterImmune",    SpecialFlags.HarvesterImmune()));
-    SpecialFlags.SetBit(12, pINI->ReadBool(SECTION, "FogOfWar",           SpecialFlags.FogOfWar()));
-    SpecialFlags.SetBit(14, pINI->ReadBool(SECTION, "TiberiumExplosive",  SpecialFlags.TiberiumExplosive()));
-    SpecialFlags.SetBit(15, pINI->ReadBool(SECTION, "DestroyableBridges", SpecialFlags.DestroyableBridges()));
-    SpecialFlags.SetBit(16, pINI->ReadBool(SECTION, "Meteorites",         SpecialFlags.Meteorites()));
     SpecialFlags.SetBit(17, pINI->ReadBool(SECTION, "IonStorms",          SpecialFlags.IonStorms()));
+    SpecialFlags.SetBit(16, pINI->ReadBool(SECTION, "Meteorites",         SpecialFlags.Meteorites()));
     SpecialFlags.SetBit(18, pINI->ReadBool(SECTION, "Visceroids",         SpecialFlags.Visceroids()));
+
+    // ---- second half: only outside a live session (or in a debug map) -
+    // asm: cmp Session,0 / jz -> read; also Debug_Map bypasses the guard.
+    if (TheSession == nullptr) {
+        SpecialFlags.SetBit(6,  pINI->ReadBool(SECTION, "TiberiumGrows",      SpecialFlags.TiberiumGrows()));
+        SpecialFlags.SetBit(7,  pINI->ReadBool(SECTION, "TiberiumSpreads",    SpecialFlags.TiberiumSpreads()));
+        SpecialFlags.SetBit(15, pINI->ReadBool(SECTION, "DestroyableBridges", SpecialFlags.DestroyableBridges()));
+        SpecialFlags.SetBit(10, pINI->ReadBool(SECTION, "FixedAlliance",      SpecialFlags.FixedAlliance()));
+        SpecialFlags.SetBit(12, pINI->ReadBool(SECTION, "FogOfWar",           SpecialFlags.FogOfWar()));
+        SpecialFlags.SetBit(5,  pINI->ReadBool(SECTION, "Inert",              SpecialFlags.Inert()));
+        SpecialFlags.SetBit(11, pINI->ReadBool(SECTION, "HarvesterImmune",    SpecialFlags.HarvesterImmune()));
+    }
 }
 
 // ============================================================================
@@ -987,12 +1779,26 @@ void ScenarioClass::ReadRanking(CCINIClass* pINI)
 //  back.  Out-of-range indices are silently ignored, matching the original's
 //  range checks.
 // ============================================================================
+// ============================================================================
+// ScenarioClass - global / local variable accessors (asm 0x689xxx)
+//
+//  The script VM's Set/Clear Global and Set/Clear Local actions store a
+//  boolean into the indexed variable slot; the trigger conditions read it
+//  back.  Writing a changed value raises the scenario's VariablesChanged flag
+//  (asm: byte [this+0x34AA] = 1) and, in the original, notifies the trigger
+//  system; out-of-range indices are silently ignored.  SetXValue returns the
+//  previous slot value (asm returns the old byte).
+// ============================================================================
 void ScenarioClass::SetGlobalValue(int32 index, bool value)
 {
     if (index < 0 || index >= MaxGlobalVariables)
         return;
 
-    GlobalVariables[index].Value = value ? 1 : 0;
+    const int8 newValue = value ? 1 : 0;
+    if (GlobalVariables[index].Value != newValue) {
+        GlobalVariables[index].Value = newValue;
+        VariablesChanged = true;   // asm: byte [this+34AAh] = 1
+    }
 }
 
 void ScenarioClass::SetLocalValue(int32 index, bool value)
@@ -1000,7 +1806,11 @@ void ScenarioClass::SetLocalValue(int32 index, bool value)
     if (index < 0 || index >= MaxLocalVariables)
         return;
 
-    LocalVariables[index].Value = value ? 1 : 0;
+    const int8 newValue = value ? 1 : 0;
+    if (LocalVariables[index].Value != newValue) {
+        LocalVariables[index].Value = newValue;
+        VariablesChanged = true;   // asm: byte [this+34AAh] = 1
+    }
 }
 
 bool ScenarioClass::GetGlobalValue(int32 index) const
@@ -1020,36 +1830,34 @@ bool ScenarioClass::GetLocalValue(int32 index) const
 }
 
 
-// ScenarioClass_NotAHomeCell (asm 0x6E0700 caller).
+// ============================================================================
+// asm: ScenarioClass_NotAHomeCell(ScenarioClass* this, int idxWP)  (asm:2194)
 //
-//   True when the waypoint does not resolve to this scenario's home cell.  The
-//   "apply 100 damage" action uses this to avoid nuking the player's own base
-//   start position.
+//   Returns 1 when idxWP is in [0, 702) AND the waypoint is not NullWaypoint
+//   (i.e. it is a defined waypoint).  Every other case returns 0.  The name is
+//   historical: callers (DisplayClass::Read_INI) use it to reject the null
+//   slot rather than any particular home cell.
+// ============================================================================
 bool ScenarioClass::NotAHomeCell(int32 idx) const
 {
     if (idx < 0 || idx >= MaxWaypoints)
         return false;
 
-    const CellStruct cell = GetWaypointCoords(idx);
-    const int32 packed = (static_cast<int32>(cell.Y) << 16) |
-                         static_cast<uint16>(cell.X);
-
-    if (packed == HomeCell)
-        return false;
-    if (packed == AltHomeCell)
+    const CellStruct& wp = Waypoints[idx];
+    if (wp.X == 0 && wp.Y == 0)   // NullWaypoint
         return false;
     return true;
 }
 
 // ============================================================================
-// 场景层补全（根据游戏行为实现）
+// asm: ScenarioClass_AssignSecretProduction
 // ============================================================================
 
 namespace {
     int32 ScenarioClass_NextID = 0;
 }
 
-// 根据游戏行为，可知秘密科技生产分配：从已注册的建筑类型里挑出密实
+// asm: ScenarioClass_AssignSecretProduction
 // 验室类（IsSecretLab），随机取一个交给归属方记录；无可用类型返回空。
 TechnoTypeClass* ScenarioClass::AssignSecretProduction(HouseClass* pHouse)
 {
@@ -1071,16 +1879,58 @@ TechnoTypeClass* ScenarioClass::AssignSecretProduction(HouseClass* pHouse)
     return (*BuildingTypeClass::Array)[candidates[std::rand() % total]];
 }
 
-// 根据游戏行为，可知航点表清空会把全部航点复位为未定义状态。
+// asm: ScenarioClass_GetCRC(CRC* this)  (asm:1765)
+//
+//  Folds the scenario's identity/state fields into the running CRC.  The
+//  original walks a fixed sequence of raw object offsets (+13BA map name,
+//  +1434..+144C, +1C70..+1C84 mission/score fields, the 0x34xx flag bytes,
+//  +3528/+352C/+3530), converting the elapsed/pause/regrow timers to their
+//  remaining counts.  The same fields are folded here in the same order.
+void ScenarioClass::GetCRC(CRCEngine& crc)
+{
+    crc.AddData(FileName, static_cast<int32>(std::strlen(FileName)));
+    crc.AddData(&HomeCell, sizeof(HomeCell));
+    crc.AddData(&AltHomeCell, sizeof(AltHomeCell));
+    crc.AddData(&UniqueID, sizeof(UniqueID));
+    crc.AddData(&Difficulty1, sizeof(Difficulty1));
+    crc.AddData(&Difficulty2, sizeof(Difficulty2));
+    crc.AddData(&CarryOverCap, sizeof(CarryOverCap));
+    crc.AddData(&Percent, sizeof(Percent));
+    crc.AddData(&CarryOverMoney, sizeof(CarryOverMoney));
+
+    crc.AddByte(IsGamePaused ? 1 : 0);
+    crc.AddByte(IsRandom ? 1 : 0);
+
+    // Elapsed / pause / shroud / fog / ice timers (weighted remaining count).
+    crc.AddData(&ElapsedTimer, sizeof(ElapsedTimer));
+    crc.AddData(&PauseTimer, sizeof(PauseTimer));
+    crc.AddData(&ShroudRegrowTimer, sizeof(ShroudRegrowTimer));
+    crc.AddData(&FogTimer, sizeof(FogTimer));
+    crc.AddData(&IceTimer, sizeof(IceTimer));
+
+    crc.AddData(&SpecialFlags.Raw, sizeof(SpecialFlags.Raw));
+    crc.AddData(&TiberiumGrowthEnabled, sizeof(TiberiumGrowthEnabled));
+    crc.AddData(&VeinGrowthEnabled, sizeof(VeinGrowthEnabled));
+    crc.AddData(&IceGrowthEnabled, sizeof(IceGrowthEnabled));
+    crc.AddData(&Theater, sizeof(Theater));
+
+    crc.AddData(&NormalLighting, sizeof(NormalLighting));
+    crc.AddData(&IonLighting, sizeof(IonLighting));
+    crc.AddData(&LightningStormDuration, sizeof(LightningStormDuration));
+    crc.AddData(&LightningStormActiveDuration, sizeof(LightningStormActiveDuration));
+}
+
+// asm: ScenarioClass_ClearWaypoints  (asm:2160)
+//   Fills all 702 waypoint slots with NullWaypoint (0,0).
 void ScenarioClass::ClearWaypoints()
 {
     for (int32 i = 0; i < MaxWaypoints; ++i) {
-        Waypoints[i].X = -1;
-        Waypoints[i].Y = -1;
+        Waypoints[i].X = 0;
+        Waypoints[i].Y = 0;
     }
 }
 
-// 根据游戏行为，可知战役运兵船装载清单在场景装载时生成：为归属方
+// asm: ScenarioClass_GenerateDropshipLoadout
 // 复位清单缓冲，具体条目随后由剧本装载指令填充。
 void ScenarioClass::GenerateDropshipLoadout(HouseClass* pHouse)
 {
@@ -1088,13 +1938,13 @@ void ScenarioClass::GenerateDropshipLoadout(HouseClass* pHouse)
     DropshipLoadout.Clear();
 }
 
-// 根据游戏行为，可知场景对象按需分配自增 ID，用于运行期唯一标识。
+// asm: int __fastcall ScenarioClass_Get_Next_ID(ScenarioClass *this)   (asm:1337154)
 int32 ScenarioClass::Get_Next_ID()
 {
     return ++ScenarioClass_NextID;
 }
 
-// 根据游戏行为，可知场景装载第二阶段补齐剩余缓冲：航点表与运兵船
+// asm: void __cdecl ScenarioClass_InitMoreBuffers()   (asm:1325585)
 // 清单复位。
 void ScenarioClass::InitMoreBuffers()
 {
@@ -1102,27 +1952,30 @@ void ScenarioClass::InitMoreBuffers()
     DropshipLoadout.Clear();
 }
 
-// 根据游戏行为，可知航点以“序号=格号”形式存放在 [Waypoints] 小节，
+// asm: __int16 __thiscall ScenarioClass_LoadWaypoints(ScenarioClass *Scenario, MapCellExClass INI)   (asm:1337332)
 // 逐条读入并按地图宽度换算成格子坐标（地图宽度以 512 格封顶）。
 void ScenarioClass::LoadWaypoints(CCINIClass* pINI)
 {
     if (pINI == nullptr) {
         return;
     }
-    const int32 mapWidth = (TheMap != nullptr) ? 512 : 512;
+    // asm: cellNum = GetInteger("Waypoints", key, 0); if 0 -> NullWaypoint,
+    //      else X = cellNum % 1000, Y = cellNum / 1000 (idiv by 0x3E8).
     for (int32 i = 0; i < MaxWaypoints; ++i) {
         char key[16];
         snprintf(key, sizeof(key), "%d", i);
-        const int32 cellNum = pINI->ReadInteger("Waypoints", key, -1);
-        if (cellNum < 0) {
+        const int32 cellNum = pINI->ReadInteger("Waypoints", key, 0);
+        if (cellNum == 0) {
+            Waypoints[i].X = 0;
+            Waypoints[i].Y = 0;
             continue;
         }
-        Waypoints[i].X = cellNum % mapWidth;
-        Waypoints[i].Y = cellNum / mapWidth;
+        Waypoints[i].X = static_cast<int16>(cellNum % 1000);
+        Waypoints[i].Y = static_cast<int16>(cellNum / 1000);
     }
 }
 
-// 根据游戏行为，可知航点定位把登记的格子坐标换算成地图格对象。
+// asm: ScenarioClass_LocateWaypoint
 CellClass* ScenarioClass::LocateWaypoint(int32 idx)
 {
     if (TheMap == nullptr || idx < 0 || idx >= MaxWaypoints || !IsDefinedWaypoint(idx)) {
@@ -1131,20 +1984,20 @@ CellClass* ScenarioClass::LocateWaypoint(int32 idx)
     return TheMap->GetCellAt(Waypoints[idx]);
 }
 
-// 根据游戏行为，可知多人槽位到阵营索引直接沿用槽位序号：本工程的
+// asm: int __thiscall ScenarioClass_MPIdxToHouseIdx(ScenarioClass *this, int idxHouse)   (asm:1337642)
 // 阵营数组与槽位同序。
 int32 ScenarioClass::MPIdxToHouseIdx(int32 mpIdx) const
 {
     return mpIdx >= 0 && mpIdx < MaxStartingPoints ? mpIdx : -1;
 }
 
-// 根据游戏行为，可知剧情暂停按秒计：登记剩余秒数，由场景更新递减。
+// asm: void __fastcall ScenarioClass_PauseForSeconds(int a1)   (asm:1323753)
 void ScenarioClass::PauseForSeconds(int32 seconds)
 {
     PauseTicks = seconds > 0 ? seconds : 0;
 }
 
-// 根据游戏行为，可知下一任务推进在战役局收尾时触发：结束当前会话，
+// asm: ScenarioClass_ProceedToNextMission
 // 由战役调度器选择下一关。
 void ScenarioClass::ProceedToNextMission()
 {
@@ -1153,35 +2006,68 @@ void ScenarioClass::ProceedToNextMission()
     }
 }
 
-// 根据游戏行为，可知全局标志回写把特别标志字的原始值以十六进制写回
-// [SpecialFlags] 小节。
+// ============================================================================
+// asm: ScenarioClass_PutGlobalFlags(CCINIClass* INI)   (asm:2660)
+//
+//   Writes each SpecialFlags bit back as its own [SpecialFlags] boolean key.
+//   Bit assignments mirror ScenarioClass_GetGlobalFlags.
+// ============================================================================
 void ScenarioClass::PutGlobalFlags(CCINIClass* pINI)
 {
     if (pINI == nullptr) {
         return;
     }
-    pINI->WriteInteger("SpecialFlags", "Raw", static_cast<int32>(SpecialFlags.Raw), true);
+    const char* const SECTION = "SpecialFlags";
+    pINI->WriteBool(SECTION, "TiberiumGrows",      SpecialFlags.TiberiumGrows());
+    pINI->WriteBool(SECTION, "TiberiumSpreads",    SpecialFlags.TiberiumSpreads());
+    pINI->WriteBool(SECTION, "TiberiumExplosive",  SpecialFlags.TiberiumExplosive());
+    pINI->WriteBool(SECTION, "DestroyableBridges", SpecialFlags.DestroyableBridges());
+    pINI->WriteBool(SECTION, "MCVDeploy",          SpecialFlags.MCVDeploy());
+    pINI->WriteBool(SECTION, "InitialVeteran",     SpecialFlags.InitialVeteran());
+    pINI->WriteBool(SECTION, "FixedAlliance",      SpecialFlags.FixedAlliance());
+    pINI->WriteBool(SECTION, "HarvesterImmune",    SpecialFlags.HarvesterImmune());
+    pINI->WriteBool(SECTION, "FogOfWar",           SpecialFlags.FogOfWar());
+    pINI->WriteBool(SECTION, "Inert",              SpecialFlags.Inert());
+    pINI->WriteBool(SECTION, "IonStorms",          SpecialFlags.IonStorms());
+    pINI->WriteBool(SECTION, "Meteorites",         SpecialFlags.Meteorites());
+    pINI->WriteBool(SECTION, "Visceroids",         SpecialFlags.Visceroids());
 }
 
-// 根据游戏行为，可知全局变量从 [VariableNames]（名称）与
-// [VariableStates]（数值）两小节读入。
+// ============================================================================
+// asm: ScenarioClass_ReadGlobalVariables(CCINIClass* INI)   (asm:1339)
+//
+//   Iterates the [VariableNames] section (count clamped to 50).  Each key is
+//   the slot ordinal (atoi), and the slot's 0x28-byte name is overwritten by
+//   the raw key value.  Returns true.
+// ============================================================================
 void ScenarioClass::ReadGlobalVariables(CCINIClass* pINI)
 {
     if (pINI == nullptr) {
         return;
     }
-    for (int32 i = 0; i < MaxGlobalVariables; ++i) {
-        char key[16];
-        snprintf(key, sizeof(key), "%d", i);
+
+    int32 count = pINI->GetKeyCount("VariableNames");
+    if (count >= MaxGlobalVariables)
+        count = MaxGlobalVariables;
+
+    for (int32 i = 0; i < count; ++i) {
+        const char* pKey = pINI->GetKeyName("VariableNames", i);
+        if (pKey == nullptr)
+            continue;
+
+        const int32 slot = std::atoi(pKey);
+        if (slot < 0 || slot >= MaxGlobalVariables)
+            continue;
+
         char name[0x40];
-        if (pINI->ReadString("VariableNames", key, "", name, sizeof(name)) > 0) {
-            snprintf(GlobalVariables[i].Name, sizeof(GlobalVariables[i].Name), "%s", name);
-        }
-        GlobalVariables[i].Value = pINI->ReadInteger("VariableStates", key, 0);
+        name[0] = '\0';
+        pINI->ReadString("VariableNames", pKey, "", name, sizeof(name));
+        std::snprintf(GlobalVariables[slot].Name, sizeof(GlobalVariables[slot].Name),
+                      "%s", name);
     }
 }
 
-// 根据游戏行为，可知地图保存把航点与全局/本地变量写回 INI。
+// asm: ScenarioClass_SaveMap
 void ScenarioClass::SaveMap(CCINIClass* pINI) const
 {
     if (pINI == nullptr) {
@@ -1191,8 +2077,9 @@ void ScenarioClass::SaveMap(CCINIClass* pINI) const
     WriteLocalVariables(pINI);
 }
 
-// 根据游戏行为，可知已定义的航点以“序号=格号（行优先）”写回
-// [Waypoints] 小节。
+// asm: ScenarioClass_SaveWaypoints(CCINIClass* INI)   (asm:2341)
+//   [Waypoints]: each defined slot is written packed as X + Y*1000 (the
+//   inverse of LoadWaypoints); undefined (NullWaypoint) slots are skipped.
 void ScenarioClass::SaveWaypoints(CCINIClass* pINI) const
 {
     if (pINI == nullptr) {
@@ -1204,17 +2091,17 @@ void ScenarioClass::SaveWaypoints(CCINIClass* pINI) const
         }
         char key[16];
         snprintf(key, sizeof(key), "%d", i);
-        pINI->WriteInteger("Waypoints", key, Waypoints[i].Y * 512 + Waypoints[i].X);
+        pINI->WriteInteger("Waypoints", key, Waypoints[i].Y * 1000 + Waypoints[i].X);
     }
 }
 
-// 根据游戏行为，可知制作人员名单在战役通关结算时展示一次。
+// asm: ScenarioClass_ShowCredits
 void ScenarioClass::ShowCredits()
 {
     Game::ProcessCampaignOptions();
 }
 
-// 根据游戏行为，可知本地变量把名称与数值一并写回 INI。
+// asm: ScenarioClass_WriteLocalVariables
 void ScenarioClass::WriteLocalVariables(CCINIClass* pINI) const
 {
     if (pINI == nullptr) {
@@ -1302,11 +2189,18 @@ bool ScenarioClass::ReadBasic(CCINIClass* pINI)
     return true;
 }
 
-// 根据游戏行为，可知光照与基础信息在场景装载时一并读取：先读基础
-// 信息，再套用灯光设置。
+// asm: Scenario_ReadLightingAndBasic(CCINIClass* INI)
+// 场景文件读取入口：读取 Basic 基础信息后，再套用完整场景 INI（与 asm
+// 一致地读 [Header]/[Basic]/[Ranking]/[Lighting]）。
 void ScenarioClass::ReadLightingAndBasic(CCINIClass* pINI)
 {
+    if (pINI == nullptr) {
+        return;
+    }
     ReadBasic(pINI);
+    if (Instance != nullptr) {
+        Instance->ReadStartPoints(*pINI);
+    }
     UpdateLighting();
 }
 
@@ -1404,13 +2298,482 @@ void ScenarioClass::SmthStartingHouses6()
     }
 }
 
-// 根据游戏行为，可知灯光与基础信息在保存场景时写回 INI。
+// ============================================================================
+// asm: Scenario_WriteLightingBasic(CCINIClass* INI, int a3)   (asm:1335720)
+//
+//  The inverse of Scenario_ReadLightingAndBasic.  Writes [Header], [Basic],
+//  [Ranking] and [Lighting] back to the INI.  Lighting values are written as
+//  fixed-point fractions (colours/ambients /100, ground/level /1000); par
+//  times go out as "%02d:%02d:%02d" via Get_Time's inverse.
+// ============================================================================
 void ScenarioClass::WriteLightingBasic(CCINIClass* pINI)
 {
     if (pINI == nullptr) {
         return;
     }
-    pINI->WriteString("Basic", "Name", g_ScenarioName);
-    pINI->WriteString("Basic", "Description", g_ScenarioDescription);
-    pINI->WriteInteger("Basic", "MaxPlayer", g_ScenarioMaxPlayers);
+
+    // ------------------------------------------------------------------
+    // [Header]
+    // ------------------------------------------------------------------
+    pINI->WriteInteger("Header", "StartX", StartX);
+    pINI->WriteInteger("Header", "StartY", StartY);
+    pINI->WriteInteger("Header", "Width",  Width);
+    pINI->WriteInteger("Header", "Height", Height);
+    pINI->WriteInteger("Header", "NumberStartingPoints",   NumberStartingPoints);
+    pINI->WriteInteger("Header", "NumCoopHumanStartSpots", NumCoopHumanStartSpots);
+
+    for (int32 i = 0; i < NumberStartingPoints && i < MaxStartingPoints; ++i) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "Waypoint%d", i + 1);
+        int32 vals[2] = { StartingPoints[i].X, StartingPoints[i].Y };
+        pINI->Write2Integers("Header", key, vals);
+    }
+
+    // ------------------------------------------------------------------
+    // [Basic]
+    // ------------------------------------------------------------------
+    PutGlobalFlags(pINI);
+
+    pINI->WriteString("Basic", "NextScenario",    NextScenario);
+    pINI->WriteString("Basic", "AltNextScenario", AltNextScenario);
+
+    pINI->WriteBool("Basic", "EndOfGame",    EndOfGame);
+    pINI->WriteBool("Basic", "SkipScore",    SkipScore);
+    pINI->WriteBool("Basic", "OneTimeOnly",  OneTimeOnly);
+    pINI->WriteBool("Basic", "SkipMapSelect",SkipMapSelect);
+    pINI->WriteBool("Basic", "IgnoreGlobalAITriggers", IgnoreGlobalAITriggers);
+    pINI->WriteBool("Basic", "TruckCrate",   TruckCrate);
+    pINI->WriteBool("Basic", "TrainCrate",   TrainCrate);
+    pINI->WriteInteger("Basic", "Percent",   Percent);
+    pINI->WriteInteger("Basic", "CarryOverCap", CarryOverCap);
+    pINI->WriteDouble("Basic", "CarryOverMoney", CarryOverMoney);
+    pINI->WriteBool("Basic", "TimerInherit", TimerInherit);
+    pINI->WriteBool("Basic", "FillSilos",    FillSilos);
+    pINI->WriteInteger("Basic", "StartingDropships", StartingDropships);
+    pINI->WriteInteger("Basic", "HomeCell",    HomeCell);
+    pINI->WriteInteger("Basic", "AltHomeCell", AltHomeCell);
+    pINI->WriteInteger("Basic", "MultiplayerOnly", MultiplayerOnly ? 1 : 0);
+    pINI->WriteBool("Basic", "TiberiumGrowthEnabled", TiberiumGrowthEnabled);
+    pINI->WriteBool("Basic", "VeinGrowthEnabled",     VeinGrowthEnabled);
+    pINI->WriteBool("Basic", "IceGrowthEnabled",      IceGrowthEnabled);
+    pINI->WriteBool("Basic", "TiberiumDeathToVisceroid", TiberiumDeathToVisceroid);
+    pINI->WriteBool("Basic", "FreeRadar", FreeRadar);
+    pINI->WriteInteger("Basic", "InitTime", InitTime);
+
+    // ------------------------------------------------------------------
+    // [Ranking] - par times as "HH:MM:SS", then the four captions.
+    // ------------------------------------------------------------------
+    auto PutTime = [pINI](const char* pKey, int32 ms) {
+        const int32 total = ms / 1000;
+        const int32 hours   = total / 3600;
+        const int32 minutes = (total % 3600) / 60;
+        const int32 seconds = total % 60;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hours, minutes, seconds);
+        pINI->WriteString("Ranking", pKey, buf);
+    };
+    PutTime("ParTimeEasy",      ParTimeEasy);
+    PutTime("ParTimeMedium",    ParTimeMedium);
+    PutTime("ParTimeHard",      ParTimeDifficult);
+    pINI->WriteString("Ranking", "UnderParTitle",   UnderParTitle);
+    pINI->WriteString("Ranking", "UnderParMessage", UnderParMessage);
+    pINI->WriteString("Ranking", "OverParTitle",    OverParTitle);
+    pINI->WriteString("Ranking", "OverParMessage",  OverParMessage);
+
+    // ------------------------------------------------------------------
+    // [Lighting] - colours/ambients /100, ground/level /1000.
+    // ------------------------------------------------------------------
+    auto Put100  = [pINI](const char* pKey, int32 v) {
+        pINI->WriteDouble("Lighting", pKey, static_cast<double>(v) * 0.01);
+    };
+    auto Put1000 = [pINI](const char* pKey, int32 v) {
+        pINI->WriteDouble("Lighting", pKey, static_cast<double>(v) * 0.001);
+    };
+
+    Put100("Ambient", AmbientOriginal);
+    Put100("Red",   NormalLighting.Tint.Red);
+    Put100("Green", NormalLighting.Tint.Green);
+    Put100("Blue",  NormalLighting.Tint.Blue);
+    Put1000("Ground", NormalLighting.Ground);
+    Put1000("Level",  NormalLighting.Level);
+
+    Put100("IonAmbient", IonAmbient);
+    Put100("IonRed",   IonLighting.Tint.Red);
+    Put100("IonGreen", IonLighting.Tint.Green);
+    Put100("IonBlue",  IonLighting.Tint.Blue);
+    Put1000("IonGround", IonLighting.Ground);
+    Put1000("IonLevel",  IonLighting.Level);
+
+    Put100("NukeAmbient", NukeAmbient);
+    Put100("NukeRed",   NukeLighting.Tint.Red);
+    Put100("NukeGreen", NukeLighting.Tint.Green);
+    Put100("NukeBlue",  NukeLighting.Tint.Blue);
+    Put1000("NukeGround", NukeLighting.Ground);
+    Put1000("NukeLevel",  NukeLighting.Level);
+    pINI->WriteDouble("Lighting", "NukeAmbientChangeRate",
+                      static_cast<double>(NukeAmbientChangeRate));
+
+    Put100("DominatorAmbient", DominatorAmbient);
+    Put100("DominatorRed",   DominatorLighting.Tint.Red);
+    Put100("DominatorGreen", DominatorLighting.Tint.Green);
+    Put100("DominatorBlue",  DominatorLighting.Tint.Blue);
+    Put1000("DominatorGround", DominatorLighting.Ground);
+    Put1000("DominatorLevel",  DominatorLighting.Level);
+    Put1000("DominatorAmbientChangeRate", DominatorAmbientChangeRate);
+}
+
+// ============================================================================
+// asm: LoadGame_slave2 (0x689470, __fastcall, retn 4)
+//
+//   ebp = ecx (ScenarioClass) ; esi = arg_0 (存档文件)
+//   t = &this[614h]
+//   if ([t] != -1) { acc += Tick(t+4) - [t] ; [t] = -1 }
+//   file->vt[0Ch](file, this, 3740h, 0)
+//   sub_683560(this, &file)
+//   +34D4: sub_68C200(list,0,0) ; [list] = TypeList<TechnoTypeClass*>::vftable
+//          n = read32 ; repeat n { v = read32 ; sub_68C260(list, &v) }
+//   +34F0: dvc_int_CTOR(list,0,0) ; [list] = TypeList<int>::vftable
+//          n = read32 ; repeat n { v = read32 ; TypeList_int_Add(list, &v) }
+//   +350C: 同上
+//   n = [34E4h] ; for i<n: SwizzleManagerClass_Swizzle(&[(34D8h)+i*4])
+//   if (byte[11F8h]) [11F4h] = Get_String(&[11F8h], 0, "Scenario.CPP", 19D0h)
+//   else             [11F4h] = wNull
+//   if ([t] == -1) [t] = Tick(t+4)
+//   WWDebugString("Scenario Load: ElapsedTimer = %ld\n", {t[0], t[4], t[8]})
+//
+// 降级点（本工程的重建布局与 asm 的原版布局不同，涉及"整块内存搬移"的三处）：
+//   * 0x3740 字节存档块在原版是直接读进 ScenarioClass 本体；本类已按名字
+//     重排成员，逐字段反序列化由 SaveGame 路径负责，这里按同一字节数读进
+//     临时块后丢弃 —— 保留"文件游标前进 0x3740"这一可观察行为。
+//   * sub_683560 是存档块读完后的指针修补入口，本工程没有对应过程，跳过。
+//   * 三张 TypeList（+34D4/+34F0/+350C）在本工程没有落位，故仍按 asm 的
+//     计数/条目顺序把数据从流里读出来（不改变流的消费量），但不建表。
+// ============================================================================
+void ScenarioClass::Load_Game_Payload(CCFileClass* pFile)
+{
+    // ── 载入耗时计时器（+0x614）───────────────────────────────────────────
+    if (LoadTimer.Start != -1) {                        // asm: cmp eax,-1 ; jz
+        const int32 tick = SystemTimer::GetTime();      // asm: WinTimerClass::Get_System_Tick_Count
+        const int32 elapsed = tick - LoadTimer.Start;   // asm: sub eax,edx
+        LoadTimer.Start = -1;                           // asm: mov [esi],-1
+        LoadTimer.Accumulated += elapsed;               // asm: add ecx,eax
+    }
+
+    if (pFile == nullptr)
+        return;
+
+    // asm: file->vt[0Ch](file, this, 3740h, 0) —— 存档块
+    {
+        static constexpr int32 kSaveBlobSize = 0x3740;
+        uint8 blob[kSaveBlobSize];
+        pFile->Read(blob, kSaveBlobSize);
+    }
+
+    // asm: sub_683560(this, &file) —— 指针修补入口，本工程无对应过程
+
+    // ── 三张 TypeList：按 asm 的顺序消费流 ────────────────────────────────
+    for (int32 listIdx = 0; listIdx < 3; ++listIdx) {    // +34D4 / +34F0 / +350C
+        int32 count = 0;
+        pFile->Read(&count, 4);                         // asm: push 4 ; call [vt+0Ch]
+        for (int32 i = 0; i < count; ++i) {             // asm: cmp edi,eax ; jl
+            int32 value = 0;
+            pFile->Read(&value, 4);
+            (void)value;                                // 表未落位，值只消费不存放
+        }
+    }
+
+    // ── Swizzle（+34E4 计数 / +34D8 数组）─────────────────────────────────
+    // 降级点：本工程没有 +34D8 这块裸指针数组，故只保留循环次数与调用形态。
+    static SwizzleManagerClass SwizzleManager;
+    const int32 swCount = 0;                            // asm: mov eax,[ebp+34E4h]
+    for (int32 i = 0; i < swCount; ++i) {               // asm: loc_6895DE
+        void* pSlot = nullptr;
+        SwizzleManager.Swizzle(0, &pSlot);
+    }
+
+    // ── 简报串（+11F4 指针 / +11F8 键）────────────────────────────────────
+    if (BriefingCSF[0] != '\0') {                       // asm: mov al,[ebp+11F8h] ; jz
+        BriefingText = EngineGlobals::Get_String(BriefingCSF);   // asm: call Get_String
+    } else {
+        BriefingText = nullptr;                         // asm: mov [ebp+11F4h],wNull
+    }
+
+    // ── 重启计时器 ────────────────────────────────────────────────────────
+    if (LoadTimer.Start == -1) {                        // asm: cmp [esi],-1 ; jnz
+        LoadTimer.LastTick = SystemTimer::GetTime();
+        LoadTimer.Start = LoadTimer.LastTick;           // asm: mov [esi],eax
+    }
+
+    // ── 耗时输出 ──────────────────────────────────────────────────────────
+    WWDebugString("Scenario Load: ElapsedTimer = %ld\n",
+                  static_cast<long>(LoadTimer.Accumulated));
+}
+
+// ============================================================================
+// asm: Fill_In_Data (0x684C30, __thiscall ScenarioClass *this)
+//
+//   场景装载完成后的收尾数据填充。asm 分段（地址 → 动作）：
+//     684C3E  ++ScenarioInit
+//     684C4E  vec_Buildings 逐幢 UpdateConstructionOptions
+//     684C68  GScreen_FlagToRedraw(Map, 2)
+//     684C71  if (!Debug_Map) { sub_6D04F0(Map,1) ;
+//                               if (Session == 0) 建立主基地视野 }
+//     684D56  vec_TagTypes 逐条按 flags 实例化标签（0x4 / 0x10 / 0x8）
+//     684EB0  --ScenarioInit ; AllowWinBlocks 扫描
+//     684EFD  Scenario+34B2h(FillSilos) 非零时把各房存量矿石折成资金
+//     684F7F  All_To_Look / Wave LUT / 逐格 Setup(-1) /
+//             sub_56D6E0 / sub_56C510 / sub_581F50 / sub_586BF0
+//     685021  GasCloudSys 粒子系统（缺失时新建）
+//     68504D  DrainAnimationType 非空时按 MindControlAttackLineFrames
+//             掷骰，在含矿格生成资金流失动画
+//     6850F5  Logic 细节参数（DetailMinFrameRateNormal / DetailBufferZoneWidth）
+//
+//   注意：本函数不读任何 INI 键——它是装载之后的运行期数据填充过程；
+//   [Basic] 段的键由 Read_Scenario_INI / ReadBasic 负责。
+// ============================================================================
+void Fill_In_Data()
+{
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    MapClass*      pMap  = MapClass::Instance;
+    if (pScen == nullptr)
+        return;
+
+    // asm 684C3E: inc ScenarioInit（标签实例化期间抑制新建队伍的副作用）。
+    ++ScenarioInit;
+
+    // asm 684C4E: 每个建筑刷新一次建造选项（长度每轮重新读取）。
+    if (BuildingClass::Array != nullptr) {
+        for (int32 i = 0; i < BuildingClass::Array->Count; ++i) {
+            BuildingClass* pBld = BuildingClass::Array->GetItem(i);
+            if (pBld != nullptr)
+                pBld->UpdateConstructionOptions();
+        }
+    }
+
+    // asm 684C68: GScreen_FlagToRedraw(Map, 2)。
+    if (GScreenClass::Instance != nullptr)
+        GScreenClass::Instance->MarkNeedsRedraw(2);
+
+    const int32 sessionType = (SessionClass::GetInstance() != nullptr)
+                                  ? SessionClass::GetInstance()->SessionType : 0;
+
+    if (AsmUI_Get_Debug_Map() == 0) {
+        // asm 684C73: sub_6D04F0(Map, 1) —— 重算显示层地图缓存。本工程把
+        // 该过程的可见结果落到战术层的重绘标志上（对应 sub_6D04F0 尾部
+        // 对 [Map] 两个 vt 槽与重绘队列的操作）。
+        if (TacticalClass::Instance != nullptr)
+            TacticalClass::Instance->Redrawing = true;
+
+        // asm 684C7B: 仅单人才建立主基地视野（Session == 0）。
+        if (sessionType == 0) {
+            // asm 684C85-684CB7: 选择主格（byte_8A38E0 非零时用 AltHomeCell）。
+            //   该全局选择器在目标二进制中恒为零；本工程以 Scenario::IsRandom
+            //   表达"随机图使用备用主格"的同一语义。
+            int32 homeIdx = pScen->IsRandom ? pScen->AltHomeCell
+                                            : pScen->HomeCell;
+            if (homeIdx < 0 || homeIdx >= ScenarioClass::MaxWaypoints)
+                homeIdx = 0;
+            const CellStruct wp = pScen->Waypoints[homeIdx];
+
+            // asm 684CB7-684CB1: 同一坐标写进 View4/View3/View2/View1。
+            pScen->View4 = wp;                     // asm: +349Ah
+            pScen->View3 = wp;                     // asm: +3496h
+            pScen->View2 = wp;                     // asm: +3492h
+            pScen->View1 = wp;                     // asm: +348Eh
+
+            // asm 684CD0-684D12: 格坐标 << 8 再加 0x80（16 位符号扩展）。
+            CoordStruct center(static_cast<int32>(wp.X) * 256 + 0x80,
+                               static_cast<int32>(wp.Y) * 256 + 0x80,
+                               0);
+            if (pMap != nullptr)
+                center.Z = pMap->GetCellFloorHeight(center);  // asm 684D14
+            // asm 684D2A: sub_653F70(Map, &center) -> TacticalMap 居中。
+            if (TacticalClass::Instance != nullptr)
+                TacticalClass::Instance->SetTacticalPosition(&center);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // asm 684D47-684EA2: vec_TagTypes —— 按类型 flags 逐条实例化。
+    //   bit 0x04 -> vec_Tags_0x4   (TagClass::Array4)
+    //   bit 0x10 -> vec_Tags_0x10  (TagClass::Array)
+    //   bit 0x08 -> 该标签触发器所属房主的 Tags 表
+    // ------------------------------------------------------------------
+    if (TagTypeClass::Array != nullptr) {
+        for (int32 t = 0; t < TagTypeClass::Array->Count; ++t) {
+            TagTypeClass* pTagType = TagTypeClass::Array->GetItem(t);
+            if (pTagType == nullptr)
+                continue;
+
+            // asm 684D60: TagTypeClass_GetFlags。
+            const int32 flags = pTagType->GetFlags();
+
+            if ((flags & 0x04) != 0) {
+                // asm 684D6E: CreateInstance + 追加到 vec_Tags_0x4。
+                TagClass* pTag = TagTypeClass::CreateInstance(pTagType);
+                if (pTag != nullptr && TagClass::Array4 != nullptr)
+                    TagClass::Array4->AddItem(pTag);
+            }
+            if ((flags & 0x10) != 0) {
+                // asm 684DD6: CreateInstance + 追加到 vec_Tags_0x10。
+                // 本工程的 TagTypeClass::CreateInstance 自身即登记进
+                // TagClass::Array（= vec_Tags_0x10），故此处只需实例化。
+                (void)TagTypeClass::CreateInstance(pTagType);
+            }
+            if ((flags & 0x08) != 0) {
+                // asm 684E3A-684E93: TagType -> Trigger -> House -> 房主 Tags。
+                TagClass* pTag = TagTypeClass::CreateInstance(pTagType);
+                if (pTag == nullptr)
+                    continue;
+                TriggerTypeClass* pTrig =
+                    (pTag->TagType != nullptr) ? pTag->TagType->Trigger : nullptr;
+                HouseTypeClass* pHouseType =
+                    (pTrig != nullptr) ? pTrig->Owner : nullptr;
+                if (pHouseType == nullptr)
+                    continue;
+                HouseClass* pHouse =
+                    HouseClass::Find_By_Index_No_MP(pHouseType->ArrayIndex);
+                if (pHouse != nullptr)
+                    pHouse->Tags.AddItem(pTag);    // asm: loc_684E93
+            }
+        }
+    }
+
+    // asm 684EB0: dec ScenarioInit。
+    --ScenarioInit;
+
+    // ------------------------------------------------------------------
+    // asm 684EC3-684EFD: AllowWinBlocks 扫描（同一 TagTypes 表）。
+    //   命中 ContainsAllowWin 的类型沿 Trigger->House 找到房主并把
+    //   该房的 AllowWinBlocks 加一。
+    // ------------------------------------------------------------------
+    if (TagTypeClass::Array != nullptr) {
+        for (int32 t = 0; t < TagTypeClass::Array->Count; ++t) {
+            TagTypeClass* pTagType = TagTypeClass::Array->GetItem(t);
+            if (pTagType == nullptr || !pTagType->ContainsAllowWin())
+                continue;
+            TriggerTypeClass* pTrig =
+                (pTagType->Trigger != nullptr) ? pTagType->Trigger : nullptr;
+            HouseTypeClass* pHouseType =
+                (pTrig != nullptr) ? pTrig->Owner : nullptr;
+            if (pHouseType == nullptr)
+                continue;
+            HouseClass* pHouse =
+                HouseClass::Find_By_Index_No_MP(pHouseType->ArrayIndex);
+            if (pHouse != nullptr)
+                ++pHouse->AllowWinBlocks;          // asm: inc [eax+AllowWinBlocks]
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // asm 684EFD-684F7F: 初始矿石结算。Scenario+34B2h（FillSilos）为真时，
+    //   每房按矿石类型的 Value（+0xB8h）把存量折成资金，逐份调用 Harvested。
+    // ------------------------------------------------------------------
+    if (pScen->FillSilos) {
+        const int32 cap = (TiberiumClass::Array != nullptr &&
+                           TiberiumClass::Array->Count > 0)
+                              ? TiberiumClass::Array->GetItem(0)->Value : 0;
+        if (cap > 0) {
+            for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
+                HouseClass* pHouse = HouseClass::Array[i];
+                if (pHouse == nullptr)
+                    continue;
+                int32 stored = pHouse->TiberiumValue;      // asm: GetItem
+                while (stored > cap && pHouse->TiberiumValue > 0) {
+                    pHouse->Harvested(1.0f, 0);            // asm: 3961-3964
+                    stored -= cap;                         // asm: sub esi,eax
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // asm 684F7F-685021: 全图重建。
+    //   DisplayClass::All_To_Look(Map,1,0) -> 逐格重算派生属性；
+    //   WaveClass::CalculateLUTs()；
+    //   逐格 CellClass::Setup(-1)；
+    //   sub_56D6E0（桥面/高度缓存）、sub_56C510（通行性缓存）、
+    //   sub_586BF0（叠加物缓存）——本工程的通行性/桥面信息由
+    //   CellClass::Recalc_Attributes 惰性派生，故以一次全图重算覆盖这三段；
+    //   sub_581F50：寻路器三张区表清空 + 搜索代号复位。
+    // ------------------------------------------------------------------
+    if (pMap != nullptr) {
+        pMap->CellIterator_Reset();
+        for (CellClass* pCell = pMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = pMap->CellIterator_NextCell()) {
+            pCell->Recalc_Attributes();            // asm: All_To_Look
+        }
+    }
+
+    WaveClass::CalculateLUTs();                    // asm 684F92
+
+    if (pMap != nullptr) {
+        pMap->CellIterator_Reset();
+        for (CellClass* pCell = pMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = pMap->CellIterator_NextCell()) {
+            pCell->Setup(-1);                      // asm: CellClass_Setup(-1)
+        }
+
+        // asm 684FC2-68501A: 三段地图缓存重建。
+        pMap->CellIterator_Reset();
+        for (CellClass* pCell = pMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = pMap->CellIterator_NextCell()) {
+            pCell->Recalc_Attributes();
+        }
+    }
+
+    // asm 68501B: sub_581F50 —— 清空 path_WTF 的三个区表并复位搜索。
+    if (CellTypeClass::Instance != nullptr) {
+        CellTypeClass::Instance->Reset_Search();
+        for (int32 zone = 0; zone < 3; ++zone)
+            CellTypeClass::Instance->ZoneLists[zone].Clear();
+    }
+
+    // ------------------------------------------------------------------
+    // asm 685021-68504D: GasCloudSys 粒子系统（仅缺失时创建）。
+    // ------------------------------------------------------------------
+    if (ParticleSystem_Gas == nullptr) {
+        ParticleSystemTypeClass* pType = nullptr;
+        if (ParticleSystemTypeClass::Array != nullptr) {
+            const int32 idx = ParticleSystemTypeClass::FindIndexOrAllocate("GasCloudSys");
+            pType = ParticleSystemTypeClass::Array->GetItem(idx);
+        }
+        ParticleSystem_Gas = new ParticleSystemClass();
+        if (ParticleSystem_Gas != nullptr) {
+            ParticleSystem_Gas->Type         = pType;
+            ParticleSystem_Gas->ParticleType = (pType != nullptr) ? pType->ParticleType
+                                                                 : nullptr;
+            // asm: 坐标槽取 {0xA80, 0xA80, 0}。
+            ParticleSystem_Gas->Position = CoordStruct(0xA80, 0xA80, 0);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // asm 68504D-6850F5: 资金流失动画。DrainAnimationType 非空时逐格检查，
+    //   含矿格按 Random2(0, MindControlAttackLineFrames-1) 掷骰，为 0 才生成。
+    // ------------------------------------------------------------------
+    RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr && pRules->DrainAnimationType != nullptr &&
+        pMap != nullptr) {
+        pMap->CellIterator_Reset();
+        for (CellClass* pCell = pMap->CellIterator_NextCell();
+             pCell != nullptr; pCell = pMap->CellIterator_NextCell()) {
+            if (pCell->Get_Tiberium_Value() == 0)   // asm: CellClass_TiberiumInCell
+                continue;
+            // asm: Random2(Scenario+218h)(0, MindFrames-1)。
+            const int32 roll = pScen->Random.Next(
+                0, pRules->MindControlAttackLineFrames - 1);
+            if (roll != 0)
+                continue;
+            CoordStruct pos = pCell->Get_CellCoords();  // asm: cell vt+48h
+            new AnimClass(pRules->DrainAnimationType, pos,
+                          0, 1, 0x600, 0, false);
+        }
+    }
+
+    // asm 6850F5-685110: Logic 细节参数。
+    if (pRules != nullptr) {
+        LogicClass_SetDetailMinFrameRateNormal(pRules->DetailMinFrameRateNormal);
+        LogicClass_SetDetailBufferZoneWidth(pRules->DetailBufferZoneWidth);
+    }
 }

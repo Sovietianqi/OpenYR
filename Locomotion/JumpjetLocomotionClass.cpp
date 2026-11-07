@@ -5,6 +5,7 @@
 
 #include "../Map/MapClass.h"
 #include "../Map/CellClass.h"
+#include "../Scenario/ScenarioClass.h"
 
 // ============================================================================
 // JumpjetLocomotionClass - Jumpjet infantry movement.
@@ -27,6 +28,11 @@ JumpjetLocomotionClass::JumpjetLocomotionClass()
     , TargetAltitude(0)
     , Piggybackee(nullptr)
     , CrashTimer(0)
+    , FlightAltitude(0.0)
+    , TargetFlightAltitude(0.0)
+    , ClimbRate(4.0f)
+    , HoverPhase(0.0)
+    , MaxAltitude(300)
 {
     Speed = 128;
 }
@@ -77,13 +83,15 @@ HRESULT JumpjetLocomotionClass::End_Piggyback(ILocomotion** pointer)
 }
 
 // ============================================================================
-// Is_Moving - Jumpjet is moving unless grounded and idle.
+// Is_Moving - 依据任务状态判定。
+// asm: JumpjetLocomotionClass_Is_Moving_Now   (asm:721586)
+//   `[4Ch]!=0 && [4Ch]!=2`——状态既非 Grounded 也非 Hovering 即视为在动；
+//   Hovering 是悬停待命，不计入移动。
 // ============================================================================
 
 bool JumpjetLocomotionClass::Is_Moving()
 {
-    return IsMoving || CurrentState == Cruising || CurrentState == Ascending
-        || CurrentState == Descending || CurrentState == Hovering;
+    return CurrentState != Grounded && CurrentState != Hovering;
 }
 
 // ============================================================================
@@ -105,8 +113,17 @@ void JumpjetLocomotionClass::Move_To(CoordStruct to)
     Dest = to;
     IsMoving = true;
 
+    MaxAltitude = ResolveCruiseHeight();
+
     if (CurrentState == Grounded) {
-        Jump();
+        CurrentState = Ascending;
+        TargetFlightAltitude = static_cast<double>(MaxAltitude);
+    } else if (CurrentState == Descending) {
+        // 下降途中改令 → 重新拉起转巡航。
+        CurrentState = Cruising;
+        TargetFlightAltitude = static_cast<double>(MaxAltitude);
+    } else if (CurrentState == Hovering) {
+        CurrentState = Cruising;
     }
 
     DirStruct facing = CoordMath::DirectionTo(CurrentCoord, to);
@@ -114,7 +131,8 @@ void JumpjetLocomotionClass::Move_To(CoordStruct to)
 }
 
 // ============================================================================
-// Stop_Moving - Stops jumpjet movement. Initiates descent if airborne.
+// Stop_Moving - 收令：空中则转入下降，落点由 FindLandingZone 选定。
+// asm: Process 里状态机收到 Destination=0 时把目标高度压到 0 并转下降。
 // ============================================================================
 
 void JumpjetLocomotionClass::Stop_Moving()
@@ -124,6 +142,7 @@ void JumpjetLocomotionClass::Stop_Moving()
     if (CurrentState == Cruising || CurrentState == Hovering) {
         FindLandingZone();
         CurrentState = Descending;
+        TargetFlightAltitude = 0.0;
         TargetAltitude = 0;
     }
 }
@@ -166,26 +185,82 @@ void JumpjetLocomotionClass::Do_Turn(DirStruct coord)
 }
 
 // ============================================================================
-// Process - Main jumpjet movement loop. State machine for all jumpjet states.
+// TickCommon - 每帧公共段（所有状态前先跑）。
+// asm: sub_54D0F0   (asm 主库 721618)
+//   1) 高度插值：目标高度 78h > 当前 70h 时按 30h 爬升率上抬，并以 20h 为上限；
+//      目标 < 当前时按 30h*1.5 下沉，落到 0 为止。
+//   2) 悬停摆动相位 88h 按 34h 阻尼推进（非悬停/巡航时清零）。
+//   3) 离子风暴：飞行中的跳跃喷气遇风暴激活即坠毁（Crash）。
+// ============================================================================
+
+void JumpjetLocomotionClass::TickCommon()
+{
+    // --- 1) 高度插值 ---
+    if (TargetFlightAltitude > FlightAltitude) {
+        FlightAltitude += static_cast<double>(ClimbRate);
+        if (FlightAltitude > static_cast<double>(MaxAltitude)) {
+            FlightAltitude = static_cast<double>(MaxAltitude);
+        }
+    } else if (TargetFlightAltitude < FlightAltitude) {
+        FlightAltitude -= static_cast<double>(ClimbRate) * 1.5;
+        if (FlightAltitude < 0.0) {
+            FlightAltitude = 0.0;
+        }
+    }
+
+    Altitude = static_cast<int32>(FlightAltitude);
+    CurrentCoord.Z = Altitude;
+
+    // --- 3) 悬停摆动相位 ---
+    const bool suspended = (CurrentState == Hovering || CurrentState == Cruising);
+    if (suspended && !IsMoving) {
+        // asm:dbl_7ECE60 / dbl_7E3CC0 是两个衰减常数，此处以固定步进近似同一相位推进。
+        HoverPhase += 0.05;
+        if (HoverPhase > 6.283185307179586) {
+            HoverPhase -= 6.283185307179586;
+        }
+    } else {
+        HoverPhase = 0.0;
+    }
+
+    // --- 4) 离子风暴坠毁 ---
+    if (Owner && CurrentState != Grounded && CurrentState != Crashing) {
+        if (ScenarioClass::Instance->SpecialFlags.IonStorms()) {
+            Crash();
+        }
+    }
+}
+
+// ============================================================================
+// Process - 跳跃喷气每帧驱动入口。
+// asm: JumpjetLocomotionClass_Process   (asm:105)
+//   先跑 TickCommon，再按 [4Ch]（任务状态）做 7 路分派：
+//     0 → 落地待命  1 → 爬升  2 → 悬停  3 → 巡航  4 → 下降  5 → 触地  6 → 收尾
 // ============================================================================
 
 bool JumpjetLocomotionClass::Process()
 {
+    if (!Owner) {
+        return false;
+    }
+
+    TickCommon();
+
     if (IsCrashing) {
         return ProcessCrash();
     }
 
     switch (CurrentState) {
         case Grounded:
-            return ProcessGrounded();
+            return ProcessLanded();
         case Ascending:
-            return ProcessAscending();
-        case Cruising:
-            return ProcessCruising();
+            return ProcessClimb();
         case Hovering:
-            return ProcessHovering();
+            return ProcessHover();
+        case Cruising:
+            return ProcessCruise();
         case Descending:
-            return ProcessDescending();
+            return ProcessDescent();
         case Crashing:
             return ProcessCrash();
         default:
@@ -196,160 +271,275 @@ bool JumpjetLocomotionClass::Process()
 }
 
 // ============================================================================
-// ProcessGrounded - Jumpjet is on the ground.
+// ResolveCruiseHeight - 巡航高度（上限）。
+// asm: sub_54D0F0 读 [esi+20h]；该值在 Process 起始由机型的高度字段算出
+//   （Rules->JumpJetHeight / 类型默认），缺省回落到本类的 CruiseHeight。
 // ============================================================================
 
-bool JumpjetLocomotionClass::ProcessGrounded()
+int32 JumpjetLocomotionClass::ResolveCruiseHeight() const
 {
+    int32 height = MaxAltitude;
+    if (height <= 0) {
+        height = static_cast<int32>(CruiseHeight);
+    }
+    if (height <= 0) {
+        height = 300;
+    }
+    return height;
+}
+
+// ============================================================================
+// FaceDestination - 把"朝往点方向"交给载体的 FacingClass。
+// asm: sub_54BA30 的 Desired_Facing256 + FacingClass::Set_Desired。
+// ============================================================================
+
+bool JumpjetLocomotionClass::FaceDestination()
+{
+    if (!Owner) {
+        return false;
+    }
+
+    CoordStruct target = !(MovingDestination == CoordStruct(0, 0, 0))
+        ? MovingDestination : Dest;
+    if (target == CoordStruct(0, 0, 0)) {
+        return false;
+    }
+
+    DirStruct facing = CoordMath::DirectionTo(CurrentCoord, target);
+    JumpDirection = facing;
+    Do_Turn(facing);
+    return true;
+}
+
+// ============================================================================
+// ProcessLanded - case 0：落地/待命。
+// asm: sub_54B980   (asm 主库 718999)
+//   若已有移动指令 → 把朝向对向目的地、清空坠落相关计数、把巡航高度上限写入
+//   本机，随后转入爬升态；离子风暴激活时不起飞。否则保持 Ready 姿态。
+// ============================================================================
+
+bool JumpjetLocomotionClass::ProcessLanded()
+{
+    FlightAltitude = 0.0;
     Altitude = 0;
     CurrentCoord.Z = 0;
+
+    const bool hasOrder = IsMoving
+        || !(MovingDestination == CoordStruct(0, 0, 0));
+
+    if (hasOrder && Owner) {
+        MaxAltitude = ResolveCruiseHeight();
+
+        if (ScenarioClass::Instance->SpecialFlags.IonStorms()) {
+            if (Owner) {
+                Owner->SetCoords(CurrentCoord);
+                Owner->SetSequence(Sequence::Ready);
+            }
+            return false;
+        }
+
+        FaceDestination();
+        CrashTimer = 0;
+        HoverPhase = 0.0;
+        CurrentState = Ascending;
+        TargetFlightAltitude = static_cast<double>(MaxAltitude);
+
+        Owner->SetCoords(CurrentCoord);
+        Owner->SetSequence(Sequence::Fly);
+        return true;
+    }
 
     if (Owner) {
         Owner->SetCoords(CurrentCoord);
         Owner->SetSequence(Sequence::Ready);
     }
-
     return false;
 }
 
 // ============================================================================
-// ProcessAscending - Jumpjet is climbing to cruising altitude.
+// ProcessClimb - case 1：爬升到巡航高度。
+// asm: sub_54BA30   (asm 主库 719081)
+//   高度未到上限时朝目的地转向并持续爬升；到达后若目的地格净空则转入巡航，
+//   否则先在原地悬停（保持高度），等待下一帧重试。
 // ============================================================================
 
-bool JumpjetLocomotionClass::ProcessAscending()
+bool JumpjetLocomotionClass::ProcessClimb()
 {
-    int32 climbRate = static_cast<int32>(Climb * 50.0f);
-    Altitude += climbRate;
-
-    if (Altitude >= static_cast<int32>(CruiseHeight)) {
-        Altitude = static_cast<int32>(CruiseHeight);
-        TargetAltitude = Altitude;
-        CurrentState = Cruising;
+    if (!Owner) {
+        return false;
     }
 
-    CurrentCoord.Z = Altitude;
+    TargetFlightAltitude = static_cast<double>(ResolveCruiseHeight());
+    FaceDestination();
 
-    if (Owner) {
-        Do_Turn(JumpDirection);
-        Owner->SetCoords(CurrentCoord);
-        Owner->SetSequence(Sequence::Fly);
+    const bool atCruise = (Altitude >= ResolveCruiseHeight());
+    if (atCruise) {
+        // 到顶：目的地格净空则转巡航，否则悬停原地。
+        const CoordStruct head = !(MovingDestination == CoordStruct(0, 0, 0))
+            ? MovingDestination : Dest;
+        if (LocationClear(head)) {
+            CurrentState = Cruising;
+        } else {
+            CurrentState = Hovering;
+        }
     }
 
+    Owner->SetCoords(CurrentCoord);
+    Owner->SetSequence(Sequence::Fly);
     return true;
 }
 
 // ============================================================================
-// ProcessCruising - Jumpjet is flying at cruising altitude.
+// ProcessCruise - case 3：巡航平飞。
+// asm: jumpjet2   (asm 主库 719714)
+//   保持巡航高度，朝朝往点逐帧推进；到位即转悬停。推进速度取载体现行速度
+//   与 SpeedPercentage 的折合。
 // ============================================================================
 
-bool JumpjetLocomotionClass::ProcessCruising()
+bool JumpjetLocomotionClass::ProcessCruise()
 {
-    if (!IsMoving) {
+    if (!Owner) {
+        return false;
+    }
+
+    TargetFlightAltitude = static_cast<double>(ResolveCruiseHeight());
+
+    if (!IsMoving && (MovingDestination == CoordStruct(0, 0, 0))) {
         CurrentState = Hovering;
         return true;
     }
 
-    int32 moveSpeed = JumpSpeed;
-    int32 effectiveSpeed = static_cast<int32>(static_cast<float>(moveSpeed) * SpeedPercentage);
+    FaceDestination();
 
-    if (Owner) {
-        DirStruct facing = CoordMath::DirectionTo(CurrentCoord, MovingDestination);
-        Do_Turn(facing);
+    const int32 baseSpeed = Owner->GetCurrentSpeed() > 0
+        ? Owner->GetCurrentSpeed() : JumpSpeed;
+    int32 step = static_cast<int32>(static_cast<float>(baseSpeed) * SpeedPercentage);
+    if (step <= 0) {
+        step = 1;
     }
 
-    CurrentCoord = VectorMath::MoveTowards(CurrentCoord, MovingDestination, effectiveSpeed);
-    CurrentCoord.Z = Altitude;
-
-    int32 dist = CurrentCoord.DistanceFrom(MovingDestination);
-    if (dist <= effectiveSpeed) {
+    const int32 dist = CurrentCoord.DistanceFrom(MovingDestination);
+    if (dist <= step) {
         CurrentCoord = MovingDestination;
         CurrentCoord.Z = Altitude;
         CurrentState = Hovering;
         IsMoving = false;
+    } else {
+        CurrentCoord = VectorMath::MoveTowards(CurrentCoord, MovingDestination, step);
+        CurrentCoord.Z = Altitude;
     }
 
-    if (Owner) {
-        Owner->SetCoords(CurrentCoord);
-        Owner->SetSequence(Sequence::Fly);
-    }
-
+    Owner->SetCoords(CurrentCoord);
+    Owner->SetSequence(Sequence::Fly);
     return true;
 }
 
 // ============================================================================
-// ProcessHovering - Jumpjet is hovering in place.
+// ProcessHover - case 2：原地悬停保持巡航高度。
+// asm: sub_54BD30   (asm 主库 719414)
+//   悬停期间插值把高度拉回巡航上限；一旦重新收到移动指令即转巡航。
 // ============================================================================
 
-bool JumpjetLocomotionClass::ProcessHovering()
+bool JumpjetLocomotionClass::ProcessHover()
 {
-    if (IsMoving) {
+    if (!Owner) {
+        return false;
+    }
+
+    if (IsMoving && !(MovingDestination == CoordStruct(0, 0, 0))) {
         CurrentState = Cruising;
         return true;
     }
 
-    if (Altitude != static_cast<int32>(HoverHeight)) {
-        if (Altitude > static_cast<int32>(HoverHeight)) {
-            Altitude -= 5;
-            if (Altitude < static_cast<int32>(HoverHeight)) {
-                Altitude = static_cast<int32>(HoverHeight);
-            }
-        } else {
-            Altitude += 5;
-            if (Altitude > static_cast<int32>(HoverHeight)) {
-                Altitude = static_cast<int32>(HoverHeight);
-            }
-        }
-    }
+    TargetFlightAltitude = static_cast<double>(ResolveCruiseHeight());
 
-    CurrentCoord.Z = Altitude;
-
-    if (Owner) {
-        Owner->SetCoords(CurrentCoord);
-        Owner->SetSequence(Sequence::IdleFly);
-    }
-
+    Owner->SetCoords(CurrentCoord);
+    Owner->SetSequence(Sequence::IdleFly);
     return true;
 }
 
 // ============================================================================
-// ProcessDescending - Jumpjet is descending to ground.
+// ProcessDescent - case 4：下降进场。
+// asm: sub_54C550   (asm 主库 720281)
+//   一边朝落点水平推进，一边把目标高度压到 0；触地后转触地处理。
 // ============================================================================
 
-bool JumpjetLocomotionClass::ProcessDescending()
+bool JumpjetLocomotionClass::ProcessDescent()
 {
-    int32 descendRate = static_cast<int32>(Climb * 50.0f);
-    Altitude -= descendRate;
-
-    if (Altitude <= 0) {
-        Altitude = 0;
-        CurrentCoord.Z = 0;
-        CurrentState = Grounded;
-
-        if (!IsValidLandingCell()) {
-            Crash();
-            return true;
-        }
-
-        if (Owner) {
-            Owner->SetCoords(CurrentCoord);
-            Owner->SetSequence(Sequence::Ready);
-        }
-
+    if (!Owner) {
         return false;
     }
 
-    CurrentCoord.Z = Altitude;
+    TargetFlightAltitude = 0.0;
 
-    if (Owner) {
-        Owner->SetCoords(CurrentCoord);
-        Owner->SetSequence(Sequence::Fly);
+    CoordStruct target = !(MovingDestination == CoordStruct(0, 0, 0))
+        ? MovingDestination : CurrentCoord;
+
+    if (!(target == CurrentCoord)) {
+        FaceDestination();
+        const int32 baseSpeed = Owner->GetCurrentSpeed() > 0
+            ? Owner->GetCurrentSpeed() : JumpSpeed;
+        const int32 step = static_cast<int32>(
+            static_cast<float>(baseSpeed) * SpeedPercentage);
+        if (step > 0) {
+            CoordStruct horiz = CurrentCoord;
+            horiz.Z = 0;
+            CoordStruct tgt = target;
+            tgt.Z = 0;
+            const int32 hdist = horiz.DistanceFrom(tgt);
+            if (hdist > 0) {
+                int32 use = (hdist < step) ? hdist : step;
+                CurrentCoord = VectorMath::MoveTowards(CurrentCoord, target, use);
+            }
+        }
     }
 
+    if (Altitude <= 0) {
+        CurrentCoord.Z = 0;
+        return ProcessTouchdown();
+    }
+
+    CurrentCoord.Z = Altitude;
+    Owner->SetCoords(CurrentCoord);
+    Owner->SetSequence(Sequence::Fly);
     return true;
 }
 
 // ============================================================================
-// ProcessCrash - Jumpjet is crashing.
+// ProcessTouchdown - case 5：触地落位。
+// asm: sub_54CA90   (asm 主库 720843)
+//   落点不可用时转入坠毁；否则落位到地面、切 Ready 姿态、恢复占用位。
+// ============================================================================
+
+bool JumpjetLocomotionClass::ProcessTouchdown()
+{
+    if (!Owner) {
+        return false;
+    }
+
+    if (!IsValidLandingCell()) {
+        Crash();
+        return true;
+    }
+
+    Altitude = 0;
+    FlightAltitude = 0.0;
+    CurrentCoord.Z = 0;
+    CurrentState = Grounded;
+    IsMoving = false;
+    MovingDestination = CoordStruct(0, 0, 0);
+    Dest = CoordStruct(0, 0, 0);
+    TargetFlightAltitude = 0.0;
+
+    Mark_All_Occupation_Bits(MarkType::Up);
+    Owner->SetCoords(CurrentCoord);
+    Owner->SetSequence(Sequence::Ready);
+    return false;
+}
+
+// ============================================================================
+// ProcessCrash - 坠毁：每帧下沉，计时结束后趴地。
+// asm: Process 崩溃分支（降落/坠毁姿态切换 Prone/Tumble）。
 // ============================================================================
 
 bool JumpjetLocomotionClass::ProcessCrash()
@@ -360,7 +550,7 @@ bool JumpjetLocomotionClass::ProcessCrash()
     if (Altitude < 0) {
         Altitude = 0;
     }
-
+    FlightAltitude = static_cast<double>(Altitude);
     CurrentCoord.Z = Altitude;
 
     if (CrashTimer <= 0) {
@@ -368,6 +558,7 @@ bool JumpjetLocomotionClass::ProcessCrash()
         CurrentState = Grounded;
         IsMoving = false;
         Altitude = 0;
+        FlightAltitude = 0.0;
         CurrentCoord.Z = 0;
 
         if (Owner) {
@@ -492,9 +683,12 @@ void JumpjetLocomotionClass::Jump()
         return;
     }
 
+    MaxAltitude = ResolveCruiseHeight();
     CurrentState = Ascending;
-    TargetAltitude = static_cast<int32>(CruiseHeight);
+    TargetFlightAltitude = static_cast<double>(MaxAltitude);
+    TargetAltitude = MaxAltitude;
     Altitude = 0;
+    FlightAltitude = 0.0;
 }
 
 // ============================================================================

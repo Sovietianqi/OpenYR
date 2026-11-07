@@ -11,6 +11,8 @@
 // ============================================================================
 class OverlayTypeClass;
 class HouseClass;
+class Surface;
+struct Point2D;
 
 // ============================================================================
 // OverlayClass - instance of an overlay (walls, bridges, tiberium, etc.)
@@ -37,6 +39,25 @@ public:
     virtual void ComputeCRC(CRCEngine& crc) const override;
 
     virtual void Update() override;
+
+    // asm: OverlayClass_GetType (0x5FDE90, mov eax,[ecx+0ACh] ; retn)
+    virtual ObjectTypeClass* GetType() const override;
+    // asm: OverlayClass_GetAbstractDerivationID (0x5FDF0F, mov eax,14h ; retn)
+    virtual int32 GetAbstractDerivationID() const;
+    // asm: OverlayClass_PointerGotInvalid (0x71D0xx, retn 8 -> 2 args)
+    virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
+
+    // asm: OverlayClass_Draw (0x5FD980, __thiscall(this, coords, OtherSurface),
+    //   retn 8 -> two arguments).  Selects the overlay frame from the growth
+    //   stage / wall-damage byte and blits it at the cell screen position.
+    void Draw(Point2D* pCoords, Surface* pOtherSurface) const;
+
+    // asm: OverlayClass::Place (0x5FC480, retn 10h) / OverlayClass_Put (0x5FD070).
+    //   Place resolves the target cell from the pixel coords, stamps the overlay
+    //   index / data into it and runs the placement side effects; Put re-anchors
+    //   an already placed overlay after a scroll.
+    bool Place(CoordStruct* pCoords, int32 overlayData, int32 a4);
+    bool Put(CoordStruct* pCoords, int32 a3);
 
     // Overlay-specific helpers
     int32  Get_CRC() const;

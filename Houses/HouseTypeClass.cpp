@@ -111,6 +111,10 @@ int32 HouseTypeClass::Init_Defaults()
         }
         pType->ParentCountry[j] = '\0';
 
+        // asm: HouseTypeClass_One_Time stamps each entry with its slot; the
+        //   owner bitmask shifts by this index, so leaving it at the
+        //   constructor default makes 1 << (index & 0x1F) collapse to bit 31.
+        pType->ArrayIndex        = i;
         pType->SideIndex         = entry.Side;
         pType->ColorSchemeIndex  = entry.Color;
         pType->Multiplay         = entry.Multiplay;
@@ -190,8 +194,10 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     }
 
     // ── Side + color scheme ─────────────────────────────────────────────
-    SideIndex = pINI->ReadInteger(section, "Side", SideIndex);
-    ColorSchemeIndex = pINI->ReadInteger(section, "Color", ColorSchemeIndex);
+    // asm: INIClass_GetSide / INIClass_GetColorSchemeIdx —— 两者都按名字在
+    //   Sides / ColorScheme 表里查序号，查不到回落旧值（asm 用旧值做 fallback）。
+    SideIndex = pINI->GetSide(section, "Side", SideIndex);
+    ColorSchemeIndex = pINI->GetColorSchemeIdx(section, "Color", ColorSchemeIndex);
 
     // ── Multiplay flags ─────────────────────────────────────────────────
     Multiplay = pINI->ReadBool(section, "Multiplay", Multiplay);
@@ -254,7 +260,8 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
 
     pINI->ReadString(section, "Suffix", Suffix, Suffix, sizeof(Suffix));
     pINI->ReadString(section, "ParentCountry", ParentCountry, ParentCountry, sizeof(ParentCountry));
-    Color = pINI->ReadInteger(section, "Color", Color);
+    // asm: Color 用 INIClass_GetColorSchemeIdx（按颜色方案名查序号）。
+    Color = pINI->GetColorSchemeIdx(section, "Color", Color);
     Groundspeed = pINI->ReadFixed(section, "Groundspeed", Groundspeed);
     Airspeed = pINI->ReadFixed(section, "Airspeed", Airspeed);
     ArmorType = pINI->ReadFixed(section, "Armor", ArmorType);
@@ -284,7 +291,10 @@ bool HouseTypeClass::LoadFromINI(CCINIClass* pINI) {
     BuildTimeBuildingsMult = pINI->ReadFixed(section, "BuildTimeBuildingsMult", BuildTimeBuildingsMult);
     BuildTimeDefensesMult = pINI->ReadFixed(section, "BuildTimeDefensesMult", BuildTimeDefensesMult);
     IncomeMult = pINI->ReadFixed(section, "IncomeMult", IncomeMult);
-    Side = pINI->ReadInteger(section, "Side", Side);
+    // asm: Side 用 INIClass_GetSide（按阵营名查序号）；同时把名字查得的序号
+    //   写回 SideIndex，保持实例侧对 Type->SideIndex 的读取一致。
+    Side = pINI->GetSide(section, "Side", Side);
+    SideIndex = Side;
 
     // ── Veteran starting units ──────────────────────────────────────────
     ReadVeteranList(pINI, section, "VeteranInfantry", VeteranInfantry);
@@ -356,6 +366,21 @@ bool HouseTypeClass::SaveToINI(CCINIClass* pINI) {
     pINI->WriteDouble(section, "IncomeMult", static_cast<double>(IncomeMult));
 
     return true;
+}
+
+// ============================================================================
+// GetMaxSize  (asm: HouseTypeClass_GetMaxSize, retn 8)
+//
+//   pcbSize 为空 -> E_POINTER (0x80004003)。否则把 64 位尺寸设为固定结构
+//   大小 0x1B4（低双字 0x1B4、高双字 0）。
+// ============================================================================
+HRESULT HouseTypeClass::GetMaxSize(uint64* pcbSize)
+{
+    if (pcbSize == nullptr)
+        return (HRESULT)0x80004003;   // E_POINTER
+
+    *pcbSize = 0x1B4u;
+    return S_OK;
 }
 
 // ============================================================================

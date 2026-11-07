@@ -97,3 +97,50 @@ bool MP::ReadNthPlayerName(wchar_t* pOut, int32 index)
     }
     return true;
 }
+
+// ============================================================================
+// MP::ReadNthPlayerName (narrow) -- asm MP_ReadNthPlayerName (0x7350C0)
+//
+//   8 个 1KB 的窄字符槽轮转复用，返回值指向本次写入的那一格。调用方只在
+//   打印之前用一次，所以在下一轮调用覆盖它之前一直是有效的。
+// ============================================================================
+static char   s_NarrowPlayerNames[8][0x400];
+static uint32 s_NarrowPlayerNameSlot = 0;   // asm: idxCurPlayer
+
+const char* MP::ReadNthPlayerName(const wchar_t* pWide)
+{
+    // asm: test ecx,ecx / jnz loc_7350C7 / xor eax,eax / retn
+    if (pWide == nullptr) {
+        return "";
+    }
+
+    char* dest = s_NarrowPlayerNames[s_NarrowPlayerNameSlot];
+
+    // asm: mov edi,400h / esi = eax ; 逐 2 字节取低位、最多 0x400 次
+    int32 remaining = 0x400;
+    const wchar_t* src = pWide;
+    if (*src != L'\0') {
+        do {
+            if (remaining == 0) {
+                break;   // asm: test edi,edi / jz loc_7350FB
+            }
+            // asm: mov dl,[ecx] / add ecx,2 / mov [esi],dl / inc esi
+            *dest++ = static_cast<char>(*src & 0xFF);
+            ++src;
+            // asm: cmp edi,0FFFFFFFFh / jz +1 / dec edi
+            if (remaining != -1) {
+                --remaining;
+            }
+        } while (*src != L'\0');
+    }
+
+    // asm: mov byte ptr [esi],0 / mov byte ptr [eax+3FFh],0
+    char* result  = s_NarrowPlayerNames[s_NarrowPlayerNameSlot];
+    dest[0]       = '\0';
+    result[0x3FF] = '\0';
+
+    // asm: mov ecx,idxCurPlayer / inc ecx / and ecx,7 / mov idxCurPlayer,ecx
+    s_NarrowPlayerNameSlot = (s_NarrowPlayerNameSlot + 1) & 7;
+
+    return result;
+}
