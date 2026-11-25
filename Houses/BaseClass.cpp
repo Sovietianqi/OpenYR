@@ -333,9 +333,15 @@ bool BaseClass::Placed(BuildingClass* pBuilding)
         return false;
 
     // asm: mov eax,[ebp+21Ch] / cmp eax,[esi+74h]
-    if (pBuilding->GetOwningHouseIndex() == this->OwnerHouseIndex) {
+    //
+    //   OwnerHouseIndex 在本树有几条建房路径（Scenario 大厅、MakeHouses）
+    //   未必都被赋值；留 -1 时用"调用本函数的这个建筑自己的房索引"兜底 ——
+    //   Placed 本来就是由该房自己的 Unlimbo 调的，两者必然同一房。
+    const int32 baseOwnerIndex = (this->OwnerHouseIndex >= 0)
+        ? this->OwnerHouseIndex : pBuilding->GetOwningHouseIndex();
+    if (pBuilding->GetOwningHouseIndex() == baseOwnerIndex) {
         // asm: mov eax,[esi+14h] / xor edi,edi / test / jle loc_42F2DE
-        const BuildingTypeClass* pBuildingType = pBuilding->Type;
+        BuildingTypeClass* pBuildingType = pBuilding->Type;
         const int32 wantIndex =
             (pBuildingType != nullptr) ? pBuildingType->Get_ArrayIndex() : -1;
 
@@ -343,12 +349,40 @@ bool BaseClass::Placed(BuildingClass* pBuilding)
             BaseNodeClass& node = this->Nodes[i];
 
             // asm: mov eax,[edx+NumberInArray] / cmp eax,[ebx]
-            if (reinterpret_cast<intptr_t>(node.pType) !=
-                static_cast<intptr_t>(wantIndex))
+            //
+            //   ★ 本工程的节点里存的是 BuildingTypeClass*（GenerateAIBuildList
+            //     ⑦ 段写指针），原版存的是数组下标。两种编码都认：先比指针，
+            //     再比下标，否则"类型匹配"这一支永远走不通，节点打不上标记。
+            const intptr_t nodeRaw = reinterpret_cast<intptr_t>(node.pType);
+            bool typeMatch =
+                (node.pType == pBuildingType)
+                || (wantIndex >= 0 && nodeRaw == static_cast<intptr_t>(wantIndex));
+
+            // 指针/下标都不等时按 ID 认：本树的类型注册走 FindOrAllocate，
+            //   同名类型在"列表登记"与"DeploysInto / FreeUnit 引用"两条路径上
+            //   有可能拿到不同实例，指针比对随之失效，节点永远打不上标记 ——
+            //   AI 就会反复造同一座建筑（实测 bldTo 卡在 GAWEAP、n08 停在 3）。
+            if (!typeMatch && node.pType != nullptr && pBuildingType != nullptr
+                && node.pType->ID[0] != '\0' && pBuildingType->ID[0] != '\0')
+            {
+                typeMatch = (std::strcmp(node.pType->ID, pBuildingType->ID) == 0);
+            }
+            if (!typeMatch)
                 continue;
 
             // asm: call [edx+1B8h] -- the building's own cell
             const CellStruct cell = pBuilding->Get_Cell_Ptr_Coord();
+
+            // 节点格还是初始的 (0,0)：首次落位就把节点钉到真实格子上。
+            //   AI 清单生成时并不选点（原版由 Base 规划器在放置前填格），
+            //   若这一步不写回，arm1 的"格子相等"永远不成立。
+            if (node.Cell.X == 0 && node.Cell.Y == 0) {
+                node.Cell = cell;
+                node.field_08 = 1;
+                node.field_0C = 0;
+                return true;
+            }
+
             if (cell.X != node.Cell.X || cell.Y != node.Cell.Y)   // asm: cmp cx/[ebx+4]
                 continue;
 
@@ -464,9 +498,20 @@ BaseNodeClass* BaseClass::Next_Buildable(int32 a2)
             if (Is_Node_Occupied(i)) {
                 continue;
             }
-            // asm: Session == 0 -> 直接返回该节点
+            // asm: Session == 0 -> 直接返回该节点 / 否则看 field_08 == 0。
+            //
+            //   ★ 单机分支不能无条件返回：原版单机任务的节点由场景脚本预置，
+            //     节点自带格子，Is_Node_Occupied 足以判"建过没有"；本工程的
+            //     节点是 GenerateAIBuildList 现生成的，落位前格子是 (0,0)，
+            //     只靠 Is_Node_Occupied 判不出重复 —— AI 会拿着同一个节点
+            //     无限重造同一座建筑（实测造出 21 座后才因缺钱停下）。
+            //     Placed() 会把节点钉到真实格子并置 field_08=1，随后
+            //     Is_Node_Occupied 与 field_08 两条都能判"已建"。
             if (SessionClass::GetInstance() == nullptr) {
-                return &node;
+                if (node.field_08 == 0) {
+                    return &node;
+                }
+                continue;
             }
             // asm: mov cl,[eax+8] / test / jz -> field_08 == 0 则可用
             if (node.field_08 == 0) {

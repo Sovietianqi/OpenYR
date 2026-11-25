@@ -76,11 +76,8 @@ TriggerTypeClass* TriggerTypeClass::FindOrAllocate(const char* pID) {
     TriggerTypeClass* found = Find(pID);
     if (found) return found;
 
-    TriggerTypeClass* newItem = GameCreate<TriggerTypeClass>(pID);
-    if (newItem && Array) {
-        Array->Add(newItem);
-    }
-    return newItem;
+    // 构造函数自登记，勿重复 Add。
+    return GameCreate<TriggerTypeClass>(pID);
 }
 
 // ----------------------------------------------------------------------------
@@ -96,9 +93,18 @@ int32 TriggerTypeClass::GetCount() {
 
 TriggerTypeClass::TriggerTypeClass(const char* pID) noexcept
     : AbstractTypeClass(pID), FirstEvent(nullptr), FirstAction(nullptr),
-      NextTrigger(nullptr), Owner(nullptr), idxInArray(Array ? Array->Count : -1),
+      NextTrigger(nullptr), Owner(nullptr), idxInArray(-1),
       Easy(true), Normal(true), Hard(true), IsDisabled(false),
       IsRepeatable(false), IsEnabled(true) {
+    // asm: TriggerTypeClass_CTOR 尾部登记进 vec_TriggerTypes 并缓存下标。
+    //   原来只有在 Array 已被别人建好时才缓存下标、且**从不 Add**，
+    //   结果 [Triggers] 解析出的每一个类型都是孤儿：Find() 找不到、
+    //    TagType 解析时又新建一份，同一条触发器被复制成多份。
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<TriggerTypeClass*>();
+    }
+    idxInArray = Array->Count;
+    Array->AddItem(this);
 }
 
 TriggerTypeClass::~TriggerTypeClass() {
@@ -243,7 +249,12 @@ bool TriggerTypeClass::LoadFromINI(CCINIClass* pINI) {
     token = std::strtok(nullptr, ",");
     Hard = (token != nullptr && std::atoi(token) != 0);
 
-    // Token 8: repeatable.
+    // Token 8: TRANSFERABLE（标签是否随载具被击毁 / 被占领而转移）。
+    //   注意：这不是"可重复"标志 —— 重复由 [Tags] 的 PERSISTENCE 决定
+    //   （0 一次性 / 1 全灭后一次 / 2 可重复）。TS/RA2/YR 的 [Triggers]
+    //   行固定是 HOUSE,LINKED_TRIGGER,NAME,DISABLED,EASY,NORMAL,HARD,
+    //   TRANSFERABLE 八段，ModEnc 明确说明 persistence 写在 tag 上。
+    //   本树暂无 transferable 的消费方，先落进 IsRepeatable 仅作记录。
     token = std::strtok(nullptr, ",");
     IsRepeatable = (token != nullptr && std::atoi(token) != 0);
 
@@ -455,7 +466,8 @@ bool TriggerTypeClass::IsWPZoneEntry() const {
 bool TriggerTypeClass::InvolvesAllowWin() const {
     for (int32 i = 0; i < ActionList.Count; ++i) {
         TActionClass* pAction = ActionList.Items[i];
-        if (pAction && static_cast<int32>(pAction->ActionKind) == 0x0F) return true;
+        // asm 比较的是 1-based kind 0x0F，ActionKind 存的是下标，故比 TAction::AllowWin。
+        if (pAction && static_cast<int32>(pAction->ActionKind) == static_cast<int32>(TAction::AllowWin)) return true;
     }
     return false;
 }
@@ -546,7 +558,8 @@ int32 TriggerTypeClass::GetFlags() const {
     for (int32 i = 0; i < ActionList.Count; ++i) {
         TActionClass* pAction = ActionList.Items[i];
         if (pAction != nullptr) {
-            flags |= getActionFlags(static_cast<int32>(pAction->ActionKind));
+            // getActionFlags 的表按 asm 的 1-based kind - 14 索引。
+            flags |= getActionFlags(static_cast<int32>(pAction->ActionKind) + 1);
         }
     }
     if (NextTrigger != nullptr) {

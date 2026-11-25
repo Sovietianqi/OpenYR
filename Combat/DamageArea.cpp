@@ -126,8 +126,11 @@ void DamageArea::ApplyCellDamage(CoordStruct center, int32 damage, TechnoClass* 
     if (!pWarhead) return;
     if (!MapClass::Instance) return;
 
-    float cellSpread = pWarhead->GetCellSpread();
-    if (cellSpread <= 0.0f) return;
+    // 注意：CellSpread == 0 的弹头（步枪、坦克炮这类"直接命中"弹头）同样
+    //   要结算——原版 Damage_At_Cell 的收集半径就是 floor(CellSpread)，
+    //   为 0 时只处理命中格自身，直接命中正是靠这一步扣血。
+    //   此前这里提前 return，导致所有无溅射武器打不掉血。
+    const float cellSpread = pWarhead->GetCellSpread();
 
     // ========================================================================
     // 正式实现：走原版 Damage_At_Cell_Update_489280 的 1:1 复刻

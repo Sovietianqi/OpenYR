@@ -393,6 +393,11 @@ public:
     int32       BuildingAbandonedSound;
     int32       BuildingRepairedSound;
     int32       CheerSound;
+    // asm: RulesData+720h / +72Ch —— Stop / Deploy 命令受理后播放的确认语音。
+    //   原版把索引直接内联在 RulesClass 结构里（+720h~+72Ch 连续三个 int32），
+    //   此处按同一段落名；-1 表示未配置，调用方据此跳过播放。
+    int32       VoiceStop = -1;
+    int32       VoiceDeploy = -1;
     int32       PlaceBeaconSound;
     int32       DefaultChronoSound;
     int32       StartPlanningModeSound;
@@ -1251,7 +1256,8 @@ public:
     AnimTypeClass* EMPulseSparkles;
     float       EngineerCaptureLevel;
     float       EngineerCaptureLevel_;
-    float       TalkBubbleTime;
+    // asm: RulesClass +0x1800 —— int32，毫秒。构造里写 0x12C (300)。
+    int32       TalkBubbleTime;
 
     // ========================================================================
     // Properties - Radiation

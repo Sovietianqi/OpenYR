@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstdlib>
+
 #include <Core/Definitions.h>
 #include <Core/Macros.h>
 #include <Core/Memory.h>
+#include <Core/Random2Class.h>
 #include <Math/CoordStruct.h>
 #include <Math/Timer.h>
 #include <Map/CellClass.h>
@@ -105,26 +108,31 @@ struct ScenarioFlags {
 };
 
 // ============================================================================
-// Randomizer - simple pseudo-random number generator
+// Randomizer —— 场景同步随机流（asm: ScenarioClass+0x218，类型 RandomizerClass）
+//
+//   原版这里就是 RandomizerClass（250 槽滞后异或表，见 Core/Random2Class）。
+//   早先这份实现是一个 4 字节 LCG，且 Randomize() 用 `this` 指针当种子 ——
+//   ScenarioClass 在堆上 new 出来、进程又是 PIE，地址每跑一次都不同，
+//   于是同一 seed 的两次运行从第一个随机数起就分叉。已改为原版算法。
 // ============================================================================
-struct Randomizer {
-    int32 Seed;
+struct Randomizer : public Random2Class {
+    Randomizer() noexcept : Random2Class() {}
 
-    Randomizer() : Seed(0) {}
-
+    // asm: ScenarioClass_Init → Random_Init(this+0x218, 0)
+    //   原版固定用种子 0（对局真正的会话种子由 sub_52FC20 另行灌入）。
+    //   回归时允许 OPENYR_SEED 覆盖，便于验证"同种子=同序列"。
     void Randomize() {
-        Seed = static_cast<int32>(reinterpret_cast<uintptr_t>(this) ^ 0x12345678);
+        int32 seed = 0;
+        if (const char* pSeed = std::getenv("OPENYR_SEED")) {
+            seed = static_cast<int32>(std::strtol(pSeed, nullptr, 10));
+        }
+        Init(seed);
     }
 
-    int32 Next() {
-        Seed = Seed * 1103515245 + 12345;
-        return (Seed >> 16) & 0x7FFF;
-    }
+    int32 Next() { return Random2Class::operator()(); }
 
     int32 Next(int32 minVal, int32 maxVal) {
-        if (minVal >= maxVal) return minVal;
-        int32 range = maxVal - minVal + 1;
-        return minVal + (Next() % range);
+        return Random2Class::operator()(minVal, maxVal);
     }
 };
 

@@ -102,8 +102,9 @@ TechnoClass* SlaveManagerClass::SpawnSlave()
         return nullptr;
     }
 
-    // asm: mov [eax+2DCh],Owner —— 记下奴隶的归属矿车。
+    // asm: mov [eax+2DCh],ecx —— 记下奴隶的归属矿车（TechnoClass::SlaveOwner）。
     pSlave->Set_Owner(Owner->Owner);
+    pSlave->SlaveOwner = Owner;
     return static_cast<TechnoClass*>(pSlave);
 }
 
@@ -432,6 +433,8 @@ void SlaveManagerClass::LoseSlave(TechnoClass* pSlave)
         pCtrl->TimeStart = Game::CurrentFrame;                  // [eax+8]=Frame
         pCtrl->field_C   = TimerVar;                            // [eax+C]=var
         pCtrl->TimeLeft  = RegenRate;                           // [eax+10]=SlaveRegen
+        // asm: mov dword ptr [edx+2DCh],0 —— 摘掉反向链接，奴隶不再受矿车管。
+        pSlave->SlaveOwner = nullptr;
         return;
     }
 }
@@ -493,6 +496,9 @@ void SlaveManagerClass::ReleaseSlaves(HouseClass* pNewOwnerHouse)
         } else {
             pDest = pFirstCivvie;
         }
+
+        // asm: 每个槽位处理前先清 [slave+2DCh]=0（解除矿车反向链接）。
+        pSlave->SlaveOwner = nullptr;
 
         if (pDest != nullptr) {
             pSlave->Set_Owner(pDest);                   // asm: vtable[0x3D4]

@@ -7,6 +7,7 @@
 #include <AI/TagClass.h>
 #include <AI/TriggerClass.h>
 #include <AI/TeamClass.h>
+#include <AI/TeamTypeClass.h>
 #include <AI/AITeamClass.h>
 #include <Combat/BombClass.h>
 #include <Houses/FactoryClass.h>
@@ -30,6 +31,9 @@
 #include <Special/WaveClass.h>
 
 #include <Core/Memory.h>
+
+#include <cstdio>
+#include <cstdlib>
 
 // ============================================================================
 // LogicClass.cpp
@@ -167,6 +171,85 @@ void LogicClass_Update()
             TeamClass* pTeam = (*TeamClass::Array)[i];
             if (pTeam != nullptr)
                 pTeam->Update();
+        }
+
+        // 临时诊断：每 300 帧打印一次队伍构成与工厂队列深度。
+        {
+            static const bool enableDump = (std::getenv("OPENYR_TEAMDBG") != nullptr);
+            static int32 lastDump = -9999;
+            if (enableDump && Game::CurrentFrame - lastDump >= 300) {
+                lastDump = Game::CurrentFrame;
+                std::fprintf(stderr, "[TEAMDBG] f=%d teams=%d\n",
+                             (int)Game::CurrentFrame, (int)TeamClass::Array->Count);
+                for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
+                    TeamClass* pT = (*TeamClass::Array)[i];
+                    if (pT == nullptr) continue;
+                    std::fprintf(stderr,
+                        "  [TEAMDBG]   t%d name=%s members=%d miss=%d m=%d counts=%d,%d,%d,%d,%d,%d\n",
+                        (int)i,
+                        (pT->Type ? pT->Type->ID : "?"),
+                        (int)pT->Members.Count,
+                        (int)pT->IsMissingMembers,
+                        (int)pT->CurrentMission,
+                        (int)pT->TeamCounts[0], (int)pT->TeamCounts[1],
+                        (int)pT->TeamCounts[2], (int)pT->TeamCounts[3],
+                        (int)pT->TeamCounts[4], (int)pT->TeamCounts[5]);
+                }
+                {
+                    for (int32 h = 0; h < HouseClass::ArrayCount; ++h) {
+                        HouseClass* pH = HouseClass::Array[h];
+                        if (pH == nullptr || pH->Type == nullptr) continue;
+                        std::fprintf(stderr, "  [HOUSEDBG] %s human=%d money=%d blds=%d units=%d inf=%d:",
+                                     pH->Type->ID, (int)pH->Is_Human(),
+                                     (int)pH->Credits,
+                                     (int)pH->OwnedBuildings.Count,
+                                     (int)pH->OwnedUnits.Count,
+                                     (int)pH->OwnedInfantry.Count);
+                        for (int32 k = 0; k < pH->OwnedBuildings.Count; ++k) {
+                            BuildingClass* pB = pH->OwnedBuildings[k];
+                            if (pB == nullptr || pB->Type == nullptr) continue;
+                            std::fprintf(stderr, " %s@%p%s", pB->Type->ID,
+                                         static_cast<void*>(pB),
+                                         pB->IsConstructed ? "" : "(wip)");
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+                if (FactoryClass::Array != nullptr) {
+                    for (int32 i = 0; i < FactoryClass::Array->Count; ++i) {
+                        FactoryClass* pF = (*FactoryClass::Array)[i];
+                        if (pF == nullptr) continue;
+                        std::fprintf(stderr,
+                            "  [FACTDBG]  f%d owner=%s bld=%s q=%d cur=%s online=%d prog=%d est=%d hold=%d cs=%d bal=%d money=%d\n",
+                            (int)i,
+                            (pF->GetOwner() && pF->GetOwner()->Type ? pF->GetOwner()->Type->ID : "?"),
+                            (pF->GetFactoryBuilding() && pF->GetFactoryBuilding()->Type ? pF->GetFactoryBuilding()->Type->ID : "orphan"),
+                            (int)pF->GetQueueCount(),
+                            (pF->GetCurrentOrder() ? pF->GetCurrentOrder()->ID : "none"),
+                            (int)(pF->Get_Product() != nullptr),
+                            (int)pF->GetProgress(),
+                            (int)pF->Get_EstimateFrames(),
+                            (int)pF->IsOnHold(),
+                            (int)pF->IsCompleteSuspended(),
+                            (int)pF->Get_Balance(),
+                            (pF->GetOwner() ? (int)pF->GetOwner()->Credits : -1));
+                    }
+                }
+            }
+        }
+
+        // ★ 回收已解散的队伍。
+        //   DoDisappear 只把成员清空并把 JustDisappeared 置位，队伍对象本身
+        //   仍留在 vec_Teams 里。不回收会有两个后果：① 每帧仍被 Update 走一遍
+        //   （虽已短路，但表会无限增长）；② HouseClass::CountInstancesOfTeam
+        //   把空壳算成"这种编队已经存在"，Max 名额永远不释放 —— 于是 AI
+        //   造出来的兵再也组不成新队伍，全部停在 Guard 驻守。
+        //   倒序删除：~TeamClass 会自己从 vec_Teams 摘除，倒序遍历保证下标安全。
+        for (int32 i = TeamClass::Array->Count - 1; i >= 0; --i)
+        {
+            TeamClass* pTeam = (*TeamClass::Array)[i];
+            if (pTeam != nullptr && pTeam->JustDisappeared)
+                delete pTeam;
         }
     }
 

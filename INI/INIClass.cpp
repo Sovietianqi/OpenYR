@@ -223,19 +223,14 @@ INIClass::~INIClass() noexcept
 
 void INIClass::Reset()
 {
-    // Delete all sections
-    INISection* section = Sections.First();
-    while (section)
-    {
-        INISection* next = static_cast<INISection*>(section->Next);
-        delete section;
-        section = next;
-    }
-    Sections.Reset();          // 元素已析构，链头必须归零（否则下次遍历是野指针）
-
-    delete LineComments;
-    LineComments = nullptr;
-
+    // asm: INIClass_Reset —— ★ 只把"当前解析游标"归位，**不清空已加载的段**。
+    //
+    //   原实现把 Sections 整条链删光，后果是：每个 *TypeClass::LoadFromINI
+    //   开头都会调它（ScriptTypeClass / AnimTypeClass / GameTypePrefsClass），
+    //   于是"加载完第一个类型，后面所有类型的 [] 段就全没了"——
+    //   [ScriptTypes] 读完 1 条后，[TaskForces]/[TeamTypes]/[AITriggerTypes]
+    //   整张表读到的是空 INI（实测 tfKeys 从 2 变 0）。
+    //   原版这里是"重置下一个待读游标"，语义上是幂等的读准备动作。
     CurrentSectionName = nullptr;
     CurrentSection = nullptr;
 }
@@ -1476,11 +1471,11 @@ CCINIClass* CCINIClass::LoadINIFile(const char* pFileName)
     CCINIClass* pINI = new CCINIClass();
     if (!pINI) return nullptr;
 
+    // 不再用 FileSystem::FileExists 预判：那是纯磁盘检查，而 rulesmd.ini /
+    // artmd.ini 在零售版里就躺在 ra2md.mix 内部。ReadCCFile 走的是
+    // CCFileClass::Open（先查 MIX 注册表、再落磁盘），失败会返回 false。
     CCFileClass* pFile = new CCFileClass(pFileName);
-    if (FileSystem::FileExists(pFileName))
-    {
-        pINI->ReadCCFile(pFile, false, false);
-    }
+    pINI->ReadCCFile(pFile, false, false);
     delete pFile;
 
     return pINI;

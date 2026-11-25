@@ -757,9 +757,14 @@ bool EventClass::HasOccurred(TEventClass* pEvent, int32 eventKind,
         case 13:   // SecondsHaveElapsed（asm 首落点 = 13）
         case 51: { // 同 SecondsHaveElapsed（跳转表索引 38）
             // asm: ActivationFrame { TimeStart @0x00, TimeLeft @0x08 }。
-            // OpenYR 側 TriggerClass 用单值 Timer 承接同一语义（剩余帧数）。
-            if (pTrigger == nullptr) return false;
-            return pTrigger->Timer <= 0;
+            //   原实现直接 `Timer <= 0` —— Timer 缺省就是 0，于是本条**恒真**，
+            //   任何带 "time elapsed" 的触发器在第一帧就开火。这里按参数语义
+            //   判定：param 是秒数，15 帧/秒。显式计时器（SetTimer）优先。
+            if (pTrigger != nullptr && pTrigger->Timer > 0) {
+                return false;              // 计时器尚未走完
+            }
+            if (param <= 0) return true;
+            return frame >= param * 15;
         }
         case 14: { // MissionTimerExpired
             if (pScenario == nullptr) return false;

@@ -1088,8 +1088,10 @@ public:
 //
 // 每帧的清零在 asm 里是按**脏区**做的（sub_6D2B60 里对 vec_DirtyAreas 的
 // 每一项算它与 rect_mouseclass_vp 的交，再 sub_7BCFB0(zbuf, rect) 填
-// 0FFFFh）。本树没有脏区向量，Draw() 本身是全量重绘，因此用整片清零等价
-// 覆盖：只要本帧重画的区域与脏区一致，z 内容就一致。
+// 0FFFFh）。本树在 TacticalClass 里建了同名容器 DirtyAreas，
+// TacticalClass::Flush_Dirty_Areas 逐块求交后调用 Clear_Rect，见
+// TacticalClass.cpp 的 Render。**不做整片清零** —— 脏区为空时一块都不清，
+// 这正是原版的语义（未变脏的区域保留上一帧写下的 z）。
 // ============================================================================
 class ZBufferClass
 {
@@ -1107,6 +1109,8 @@ public:
 
     // asm: sub_7BCFB0(zbuf, x, y, w, h) —— 视口坐标下的矩形清除
     void Clear_Rect(int32 x, int32 y, int32 w, int32 h);
+    // 同上，矩形形态（与 vec_DirtyAreas 里的 DirtyAreaStruct 同构）
+    void Clear_Rect(const Rectangle& rect);
 
     // asm: sub_7BD130 —— Lock(x, y - top) + [+10h]，再做一次回绕
     uint16* Lock(int32 x, int32 y);

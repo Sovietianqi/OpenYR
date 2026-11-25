@@ -1,5 +1,8 @@
 #include <Abstract/FootClass.h>
 #include <Abstract/BuildingTypeClass.h>
+#include <Abstract/UnitTypeClass.h>
+#include <Abstract/AircraftTypeClass.h>
+#include <Combat/WeaponTypeClass.h>
 #include <Locomotion/LocomotionClass.h>
 
 #include <Core/Memory.h>
@@ -22,9 +25,14 @@
 #include <Houses/HouseClass.h>
 #include <Game/GameInit.h>
 #include <Scenario/ScenarioClass.h>
+#include <Core/Random2Class.h>
 #include <Game/ChainDebug.h>   // 逐帧调用链探针（#6/#7 验证）
 
 #include <cstdlib>
+#include <cstdio>
+#include <vector>
+#include <queue>
+#include <functional>
 
 // 前置声明：这两个 helper 定义在本文件下方（asm 里被内联在各任务处理器尾部），
 // 上方多个 Mi_/Mission_ 处理器要先用到它们。
@@ -589,10 +597,111 @@ void FootClass::AI()
         }
     }
 
+    // ---- 段 K：空闲目标重评（asm TechnoClass::Target_Something_Nearby）------
+    //   原版由 TechnoClass_Update 的"目标重评计时器"分支驱动：计时器到点后
+    //   调 Target_Something_Nearby，由它重置计时器并在警戒半径内重新索敌。
+    //   本树此前没有任何地方调它 —— 单位即使站在敌人旁边也永远不会主动
+    //   开火，只能靠玩家手动下 Attack。这里补上同一套定时门。
+    if (!IsInLimbo && Health > 0)
+    {
+        const Mission current = GetMission();
+        const bool idleish = (current == Mission::Guard
+                           || current == Mission::AreaGuard
+                           || current == Mission::Hunt
+                           || current == Mission::Sleep);
+        if (idleish)
+        {
+            int32 remaining = TargetingTimer.TimeLeft;
+            if (TargetingTimer.StartTime != -1)
+            {
+                const int32 elapsed = frame - TargetingTimer.StartTime;
+                remaining = (elapsed >= remaining) ? 0 : (remaining - elapsed);
+            }
+
+            if (TargetingTimer.StartTime == -1 || remaining <= 0)
+                Target_Something_Nearby(0, 0);
+        }
+    }
+
     // ---- 段 J：传送收尾 + 挂靠对象推进 ------------------------------------
     // asm: 482511 起 —— 若不在"传送进入"中则跑一次落位收尾，并推进挂靠单位。
     //   本项目未建模挂靠单位指针（+0x694），且落位收尾 sub_70D7E0 依赖
     //   无线电台握手（Radio_SendCommand），故此处保持不动作。
+}
+
+// ============================================================================
+// asm: TechnoClass::Target_Something_Nearby(this, arg0, arg4)   (asm:1590090)
+//
+//   空闲单位每一轮"目标重评"的入口：重置计时器 → 淘汰打不成的旧目标 →
+//   在警戒半径内重新索敌。
+//   asm 里它是 TechnoClass 的虚函数（.rdata:007E2640），由 AI 在每个单位
+//   的更新周期里调用；本树把计时器放在 FootClass（+0x180/+0x188），故实现
+//   也落在这里，语义与调用时机保持一致。
+// ============================================================================
+bool FootClass::Target_Something_Nearby(int32 arg0, int32 arg4)
+{
+    const int32 frame = Game::GetCurrentFrame();
+
+    // asm: 计时器 TimeStart=Frame / TimeLeft = Rules 延迟 + Random(0,2)
+    int32 delay = 0;
+    RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr)
+    {
+        delay = (GetMission() == Mission::AreaGuard)
+              ? pRules->GuardAreaTargetingDelay
+              : pRules->NormalTargetingDelay;
+    }
+    TargetingTimer.StartTime = frame;
+    TargetingTimer.TimeLeft  = delay + NonCriticalRandomNumber(0, 2);
+
+    // asm loc_7098AC: 有目标 → 用开火状态淘汰打不成的旧目标。
+    //   状态 5（Movement）/ 6（Recharge，原版还会建生成节点）/ 8（Area）
+    //   一律 SetTarget(0)。
+    if (CurrentTarget != nullptr)
+    {
+        const AbstractType tgtWhat = CurrentTarget->WhatAmI();
+        if (tgtWhat == AbstractType::Unit || tgtWhat == AbstractType::Infantry
+         || tgtWhat == AbstractType::Aircraft || tgtWhat == AbstractType::Building)
+        {
+            TechnoClass* pTech = static_cast<TechnoClass*>(CurrentTarget);
+            const int32 idx   = SelectWeapon(pTech);
+            const int32 state = Can_Fire(pTech, idx, 1);
+            if (state == static_cast<int32>(FireError::Movement)
+             || state == static_cast<int32>(FireError::Recharge)
+             || state == static_cast<int32>(FireError::Area))
+                SetTarget(nullptr);
+        }
+        else
+        {
+            SetTarget(nullptr);       // 目标已不是可攻击的技术对象
+        }
+    }
+
+    // asm loc_709918: 仍然没有目标 → 在警戒半径内重新索敌。
+    if (CurrentTarget == nullptr)
+    {
+        // 掩码：把本单位两档武器的反地/反空标志折进来（同
+        //   UnitClass_SelectAutoTarget 的常规分支）。
+        int32 mask = 0;
+        if (TechnoType != nullptr)
+        {
+            for (int32 i = 0; i < 2; ++i)
+            {
+                WeaponStruct& ws = TechnoType->Weapons[i];
+                if (ws.WeaponType != nullptr)
+                    mask |= WeaponTypeClass::GetProjectileAGAA_Flags(ws.WeaponType);
+            }
+        }
+        if (mask == 0)
+            mask = static_cast<int32>(ProjectileTypeFlags::ttAllGround);
+
+        ObjectClass* pNew = Greatest_Threat(mask, arg0, 0);
+        if (pNew != nullptr)
+            SetTarget(pNew);
+        (void)arg4;
+    }
+
+    return CurrentTarget != nullptr;
 }
 
 // ============================================================================
@@ -1467,14 +1576,153 @@ int32 Foot_BuildRetreatPath(const CoordStruct* pRecentPath, int32 recentCount,
 // Movement helpers
 // ============================================================================
 
+// ============================================================================
+// FootClass::Find_Fallback_Cell —— 目标格不可入时的替代落点
+//
+//   原版 FootClass::Set_Destination（asm: TechnoClass_SetDestination 之上那层）
+//   对"目标格进不去"的处理不是报错，而是以目标格为中心向外找一格能站的地方：
+//   追击坦克时停在它旁边、点水面时走到最近的岸边，都是这条规则的结果。
+//
+//   本树的 Set_Destination 此前是"不可入 → return false"，于是 Mission_Guard
+//   把目标所在格设为目的地后立刻失败、单位原地不动（实测：Guard 的步兵面对
+//   敌方载具一格都不走）。
+//
+//   挑选次序（确定性，不含浮点）：
+//     ① 候选 = 目标格周围 1..4 环上所有可站格；
+//     ② **先比到目标格的平方距离** —— 落点必须是"贴着目标的邻格"，正交
+//        邻格(1)优于对角(2)，一环优于二环；
+//     ③ 等距时再比到自身的平方距离 —— 目标身上还压着别的单位时，从右侧
+//        追来的车停右邻格、从下方停下方邻格，不会横穿目标绕到对面；
+//     ④ 仍相等则保留先遍历到的（ox/oy 由负到正，结果稳定）。
+//
+//   ★ 次序不能反。曾试过"先比到自身的距离"，结果追兵从 (18,10) 去追
+//   (10,10) 时选了 (14,10) —— 那是它自己那侧的 r=4 环格，离目标还有 4 格，
+//   根本没贴上去。距离目标的远近才是这条规则的语义，自身距离只用来在
+//   同距离的候选之间挑一个顺路的。
+// ============================================================================
+bool FootClass::Find_Fallback_Cell(const CellStruct& centre, CellStruct& out) const
+{
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr || pMap->CellArray == nullptr)
+        return false;
+
+    const int32 width  = pMap->MapWidth;
+    const int32 height = pMap->MapHeight;
+    if (width <= 0 || height <= 0)
+        return false;
+
+    const CellStruct here = CellClass::Coord2Cell(GetCoords());
+
+    bool found = false;
+    int32 bestToTarget = 0;
+    int32 bestToSelf   = 0;
+
+    for (int32 r = 1; r <= 4; ++r)
+    {
+        for (int32 oy = -r; oy <= r; ++oy)
+        {
+            for (int32 ox = -r; ox <= r; ++ox)
+            {
+                if (std::abs(ox) != r && std::abs(oy) != r)
+                    continue;                       // 只看这一圈的边
+
+                const int32 px = static_cast<int32>(centre.X) + ox;
+                const int32 py = static_cast<int32>(centre.Y) + oy;
+                if (px < 0 || py < 0 || px >= width || py >= height)
+                    continue;
+
+                const CellStruct probe(static_cast<int16>(px), static_cast<int16>(py));
+                if (!Can_Enter_Cell(probe))
+                    continue;
+
+                const int32 dToTarget = ox * ox + oy * oy;
+                const int32 hx = px - static_cast<int32>(here.X);
+                const int32 hy = py - static_cast<int32>(here.Y);
+                const int32 dToSelf = hx * hx + hy * hy;
+
+                if (!found
+                    || dToTarget < bestToTarget
+                    || (dToTarget == bestToTarget && dToSelf < bestToSelf))
+                {
+                    found = true;
+                    bestToTarget = dToTarget;
+                    bestToSelf   = dToSelf;
+                    out = probe;
+                }
+            }
+        }
+    }
+
+    return found;
+}
+
 bool FootClass::Set_Destination(const CoordStruct& dest)
 {
     if (Locomotion == nullptr || MapClass::Instance == nullptr)
         return false;
 
+    // 落点诊断：只打印"降级"与"彻底不可达"两种异常，正常路径不产生日志。
+    static const bool kDestDbg = (std::getenv("OPENYR_MOVE_DBG") != nullptr);
+
     CellStruct destCell = CoordMath::CoordToCell(dest);
+    CoordStruct goal = dest;
+
     if (!Can_Enter_Cell(destCell))
-        return false;
+    {
+        // 飞机不降级：停机坪/机位必须是那一格本身，落到旁边会让飞机永远
+        //   进不了机位（AircraftClass 的降落流程依赖精确落点）。
+        const AbstractType type = WhatAmI();
+        if (type != AbstractType::Unit && type != AbstractType::Infantry)
+        {
+            if (kDestDbg)
+                std::fprintf(stderr, "[DEST] reject type=%d cell=(%d,%d)\n",
+                             static_cast<int>(type), (int)destCell.X, (int)destCell.Y);
+            return false;
+        }
+
+        CellStruct fallback;
+        if (!Find_Fallback_Cell(destCell, fallback))
+        {
+            if (kDestDbg)
+                std::fprintf(stderr, "[DEST] unreachable cell=(%d,%d)\n",
+                             (int)destCell.X, (int)destCell.Y);
+            return false;
+        }
+
+        if (kDestDbg)
+        {
+            const CellStruct dbgSelf = CellClass::Coord2Cell(GetCoords());
+            std::fprintf(stderr,
+                         "[DEST] unit=%p self=(%d,%d) from=(%d,%d) to=(%d,%d)\n",
+                         static_cast<const void*>(this),
+                         (int)dbgSelf.X, (int)dbgSelf.Y,
+                         (int)destCell.X, (int)destCell.Y,
+                         (int)fallback.X, (int)fallback.Y);
+        }
+
+        destCell = fallback;
+        goal = CoordStruct(static_cast<int32>(fallback.X) * 256 + 128,
+                           static_cast<int32>(fallback.Y) * 256 + 128,
+                           dest.Z);
+
+        // 降级目标限流。
+        //   任务层是每帧重下目的地的（Mission_Guard 每个任务步都重设目标格），
+        //   而"目标格被占"这件事在目标死/走之前不会变 —— 每次都重算一遍
+        //   邻格搜索 + 全图 A* 纯属浪费。路径还在、且已经指向同一个降级格时，
+        //   只刷新坐标即可。路径走完或单位停下后本短路自动失效，会重算一次
+        //   （届时起点=终点，A* 立刻收敛）。
+        //   ★ 只对降级路径生效：可入目标的行为保持原样（每次照常 Move_To）。
+        if (Has_Path() && Locomotion->Is_Moving())
+        {
+            const CellStruct curCell =
+                CoordMath::CoordToCell(Locomotion->Destination());
+            if (curCell.X == destCell.X && curCell.Y == destCell.Y)
+            {
+                Locomotion->Move_To(goal);
+                return true;
+            }
+        }
+    }
 
     // Route through the map when possible; fall back to a direct move.
     UnitClass* pUnit = (WhatAmI() == AbstractType::Unit)
@@ -1495,13 +1743,13 @@ bool FootClass::Set_Destination(const CoordStruct& dest)
                                      pos.Z);
                 Append_Path(waypoint);
             }
-            Locomotion->Move_To(dest);
+            Locomotion->Move_To(goal);
             return true;
         }
     }
 
-    Set_Path(&dest, 1);
-    Locomotion->Move_To(dest);
+    Set_Path(&goal, 1);
+    Locomotion->Move_To(goal);
     return true;
 }
 
@@ -1516,7 +1764,284 @@ bool FootClass::Can_Enter_Cell(const CellStruct& cell) const
     if (pCell == nullptr)
         return false;
 
-    return pCell->PassableFor(TechnoType->MoveZone);
+    if (!pCell->PassableFor(TechnoType->MoveZone))
+        return false;
+
+    // ── 占用校验（原版 CellClass 进入判定里与地形并列的那一半）──────────
+    //   建筑与载具独占一格，步兵每格最多 3 人（原版把步兵视为可叠放，但
+    //   有上限，超过就不再允许进入）。此前本树只查地形可通行性，于是 AI
+    //   整队步兵会走进敌方单位所在的那一格叠在一起：实测 6 名 E1 站在
+    //   (4608,3840) 同一格，同时能开火的只有最前面一个，4200 帧只打出
+    //   1 个击杀。
+    //
+    //   步兵数走 CellClass::Infantry_Count()（旁表权威计数）：FirstObject
+    //   链在单位被外力挪格时会留下残链，靠链数人会漏（实测链长 2、实际
+    //   6 人）。建筑/载具仍看 Occupier 槽与链上的类型。
+    //
+    //   ★ Occupier 槽必须先排除自己：载具现在会真的登记占用，于是"本单位
+    //   所在的格"里 Occupier 可能就是自己。不排除时，一辆坦克对"自己脚下
+    //   那格"的 Can_Enter_Cell 会返回 false —— Set_Destination 到本格、
+    //   Mission_Attack 的落点复检（Can_Enter_Cell(curDst)）全部误判成
+    //   "目标格不可进入"，单位原地打转或反复重新选址。
+    ObjectClass* pSlotOccupier = pCell->Get_Occupier();
+    if (pSlotOccupier != nullptr && pSlotOccupier != this)
+    {
+        const AbstractType occupierType = pSlotOccupier->WhatAmI();
+        if (occupierType == AbstractType::Building || occupierType == AbstractType::Unit)
+            return false;
+    }
+
+    for (ObjectClass* pObj = pCell->First_Object(false);
+         pObj != nullptr;
+         pObj = pObj->NextObject)
+    {
+        if (pObj == this)
+            continue;                       // 自己所在的格子永远算"能待"
+
+        switch (pObj->WhatAmI())
+        {
+        case AbstractType::Building:
+            return false;
+        case AbstractType::Unit:
+            return false;                   // 载具独占一格（碾压走 CheckCrush）
+        case AbstractType::Aircraft:
+            // 空中的飞机不占地面格；落地/停机才挡。
+            if (pObj->GetCoords().Z > 0)
+                break;
+            return false;
+        default:
+            break;
+        }
+    }
+
+    int32 infantryOnCell = pCell->Infantry_Count();
+    if (infantryOnCell == 0)
+    {
+        // 旁表没记到（例如单位是本轮之前落位、只进了链）：退回链上计数，
+        //   避免 3 人上限因为"漏登记"而失效。
+        for (ObjectClass* pObj = pCell->First_Object(false);
+             pObj != nullptr;
+             pObj = pObj->NextObject)
+        {
+            if (pObj != this && pObj->WhatAmI() == AbstractType::Infantry)
+                ++infantryOnCell;
+        }
+    }
+
+    return infantryOnCell < 3;
+}
+
+// ============================================================================
+// FootClass::Build_Path —— 逐格 A*（通行判据 = Can_Enter_Cell）
+//
+//   本树此前的行走路径是"起点到终点的直线补全"（WalkLocomotionClass::Move_To），
+//   既不查地形也不查占用：整队步兵会一路走进敌方单位所在的格子叠在一起，
+//   遇到水面/建筑也只是照直走。载具侧本来就走 UnitClass::Find_Path，步兵侧
+//   没有任何寻路 —— 这里补上一个与占用判定一致的逐格 A*，供 Walk 使用。
+//
+//   代价：直行 256 / 斜行 362（与原版 lepton 步长的比例一致），启发式用
+//   octile 距离，节点数上限 40000（约等于 200x200 的可达区域，足够一张
+//   常规遭遇战地图，超出即判定不可达并回落到直线）。
+// ============================================================================
+bool FootClass::Build_Path(const CellStruct& destCell,
+                           DynamicVectorClass<CellStruct>& outPath) const
+{
+    outPath.Clear();
+
+    MapClass* pMap = MapClass::Instance;
+    if (pMap == nullptr || pMap->CellArray == nullptr || TechnoType == nullptr)
+        return false;
+
+    const int32 width  = pMap->MapWidth;
+    const int32 height = pMap->MapHeight;
+    if (width <= 0 || height <= 0)
+        return false;
+
+    const CellStruct start = CellClass::Coord2Cell(GetCoords());
+    if (start.X < 0 || start.Y < 0 || start.X >= width || start.Y >= height)
+        return false;
+
+    // 终点不可进入（建筑/载具占住、或步兵已满 3 人）→ 在终点周围找落点。
+    //   这一段是"步兵不再叠在同一格"的关键：目标格站满之后，后来者会停在
+    //   相邻的可站格，而不是把坐标压成同一个点。
+    CellStruct goal = destCell;
+    if (goal.X < 0 || goal.Y < 0 || goal.X >= width || goal.Y >= height)
+        return false;
+
+    if (!Can_Enter_Cell(goal))
+    {
+        bool found = false;
+        for (int32 r = 1; r <= 4 && !found; ++r)
+        {
+            for (int32 oy = -r; oy <= r && !found; ++oy)
+            {
+                for (int32 ox = -r; ox <= r && !found; ++ox)
+                {
+                    if (std::abs(ox) != r && std::abs(oy) != r)
+                        continue;               // 只看这一圈的边
+                    const CellStruct probe(static_cast<int16>(destCell.X + ox),
+                                           static_cast<int16>(destCell.Y + oy));
+                    if (probe.X < 0 || probe.Y < 0 || probe.X >= width || probe.Y >= height)
+                        continue;
+                    if (!Can_Enter_Cell(probe))
+                        continue;
+                    goal = probe;
+                    found = true;
+                }
+            }
+        }
+        if (!found)
+            return false;
+    }
+
+    if (start.X == goal.X && start.Y == goal.Y)
+    {
+        outPath.Add(start);
+        return true;
+    }
+
+    // ── 先试直线：所有途经格都能进就直接用直线，跳过 A* ─────────────────
+    //   A* 的成本对"开阔地形上的常规行军"完全是浪费，而步兵的移动命令是
+    //   每帧都会重下的。绝大多数行军在空旷地图上直线即通，这一条短路把
+    //   "每个步兵每帧一次 A*" 降到"一次线性扫描"。只有直线被挡（建筑、
+    //   水面、站满的格子）才走下面的 A*。
+    {
+        const int32 dx = static_cast<int32>(goal.X) - static_cast<int32>(start.X);
+        const int32 dy = static_cast<int32>(goal.Y) - static_cast<int32>(start.Y);
+        const int32 adx = std::abs(dx);
+        const int32 ady = std::abs(dy);
+        const int32 steps = (adx > ady) ? adx : ady;
+
+        if (steps > 0)
+        {
+            bool clear = true;
+            for (int32 i = 1; i <= steps; ++i)
+            {
+                const CellStruct cs(
+                    static_cast<int16>(static_cast<int32>(start.X) + (dx * i) / steps),
+                    static_cast<int16>(static_cast<int32>(start.Y) + (dy * i) / steps));
+                if (i == steps)
+                    break;                  // 终点格单独判过（可能是替代格）
+                if (!Can_Enter_Cell(cs))
+                {
+                    clear = false;
+                    break;
+                }
+            }
+
+            if (clear)
+            {
+                outPath.Add(start);
+                for (int32 i = 1; i < steps; ++i)
+                {
+                    outPath.Add(CellStruct(
+                        static_cast<int16>(static_cast<int32>(start.X) + (dx * i) / steps),
+                        static_cast<int16>(static_cast<int32>(start.Y) + (dy * i) / steps)));
+                }
+                outPath.Add(goal);
+                return true;
+            }
+        }
+    }
+
+    const int32 total = width * height;
+    const int32 kInf  = 0x7FFFFFFF;
+
+    std::vector<int32> g(total, kInf);
+    std::vector<int32> came(total, -1);
+    std::vector<uint8> closed(total, 0);
+
+    const auto idxOf = [width](int32 x, int32 y) { return y * width + x; };
+    const auto heuristic = [](int32 ax, int32 ay, int32 bx, int32 by) -> int32
+    {
+        const int32 dx = std::abs(bx - ax);
+        const int32 dy = std::abs(by - ay);
+        const int32 diag = (dx < dy) ? dx : dy;
+        return (dx + dy - 2 * diag) * 256 + diag * 362;
+    };
+
+    static const int8 ddx[8] = {  0,  1,  1,  1,  0, -1, -1, -1 };
+    static const int8 ddy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    std::priority_queue<std::pair<int32, int32>,
+                        std::vector<std::pair<int32, int32>>,
+                        std::greater<std::pair<int32, int32>>> openList;
+
+    const int32 startIdx = idxOf(start.X, start.Y);
+    const int32 goalIdx  = idxOf(goal.X, goal.Y);
+    g[startIdx] = 0;
+    openList.push({ heuristic(start.X, start.Y, goal.X, goal.Y), startIdx });
+
+    int32 expanded = 0;
+    bool reached = false;
+    while (!openList.empty() && expanded < 8000)
+    {
+        const int32 cur = openList.top().second;
+        openList.pop();
+        if (closed[cur])
+            continue;
+        if (cur == goalIdx)
+        {
+            reached = true;
+            break;
+        }
+        closed[cur] = 1;
+        ++expanded;
+
+        const int32 cx = cur % width;
+        const int32 cy = cur / width;
+
+        for (int32 d = 0; d < 8; ++d)
+        {
+            const int32 nx = cx + ddx[d];
+            const int32 ny = cy + ddy[d];
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height)
+                continue;
+            const int32 nIdx = idxOf(nx, ny);
+            if (closed[nIdx])
+                continue;
+
+            const CellStruct cs(static_cast<int16>(nx), static_cast<int16>(ny));
+            if (!Can_Enter_Cell(cs))
+                continue;
+
+            // 斜走不许"切角"：两条正交边也必须能进。
+            if (d & 1)
+            {
+                if (!Can_Enter_Cell(CellStruct(static_cast<int16>(nx), static_cast<int16>(cy))))
+                    continue;
+                if (!Can_Enter_Cell(CellStruct(static_cast<int16>(cx), static_cast<int16>(ny))))
+                    continue;
+            }
+
+            const int32 step = (d & 1) ? 362 : 256;
+            const int32 tentative = g[cur] + step;
+            if (tentative < g[nIdx])
+            {
+                g[nIdx] = tentative;
+                came[nIdx] = cur;
+                openList.push({ tentative + heuristic(nx, ny, goal.X, goal.Y), nIdx });
+            }
+        }
+    }
+
+    if (!reached)
+        return false;
+
+    // 回溯：goal → start，再翻转成 start → goal。
+    std::vector<CellStruct> rev;
+    for (int32 c = goalIdx; c != -1; c = came[c])
+    {
+        rev.push_back(CellStruct(static_cast<int16>(c % width),
+                                 static_cast<int16>(c / width)));
+        if (c == startIdx)
+            break;
+    }
+
+    for (auto it = rev.rbegin(); it != rev.rend(); ++it)
+        outPath.Add(*it);
+
+    return outPath.GetCount() > 0;
 }
 
 // ============================================================================
@@ -1847,29 +2372,119 @@ bool FootClass::CanBeRecruited(HouseClass* pHouse) const
 // ============================================================================
  // asm: char __fastcall FootClass_CanFightBack(_FootClass *this)   (asm:12110 / 7092E0)
  //
-//  单位是否值得还击（被动还击门）。原版控制流：
-//    * 前置过滤（只有全部成立才直接放行）：无目标(+0x2B4)、本属方非真人、
-//      +0x14 bit2 置位、归属于某队、队类型非 Suicide 且允许开火(+0xAD)、
-//      当前姿态(+0xAC)==2。
-//    * 其余情况一律落到 TechnoClass_CanPassiveAquire()：为假直接返回假；
-//      为真后再按 BalloonHover/规划路径(+0x514)等逐步放宽，最终返回真。
+//  单位是否值得还击（被动还击门）。
+//
+//  完整控制流（asm 0x7092C8 .. 0x70945D，逐分支核对过）：
+//    A. 0x7092C8：无目标(+0x2B4) / 本属方非真人 / +0x14 bit2 / 归属某队 /
+//       队类型非 Suicide 且 LooseRecruit==0 且 当前任务(+0xAC)==Move(2)
+//       → 直接 return true。
+//    B. loc_7092F2：`TechnoClass_CanPassiveAquire()` 为假 → return false。
+//    C. loc_709301 / 0x709366（仅 mission==Move）：气球悬停单位与"简易部署者"
+//       在"导航目的地 != 当前目标"时提前放行。
+//    D. loc_7093D5：类型的 OpportunityFire 为真 → return true；
+//       任务不是 Guard(5) → return false。
+//    E. loc_7093F8（仅 mission==Guard）：当前槽武器是范围杀伤、且
+//       SelectWeapon(目标) 选中的正是这一槽 → return false（会把自己炸到），
+//       否则 return true。
+//
+//  ★ 旧实现只做了 A + B。在「兜底规则 + 单位有目标」的常见组合下，那条
+//    路径的返回值完全由 `CanPassiveAquire()` 决定 —— 而那个标志当时**没有
+//    构造初值**（见 TechnoTypeClass 构造函数），实测为 0，于是 **任何 Guard
+//    单位都不可能还击**，`Mission_Guard` 里 `if (CanFightBack())` 恒假，
+//    警戒追击永远不下目的地。两个缺陷叠在一起：标志没默认值 + 分支没补全。
+//
+//  ★ C/D/E 补上之后，差别出现在「任务不是 Guard」的场景：
+//    原版对 mission==Move/Attack 的单位在 CanPassiveAquire 为真之后仍然
+//    **返回 false**（除非类型开了 OpportunityFire），旧实现会误判为"可以
+//    还击"，让正在执行移动命令的单位掉头去追打路过的敌人。
+//    Guard(5) 分支还要过一道"当前武器是否范围杀伤且选中的就是这一槽"，
+//    防的是榴弹类武器贴脸还击把自己炸了。
+//
+//  ★ 段 C 的两处依赖在本树里不完全对应：
+//      * 原版把 BalloonHover 放在 TechnoTypeClass 上，本树拆到了
+//        UnitTypeClass / AircraftTypeClass；
+//      * 原版比较的是 `NavCom_Destination`（+0x514 的导航目的地），本树没有
+//        这个字段，用"行走逻辑的当前目的地格 == 目标所在格"等价表达。
+//    这一段只影响"气球 / 简易部署者正在 Move"的还击判定，普通单位不受影响。
 // ============================================================================
 bool FootClass::CanFightBack() const
 {
-    // asm: 7092E0
+    const Mission missionEnum = GetMission();
+    const int32   mission     = static_cast<int32>(missionEnum);
+
+    // ── A. asm 0x7092C8 -----------------──────────────────────────────────
     if (CurrentTarget == nullptr
         && Owner != nullptr && !Owner->Is_Human()
         && (field_14 & 0x04) != 0
         && Team != nullptr && Team->Type != nullptr
         && !Team->Type->Suicide
-        && !Team->Type->LooseRecruit)
+        && !Team->Type->LooseRecruit
+        && mission == static_cast<int32>(Mission::Move))
     {
-        // asm: 70944F -- 前置条件全中，直接判为可还击。
         return true;
     }
 
-    // asm: loc_7092F2 -- 落到被动捕捉判定。
-    return CanPassiveAquire();
+    // ── B. loc_7092F2 -----------------------------------------------------
+    if (!CanPassiveAquire())
+        return false;
+
+    // ── C. loc_709301 / 0x709366（仅 Move）--------------------------------
+    if (mission == static_cast<int32>(Mission::Move) && TechnoType != nullptr)
+    {
+        bool balloonHover  = false;
+        bool simpleDeployer = false;
+        if (WhatAmI() == AbstractType::Unit)
+        {
+            const UnitTypeClass* pUt = static_cast<const UnitTypeClass*>(TechnoType);
+            balloonHover   = pUt->IsBalloonHover;
+            simpleDeployer = pUt->IsSimpleDeployer;
+        }
+        else if (WhatAmI() == AbstractType::Aircraft)
+        {
+            balloonHover = static_cast<const AircraftTypeClass*>(TechnoType)->IsBalloonHover;
+        }
+
+        if (balloonHover && (field_14 & 0x04) == 0)
+            return false;               // asm: 0x70932D 的 var_1 判空
+
+        if (balloonHover || simpleDeployer)
+        {
+            // asm 比较 NavCom 目的地与目标；本树以"目的地格 == 目标格"表达。
+            bool headedAtTarget = false;
+            if (CurrentTarget != nullptr && Locomotion != nullptr)
+            {
+                CoordStruct tgtCoords{};
+                CurrentTarget->GetCoords(&tgtCoords);
+                const CellStruct tgtCell = CellClass::Coord2Cell(tgtCoords);
+                const CellStruct dstCell =
+                    CellClass::Coord2Cell(Locomotion->Destination());
+                headedAtTarget = (tgtCell.X == dstCell.X && tgtCell.Y == dstCell.Y);
+            }
+            if (headedAtTarget)
+                return true;            // asm: 0x70944F
+        }
+    }
+
+    // ── D. loc_7093D5 -----------------------------------------------------
+    if (TechnoType != nullptr && TechnoType->OpportunityFire)
+        return true;
+
+    if (mission != static_cast<int32>(Mission::Guard))
+        return false;
+
+    // ── E. loc_7093F8（仅 Guard）------------------------------------------
+    //   slot = IsNoSprayAttack()（原版该槽返回"不溅射时用的武器槽"0/1）
+    const int32 slot = IsNotSprayAttack() ? 0 : 1;
+    const WeaponStruct* pWs = TechnoType->GetWeapon(slot);
+    const WeaponTypeClass* pWeapon = (pWs != nullptr) ? pWs->WeaponType : nullptr;
+    const bool areaFire = (pWeapon != nullptr && pWeapon->AreaFire);
+    // ★ SelectWeapon 在原版是 thiscall 非 const（会按目标改写武器槽状态），
+    //   而本槽的声明是 const —— 汇编里这里确实是"查询型"调用（只读比较），
+    //   故用 const_cast 平移，语义不变。
+    if (areaFire && const_cast<FootClass*>(this)->SelectWeapon(CurrentTarget) == slot)
+        return false;
+
+    return true;
 }
 
 // ============================================================================
@@ -2479,10 +3094,13 @@ int32 FootClass::Mi_Capture()
         && !HasAbility(ABILITY_C4))
     {
         // asm: 4D4C49 SetTarget(0) ; SetDestination(0,1) ; ForceMission(0xF, 0)
+        //   ★ 0xF 是 Hunt（15），不是 Enter（7）。写成 Enter 会让"占领任务
+        //     兜底"的单位从此停在 Enter 上：不移动、不索敌、不采矿，任务
+        //     计时器每帧空转 —— 矿车与 AI 载具最容易踩到这条。
         SetTarget(nullptr);
         Stop_Moving();
         Clear_Path();
-        SetMission(Mission::Enter);
+        SetMission(Mission::Hunt);
     }
 
     // asm: 4D4C71 —— 本步耗时。
@@ -2563,18 +3181,30 @@ int32 FootClass::Mi_Rescue()
 //  给地面单位换一个目标：先解除与原目标的关联，再记下新目标并复位任务步进，
 //  使当前任务从第一步重新开始。
 // ============================================================================
+void FootClass::SetTarget(AbstractClass* pTarget)
+{
+    CurrentTarget = pTarget;
+}
+
+// ============================================================================
+// asm: FootClass_SetNewTarget
+//
+//  给地面单位换一个目标：先解除与原目标的关联，再记下新目标并复位任务步进，
+//  使当前任务从第一步重新开始。
+// ============================================================================
 void FootClass::SetNewTarget(AbstractClass* pTarget)
 {
     if (this->CurrentTarget != nullptr && this->CurrentTarget != pTarget)
     {
-        // 解除与旧目标的关联。
-        this->CurrentTarget = nullptr;
+        // 解除与旧目标的关联。必须走虚分派：派生类还存着自己的一份目标
+        // 指针，只清 CurrentTarget 会让两份存储分叉。
+        this->SetTarget(nullptr);
     }
 
     if (pTarget == nullptr)
         return;
 
-    this->CurrentTarget = pTarget;
+    this->SetTarget(pTarget);
 
     // 复位任务步进，让当前任务的流程从头走。
     this->SetMission(this->GetMission());
@@ -2911,6 +3541,267 @@ inline int32 FootMissionStep(FootClass* pFoot)
 }
 
 // (end of former anon namespace)
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall FootClass_Attack(_FootClass *this)   (asm:1703412 → 470811)
+//
+//   UnitClass_Attack 是 `jmp FootClass_Attack` 的 thunk，所以载具与步兵共用
+//   这一份实现。原版流程（按 asm 分三段）：
+//
+//    ① 悬停攻击型（type->HoverAttack）且 CanFire 已通过 → 直接把目标格设成
+//       目的地，不再做后续距离比较；
+//    ② 无目标 / 目标已失效 → 收掉目标、转 Guard；
+//    ③ 有目标 → 取双方坐标算欧氏距离，与当前选中武器的 Range 比较：
+//         距离 > 射程  → Set_Destination(目标坐标)，继续接近；
+//         距离 <= 射程 → 站住（撤销目的地），交给 TechnoClass::Update_Combat
+//                        每帧做 Can_Fire → Fire。
+//   最后统一返回任务步进（Rate*900 + Random2(0,2)）。
+//
+//   ★ 本树此前只有 InfantryClass 覆写了 Mission_Attack，且尾段退到基类的
+//   MissionClass::Mission_Attack（asm 里就是 `mov eax,1C2h` 什么都不做），
+//   于是"攻击"任务实际上不移动也不开火——单位接到攻击命令后会僵在原地。
+//   这里补的就是缺失的接近逻辑。
+// ----------------------------------------------------------------------------
+int32 FootClass::Mission_Attack()
+{
+    AbstractClass* pTarget = GetTarget();
+
+    // 目标消失 / 已死：收目标，回 Guard。
+    if (pTarget == nullptr || pTarget->IsDead())
+    {
+        if (pTarget != nullptr)
+            SetTarget(nullptr);
+        ForceMission(Mission::Guard);
+        return MissionStepDelay(Mission::Attack);
+    }
+
+    // 当前武器射程（lepton）。武器槽缺失时按 0 处理，等价于"永远要靠近"。
+    int32 range = 0;
+    if (TechnoType != nullptr)
+    {
+        const int32 idx = SelectWeapon(pTarget);
+        WeaponStruct* pSlot = TechnoType->GetWeapon(idx >= 0 ? idx : 0);
+        if (pSlot != nullptr && pSlot->WeaponType != nullptr)
+            range = pSlot->WeaponType->Range;
+    }
+
+    const CoordStruct myPos = GetCoords();
+    CoordStruct tgtPos(0, 0, 0);
+    pTarget->GetCoords(&tgtPos);
+
+    const double dx = static_cast<double>(tgtPos.X - myPos.X);
+    const double dy = static_cast<double>(tgtPos.Y - myPos.Y);
+    const double dz = static_cast<double>(tgtPos.Z - myPos.Z);
+    const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (dist > static_cast<double>(range))
+    {
+        // 未进入射程：朝目标移动。但**不能**把目的地设成目标所在的那一格：
+        //   敌方单位/建筑正站在那儿，驱动层（Drive/Walk）进不去那个格，于是
+        //   单位会一直保持"在移动"状态却一帧也推不动 —— 实测 AI 坦克
+        //   dest=(4352,3840)（玩家步兵所在的格）时坐标从 f=600 到 f=1800
+        //   一米没动。这里改成停在射程外沿（约 0.9 倍射程），并在落点格
+        //   不可进入时就近找一格可站的位置。
+        bool needReplan = (Locomotion == nullptr || !Locomotion->Is_Moving());
+        if (!needReplan)
+        {
+            // 已经在走，但目的地是不可进入的格子 → 判定卡死，强制重新选址。
+            const CoordStruct curDst = Locomotion->Destination();
+            if (!Can_Enter_Cell(CellClass::Coord2Cell(curDst)))
+            {
+                Stop_Moving();
+                needReplan = true;
+            }
+        }
+
+        if (needReplan)
+        {
+            const double stopDist =
+                (range > 512) ? (static_cast<double>(range) * 0.9) : 512.0;
+            CoordStruct dst = tgtPos;
+            if (dist > stopDist + 1.0)
+            {
+                const double k = (dist - stopDist) / dist;
+                dst.X = myPos.X + static_cast<int32>(dx * k);
+                dst.Y = myPos.Y + static_cast<int32>(dy * k);
+                dst.Z = myPos.Z;
+            }
+
+            const CellStruct want = CellClass::Coord2Cell(dst);
+            if (!Can_Enter_Cell(want))
+            {
+                // 落点格被占/不可通行：以目标为中心向外扫一圈，取最近的
+                //   可进入格，保证单位能真的走到射程边缘而不是原地打转。
+                const CellStruct centre = CellClass::Coord2Cell(tgtPos);
+                bool found = false;
+                for (int32 r = 1; r <= 4 && !found; ++r)
+                {
+                    for (int32 oy = -r; oy <= r && !found; ++oy)
+                    {
+                        for (int32 ox = -r; ox <= r && !found; ++ox)
+                        {
+                            if (std::abs(ox) != r && std::abs(oy) != r)
+                                continue;   // 只看这一圈的边
+                            const CellStruct probe(static_cast<int16>(centre.X + ox),
+                                                   static_cast<int16>(centre.Y + oy));
+                            if (!Can_Enter_Cell(probe))
+                                continue;
+                            const CoordStruct slot(probe.X * 256, probe.Y * 256, myPos.Z);
+                            found = Set_Destination(slot);
+                        }
+                    }
+                }
+                if (!found)
+                    Set_Destination(dst);
+            }
+            else
+            {
+                Set_Destination(dst);
+            }
+        }
+    }
+    else
+    {
+        // 已在射程内：站定。开火由 Update_Combat 的 Can_Fire → Fire 完成。
+        if (Locomotion != nullptr && Locomotion->Is_Moving())
+            Stop_Moving();
+    }
+
+    return MissionStepDelay(Mission::Attack);
+}
+
+// ----------------------------------------------------------------------------
+// asm: MissionClass_Mi_Hunt（跳表 15）在 FootClass 层的实体。
+//
+//   原版把"猎杀"拆成两段：
+//     ① 身上已有可打的目标 → 交给 Attack 的接近/开火流程（原版同样在
+//        Mi_Hunt 里 `jmp Mi_Attack` 的形态）；
+//     ② 没有目标 → 朝"敌方要害"推进一步，靠 Target_Something_Nearby 在
+//        警戒半径内自动接手。原版靠 ai.ini 的脚本动作（Move to waypoint /
+//        Attack Waypoint）把队伍送到玩家附近，OpenYR 的兜底脚本没有航点
+//        数据，因此这里直接以**最近的敌方建筑（优先建造场）**为推进目标，
+//        走到其 4 格内即停下交给索敌——功能等价于"推进到敌区再交战"。
+//
+//   节流：只在"当前没在移动"时重算目的地，行进途中不打断，避免寻路抖动。
+// ----------------------------------------------------------------------------
+int32 FootClass::Mission_Hunt()
+{
+    // ① 有目标：转 Attack（接近 + 开火）。
+    AbstractClass* pTarget = GetTarget();
+    if (pTarget != nullptr && pTarget->IsDead())
+    {
+        SetTarget(nullptr);
+        pTarget = nullptr;
+    }
+    if (pTarget != nullptr)
+    {
+        ForceMission(Mission::Attack);
+        return MissionStepDelay(Mission::Attack);
+    }
+
+    // ② 没目标：正在推进就不重算。
+    if (Locomotion != nullptr && Locomotion->Is_Moving())
+        return MissionStepDelay(Mission::Hunt);
+
+    if (Owner == nullptr || MapClass::Instance == nullptr)
+        return MissionStepDelay(Mission::Hunt);
+
+    const CoordStruct myPos = GetCoords();
+
+    // 选推进目标：最近的敌方建筑；没有建筑就选最近的敌方单位。
+    //   建筑优先是因为"打掉敌方基地"是 AI 的终局目标，且建筑不会跑。
+    const auto pickNearest = [&](DynamicVectorClass<TechnoClass*>* pPool,
+                                 TechnoClass*& outBest) -> void
+    {
+        if (pPool == nullptr)
+            return;
+        int64 bestSq = 0;
+        for (int32 i = 0; i < pPool->Count; ++i)
+        {
+            TechnoClass* pCand = pPool->GetItem(i);
+            if (pCand == nullptr || pCand == this || pCand->IsDead())
+                continue;
+            if (pCand->Owner == nullptr || Owner->Is_Ally(pCand))
+                continue;
+            // 平民 / 中立不是"敌人的要害"：原版 AI 也不会把猎杀目标定在
+            //   民用建筑上（那会让整队绕路去打风景）。排除掉才能让推进
+            //   方向真正指向敌方基地。
+            if (pCand->Owner->IsCivilians)
+                continue;
+            const CoordStruct p = pCand->GetCoords();
+            const int64 dx = static_cast<int64>(p.X) - myPos.X;
+            const int64 dy = static_cast<int64>(p.Y) - myPos.Y;
+            const int64 sq = dx * dx + dy * dy;
+            if (outBest == nullptr || sq < bestSq)
+            {
+                bestSq = sq;
+                outBest = pCand;
+            }
+        }
+    };
+
+    TechnoClass* pObjective = nullptr;
+    pickNearest(reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(BuildingClass::Array),
+                pObjective);
+    if (pObjective == nullptr)
+        pickNearest(reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(UnitClass::Array),
+                    pObjective);
+    if (pObjective == nullptr)
+        pickNearest(reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(InfantryClass::Array),
+                    pObjective);
+
+    if (pObjective == nullptr)
+        return MissionStepDelay(Mission::Hunt);   // 地图上没有敌人
+
+    CoordStruct dst = pObjective->GetCoords();
+
+    // 已经贴脸（4 格内）：站定，让 Target_Something_Nearby / Attack 接手。
+    const int32 adx = std::abs(dst.X - myPos.X);
+    const int32 ady = std::abs(dst.Y - myPos.Y);
+    if (adx <= 1024 && ady <= 1024)
+        return MissionStepDelay(Mission::Hunt);
+
+    // 长距离推进：每次只走"目标方向 10 格"的一段，寻路稳定且能绕过障碍。
+    const int32 step = 10 * 256;
+    if (adx > step || ady > step)
+    {
+        const double len = std::sqrt(static_cast<double>(adx) * adx +
+                                     static_cast<double>(ady) * ady);
+        if (len > 0.0)
+        {
+            const double k = static_cast<double>(step) / len;
+            dst.X = myPos.X + static_cast<int32>((dst.X - myPos.X) * k);
+            dst.Y = myPos.Y + static_cast<int32>((dst.Y - myPos.Y) * k);
+        }
+    }
+    dst.Z = myPos.Z;
+
+    if (!Set_Destination(dst))
+    {
+        // 该格走不进去（水面/建筑）：换个 8 邻格里能站的点，避免原地死锁。
+        const CellStruct centre = CellClass::Coord2Cell(dst);
+        for (int32 r = 1; r <= 4; ++r)
+        {
+            bool moved = false;
+            for (int32 dy = -r; dy <= r && !moved; ++dy)
+            {
+                for (int32 dx = -r; dx <= r && !moved; ++dx)
+                {
+                    const CellStruct probe(static_cast<int16>(centre.X + dx),
+                                           static_cast<int16>(centre.Y + dy));
+                    if (!Can_Enter_Cell(probe))
+                        continue;
+                    const CoordStruct slot(probe.X * 256, probe.Y * 256, myPos.Z);
+                    moved = Set_Destination(slot);
+                }
+            }
+            if (moved)
+                break;
+        }
+    }
+
+    return MissionStepDelay(Mission::Hunt);
+}
 
 // ----------------------------------------------------------------------------
  // asm: int __thiscall FootClass::Mission_Move(_FootClass *this)   (asm:495 / 4D4202)
@@ -3730,7 +4621,7 @@ void FootClass::PointerGotInvalid(AbstractClass* pInvalid, bool removed)
  //  足类承伤入口：把任务中断等足类副作用处理完后，转交 TechnoClass 的统一承伤。
  // ============================================================================
 int32 FootClass::ReceiveDamage(int32* pDamage, int32 typeSource,
-                               WarheadTypeClass* pWarhead, int32 target,
+                               WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                int32 ignoreDefenses, int32 arg10,
                                HouseClass* pSourceHouse)
 {
@@ -3738,7 +4629,7 @@ int32 FootClass::ReceiveDamage(int32* pDamage, int32 typeSource,
     PlanningPathIndex = -1;
     PlanningWaypoints.Clear();
 
-    return TechnoClass::ReceiveDamage(pDamage, typeSource, pWarhead, target,
+    return TechnoClass::ReceiveDamage(pDamage, typeSource, pWarhead, pAttacker,
                                       ignoreDefenses, arg10, pSourceHouse);
 }
 

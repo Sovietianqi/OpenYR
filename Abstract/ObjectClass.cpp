@@ -8,6 +8,9 @@
 #include <Core/Memory.h>
 #include <Core/Macros.h>
 #include <Game/Game.h>
+#include <Game/Externs.h>
+#include <Helpers/AsmMath.h>
+#include <Rendering/Surface.h>
 #include <Rendering/DisplayClass.h>
 #include <Rendering/TacticalClass.h>
 #include <Math/CoordStruct.h>
@@ -198,6 +201,48 @@ bool ObjectClass::Is_Logic_Registered() const
 }
 
 // ============================================================================
+// FinalizeUnlimbo —— 见头文件说明。三个动作按原版 ObjectClass::Unlimbo 尾部
+//   的顺序执行：置 Alive、登记主表、交给显示层。
+// ============================================================================
+void ObjectClass::FinalizeUnlimbo()
+{
+    Alive = 1;                       // +0x88：MissionClass_Update 的第一道门
+
+    // +0x6C：原版落位时置位的"在图上"标志字节。MapClass::Damage_At_Cell 的
+    //   结算循环第一件事就是 `mov al,[obj+6Ch] / test / jz skip`——为 0 的
+    //   对象一律跳过，等于全世界免疫伤害。本树此前从没人写过这一位，
+    //   于是所有武器都打不掉血。
+    field_6C = 1;
+    Register_Logic();                // asm L1049805 vec_Logics.Add
+
+    if (DisplayClass::Instance != nullptr)
+        DisplayClass::Instance->Submit(this);   // 进 vec_VisibleObjects / 层表
+
+    // asm: 落位成功后把对象挂到所在格的占用链上（CellClass::AddContent）。
+    //   格子的 FirstObject 链是 Cell_Techno / Cell_Building / 弹体命中判定
+    //   （BulletClass::Resolve_Ballistic_Hit 的"0x80 内 occupant"）唯一的
+    //   查找入口；不挂链时单位虽然存在于世界里，但对格子而言是隐形的：
+    //   炮弹会直接穿过目标，建筑也压不住格子。
+    if (MapClass::Instance != nullptr)
+    {
+        const AbstractType what = WhatAmI();
+        if (what == AbstractType::Unit || what == AbstractType::Infantry
+         || what == AbstractType::Building || what == AbstractType::Aircraft)
+        {
+            // 建筑已经由 BuildingClass::Mark 按整个地基登记过占用
+            //   （主格入链 + 其余格 Occupier），这里不再重复挂链。
+            if (what != AbstractType::Building)
+            {
+                const CellStruct cell = CellClass::Coord2Cell(GetCoords());
+                CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+                if (pCell != nullptr)
+                    pCell->AddContent(this, false);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // ~ObjectClass
 //
 //  asm: ObjectClass_DTOR (proc@1047138)，L1047348 从 vec_Logics 摘除。
@@ -207,6 +252,26 @@ bool ObjectClass::Is_Logic_Registered() const
 ObjectClass::~ObjectClass()
 {
     Unregister_Logic();
+
+    // asm: ObjectClass_DTOR 尾部把对象从显示层与所在格的占用链上摘掉。
+    //   缺这两步时，弹体/被摧毁的单位会在 vec_VisibleObjects 与格子的
+    //   FirstObject 链里留下悬垂指针：下一帧 Draw 解引用即崩，
+    //   命中判定也会读到已释放内存。
+    if (DisplayClass::Instance != nullptr)
+        DisplayClass::Instance->Remove(this);
+
+    if (MapClass::Instance != nullptr)
+    {
+        const AbstractType what = WhatAmI();
+        if (what == AbstractType::Unit || what == AbstractType::Infantry
+         || what == AbstractType::Building || what == AbstractType::Aircraft)
+        {
+            const CellStruct cell = CellClass::Coord2Cell(Location);
+            CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+            if (pCell != nullptr)
+                pCell->RemoveContent(this, false);
+        }
+    }
 }
 
 // ============================================================================
@@ -415,6 +480,8 @@ bool ObjectClass::Unlimbo()
     //   （== 0xFFFFFFFE 即“已在表内”）再决定是否 Add；本项目由
     //   LogicClass_Register 的查重承担同一语义。
     Register_Logic();
+
+    FinalizeUnlimbo();
 
     // asm: the tail of Unlimbo submits the object to the tactical display
     //   layer (DisplayClass::Submit).  Without it the object exists in the
@@ -893,19 +960,22 @@ CoordStruct* ObjectClass::GetCoords1(CoordStruct* pCrd) const
 // ============================================================================
 // IsRepairable / IsSellable
 //
- // / 0x5F62FF
+//  asm: ObjectClass_IsRepairable (asm:1047989) — body is `xor al, al / retn`.
+//  asm: ObjectClass_IsSellable   (asm:1048002) — body is `xor al, al / retn`.
 //
-//  The base implementation returns false for every object that is not a
-//  TechnoClass; TechnoClass and its children supply the real answers.
+//  A 类（常量返回）：两个函数在汇编里就只有一条清 AL 的指令，没有任何字段
+//  读取或子调用。基类答"不可修 / 不可卖"；可修/可卖与否由各自槽位上的
+//  派生实现回答（汇编里是 TechnoClass::Can_Repair 与 FootClass_CanBeSold，
+//  见 vftable 槽表）。
 // ============================================================================
 bool ObjectClass::IsRepairable() const
 {
-    return false;
+    return false;                                       // asm: xor al, al
 }
 
 bool ObjectClass::IsSellable() const
 {
-    return false;
+    return false;                                       // asm: xor al, al
 }
 
 // ============================================================================
@@ -1250,109 +1320,153 @@ namespace
 //  are exactly those produced by the assembly (false for `xor al, al`,
 //  zero/null for `xor eax, eax`, true for `mov al, 1`, and no result for a
 //  bare `retn`).
+//
+//  逐个核对结果：这一组全部是 A 类（汇编本身就是常量返回 / 裸 retn），
+//  没有任何一个函数读字段、走分支或调子函数，故实现保持原样，只把汇编
+//  符号名与行号补进注释。
 // ============================================================================
 
-// asm: xor al, al / retn
+// asm: ObjectClass_IsUndeployable (asm:123052) — xor al, al / retn
 bool ObjectClass::IsUndeployable() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsDisguised (asm:123127) — xor al, al / retn
+//
+//  B 类：基类默认"没伪装"，TechnoClass 覆写为读 IsDisguised 字节
+//  (TechnoClass_IsDisguised, asm:102649)。
 bool ObjectClass::IsDisguised() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsIronCurtained (asm:123208) — xor al, al / retn
 bool ObjectClass::IsIronCurtained() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsBeingWarpedOut (asm:123270) — xor al, al / retn
 bool ObjectClass::IsBeingWarpedOut() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsWarpingIn (asm:123283) — xor al, al / retn
 bool ObjectClass::IsWarpingIn() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsWarpingSomethingOut (asm:123295) — xor al, al / retn
 bool ObjectClass::IsWarpingSomethingOut() const
 {
     return false;
 }
 
+// asm: ObjectClass_IsActive (asm:1048015) — xor al, al / retn
 bool ObjectClass::IsActive() const
 {
     return false;
 }
 
+// asm: ObjectClass_A0 (asm:1048027) — xor al, al / retn
+//
+//  A 类：汇编里该槽的符号是 ObjectClass_A0（IDA 未给语义名），函数体就是
+//  一条 xor al, al。它在本项目里对应 IsAnimated()：ObjectClass 的虚表里
+//  紧跟 IsActive 之后正好是这个桩（vftable 顺序 IsRepairable → IsSellable
+//  → IsActive → A0），返回值与 C++ 的 false 完全一致。
 bool ObjectClass::IsAnimated() const
 {
     return false;
 }
 
-// asm: mov al, 1 / retn
+// asm: ObjectClass_IsNotWarping (asm:123308) — mov al, 1 / retn
 bool ObjectClass::IsNotWarping() const
 {
     return true;
 }
 
-// asm: xor al, al / retn 4
+// asm: ObjectClass_IsDisguisedAs (asm:123139) — xor al, al / retn 4
 bool ObjectClass::IsDisguisedAs(int32 a2) const
 {
     (void)a2;
     return false;
 }
 
-// asm: xor al, al / retn 8
+// asm: ObjectClass_Ignite (asm:1048182) — xor al, al / retn（无参数）
 bool ObjectClass::Ignite() const
 {
     return false;
 }
 
-// asm: xor eax, eax / retn
+// asm: ObjectClass_GetRemapColour (asm:123320) — xor eax, eax / retn
 uint32 ObjectClass::GetRemapColour() const
 {
     return 0;
 }
 
+// asm: ObjectClass_GetType (asm:492530) — xor eax, eax / retn
+//
+//  B 类：基类不持有类型指针；具体类（AnimClass 等）在自己的槽里返回
+//  Type 成员。
 ObjectTypeClass* ObjectClass::GetType() const
 {
     return nullptr;
 }
 
+// asm: ObjectClass_GetTechnoType (asm:1053499) — xor eax, eax / retn
 TechnoTypeClass* ObjectClass::GetTechnoType() const
 {
     return nullptr;
 }
 
-// asm: retn 4
+// asm: ObjectClass_19C (asm:1048231) — retn 4（无返回值）
 int32 ObjectClass::GetSomeInt(int32 a2) const
 {
     (void)a2;
     return 0;
 }
 
-// asm: bare retn - nothing to do at this layer
+// asm: ObjectClass_UnCloak2 (asm:1048063) — 裸 retn
 void ObjectClass::UnCloak2() const
 {
 }
 
+// asm: ObjectClass_FreeCaptured (asm:123221) — 裸 retn
 void ObjectClass::FreeCaptured() const
 {
 }
 
+// asm: ObjectClass::Detach (第二个同名 proc, asm:1052688) —— 见函数内注释。
+//
+//  该槽（vftable +0xF8）就是原版的 "ObjectClass::UnInit"。汇编体不是空的：
+//    1. [this+0x38] 非空 → BombClass_Disarm()；
+//    2. derivationFlags (+0x14) bit0 置位（说明是 Techno）→
+//       TechnoClass::Kill_Cargo(0)；
+//    3. call Detach(this, 1)（vftable +0x28 的引用清理）；
+//    4. 虚调用 vftable +0xD4；
+//    5. byte[this+0x90] = 0；
+//    6. 把 this 追加进 vec_VisibleObjects（帧尾 VisibleObjects_DeleteDead
+//       统一回收）。
+//  C 类，但本工程无法照搬：
+//    * +0x38 的 Bomb 成员、TechnoClass::Kill_Cargo、vftable+0x28 的
+//      ObjectClass::Detach(pObj, bool) 在工程里都不存在，需要新增公共头
+//      文件成员/方法（会改变既有类布局与虚表槽位）；
+//    * +0x90 的存活字节在工程布局里也未被建模（ObjectClass::Alive 是 +0x88
+//      的工程自有字段，语义不同）。
+//  按"不得臆造、不得动公共布局"的约束保留为空实现，并在报告中列为未解决。
 void ObjectClass::UnInit() const
 {
 }
 
+// asm: ObjectClass_StopAirstrikeTimer1 (asm:123184) — 裸 retn
 void ObjectClass::StopAirstrikeTimer1() const
 {
 }
 
-// asm: retn 4
+// asm: ObjectClass_StopAirstrikeTimer2 (asm:123196) — retn 4（无返回值）
 void ObjectClass::StopAirstrikeTimer2(int32 a2) const
 {
     (void)a2;
@@ -1428,31 +1542,38 @@ void ObjectClass::AnimPointerGotInvalid(AnimClass* pAnim)
         AttachedAnim = nullptr;
 }
 
- // ObjectClass_GetDisguiseHouse: base returns null (xor eax,eax).
+// asm: ObjectClass_GetDisguiseHouse (asm:102333) — xor eax, eax / retn 4
 HouseClass* ObjectClass::GetDisguiseHouse(int32 /*a2*/) const
 {
     return nullptr;
 }
 
- // ObjectClass_GetDisguise: base returns null (xor eax,eax).
+// asm: ObjectClass_GetDisguise (asm:102347) — xor eax, eax / retn 4
 int32 ObjectClass::GetDisguise(int32 /*a2*/) const
 {
     return 0;
 }
 
- // ObjectClass_KickOutUnit: base returns false (xor eax,eax).
+// asm: ObjectClass_KickOutUnit (asm:1048074) — xor eax, eax / retn 8
 bool ObjectClass::KickOutUnit(FootClass* /*pUnit*/) const
 {
     return false;
 }
 
- // ObjectClass_ClickedMission: base returns false (xor al,al).
+// asm: ObjectClass_ClickedMission (asm:1048108) — xor al, al / retn 0Ch
 bool ObjectClass::ClickedMission(int32 /*a2*/, int32 /*a3*/, int32 /*a4*/) const
 {
     return false;
 }
 
- // ObjectClass_GetCurrentMission: base returns -1.
+// asm: ObjectClass_GetCurrentMission (asm:1048218) — or eax, 0FFFFFFFFh / retn
+//
+//  A 类：基类没有使命层，答 -1"无使命"。原版该槽是虚函数，TechnoClass 在
+//  自己的槽位上返回真实的 CurrentMission（调用点见 asm:183418 等，走
+//  [edx+vt_TechnoClass.r.m.o.GetCurrentMission]）。本项目的
+//  ObjectClass::GetCurrentMission 目前是非虚的（见 ObjectClass.h:298），
+//  所有调用者拿到的都是基类的 -1 —— 这是对象模型层面的既有差异，不在本次
+//  "常量返回到汇编核对" 的范围内，未改动。
 int32 ObjectClass::GetCurrentMission() const
 {
     return -1;
@@ -1493,8 +1614,12 @@ void ObjectClass::LoadTables(IStream* pStm)
     AbstractClass::LoadTables(pStm);
 }
 
-// ObjectClass_StopAmbientSound.  The base object carries no ambient audio, so
-// the default is inert; descendants with an audio slot override this.
+// asm: ObjectClass_StopAmbientSound —— 汇编里查不到同名 proc。
+//
+//  该槽在本项目里由 CellClass::Silence_Attached_Ambient 以 -1 调用，用来
+//  掐掉格子上的环境音循环；原版的对应实现没有独立符号（要么被内联，要么
+//  藏在某个未命名的 retn 4 桩里，无法唯一确定是哪一个）。没有可核对的函数
+//  体就不改行为，保留"基类无环境音、直接返回"的空实现。
 void ObjectClass::StopAmbientSound(int32 flag) { (void)flag; }
 
  // ObjectClass::Mark.
@@ -1792,9 +1917,138 @@ bool ObjectClass::Who_Can_Build_Me(TechnoTypeClass* pType, bool buildLimit, cons
     return false;
 }
 
-void ObjectClass::DrawALinkTo(const ObjectClass* pTarget) const
+// ============================================================================
+// asm: ObjectClass_DrawALinkTo (asm:1581334 – 1581665，332 行，retn 1Ch)
+//
+//   void __thiscall ObjectClass_DrawALinkTo(ObjectClass* this,
+//        int32 srcX, int32 srcY, int32 srcZ,   // 起点世界坐标（leptons）
+//        int32 dstX, int32 dstY, int32 dstZ,   // 终点世界坐标
+//        RGBb  colour)                         // 链路基色
+//
+//   逐句对照：
+//    1) 两次 Tactical::Coord_To_Pixel：分别把起点、终点投影到像素；
+//       随后两端 X、Y 都加上视口左边界（原文两处都是 rect_mouseclass_vp.L）。
+//    2) 基色按 565 打包（R>>3<<11 | G>>2<<5 | B>>3）。
+//    3) 两端各构造 {px-2, py-2, 3, 3} 的方框，与视口求交（sub_421B60），
+//       非空则 DSurface_Composite->vt[14h] 即 FillRect 落一个端点块。
+//    4) 主循环 32 段（ebp 从 8 步进到 100h）：以 i:(32-i) 对起点/终点做
+//       线性插值（X/Y/Z 各自 /32，负数按 (v+31)>>5 取整）；Z 再叠加抛物线
+//       下垂量 —— asm 里是 st0 = interpZ + (1-Q^2)*512，Q=(i-16)/16，
+//       512.0 即 dbl_7EC050；结果 Float_To_Int_Floor 后作为该点的 Z。
+//       每段把上一点与新点投影成像素再 vt[30h] 即 DrawLine。
+//    5) 每段颜色从基色重新取，按 (step - timePhase) & 0x1F8 求"流动"差值，
+//       差值落在 (0, 0xF8] 时向黑色 RGBClass::Adjust，形成沿链跑的亮带；
+//       timePhase = (timeGetTime() >> 4) << 3。
+//
+//   原版目标面是 DSurface_Composite；本树统一经 Target_Surface() 取当前面。
+// ============================================================================
+
+namespace
 {
-    (void)pTarget;
+    // asm: col_*_SHR_*/SHL_* —— 24bpp RGB 压成 16bpp 565。
+    inline DWORD PackLinkColor565(const RGBClass& rgb)
+    {
+        return ((static_cast<DWORD>(rgb.Red)   >> 3) << 11) |
+               ((static_cast<DWORD>(rgb.Green) >> 2) << 5)  |
+                (static_cast<DWORD>(rgb.Blue)  >> 3);
+    }
+
+    // asm: cdq / and edx,1Fh / add eax,edx / sar eax,5 —— 除以 32，向零取整。
+    inline int32 Div32RoundTowardZero(int32 value)
+    {
+        return (value + ((value < 0) ? 31 : 0)) >> 5;
+    }
+}  // namespace
+
+void ObjectClass::DrawALinkTo(int32 srcX, int32 srcY, int32 srcZ,
+                              int32 dstX, int32 dstY, int32 dstZ,
+                              const ColorStruct& colour) const
+{
+    TacticalClass* pTactical = TacticalClass::Instance;
+    if (pTactical == nullptr)
+        return;
+
+    Surface* pSurface = pTactical->Target_Surface();
+    if (pSurface == nullptr || pSurface->Buffer == nullptr)
+        return;
+
+    // asm: rect_mouseclass_vp —— 全屏战术视口（L/T/W/H）。
+    const Rectangle viewport = (TheDisplay != nullptr)
+        ? TheDisplay->VisibleRect
+        : Rectangle(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+
+    // asm: Tactical::Coord_To_Pixel(TacticalMap, &pSrc, &srcXYZ)
+    //      Tactical::Coord_To_Pixel(TacticalMap, &pDst, &dstXYZ)
+    const CoordStruct srcCoord(srcX, srcY, srcZ);
+    const CoordStruct dstCoord(dstX, dstY, dstZ);
+    Point2D pSrc = pTactical->To_Pixel(srcCoord);
+    Point2D pDst = pTactical->To_Pixel(dstCoord);
+
+    // asm: add X, rect_mouseclass_vp.L / add Y, rect_mouseclass_vp.L
+    pSrc.X += viewport.X;
+    pSrc.Y += viewport.X;
+    pDst.X += viewport.X;
+    pDst.Y += viewport.X;
+
+    // asm: 基色 565 打包
+    const RGBClass baseRgb(colour.R, colour.G, colour.B);
+    const DWORD basePacked = PackLinkColor565(baseRgb);
+
+    // asm: 两个端点各 Rect_SetPos({px-2, py-2}, 3, 3) → sub_421B60 求交 →
+    //      DSurface_Composite->vt[14h](rect, colour)（FillRect）
+    const Point2D endpoints[2] = { pSrc, pDst };
+    for (const Point2D& p : endpoints)
+    {
+        const Rectangle box(p.X - 2, p.Y - 2, 3, 3);
+        Rectangle clipped = box.Intersection(viewport);
+        if (clipped.Width > 0 && clipped.Height > 0)
+            pSurface->FillRect(&clipped, basePacked);
+    }
+
+    // asm: call ds:__imp_timeGetTime / shr eax,4 / shl eax,3
+    //   本树没有独立毫秒时钟，逐帧时钟沿用 BuildingClass::DrawRadialIndicator
+    //   的既有映射（Game::GetCurrentFrame()）。
+    const int32 timePhase =
+        static_cast<int32>((static_cast<uint32>(Game::GetCurrentFrame()) >> 4) << 3);
+
+    // asm: mov esi,1 / mov edi,1Fh / mov ebp,8 —— i、32-i、步长
+    CoordStruct prevCoord = srcCoord;
+    int32 step = 8;
+    for (int32 i = 1; i <= 32; ++i, step += 8)
+    {
+        const int32 j = 32 - i;
+
+        // asm: 三点各自 (dst*i + src*j) / 32
+        const int32 ix = Div32RoundTowardZero(dstX * i + srcX * j);
+        const int32 iy = Div32RoundTowardZero(dstY * i + srcY * j);
+        const int32 iz = Div32RoundTowardZero(dstZ * i + srcZ * j);
+
+        // asm: Q = 0.0625*(i-16)；st0 = interpZ + (1-Q^2)*512.0 → floor
+        const double q  = (static_cast<double>(i) - 16.0) * 0.0625;
+        const double sag = static_cast<double>(iz) + (1.0 - q * q) * 512.0;
+        const int32 curZ = static_cast<int32>(Float_To_Int_Floor(sag));
+
+        const CoordStruct curCoord(ix, iy, curZ);
+
+        // asm: 每段把"上一点"和"当前点"投影成像素
+        Point2D pPrev = pTactical->To_Pixel(prevCoord);
+        Point2D pCur  = pTactical->To_Pixel(curCoord);
+        pPrev.X += viewport.X;
+        pPrev.Y += viewport.X;
+        pCur.X  += viewport.X;
+        pCur.Y  += viewport.X;
+
+        // asm: 基色 → (step - phase) & 0x1F8 → 0 < d <= 0xF8 时 Adjust(d, black)
+        RGBClass segRgb = baseRgb;
+        const int32 delta = (step - timePhase) & 0x1F8;
+        if (delta != 0 && delta <= 0xF8)
+            segRgb.Adjust(delta, RGBClass(0, 0, 0));
+
+        // asm: DSurface_Composite->vt[30h](&pPrev, &pCur, colour565)（DrawLine）
+        pSurface->DrawLine(&pPrev, &pCur, PackLinkColor565(segRgb));
+
+        prevCoord = curCoord;
+    }
 }
 
 // ============================================================================

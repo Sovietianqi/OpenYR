@@ -21,9 +21,12 @@
 #include <Animations/AnimClass.h>
 #include <Animations/AnimTypeClass.h>
 #include <Locomotion/LocomotionClass.h>
+#include <Locomotion/DriveLocomotionClass.h>
+#include <cstdlib>
 #include <Particles/ParticleSystemClass.h>
 #include <Scenario/ScenarioClass.h>
 #include <Special/TemporalClass.h>
+#include <Abstract/MissionClass.h>
 #include <AI/TagClass.h>
 #include <Houses/HouseClass.h>
 #include <Rules/RulesClass.h>
@@ -672,6 +675,11 @@ void UnitClass::Draw(Point2D& point, RectangleStruct& rect)
     if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
         ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
 
+    // ---- ④ 附加绘制（话泡 / 军衔等）--------------------------------------
+    //   原版由 TechnoClass::DrawExtras 承担；本树 Draw() 不走 vtable 分派，
+    //   因此在具体类末尾显式调用一次。当前 DrawExtras 只落地了话泡。
+    DrawExtras(&point, &rect);
+
     if (g_bDebugMode)
         g_RenderDebugStats.DrawCalls++;
 }
@@ -891,16 +899,132 @@ bool UnitClass::GotoClearSpot()
     return false;
 }
 
+// =============================================================================
+// asm: UnitClass::Try_To_Deploy (0x739330, this=ecx)
+//
+//   MCV 这类"展开成建筑"的单位在这里完成真正的转换：
+//     * 目标类型 = UnitType->DeploysInto；为空则是简单部署器，只走动画；
+//     * 落位格 = 当前格；地基任一维大于 2 时右移一格让建筑居中
+//       （asm loc_739499 的 CellCoordDirections[+1C/+1E]）；
+//     * Legal_Placement：按地基逐格确认可建；
+//     * 造 BuildingClass、按血量比例继承、格心落位；
+//     * 非人类房写 BaseSpawnCell（AcquiredConyard 由 Unlimbo 的登记段触发）；
+//     * 原单位退场。
+//
+//   ★ 此前本函数只有"置 Deploying + 播动画"两句，从不生成建筑：MCV 展开
+//   后原地消失成一辆贴着 Deployed 序列的载具，建造场永远不存在，AI 的
+//   建造清单（OwnedConyards → AcquiredConyard → GenerateAIBuildList）也就
+//   永远没有入口。
+// =============================================================================
 bool UnitClass::TryToDeploy()
 {
+    if (!Type) return false;
+    if (Deploying || Deployed) return false;
     if (!CanDeploy()) return false;
-    if (Deploying) return false;
-    if (Deployed) return false;
 
-    Deploying = true;
-    Undeploying = false;
-    unknown_7E0 = 0; // reset deploy animation frame counter
-    SetSequence(Sequence::Deploy);
+    BuildingTypeClass* pDeployType = Type->DeploysInto;
+
+    // ── 非建筑展开型：雷达车 / 裂缝产生器一类，只切换序列 ────────────────
+    if (pDeployType == nullptr)
+    {
+        Deploying   = true;
+        Undeploying = false;
+        unknown_7E0 = 0;
+        SetSequence(Sequence::Deploy);
+        return true;
+    }
+
+    if (IsInLimbo || Owner == nullptr || MapClass::Instance == nullptr)
+        return false;
+
+    // ── 落位格 ───────────────────────────────────────────────────────────
+    CellStruct placeCell = CellClass::Coord2Cell(GetCoords());
+    const int32 fundX = pDeployType->X_Foundation_Value();
+    const int32 fundY = pDeployType->Y_Foundation_Value(false);
+    if (fundX > 2 || fundY > 2)
+    {
+        placeCell.X = static_cast<int16>(placeCell.X + 1);
+        placeCell.Y = static_cast<int16>(placeCell.Y + 1);
+    }
+
+    // ── Legal_Placement：根基逐格确认可建 ────────────────────────────────
+    const int32 spanX = pDeployType->X_Foundation_Value();
+    const int32 spanY = pDeployType->Y_Foundation_Value(true);
+    for (int32 dy = 0; dy < spanY; ++dy)
+    {
+        for (int32 dx = 0; dx < spanX; ++dx)
+        {
+            const CellStruct probe(static_cast<int16>(placeCell.X + dx),
+                                   static_cast<int16>(placeCell.Y + dy));
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr) return false;
+            if (pCell->IsOccupied()) return false;
+            if (!pDeployType->IsNaval && !pCell->IsPassable()) return false;
+        }
+    }
+
+    // ── 把自己从占用链上摘下：建筑落位的地基检查会撞到原单位 ─────────────
+    const CoordStruct savedCoord = GetCoords();
+    Limbo();
+
+    // ── 创建建筑 ─────────────────────────────────────────────────────────
+    BuildingClass* pBuilding = new BuildingClass(Owner);
+    if (pBuilding == nullptr)
+    {
+        // 回滚：把自己放回原处。
+        Location  = savedCoord;
+        IsInLimbo = true;
+        Unlimbo();
+        return false;
+    }
+
+    pBuilding->Type       = pDeployType;
+    pBuilding->TechnoType = pDeployType;
+    pBuilding->IsInLimbo  = true;
+
+    // 血量按原单位比例继承（asm 尾段：Health_Ratio * Strength，下限 1）。
+    int32 newHealth = 1;
+    if (pDeployType->Strength > 0)
+    {
+        const int32 maxHp = (MaxHealth > 0) ? MaxHealth : 1;
+        newHealth = static_cast<int32>(
+            static_cast<double>(Health) * static_cast<double>(pDeployType->Strength)
+            / static_cast<double>(maxHp));
+    }
+    if (newHealth < 1) newHealth = 1;
+    pBuilding->Health    = newHealth;
+    pBuilding->MaxHealth = (pDeployType->Strength > 0) ? pDeployType->Strength : newHealth;
+
+    // 落位坐标取格心（原版 `cell<<8 + 0x80`）。
+    pBuilding->Location = CoordStruct(
+        static_cast<int32>(placeCell.X) * 256 + 128,
+        static_cast<int32>(placeCell.Y) * 256 + 128, 0);
+
+    if (!pBuilding->Unlimbo())
+    {
+        delete pBuilding;
+        // 回滚：把自己放回原处。
+        Location  = savedCoord;
+        IsInLimbo = true;
+        Unlimbo();
+        return false;
+    }
+
+    // ★ 展开出来的建造场同样要走"建造段"才上线。
+    //   原版 MCV 展开后建筑从地基升起、播完动画才 IsConstructed=1 并供电；
+    //   少了这一步，AI 的建造场永远停在"未建成"：OwnedConyards 里的计数
+    //   对不上（实测 cy=2 —— 建成判定失效导致去重也失效，又造了一座）、
+    //   电力不产出、基地扩张的门槛（已建成建筑数）永远跨不过去。
+    pBuilding->Place(false);
+    pBuilding->QueueMission(Mission::Construction);
+
+    // ── AI 房的基地锚点（asm loc_73982C 之后）───────────────────────────
+    if (!Owner->Is_Human())
+        Owner->BaseSpawnCell = placeCell;
+
+    // ── 原单位退场 ───────────────────────────────────────────────────────
+    Deployed  = true;
+    Deploying = false;
     return true;
 }
 
@@ -1297,6 +1421,10 @@ void UnitClass::UnmarkAllOccupationBits(const CoordStruct& coords)
 // =============================================================================
 void UnitClass::SetTarget(AbstractClass* pTarget)
 {
+    // 先写 FootClass 层那一份：UpdateTargeting / Mission_Enter / Mission_Guard
+    // 统一读 CurrentTarget，漏掉这一步它们看到的永远是空目标。
+    FootClass::SetTarget(pTarget);
+
     // Store the target pointer across two adjacent DWORD fields.
     uintptr_t ptrVal = reinterpret_cast<uintptr_t>(pTarget);
     unknown_7E8 = static_cast<DWORD>(ptrVal);
@@ -1312,6 +1440,7 @@ AbstractClass* UnitClass::GetTarget() const
 
 void UnitClass::ClearTarget()
 {
+    FootClass::SetTarget(nullptr);
     unknown_7E8 = 0;
     unknown_7EC = 0;
 }
@@ -1357,16 +1486,22 @@ void UnitClass::SetMission(Mission mission)
 
 Mission UnitClass::GetMission() const
 {
-    return static_cast<Mission>(unknown_7F0);
+    // ★ 唯一权威是任务层 +0xA8（MissionClass::CurrentMission）。
+    //   本树早期另开了一个 unknown_7F0 副本，SetMission 写它、GetMission 读它；
+    //   但 MissionClass_Update 的任务采用段改的是 +0xA8 —— 两条路各走一边，
+    //   于是 QueueMission(Hunt) 之后 GetMission() 永远看不到 Hunt：
+    //   MCV 的"自动展开"分支排了任务却永远不执行。
+    return MissionClass::CurrentMission;
 }
 
 void UnitClass::QueueMission(Mission mission)
 {
     unknown_7F4 = static_cast<DWORD>(mission);
 
-    // 同步排队槽（asm +0xB0 QueuedMission）：MissionClass::ResetMission /
-    // Override_Mission 都要读它。
-    MissionClass::QueuedMission = mission;
+    // asm: TechnoClass_QueueMission → Assign_Mission，目标写进 field_B4，
+    //   由 NextMission 提升为 `what`，再由任务采用段转正。
+    //   必须走任务层，才能和 +0xA8/+0xAC/+0xB4 三槽的节拍对齐。
+    MissionClass::Queue_Mission(mission);
 }
 
 // =============================================================================
@@ -1722,22 +1857,26 @@ bool UnitClass::Can_Fire_At(TechnoClass* pTarget, int32 weaponIndex) const
 int32 UnitClass::GetWeaponRange(int32 weaponIndex) const
 {
     if (!Type) return 0;
-    if (weaponIndex < 0 || weaponIndex >= Type->WeaponCount) return 0;
 
-    // Return the range of the specified weapon.
-    WeaponStruct& ws = Type->Weapons[weaponIndex];
-    if (!ws.WeaponType) return 0;
+    // 走 GetWeapon()：它会按 Primary/Secondary 别名补齐 0/1 号槽，
+    //   避免只填了别名而漏写数组时射程被算成 0（等于永远打不到人）。
+    WeaponStruct* pSlot = Type->GetWeapon(weaponIndex);
+    if (pSlot == nullptr || pSlot->WeaponType == nullptr) return 0;
+    WeaponStruct& ws = *pSlot;
 
-    // Range is stored in leptons; use the weapon type's range.
-    return static_cast<int32>(Type->GuardRange);
+    // asm: 射程取武器槽上的 WeaponType->Range（已由 CCINIClass::Get_Lepton
+    //   换算成 lepton）。原实现返回 GuardRange（格），与 lepton 距离比较时
+    //   恒判"射程不足"。
+    return ws.WeaponType->Range;
 }
 
 int32 UnitClass::GetWeaponDamage(int32 weaponIndex) const
 {
     if (!Type) return 0;
-    if (weaponIndex < 0 || weaponIndex >= Type->WeaponCount) return 0;
 
-    WeaponStruct& ws = Type->Weapons[weaponIndex];
+    WeaponStruct* pSlot = Type->GetWeapon(weaponIndex);
+    if (pSlot == nullptr) return 0;
+    WeaponStruct& ws = *pSlot;
     if (!ws.WeaponType) return 0;
 
     // Return the weapon's damage value.
@@ -1991,9 +2130,13 @@ void UnitClass::Kill()
 bool UnitClass::CanDeploy() const
 {
     if (!Type) return false;
-    if (!Type->HasDeployer) return false;
     if (Deploying || Deployed) return false;
-    return true;
+    if (IsInLimbo) return false;
+    // asm: UnitClass_Can_Deploy —— 两种部署者：`Deployer=yes` 的简单部署器
+    //   （雷达车/裂缝产生器）与 `DeploysInto=<建筑>` 的展开型（MCV）。
+    //   此前只认前者，MCV 的 DeploysInto 被完全忽略，展开命令一律被拒。
+    if (Type->DeploysInto != nullptr) return true;
+    return Type->HasDeployer;
 }
 
 bool UnitClass::CanEnter() const
@@ -2210,10 +2353,13 @@ bool UnitClass::Unlimbo()
 {
     if (!IsInLimbo) return false;
     IsInLimbo = false;
+    Init_Locomotion();          // 按类型装配行走逻辑（TechnoClass_Init 段）
+    Start_Default_Mission();    // 落位后启动默认 Guard 任务
     MarkAllOccupationBits(Location);
-    // asm: UnitClass_Unlimbo -> ObjectClass::Unlimbo 尾部 vec_Logics.Add
-    //   （L1049805）。覆写版必须补上这一步，否则单位不进逐帧主表。
-    Register_Logic();
+    // asm: UnitClass_Unlimbo -> ObjectClass::Unlimbo 尾部：置 Alive、进
+    //   vec_Logics、交显示层（L1049805）。覆写版必须补上这一步，
+    //   否则单位进不了逐帧主表。
+    FinalizeUnlimbo();
     return true;
 }
 
@@ -2536,7 +2682,19 @@ void UnitClass::DumpTiberium()
         if (pCell != nullptr && pCell->TiberiumValue > 0)
             cellValue = pCell->TiberiumValue;
     }
-    int32 credits = HarvestAmount * cellValue;
+    // 结算金额优先用货舱里累计的"矿石价值"（Harvest() 每采一份就按当时那
+    //   一格的矿石单价累进 TotalTiberiumValue）。只有它为 0（脚本/存档直接
+    //   填了 HarvestAmount）时才退回"舱量 × 当前格单价"。
+    //   ★ 之前一律用"矿车当前格（炼油厂格）"的 TiberiumValue，那里根本没有矿，
+    //   永远取到 0 → 兜底 10 点/单位，A 类矿石和 B 类矿石卖一个价。
+    int32 credits = (TotalTiberiumValue > 0)
+        ? TotalTiberiumValue
+        : (HarvestAmount * cellValue);
+    if (std::getenv("OPENYR_HARV_PROBE") != nullptr) {
+        std::printf("[DUMP] f=%d cargo=%d cellValue=%d credits=%d creditsBefore=%d\n",
+                    Game::GetCurrentFrame(), HarvestAmount, cellValue, credits,
+                    Owner->Credits);
+    }
     Owner->GiveMoney(credits);
 
     HarvestAmount = 0;
@@ -2545,6 +2703,11 @@ void UnitClass::DumpTiberium()
 
     // Resume harvesting on the next AI tick.
     IsHarvestingTiberium = true;
+
+    // asm: Mission_Unload 卸空后的下场是"回矿"（TechnoClass_Mission_Unload →
+    //   QueueMission(Harvest)）。少了这一步，矿车卸完货就永久停在 Unload 上
+    //   （货舱已空 → Mission_Unload 直接返回 1），一车只赚一次钱。
+    QueueMission(Mission::Harvest);
 }
 
 // ============================================================================
@@ -3136,7 +3299,7 @@ void UnitClass::CreateFromINIList(CCINIClass* pINI)
         if (pOwnerName == nullptr || pTypeName == nullptr)
             continue;
 
-        const int32 ownerIndex = HouseClass::FindIndexByName(pOwnerName);
+        const int32 ownerIndex = HouseClass::FindIndexByNameOrType(pOwnerName);
         if (ownerIndex < 0)
             continue;
 
@@ -3148,12 +3311,16 @@ void UnitClass::CreateFromINIList(CCINIClass* pINI)
         if (pOwner == nullptr)
             continue;
 
-        // 按原版顺序读取其余字段：生命值、朝向、坐标、任务。
+        // ★ 字段顺序以 asm 为准：owner,type,health,x,y,facing,mission,...
+        //
+        //   UnitClass_CreateFromINIList（asm 0x7432xx）的读取顺序是：
+        //     field3 -> health（var_88）
+        //     NewINIFormat >= 4：field4 -> X, field5 -> Y
+        //     其后第一个字段才是朝向（写 +0x150，经 Mult1_100th 量化到 256 分度）
+        //   此前这里写成了 health,facing,x,y —— 把朝向当 X、X 当 Y，
+        //   任何真实地图的载具都会落在左上角并朝错方向。
         const char* pField = std::strtok(nullptr, ",");
         const int32 health = (pField != nullptr) ? std::atoi(pField) : 0;
-
-        pField = std::strtok(nullptr, ",");
-        int32 facing = (pField != nullptr) ? std::atoi(pField) : 0;
 
         pField = std::strtok(nullptr, ",");
         const int32 x = (pField != nullptr) ? std::atoi(pField) : 0;
@@ -3161,16 +3328,35 @@ void UnitClass::CreateFromINIList(CCINIClass* pINI)
         pField = std::strtok(nullptr, ",");
         const int32 y = (pField != nullptr) ? std::atoi(pField) : 0;
 
+        pField = std::strtok(nullptr, ",");
+        const int32 facing = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        // 第 7 字段：Mission（名字）。第 8 字段：Tag。
+        //   ModEnc [Units]：OWNER,ID,HEALTH,X,Y,FACING,MISSION,TAG,VETERANCY,...
+        const char* pMissionName = std::strtok(nullptr, ",");
+        const char* pTagName = std::strtok(nullptr, ",");
+
         // 实例化并放到地图上。
         UnitClass* pUnit = new UnitClass(pOwner);
         if (pUnit == nullptr)
             continue;
 
+        pUnit->Type       = pType;
+        pUnit->TechnoType = pType;
+        pUnit->MaxHealth  = (pType->Strength > 0) ? pType->Strength : 200;
+        if (health > 0 && pType->Strength > 0)
+        {
+            int32 hp = static_cast<int32>(
+                (static_cast<int64>(pType->Strength) * health) / 256);
+            pUnit->Health = (hp > 0) ? hp : 1;
+        }
+        else
+        {
+            pUnit->Health = pUnit->MaxHealth;
+        }
+
         // 朝向按 256 分度写回。
         pUnit->PrimaryFacing = DirStruct(static_cast<uint8>(facing & 0xFF));
-
-        if (health > 0)
-            pUnit->Health = health;
 
         CoordStruct pos(x, y, 0);
         if (MapClass::Instance != nullptr) {
@@ -3179,7 +3365,47 @@ void UnitClass::CreateFromINIList(CCINIClass* pINI)
             if (pCell != nullptr)
                 pCell->ConvertCoords(&pos);
         }
-        pUnit->SetCoords(pos);
+        pUnit->Location  = pos;
+        pUnit->IsInLimbo = true;
+
+        // ★ 必须走 Unlimbo 才真正落图。
+        //   只 SetCoords 的对象仍带 IsInLimbo=1：不参与绘制、不参与碰撞、
+        //   不进 Display 的可见表，等于"造出来就消失了"。
+        if (!pUnit->Unlimbo())
+        {
+            delete pUnit;
+            continue;
+        }
+        if (TheDisplay != nullptr)
+            TheDisplay->Submit(pUnit);
+
+        // [Units] 第 7 字段的 Mission：预置单位可以带 Hunt / Sleep / Stunned 等
+        //   初始任务（Unlimbo 里已由 Start_Default_Mission 设成 Guard，这里覆盖）。
+        if (pMissionName != nullptr && pMissionName[0] != '\0' &&
+            _strcmpi(pMissionName, "<none>") != 0 && _strcmpi(pMissionName, "none") != 0)
+        {
+            const Mission m = MissionControlClass::FindIndex(pMissionName);
+            if (m != Mission::Guard && m != Mission::Sleep)
+                pUnit->ForceMission(m);
+        }
+
+        // [Units] 第 8 字段的 Tag：附着到实例并登记进标签的权威表。
+        //   persistence=1（半持久）要靠这张表判断"附着对象是否全灭"。
+        if (pTagName != nullptr && pTagName[0] != '\0' &&
+            _strcmpi(pTagName, "<none>") != 0 && _strcmpi(pTagName, "none") != 0)
+        {
+            // ★ 实体落位（Setup 的 4.x 段）早于 [Tags]/[Triggers] 的解析，
+            //   所以这里必须用 FindOrAllocate 先建占位实例；随后的
+            //   TagTypeClass::CreateInstance 会按同名复用并把 TagType 补上。
+            //   若地图没有 [Tags] 段而实体写了标签名，这个占位实例的
+            //   TagType 恒空，RaiseEvent 会直接返回 false —— 无害。
+            TagClass* pTag = TagClass::FindOrAllocate(pTagName);
+            if (pTag != nullptr)
+            {
+                pUnit->Tag = pTag;
+                pTag->Assign_To_Object(pUnit);
+            }
+        }
     }
 }
 
@@ -3212,8 +3438,8 @@ void UnitClass::SaveToMapINIList(INIClass* pINI)
 
 // asm: void __thiscall UnitClass_SaveToMapINI(UnitClass *this, INIClass *INI)
 //
-//  回写单台载具的放置记录，格式（NewINIFormat >= 5）：
-//    <index> = <owner>,<type>,<health>,<facing>,<x>,<y>,<mission>
+//  回写单台载具的放置记录，字段顺序与 CreateFromINIList 对称（asm）：
+//    <index> = <owner>,<type>,<health>,<x>,<y>,<facing>,<mission>
 void UnitClass::SaveToMapINI(INIClass* pINI) const
 {
     if (pINI == nullptr || Type == nullptr)
@@ -3243,10 +3469,15 @@ void UnitClass::SaveToMapINI(INIClass* pINI) const
     // 当前任务。
     const int32 mission = static_cast<int32>(GetMission());
 
+    // ★ 坐标写的是**格号**，不是世界像素：读取端会拿格号做 ConvertCoords。
+    //   直接写 pos.X/pos.Y（像素）会让地图在"读→写→读"后整体放大 256 倍。
+    const CellStruct cell = CellClass::Coord2Cell(pos);
+
     char value[256];
     std::snprintf(value, sizeof(value), "%s,%s,%d,%d,%d,%d,%d",
-                  pOwnerName, pTypeName, health, facing256,
-                  static_cast<int>(pos.X), static_cast<int>(pos.Y), mission);
+                  pOwnerName, pTypeName, health,
+                  static_cast<int>(cell.X), static_cast<int>(cell.Y),
+                  facing256, mission);
 
     pINI->WriteString("Units", key, value);
 }
@@ -3905,7 +4136,15 @@ void UnitClass::Update()
         bool isBaseConstant = false;
         for (int32 i = 0; i < pRules->BuildConst.Count; ++i)
         {
-            if (pRules->BuildConst[i] == Type->DeploysInto) {
+            BuildingTypeClass* pConst = pRules->BuildConst[i];
+            if (pConst == nullptr)
+                continue;
+            // 指针优先，再按 ID 兜底：BuildConst 与 DeploysInto 若走了不同的
+            //   注册路径（大小写/重复登记），指针会不等而同名，此时按 ID 认。
+            if (pConst == Type->DeploysInto
+                || (pConst->ID[0] != '\0'
+                    && std::strcmp(pConst->ID, Type->DeploysInto->ID) == 0))
+            {
                 isBaseConstant = true;
                 break;
             }
@@ -3918,6 +4157,29 @@ void UnitClass::Update()
         {
             QueueMission(Mission::Hunt);
         }
+
+        // 直接展开：原版 MCV 的展开是本帧任务体（Unload/Hunt）里调
+        //   UnitClass::Try_To_Deploy 完成的。任务层在本树仍有一条
+        //   "排队 → 采用"的链路没有完全跑通（QueueMission 写进 field_B4 后
+        //   没有被提升），于是 MCV 会永远停在 None 上不动，建造场永不出现 ——
+        //   AI 的整条基地建设链随之作废。这里在段 F 内直接调用展开，
+        //   语义与"任务体执行展开"等价，且不受任务层节拍影响。
+        if (isBaseConstant && !IsInLimbo && GetMission() != Mission::Unload)
+        {
+            if (TryToDeploy())
+                return;             // 已变成建筑，本帧不再跑后续段
+        }
+    }
+
+    // ---- 段 F2：展开型单位执行转换 --------------------------------------
+    //   段 F 只负责把任务排成 Hunt（原版语义），真正的转换发生在任务体的
+    //   `if (DeploysInto) Try_To_Deploy()` 分支里。本树此前只有排队、没有
+    //   执行：AI 的 MCV 会永远停在 Hunt 状态原地不动，建造场永远不会出现。
+    if (GetMission() == Mission::Hunt && !IsInLimbo
+        && Type != nullptr && Type->DeploysInto != nullptr)
+    {
+        if (TryToDeploy())
+            return;                 // 已变成建筑，本帧不再跑后续段
     }
 
     // ---- 段 G：父类逐帧 -------------------------------------------------
@@ -3956,6 +4218,107 @@ void UnitClass::Update()
             SetDestination(pBay->GetCoords());
             SetTarget(nullptr);
             QueueMission(Mission::Enter);
+        }
+    }
+
+    // ---- 临时探针：矿车卡死定位（OPENYR_HARV_PROBE=1）--------------------
+    if (Type != nullptr && (Type->Harvester || Type->Weeder)
+        && (frame & 31) == 0 && std::getenv("OPENYR_HARV_PROBE") != nullptr)
+    {
+        const CoordStruct at = GetCoords();
+        const CoordStruct dst = Get_Destination();
+        DriveLocomotionClass* pDrive = static_cast<DriveLocomotionClass*>(Locomotion);
+        CellClass* pCell = (MapClass::Instance != nullptr)
+            ? MapClass::Instance->GetCellAt(Math::CoordToCell(at)) : nullptr;
+        BuildingClass* pB = (pCell != nullptr) ? pCell->Cell_Building() : nullptr;
+        BuildingClass* pRef = (Owner != nullptr) ? FindNearestBuilding(
+            Owner, at,
+            [](BuildingClass* pX) { return pX->Type != nullptr && pX->Type->Refinery; })
+            : nullptr;
+        int32 refDist = -1;
+        if (pRef != nullptr) {
+            CoordStruct rc;
+            pRef->GetCoords(&rc);
+            refDist = rc.DistanceFrom(at);
+        }
+        std::printf("[HARV] f=%d m=%d at=(%d,%d) dest=(%d,%d) locoDest=(%d,%d)"
+                    " driving=%d acc=%d dist=%d cellbld=%s ref=%d cargo=%d"
+                    " full=%d dump=%d harvest=%d\n",
+                    frame, static_cast<int32>(GetMission()), at.X, at.Y,
+                    dst.X, dst.Y,
+                    (pDrive != nullptr) ? pDrive->Destination.X : -1,
+                    (pDrive != nullptr) ? pDrive->Destination.Y : -1,
+                    (pDrive != nullptr) ? static_cast<int32>(pDrive->IsDriving) : -1,
+                    (pDrive != nullptr) ? pDrive->SpeedAccum : -1,
+                    (pDrive != nullptr) ? pDrive->CurrentCoord.DistanceFrom(pDrive->Destination) : -1,
+                    (pB != nullptr && pB->Type != nullptr) ? pB->Type->ID : "-",
+                    refDist, HarvestAmount,
+                    static_cast<int32>(IsHarvestingTooMuch()),
+                    static_cast<int32>(IsDumpingTiberium),
+                    static_cast<int32>(IsHarvestingTiberium));
+        std::printf("[HARV]    what=%d b4=%d q=%d status=%d\n",
+                    static_cast<int32>(what), field_B4,
+                    static_cast<int32>(QueuedMission), MissionStatus);
+    }
+
+    // ---- 段 K0：矿车任务看门狗 -------------------------------------------
+    //   矿车只该在 Harvest / Unload / Return / Guard / Move 之间循环。若它停在
+    //   Enter（进建筑）且没有任何目标，说明有一条把"进场"当默认结局的路径
+    //   摸到了它（原版不会：矿车的任务表里没有这条兜底）。停在这里的矿车既不
+    //   移动也不采集，阵营从此没有收入，AI 花完开局资金就彻底停摆。
+    //   这里按"恢复采集"处理，等价于原版 Mission_Guard 的矿车回矿分支。
+    if (Type != nullptr && (Type->Harvester || Type->Weeder)
+        && !IsInLimbo && Owner != nullptr && !Owner->Is_Human()
+        && GetMission() == Mission::Enter && GetTarget() == nullptr)
+    {
+        SetMission(Mission::Harvest);
+    }
+
+    // ---- 段 K1：矿车逐帧采集推进 -----------------------------------------
+    //   任务层的 Mission_Harvest 受任务计时器节流（原版一步大约 0.3 秒），
+    //   而本树的节拍表在缺 ini 时常常落到很大值，矿车到了矿上却迟迟不动。
+    //   这里按"每 8 帧采一份"直接推进：等价于原版"站在矿格上持续采集"的
+    //   稳定速率，且不受任务计时器影响。
+    if (Type != nullptr && (Type->Harvester || Type->Weeder)
+        && !IsInLimbo && MapClass::Instance != nullptr
+        && (frame & 7) == 0 && !IsHarvestingTooMuch())
+    {
+        const CellStruct hereCell = Math::CoordToCell(GetCoords());
+        CellClass* pHere = MapClass::Instance->GetCellAt(hereCell);
+        if (pHere != nullptr && pHere->IsTiberium()
+            && pHere->Get_Tiberium_Value() > 0)
+        {
+            Harvest();
+        }
+        else if (!Is_Moving())
+        {
+            // 脚下这格采空了：找下一格矿开过去。
+            //   原版矿车采空一格会自己沿矿脉挪一格；只做"脚下采集"会让矿车
+            //   采完第一格就永远停在那里（实测 cargo 停在 150/210 不动）。
+            CellStruct oreCell;
+            if (Find_Ore(oreCell))
+                SetDestination(Math::CellToCoord(oreCell));
+        }
+    }
+
+    // ---- 段 K2：满舱回炼油厂 ---------------------------------------------
+    //   舱满后必须转 Unload，否则矿车站在矿上无限"采满即停"：货不入账，
+    //   阵营就永远没有收入（实测 cargo=360 卡住、资金停在 0）。
+    if (Type != nullptr && (Type->Harvester || Type->Weeder)
+        && !IsInLimbo && Owner != nullptr && IsHarvestingTooMuch()
+        && (frame & 15) == 0)
+    {
+        BuildingClass* pRefinery = FindNearestBuilding(
+            Owner, GetCoords(),
+            [](BuildingClass* pB) {
+                return pB->Type != nullptr && pB->Type->Refinery;
+            });
+        if (pRefinery != nullptr)
+        {
+            if (!Is_Moving())
+                SetDestination(pRefinery->GetCoords());
+            IsDumpingTiberium = true;
+            QueueMission(Mission::Unload);
         }
     }
 
@@ -4125,6 +4488,17 @@ int32 UnitClass::Mission_Guard()
                 }
             }
 
+            // Dock 列表为空时（内置兜底规则集里 [HARV] 没有 Dock= 键）退一步：
+            //   只要本房有炼油厂就算"有地方卸矿"。缺这条兜底，矿车永远
+            //   Guard 在原地 —— 不采矿就没有收入，AI 花光开局资金后停摆。
+            if (!hasDock && Type->Dock.Count == 0)
+            {
+                hasDock = (FindNearestBuilding(Owner, GetCoords(),
+                    [](BuildingClass* pB) {
+                        return pB->Type != nullptr && pB->Type->Refinery;
+                    }) != nullptr);
+            }
+
             if (hasDock)
             {
                 // asm: 满舱 / 正在卸 → 直接转 Harvest 由任务层接着跑。
@@ -4170,7 +4544,7 @@ int32 UnitClass::Mission_Hunt()
         GotoClearSpot();
     }
 
-    return MissionClass::Mission_Hunt();
+    return FootClass::Mission_Hunt();
 }
 
 // ----------------------------------------------------------------------------
@@ -4179,6 +4553,118 @@ int32 UnitClass::Mission_Hunt()
 //  矿车：满舱 → 回最近炼油厂（Unload）；空舱 → 回矿脉（Harvest）。
 //  其余载具：退回基类的返航处理。
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// asm: int __thiscall UnitClass::Mission_Harvest(UnitClass *this)
+//
+//  采集任务本体（任务表槽位 10）。原版是状态机，每步只推进一步：
+//    ① 舱满（或已在卸矿态）→ 找最近炼油厂，设目的地并转 Unload；
+//    ② 脚下这一格有矿       → 采一份（Harvest() 内部扣格 / 累舱），
+//                             返回 1 表示"本步有效，下帧继续"；
+//    ③ 脚下没矿             → Find_Ore 找最近的矿格开过去；
+//    ④ 附近无矿             → 先回炼油厂待命（原版同样会往基地靠）。
+//
+//  ★ 本树此前只实现了单步的 Harvest()，任务槽仍落在 MissionClass 的空实现
+//    上：矿车接到 Harvest 后既不移动也不采，舱里恒 0，AI 把开局资金花完就
+//    再也回不了血。这一段把任务与单步函数接起来。
+// ----------------------------------------------------------------------------
+int32 UnitClass::Mission_Harvest()
+{
+    if (Type == nullptr || (!Type->Harvester && !Type->Weeder)
+        || MapClass::Instance == nullptr)
+    {
+        return MissionClass::Mission_Harvest();
+    }
+
+    // ① 舱满 / 正在卸：回炼油厂。
+    if (IsHarvestingTooMuch() || IsDumpingTiberium)
+    {
+        IsHarvestingTiberium = false;
+        IsDumpingTiberium    = true;
+        if (Owner != nullptr)
+        {
+            BuildingClass* pRefinery = FindNearestBuilding(
+                Owner, GetCoords(),
+                [](BuildingClass* pB) {
+                    return pB->Type != nullptr && pB->Type->Refinery;
+                });
+            if (pRefinery != nullptr)
+            {
+                CoordStruct dock;
+                pRefinery->GetCoords(&dock);
+                // 到站判定按距离，不按 "Is_Moving() == false"：任务每一步都会
+                //   重新 SetDestination，移动标志会被反复点亮，用它在厂门口
+                //   等"停下"永远等不到。
+                if (dock.DistanceFrom(GetCoords()) <= 0x200)
+                {
+                    QueueMission(Mission::Unload);
+                    return 0;
+                }
+                SetDestination(dock);
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    // ② 脚下有矿：采一份。
+    const CellStruct here = Math::CoordToCell(GetCoords());
+    CellClass* pCell = MapClass::Instance->GetCellAt(here);
+    if (pCell != nullptr && pCell->IsTiberium() && pCell->Get_Tiberium_Value() > 0)
+    {
+        if (Harvest())
+        {
+            // 装满后立刻转卸矿，避免在矿上多停一帧。
+            if (IsHarvestingTooMuch())
+            {
+                IsHarvestingTiberium = false;
+                IsDumpingTiberium    = true;
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    // ③ 不在矿上：找最近的矿格。
+    //   先按 12 格的局部半径找（原版采矿的常规范围）；近处被采空就放大到
+    //   64 格再搜一次 —— 否则矿车卸完货回到厂里、附近 12 格内已经没矿时，
+    //   会永远停在炼油厂格上（实测 f=736 之后 cargo 恒 0、资金不再增长）。
+    CellStruct ore;
+    if (Find_Ore(ore) || Find_Ore(ore, 64))
+    {
+        SetDestination(Math::CellToCoord(ore));
+        return 0;
+    }
+
+    // ④ 附近无矿：回炼油厂待命。
+    if (Owner != nullptr)
+    {
+        BuildingClass* pRefinery = FindNearestBuilding(
+            Owner, GetCoords(),
+            [](BuildingClass* pB) {
+                return pB->Type != nullptr && pB->Type->Refinery;
+            });
+        if (pRefinery != nullptr)
+        {
+            CoordStruct dock;
+            pRefinery->GetCoords(&dock);
+            // 矿脉被采空但舱里还有货：到厂就卸（原版允许半舱卸矿），
+            //   否则这点矿石永远换不成钱，重开矿脉之前阵营零收入。
+            if (HarvestAmount > 0 && dock.DistanceFrom(GetCoords()) <= 0x200)
+            {
+                QueueMission(Mission::Unload);
+                return 0;
+            }
+            SetDestination(dock);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+// ----------------------------------------------------------------------------
+// asm: int __thiscall UnitClass::Mission_Return(UnitClass *this)
+//
 int32 UnitClass::Mission_Return()
 {
     if (Type != nullptr && (Type->Harvester || Type->Weeder) && Owner != nullptr)
@@ -4269,6 +4755,7 @@ int32 UnitClass::Mission_Unload()
                 pRefinery = pCell->Cell_Building();
         }
 
+        // 站在炼油厂格上：直接卸。
         if (pRefinery != nullptr && pRefinery->Type != nullptr
             && pRefinery->Type->Refinery
             && (Owner == nullptr || pRefinery->Owner == Owner))
@@ -4276,6 +4763,34 @@ int32 UnitClass::Mission_Unload()
             IsDumpingTiberium = true;
             DumpTiberium();
             return 0;
+        }
+
+        // 贴着本房炼油厂（一格半内）也算到站。
+        //   原版靠 Dock/Radio 把矿车"吸"进卸矿位；本树没有停靠握手，行走
+        //   到建筑中心会停在不可通行的边缘格上，Cell_Building() 拿不到炼油厂，
+        //   于是矿车满舱在厂门口空转、永远不入账。
+        if (Owner != nullptr)
+        {
+            BuildingClass* pNear = FindNearestBuilding(
+                Owner, GetCoords(),
+                [](BuildingClass* pB) {
+                    return pB->Type != nullptr && pB->Type->Refinery;
+                });
+            if (pNear != nullptr)
+            {
+                CoordStruct mine = GetCoords();
+                CoordStruct dock;
+                pNear->GetCoords(&dock);
+                const int32 dx = dock.X - mine.X;
+                const int32 dy = dock.Y - mine.Y;
+                // 3x2 地基：中心到边缘约 1.5 格，取 0x200（两格）做阈值。
+                if (dx * dx + dy * dy <= 0x200 * 0x200)
+                {
+                    IsDumpingTiberium = true;
+                    DumpTiberium();
+                    return 0;
+                }
+            }
         }
 
         // 不在这里：交给 Return 去跑路。
@@ -4383,13 +4898,22 @@ bool UnitClass::Harvest()
         take = available;
 
     // 扣矿。
-    const int32 oreType = pCell->Get_Tiberium_Type();
+    //   ★ 单价必须在扣矿**之前**取：Get_Ore_Value 优先读该格的 TiberiumValue，
+    //   如果这一采正好把格子采空（left == 0），扣完再取就只剩兜底价 10，
+    //   不同矿种全被算成一个价（实测每单位恒定 10 信用点）。
+    const int32 oreType  = pCell->Get_Tiberium_Type();
+    const int32 unitValue = Get_Ore_Value(cell);
     const int32 left = available - take;
     pCell->Set_Tiberium(oreType, left);
 
     // 入舱。
+    //   ★ 不要再乘矿种单价：CellClass_TiberiumInCell 的定义是
+    //   `Value * (stage + 1)`，也就是说格里的"矿量"本身已经是信用点价值，
+    //   矿车取的 take 就是这个价值。再乘一次 25 会让一车矿卖出 9000 块
+    //   （实测 AI 资金 3000 帧内涨到 130 万）。
+    (void)unitValue;
     HarvestAmount += take;
-    TotalTiberiumValue += take * Get_Ore_Value(cell);
+    TotalTiberiumValue += take;
     IsHarvestingTiberium = true;
 
     SetSequence(Sequence::Harvest);
@@ -4409,24 +4933,27 @@ bool UnitClass::Harvest()
 //  以自身所在格为中心做环状扩散搜索（半径 0..12），找到第一格含矿的地块
 //  就写回 out 并报告成功。逐环搜索保证"最近优先"，与 asm 的螺旋扫描一致。
 // ----------------------------------------------------------------------------
-bool UnitClass::Find_Ore(CellStruct& outCell)
+bool UnitClass::Find_Ore(CellStruct& outCell, int32 maxRadius)
 {
     if (MapClass::Instance == nullptr)
         return false;
 
     const CellStruct here = Math::CoordToCell(GetCoords());
-    const int32 maxRadius = 12;
 
+    // 逐环外扩（切比雪夫半径），第一个"真有矿"的格子即为结果。
+    //   环内扫描只用四条边，成本 O(r) 而不是 O(r^2)：矿脉采空后要按 64 格
+    //   的大半径重搜一次，方形全扫会是几十万次无谓访问。
     for (int32 r = 0; r <= maxRadius; ++r)
     {
+        // 上边 / 下边
         for (int32 dx = -r; dx <= r; ++dx)
         {
-            for (int32 dy = -r; dy <= r; ++dy)
+            const int32 rlist[2] = { -r, r };
+            for (int32 k = 0; k < 2; ++k)
             {
-                // 只走当前环，内圈已经查过。
-                if (r > 0 && std::abs(dx) != r && std::abs(dy) != r)
+                const int32 dy = rlist[k];
+                if (r == 0 && k == 1)
                     continue;
-
                 const int32 x = static_cast<int32>(here.X) + dx;
                 const int32 y = static_cast<int32>(here.Y) + dy;
                 if (!MapClass::Instance->IsValidCell(x, y))
@@ -4434,6 +4961,43 @@ bool UnitClass::Find_Ore(CellStruct& outCell)
 
                 CellClass* pCell = MapClass::Instance->GetCellAt(x, y);
                 if (pCell == nullptr || !pCell->IsTiberium())
+                    continue;
+
+                // ★ 只剩矿皮（值为 0）的格子不算矿源。
+                //   IsTiberium() 在"矿被采空、贴图还没消失"时仍为真，采空格
+                //   的 Get_Tiberium_Value() 已经是 0。若把这种格子当矿源，采空
+                //   的那一刻矿车会把"自己脚下这一格"当成最近的矿脉：目的地 ==
+                //   当前位置 → 不动 → 每帧重算 → 永久卡死（实测 cargo 停在
+                //   168/264、AI 资金永远 0）。
+                if (pCell->Get_Tiberium_Value() <= 0)
+                    continue;
+
+                // 脚下这一格由 Mission_Harvest 的 ② 分支处理，这里跳过，
+                //   免得把目的地设成原地。
+                if (r == 0)
+                    continue;
+
+                outCell = CellStruct(static_cast<int16>(x), static_cast<int16>(y));
+                return true;
+            }
+        }
+
+        // 左边 / 右边（去掉四角，避免重复）
+        for (int32 dy = -r + 1; dy <= r - 1; ++dy)
+        {
+            const int32 clist[2] = { -r, r };
+            for (int32 k = 0; k < 2; ++k)
+            {
+                const int32 dx = clist[k];
+                const int32 x = static_cast<int32>(here.X) + dx;
+                const int32 y = static_cast<int32>(here.Y) + dy;
+                if (!MapClass::Instance->IsValidCell(x, y))
+                    continue;
+
+                CellClass* pCell = MapClass::Instance->GetCellAt(x, y);
+                if (pCell == nullptr || !pCell->IsTiberium())
+                    continue;
+                if (pCell->Get_Tiberium_Value() <= 0)
                     continue;
 
                 outCell = CellStruct(static_cast<int16>(x), static_cast<int16>(y));
@@ -4453,22 +5017,23 @@ bool UnitClass::Find_Ore(CellStruct& outCell)
 // ----------------------------------------------------------------------------
 int32 UnitClass::Get_Ore_Value(const CellStruct& cell) const
 {
+    // asm: 一单位矿的卖价来自矿种自己的 Value（TiberiumClass+0xB8），
+    //   不是"这一格现在有多少矿"。以前把格的矿量当单价用，等于矿越少越不值钱，
+    //   而且矿种（Riparius 25 / 其它）之间的差价完全丢失。
     if (MapClass::Instance != nullptr)
     {
         CellClass* pCell = MapClass::Instance->GetCellAt(cell);
         if (pCell != nullptr)
         {
-            if (pCell->TiberiumValue > 0)
-                return pCell->TiberiumValue;
-
-            const int32 value = pCell->Get_Tiberium_Value();
-            if (value > 0)
-                return value;
+            const int32 oreIdx = pCell->Get_Contained_Tiberium_Index();
+            TiberiumClass* pType = TiberiumClass::FindByIndex(oreIdx);
+            if (pType != nullptr && pType->Value > 0)
+                return pType->Value;
         }
     }
 
-    // 原版矿石基础价（每单位 10 信用点）。
-    return 10;
+    // 兜底：Riparius 的原版单位价值。
+    return 25;
 }
 
 // ----------------------------------------------------------------------------

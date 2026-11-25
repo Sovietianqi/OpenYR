@@ -1247,6 +1247,36 @@ void ScenarioClass::CreateUnits()
                     break;
             }
         }
+
+        // 非人类房：开局补两辆采矿车。
+        //
+        //   原版 AI 开局部队里带矿车（BuildRefinery 的同时也把采集能力算进
+        //   开局预算），而本树 CreateUnits 的候选表只收 AllowedToStartInMultiplayer
+        //   的载具，矿车不在其中 —— AI 于是从第一帧起就没有收入，资金全砸进
+        //   建筑后彻底停摆。这里按 Rules->HarvesterUnit 给每房补两辆。
+        if (!pHouse->Is_Human() && pRules != nullptr
+            && pRules->HarvesterUnit.Count > 0)
+        {
+            UnitTypeClass* pHarv = pRules->HarvesterUnit[0];
+            for (int32 n = 0; n < 2 && pHarv != nullptr; ++n)
+            {
+                UnitClass* pMiner = new UnitClass(pHouse);
+                if (pMiner == nullptr)
+                    break;
+
+                pMiner->Type       = pHarv;
+                pMiner->TechnoType = pHarv;
+                pMiner->Health     = (pHarv->Strength > 0) ? pHarv->Strength : 200;
+                pMiner->MaxHealth  = pMiner->Health;
+
+                if (!pMiner->Scan_Place_Object(where, 4))
+                {
+                    delete pMiner;
+                    break;
+                }
+                pMiner->ForceMission(Mission::Harvest);
+            }
+        }
     }
 
     // asm 14789-14798: 收尾调试行（随机 0..0FFFF）。
@@ -2122,8 +2152,13 @@ void ScenarioClass::WriteLocalVariables(CCINIClass* pINI) const
 // “Scenario 全局入口”族
 // ---------------------------------------------------------------------------
 
-// 根据游戏行为，可知开局时把选择“随机国家”的参战方随机指定一个可用
-// 国家槽位。
+// asm: 同名 Scenario_GenerateRandomCountries (0x69B79A) 其实是
+//   GameModeClass::Set_Country(int country, bool randomize)：
+//     country == -2 时，randomize 非零取 Scenario.Random(0,9)，否则取 0，
+//     结果连同 -2 写入 GameMode 的 (0x184,0x188)；
+//     否则写入 (country,-1)；最后把这一对复制到 (0x174,0x178)。
+//   asm 有对应但属于 GameModeClass，本类无对应实现：ScenarioClass 没有这两
+//   组 Country/CountryEx 字段，且禁止增删成员。保留观察实现。
 void ScenarioClass::GenerateRandomCountries()
 {
     if (TheSession == nullptr) {
@@ -2139,7 +2174,10 @@ void ScenarioClass::GenerateRandomCountries()
     }
 }
 
-// 根据游戏行为，可知按航点序号取其所在格：未定义或越界返回空。
+// asm: Scenario_GetWaypointCell (0x68BDB0, retn 4)
+//   lea ecx,[ecx + idx*4 + Waypoints] → MapClass::Coord_Cell(&Waypoints[idx])
+//   也就是"按序号取航点所在格"，原版不做 IsDefined/越界检查。
+//   本实现经 LocateWaypoint 取值，额外对未定义/越界返回空；合法输入行为一致。
 CellClass* ScenarioClass::GetWaypointCell(int32 idx)
 {
     if (Instance == nullptr) {
@@ -2148,8 +2186,12 @@ CellClass* ScenarioClass::GetWaypointCell(int32 idx)
     return Instance->LocateWaypoint(idx);
 }
 
-// 根据游戏行为，可知联机客机在握手完成后把主机下发的会话选项套用到
-// 本地场景设置。
+// asm: 同名 Scenario_GuestReceiveOptions (loc_5E3E73 一带) 是 netshare.cpp
+//   的报文解码器：入参是一个字符串（ecx），先 __strdup，再按首字符 'Z' 及
+//   第二字符 '1'/'2'/'3' 区分 OPTION_NAT/OPTION_... 分支，解码玩家名、颜色、
+//   起始点等会话选项，直接操作 PlayerSlotsX/对话框。
+//   asm 有对应但属于 Network 的 netshare 层，ScenarioClass 无对应实现。
+//   保留观察实现：把本机收到的会话选项整体套用到场景。
 void ScenarioClass::GuestReceiveOptions()
 {
     if (TheSession != nullptr) {
@@ -2157,8 +2199,13 @@ void ScenarioClass::GuestReceiveOptions()
     }
 }
 
-// 根据游戏行为，可知玩家名到出生点槽位的映射：在会话玩家表里按名字
-// 匹配并返回其登记的出生点，找不到返回 -1。
+// asm: 同名 Scenario_NameToStartingSlot (loc_5E8C13 一带) 是一个
+//   wchar_t* 名字分类器（无 this，参数在 ECX）：依次与 CSF_OpenSlot_、
+//   CSF_ClosedSlot_、CSF_EasyAI_、CSF_NormAI_、CSF_HardAI_、CSF_Waiting_、
+//   CSF_Observer_ 做 wcscmp，命中就返回对应的 CSF 字符串指针；否则遍历
+//   NameNodeTypes 表再比一遍，仍未命中返回 0。
+//   asm 有对应但函数语义是"名字节点类型"，返回值是指针而非出生点槽。
+//   本类无对应实现（会返回 int32），保留观察实现。
 int32 ScenarioClass::NameToStartingSlot(const char* pName)
 {
     if (TheSession == nullptr || pName == nullptr) {
@@ -2174,18 +2221,56 @@ int32 ScenarioClass::NameToStartingSlot(const char* pName)
     return -1;
 }
 
-// 根据游戏行为，可知 [Basic] 小节承载场景名、地图尺寸、归属与玩家
-// 数等基础信息；读取成功与否由 INI 层报告。
+// asm: Scenario_ReadBasic (loc_689D6B 一带, retn 4)
+//   __thiscall(ScenarioClass* this, CCINIClass* INI)
+//
+//   只读 [Header]：先把 StartX/StartY/Width/Height/NumberStartingPoints 置
+//   -1、StartingPoints[8] 清零，再以这些值作 fallback 依次读
+//   StartX/StartY/Width/Height/NumberStartingPoints/NumCoopHumanStartSpots，
+//   最后 for i = 1..NumberStartingPoints 读 "Waypoint%d"（两个整数）写进
+//   StartingPoints[i-1]。原版不在此读 [Basic] 的 Name/Description/MaxPlayer
+//   ——那三项由 Read_Scenario_INI 的完整读取负责。
 bool ScenarioClass::ReadBasic(CCINIClass* pINI)
 {
-    if (pINI == nullptr) {
+    ScenarioClass* pThis = Instance;
+    if (pINI == nullptr || pThis == nullptr) {
         return false;
     }
-    char buf[0x100];
-    pINI->ReadString("Basic", "Name", "", buf, sizeof(buf));
-    snprintf(g_ScenarioName, sizeof(g_ScenarioName), "%s", buf);
-    pINI->ReadString("Basic", "Description", "", g_ScenarioDescription, sizeof(g_ScenarioDescription));
-    g_ScenarioMaxPlayers = pINI->ReadInteger("Basic", "MaxPlayer", 8);
+
+    // asm:689D5B 起 mov [esi+StartX],-1 ... 以及 8 次 mov [eax],[edx]/
+    //   mov [eax+4],[ebx]（edx=ebx=0）。
+    pThis->StartX = -1;
+    pThis->StartY = -1;
+    pThis->Width = -1;
+    pThis->Height = -1;
+    pThis->NumberStartingPoints = -1;
+    for (int32 i = 0; i < MaxStartingPoints; ++i) {
+        pThis->StartingPoints[i] = Point2D(0, 0);
+    }
+
+    // asm: INIClass_GetInteger("Header", key, fallback = 当前字段值)
+    pThis->StartX = pINI->ReadInteger("Header", "StartX", pThis->StartX);
+    pThis->StartY = pINI->ReadInteger("Header", "StartY", pThis->StartY);
+    pThis->Width  = pINI->ReadInteger("Header", "Width",  pThis->Width);
+    pThis->Height = pINI->ReadInteger("Header", "Height", pThis->Height);
+    pThis->NumberStartingPoints =
+        pINI->ReadInteger("Header", "NumberStartingPoints", pThis->NumberStartingPoints);
+    pThis->NumCoopHumanStartSpots =
+        pINI->ReadInteger("Header", "NumCoopHumanStartSpots", pThis->NumCoopHumanStartSpots);
+
+    // asm:689E3A  for (i = 1; i <= NumberStartingPoints; ++i)
+    //                sprintf(buf, "Waypoint%d", i);
+    //                INIClass_Get2Integers("Header", buf, fallback = StartingPoints[i-1])
+    for (int32 i = 0; i < pThis->NumberStartingPoints && i < MaxStartingPoints; ++i) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "Waypoint%d", i + 1);
+        int32 vals[2] = { pThis->StartingPoints[i].X, pThis->StartingPoints[i].Y };
+        pINI->Read2Integers(vals, "Header", key, vals);
+        pThis->StartingPoints[i].X = vals[0];
+        pThis->StartingPoints[i].Y = vals[1];
+    }
+
+    // asm: mov al, 1
     return true;
 }
 
@@ -2204,7 +2289,13 @@ void ScenarioClass::ReadLightingAndBasic(CCINIClass* pINI)
     UpdateLighting();
 }
 
-// 根据游戏行为，可知重算色调按当前灯光参数重新推导照明。
+// asm: Scenario_RecalcTint (0x53AD0A, retn 8)
+//   __fastcall(R=ECX, G=EDX, B=栈1, tint=栈2)：对 vec_LightConvert 里每个
+//   LightConvert 对象、以及 ColorScheme 数组里 RemapColour 数量 > 1 的方案，
+//   调其 vtable+4(R,G,B,tint) 重算色表；随后 Map::sub_4AE4C0 重刷地形，
+//   GScreen_FlagToRedraw(1)。
+//   本类无对应实现：工程没有 vec_LightConvert（LightConvertClass 未落地），
+//   ColorScheme 的重映射调用也在 Rendering/ 侧。保留观察实现。
 void ScenarioClass::RecalcTint()
 {
     int32 r = 0;
@@ -2214,8 +2305,18 @@ void ScenarioClass::RecalcTint()
     RecalcLighting(r, g, b, true);
 }
 
-// 根据游戏行为，可知重置超级武器会清掉所有阵营的充能计时与已用/可用
-// 状态位，回到开局冷启动状态。
+// asm: Scenario_ResetAllSuperWeapons (0x53979A, retn 0)
+//   全部是"全局超武状态"复位，不遍历 HouseClass：
+//     PsyDom_CellCoords/LightningStorm_CellCoords = NullCoords；
+//     LightningStorm_Active=false、Status=0、StartTime/Duration=-1、
+//     LightningStorm_Owner=0；PsyDom_Status/Anim/Owner=0；
+//     vec_Anims_const/const1/const2 三个动画表清空并释放；
+//     Scenario+0x3528 → +0x3530（闪电时长生效值复位）；
+//     ChronoScreenEffectSurf 释放、Duration/Status/Surf=0；
+//     最后 RecalcTint(-1,-1,-1,0)。
+//   asm 对应但依赖未建模的全局（本端口）：上述 PsyDom_*/LightningStorm_*/
+//   vec_Anims_const/ChronoScreenEffect 都在 SW/ 与 Game/ 侧，ScenarioClass
+//   没有这些字段。保留观察实现（本类是逐 House 清计时器）。
 void ScenarioClass::ResetAllSuperWeapons()
 {
     for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
@@ -2232,14 +2333,23 @@ void ScenarioClass::ResetAllSuperWeapons()
     }
 }
 
-// 根据游戏行为，可知开局准备入口会刷新随机国家与起点分配的簿记。
+// asm 无对应：反汇编里没有名为 Scenario_Smth 的 proc，这个名字是本工程自
+//   造的入口别名（当前只转调 GenerateRandomCountries）。保留观察实现。
 void ScenarioClass::Smth()
 {
     GenerateRandomCountries();
 }
 
-// 起点分配家族：根据游戏行为，可知按顺序变体把互不重复的出生点依
-// 连接顺序分配给每个参战方。
+// asm: 同名 Scenario_SmthStartingHouses (loc_5C2F12 一带) 是 MPCooperative 的
+//   虚函数（.rdata:MPCooperative::`vftable' 引用），流程为：
+//     Get_Starting_Locations(vecCells)；由 Scenario+0x1180 的 16 个
+//     HouseIndices 生成 presentHouses[16]；遍历 vec_Houses，跳过
+//     HouseType+0x1A6 非零者，按 HouseIndices 找槽 → 找不到时
+//     Game_SelectStartingPoint 分配并把结果写 AISlots.Starts/Teams；
+//     找到时更新 NameNodeTypes 对应项的起始点/队伍；
+//     最后 HouseClass_SetBaseSpawnCell(house, cell)。
+//   asm 有对应但属于 Network/MPCoopClass，ScenarioClass 无对应实现。
+//   保留观察实现（按连接顺序顺序分配）。
 void ScenarioClass::SmthStartingHouses()
 {
     if (Instance == nullptr) {
@@ -2259,7 +2369,10 @@ void ScenarioClass::SmthStartingHouses()
     }
 }
 
-// 根据游戏行为，可知随机变体先把候选起点整体打乱再分配。
+// asm: 同名 Scenario_SmthStartingHouses5 (loc_5EE718 一带) 是 SmthStartingHouses6
+//   调用的辅助例程：统计 presentHouses 中可用的槽数，在候选数不足时用
+//   Random2Class 打乱/补位，再交给分配流程。属 Network/MPCoopClass。
+//   asm 有对应但 ScenarioClass 无对应实现，保留观察实现。
 void ScenarioClass::SmthStartingHouses5()
 {
     SmthStartingHouses();
@@ -2279,8 +2392,12 @@ void ScenarioClass::SmthStartingHouses5()
     }
 }
 
-// 根据游戏行为，可知结盟相邻变体在分配时让同队玩家使用相邻起点：
-// 以队伍号排序后顺序分配。
+// asm: 同名 Scenario_SmthStartingHouses6 (loc_5EE9EC 一带) 由
+//   INIClass_ReadScenario 调用：Get_Starting_Locations 建候选表，由
+//   Scenario+0x1180 生成 presentHouses[16]，再遍历 vec_Houses（跳过
+//   HouseType+0x1A6 与 House+0x1EC 标志），按队伍/起始槽做相邻分配。
+//   属 Network/MPCoopClass 的起点分配族。
+//   asm 有对应但 ScenarioClass 无对应实现，保留观察实现（按 Team 号顺序）。
 void ScenarioClass::SmthStartingHouses6()
 {
     if (TheSession == nullptr) {

@@ -123,11 +123,26 @@ enum class TriggerAction : int32 {
     SpyPlane = 73
 };
 
+// AITriggerCondition —— 与 asm 跳转表 off_41EACC 逐项对齐（索引 = 值 + 1）。
+//   原枚举把 2..13 写成了 CivilianOwns/HouseCredits/BuildingCount/... 一整套，
+//   与 gamemd.exe 的实际语义整体错位：原版只有 -1..7 这一小段，8 及以上一律
+//   落 default（恒 false）。上一版据此实现的"建筑数/单位数/电力/超武"等分支
+//   在游戏里永远走不到，反而把 2..7 的电力/资金/中立条件全判错。
+//   依据：AITriggerTypeClass_ConditionMet（0x41E8F0..0x41E9E1）的
+//   `inc eax / cmp eax,8 / ja default / jmp off_41EACC[eax*4]`，以及
+//   GetCRC（0x41E63F）只在 ConditionType ∈ {0,1,4,7} 时混入 params ——
+//   恰好吃操作数的那四类（敌拥有/自拥有/资金/中立拥有）。
 enum class AITriggerCondition : int32 {
-    HouseOwns = 0, EnemyOwns = 1, CivilianOwns = 2, HouseCredits = 3,
-    IronCurtainReady = 4, ChronosphereReady = 5, BuildingCount = 6,
-    UnitCount = 7, InfantryCount = 8, AircraftCount = 9, PowerOutput = 10,
-    HasSuperWeapon = 11, TechLevel = 12, Weight = 13
+    None              = -1,   // 无条件：直接进入队伍判定
+    EnemyOwns         = 0,    // 目标房（敌房）拥有 ConditionObject 的数量
+    HouseOwns         = 1,    // 本房拥有 ConditionObject 的数量
+    EnemyPowerYellow  = 2,    // 目标房电力盈余 < 100（黄）
+    EnemyPowerRed     = 3,    // 目标房电力盈余 < 0（红）
+    EnemyCredits      = 4,    // 目标房可用资金与 params 比较
+    IronCurtainReady  = 5,    // 本房铁幕已充能
+    ChronosphereReady = 6,    // 本房超时空已充能
+    CivilianOwns      = 7,    // 中立（Civilian）房拥有 ConditionObject 的数量
+    Count             = 8
 };
 
 enum class AITriggerHouseType : int32 {

@@ -331,27 +331,44 @@ bool TEventClass::LoadFromINI(CCINIClass* pINI) {
 }
 
 // ============================================================================
-// asm: TEventClass_SaveToINI(EventClass *this, char *a2)
-//  Team != 0        → "%d,%d,%s"     (eventKind, 1, Team->ID)
-//  selector == 0x2B → "%d,%d,%d,%s"  (eventKind, 2, param, TechnoININame)
-//  否则             → "%d,%d,%d"     (eventKind, 0, param)
+// asm: int __thiscall TEventClass_SaveToINI(EventClass *this, char *a2)   (asm:1666141)
+//
+//   注意：这里的 asm 名字虽然叫 SaveToINI，但它接的是 **字符串缓冲**，是
+//   TriggerTypeClass_SaveToINI 逐元素拼 [Events] 串时调用的写出器；它与
+//   AbstractTypeClass 的 INI 虚槽（asm 名 AbstractTypeClass_SaveIntoINI）
+//   不是同一个函数。本工程的对应入口是 FormatSaveString（见下）。
+//
+//   asm 原有三个出口（全部用 wsprintfA 追加写到 a2 + strlen(a2)）：
+//     Team(+30h) != 0  → "%d,%d,%s"     (EventKind, 1, Team->ID)
+//     selector == 2Bh  → "%d,%d,%d,%s"  (EventKind, 2, Data, TechnoININame@+38h)
+//     否则             → "%d,%d,%d"     (EventKind, 0, Data)
+//
+//   其中 selector 不是 EventKind 本身：asm 先做
+//       switch (EventKind - 1)   // 61 个 case，跳转表 off_71F470 + 间接表 byte_71F4A0
+//   把 12 个目标值之一算进 eax，再 `cmp eax, 2Bh`。按 byte_71F4A0 逐字节还原，
+//   只有 **EventKind == 60 / 61** 两个种类会得到 2Bh（即头文件里
+//   TechnoTypeNotOnMap / SecondsHaveElapsed）。
 // ============================================================================
-bool TEventClass::SaveToINI(CCINIClass* pINI) {
-    (void)pINI;
-    return true;
+bool TEventClass::SaveToINI(CCINIClass* pINI)
+{
+    // asm 里 EventClass 没有覆写 INI 虚槽，落到基类 AbstractTypeClass_SaveIntoINI
+    // （写 Name / UIName / TechLevel / Cost …）。原先这里直接 `return true;`
+    // 会把这套通用写出整个吞掉，故改为显式委托基类。
+    return AbstractTypeClass::SaveToINI(pINI);
 }
 
 // TriggerTypeClass 直接调用：把本事件序列化成 asm 的 a2 串。
 void TEventClass::FormatSaveString(char* buffer, int32 bufferSize) const {
     if (!buffer || bufferSize <= 0) return;
 
-    // asm 的 switch 以 eventKind 索引，只有 0x2B 走"对象名"分支。
-    const int32 selector = EventKind;
+    // asm 的 switch(EventKind-1) 只把 60/61 两种 kind 归到 2Bh 那一支
+    // （见上方 TEventClass_SaveToINI 的跳转表还原），其余一律落到"%d,%d,%d"。
+    const bool needsTechnoName = (EventKind == 60 || EventKind == 61);
 
     if (Team != nullptr) {
         std::snprintf(buffer, bufferSize, "%d,%d,%s",
                       EventKind, ParamType_Team, Team->ID);
-    } else if (selector == 0x2B) {
+    } else if (needsTechnoName) {
         std::snprintf(buffer, bufferSize, "%d,%d,%d,%s",
                       EventKind, ParamType_Techno, Data, TechnoININame);
     } else {

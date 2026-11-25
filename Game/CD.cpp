@@ -1,17 +1,54 @@
 #include "CD.h"
 
+#include <cstdio>
+
+#if defined(_WIN32) || defined(_WIN64)
+    #define OPENYR_CD_WIN32 1
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
+
 static int32 int_RequiredCD = 0;
 static int32 int_CurrentCD = 0;
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知换盘请求以模态提示框告知玩家插入指定盘号，
-// 玩家确认即视为盘已就位。
+// asm: CD_Inserted   (asm:384550, retn 4)
+//
+//   char __cdecl CD_Inserted(int diskNumber)
+//   {
+//       char text[256];
+//       sprintf(text, "Please insert disk %d", diskNumber);
+//       return MessageBoxA(NULL, text, "Hey!", MB_OKCANCEL) == IDOK;
+//   }
+//
+//   asm 逐句：
+//     sub esp,100h / lea ecx,[esp+Text] / push eax(盘号)
+//     push offset aPleaseInsertDi ("Please insert disk %d") / push ecx
+//     call _sprintf
+//     push 1 (uType = MB_OKCANCEL) / push offset aHey ("Hey!")
+//     push text / push 0 (hWnd) / call ds:MessageBoxA
+//     cmp eax,1 / setz al            ; IDOK == 1 -> true
+//     retn 4
+//
+//   注意返回值是"玩家点了确定"，不是"盘真的在驱动器里"。原版把后续的
+//   真实探测交给 CD::Get_CD_Index，本函数只负责弹框。
+//   非 Windows 构建没有消息框：按本工程既有约定（Game/Shell.cpp）退化为
+//   stderr 日志，仍返回 false —— 不能假装玩家点了确定。
 // ------------------------------------------------------------------------
 bool CD::Inserted(int32 diskNumber)
 {
-    (void)diskNumber;
-    int_CurrentCD = diskNumber;
-    return true;
+    char text[256];
+    std::snprintf(text, sizeof(text), "Please insert disk %d", static_cast<int>(diskNumber));
+
+#if defined(OPENYR_CD_WIN32)
+    const int result = MessageBoxA(nullptr, text, "Hey!", MB_OKCANCEL /* 1 */);
+    return result == IDOK;
+#else
+    std::fprintf(stderr, "[CD] Hey! %s (no message box on this build)\n", text);
+    return false;
+#endif
 }
 
 // ------------------------------------------------------------------------

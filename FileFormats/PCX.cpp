@@ -1,4 +1,5 @@
 #include "PCX.h"
+#include "IO/FileSystem.h"
 
 #include <cstdio>
 #include <cstring>
@@ -78,7 +79,7 @@ bool PCXClass::LoadFromFile(const char* pFilename)
         return false;
 
     // asm: fopen / fread header (128 bytes)
-    std::FILE* fp = std::fopen(pFilename, "rb");
+    std::FILE* fp = File_Open_Archive_Stream(pFilename);
     if (fp == nullptr)
         return false;
 

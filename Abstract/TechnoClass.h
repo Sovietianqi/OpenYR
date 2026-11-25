@@ -12,6 +12,7 @@ class SpawnManagerClass;   // asm: _TechnoClass.t.SpawnManager 子机管理器�
 class SlaveManagerClass;   // asm: _TechnoClass.t.SlaveManager 奴隶矿工管理器
 class ParasiteClass;       // asm: _TechnoClass.t.Parasite 寄生武器（恐怖机器人）
 class BombClass;           // asm: _TechnoClass.t.Bomb 附着炸弹（伊文 C4）
+class AnimClass;           // asm: _TechnoClass.t.BehindAnim / DeployingAnim
 
 // ============================================================================
 // CloakStateEnum - tracks the cloak fade animation
@@ -55,7 +56,7 @@ public:
         , ForceShieldTimer(0)
         , IronTintTimer(0), IronTintStage(0)
         , AirstrikeTintTimer(0), AirstrikeTintStage(0)
-        , LastFireFrame(-0x7FFFFFFF)
+        , LastFireFrame(-0x40000000)   // "从未开火"哨兵：留足余量，任何 Frame-last 都不会溢出
         , FiringWave(nullptr)       // asm: _TechnoClass.t.FiringWave 初始为空
         , FireDamageTimer(0)
         , SparkyCounter(0)
@@ -116,6 +117,11 @@ public:
         , RadioFlag419(false)
         , RearmCount(0)
         , IsDizzy(false)
+        , Deactivated(false)       // asm: _TechnoClass.t.Deactivated (+0x1C8)
+        , EMPDurationRemaining(0)  // asm: _TechnoClass.t.EMPDurationRemaining
+        , SlaveOwner(nullptr)      // asm: _TechnoClass.t.SlaveOwner (+0x2DC)
+        , BehindAnim(nullptr)      // asm: _TechnoClass.t.BehindAnim (+0x128)
+        , DeployingAnim(nullptr)   // asm: _TechnoClass.t.DeployingAnim (+0x12C)
     {
         // asm: TechnoClass_CTOR links the new instance into the global
         //   TechnoClass::Array; every engine sweep (AI, radar, save) walks
@@ -129,6 +135,12 @@ public:
     }
 
     virtual AbstractType WhatAmI() const override { return AbstractType::Techno; }
+
+    // asm: vtable 槽 GetTechnoType（vt+0x84）—— 任何技术对象都应回自己的类型。
+    //   基类 ObjectClass 的实现是 `return nullptr`，而全项目没有一处覆写，
+    //   于是 GetTechnoType() 恒空：TaskForce 招募（按类型匹配坑位）、脚本/
+    //   触发器的目标解析、AI 的"能否生产该类型"全部失效。
+    virtual TechnoTypeClass* GetTechnoType() const override { return TechnoType; }
     virtual int32 Size() const override { return sizeof(TechnoClass); }
 
     virtual HRESULT GetClassID(CLSID* pClassID) override { return E_FAIL; }
@@ -154,7 +166,12 @@ public:
     virtual int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4) override;
 
     HouseClass* GetOwningHouse() const { return Owner; }
-    int32 GetOwningHouseIndex() const { return 0; }
+    // asm: [this+21Ch] —— 建筑/单位身上的"归属房索引"。BaseClass::Placed 的
+    //   第一分支就是拿它跟 Base.OwnerHouseIndex 比：相等才按"类型 + 格子"
+    //   精确匹配节点。此前这里恒返回 0，等于把每座建筑都当成 0 号房的，
+    //   AI 房的基地节点永远打不上标记 —— 清单不收敛，AI 会无限重复造同一座。
+    //   定义放在 TechnoClass.cpp（此处 HouseClass 尚未完整定义）。
+    int32 GetOwningHouseIndex() const;
 
  // TechnoClass_GetThreatPosed.  The threat this object
     // presents to the enemy, counted into the owning house's threat grid.
@@ -218,11 +235,23 @@ public:
     void DrawVeterancy(Point2D* pCoord, RectangleStruct* pRect);
 
     // ========================================================================
-    // 根据游戏行为，可知 DisplayTalkBubble 让单位在头顶冒出一个带文本的气泡，
-    //  UpdateTalkBubble 负责在到点后把气泡收掉。
+    // asm: TechnoClass_DisplayTalkBubble (asm:1600862)
+    //      void __fastcall(TechnoClass* this, int type)
+    //
+    //  让**游戏全局**只有一个人说话：写入 TalkBubbleType / TalkBubbleOwner /
+    //  TalkBubbleTimer（时长取 Rules->TalkBubbleTime，默认 300ms），再让该
+    //  单位所在格可见。type 是 TALKBUBL.SHP 的 1-based 帧号；
+    //  type == 0 表示"收掉当前话泡"（Owner 与 Type 一并清零）。
+    //
+    //  绘制侧在 TechnoClass::DrawExtras 里：只有 TalkBubbleOwner == this 且
+    //  计时未到时才画 TALKBUBL.SHP 的第 type-1 帧。
     // ========================================================================
-    bool DisplayTalkBubble(const wchar_t* pText, int32 duration);
-    void UpdateTalkBubble();
+    void DisplayTalkBubble(int32 type);
+
+    // 原版的函数体允许 this == nullptr（= "没人说话"，用于动作清场）。
+    // C++ 成员函数做不到空 this，因此把真正的实现放在这个静态入口上，
+    // 成员版本只是转发。Owner 为 nullptr 时等价于清空全局话泡。
+    static void DisplayTalkBubble_Global(TechnoClass* pOwner, int32 type);
 
     // ========================================================================
     // 根据游戏行为，可知 CreatePlanningToken 为一个将要执行的行军规划点分配
@@ -247,6 +276,80 @@ public:
     //  已不在有效打击范围）。
     // ========================================================================
     bool ShouldSuppress(AbstractClass* pTarget) const;
+
+    // ========================================================================
+    // asm: TechnoClass_9C   (asm:1574440, retn)
+    //
+    //   char __thiscall CanBeCommanded(_TechnoClass *this)
+    //   {
+    //       if (this->Deactivated /* +0x1C8 */) return false;
+    //       if (!this->Owner /* +0x21C */->Is_Player()) return false;
+    //       ws = this->GetWeapon_TurretChanger();      // vt+0x3F4
+    //       if (!ws) return false;
+    //       if (*ws == 0) return false;                // 武器槽里没有 WeaponType
+    //       if (this->IsUnderEMP()) return false;      // vt+0x37C
+    //       return true;
+    //   }
+    //
+    //  这是「玩家发出的指令能不能落到这个单位身上」的总闸门；Stop / Deploy
+    //  两条命令的循环都以它（或 0x0A0 CanReceiveWaypoint）为先决条件。
+    //  0x3F4 → GetTurretChangingWeapon()，0x37C → IsUnderEMP()。
+    // ========================================================================
+    bool Can_Be_Commanded() const;
+
+    // ========================================================================
+    // Init_Locomotion —— 按 TechnoType->Locomotor 装配行走逻辑（asm +0x674）
+    //
+    //   原版在 TechnoClass_Init 里用 CoCreateInstance(type->Locomotor) 造出
+    //   ILocomotion 子对象再 Link_To_Object(this)。本树此前从未装配，
+    //   于是 FootClass::Update_Movement 的 `Locomotor == nullptr` 门恒真、
+    //   所有单位永远不动。这里补上同一件事：
+    //     ① 解析 GUID 串（或裸名字）→ CLSIDs 索引；
+    //     ② CreateInstance → Link_To_Object(this)；
+    //     ③ 类型没写 Locomotor 时按 RTTI 给默认值
+    //        （Unit→Drive、Infantry→Walk、Aircraft→Fly）。
+    //   已有实例或类型缺失时安全返回；返回是否最终持有行走逻辑。
+    // ========================================================================
+    bool Init_Locomotion();
+
+    // ========================================================================
+    // Start_Default_Mission —— 落位后的任务启动（asm TechnoClass::Unlimbo 尾）
+    //
+    //   `call Enter_Idle_Mode(1,1)` 只把 Guard 塞进待提升槽（field_B4），
+    //   随后 asm 还有 `if (vt+200h()) call [vt+1ECh]` 才真正把它提升为
+    //   当前任务。本树此前只做了前半段，于是所有新对象的 CurrentMission
+    //   恒为 None(-1)，32 路分派落进 default（QMove/Sleep），任务系统空转。
+    //   这里补齐后半段；已有任务的对象不受影响。
+    // ========================================================================
+    void Start_Default_Mission();
+
+    // ------------------------------------------------------------------------
+    // asm: TechnoClass_374   (asm:1572021)   虚表槽 0x374
+    //
+    //   原版把 `mission` 包成 NetworkEvent 塞进 0x80 槽环形包队列，由各端
+    //   按序消费。本工程没有该包格式，功能等价地直接落到 MissionClass 的
+    //   任务队列：受理成功返回 true（命令随之播确认语音），被拒返回 false。
+    // ------------------------------------------------------------------------
+    bool DispatchMission(Mission mission);
+
+    // ========================================================================
+    // asm: TechnoClass_37C   (asm:1600595)   —— 虚表槽 0x37C
+    //
+    //     mov edx,[ecx+EMPDurationRemaining] / xor eax,eax / test / setnle al
+    //     return EMPDurationRemaining > 0;
+    //
+    //  EMP 脉冲（EMPulseClass_Initialize 写 [+30h] 到这里）打上的瘫痪计时；
+    //  TechnoClass_Update 每帧递减，归零那一帧才恢复动力/雷达。
+    // ========================================================================
+    virtual bool IsUnderEMP() const;
+
+    // ========================================================================
+    // 虚表槽 0x380 —— asm 里 Techno 对象指向 FootClass_IsParalysed。
+    //  TechnoClass 本身没有瘫痪计时器，基类实现恒为 false；FootClass 覆写
+    //  后读取 ParalysisTimer。CanSetWaypoint（以及 Can_Be_Commanded）都走
+    //  虚调用，所以建筑/地形自然落到这里的 false。
+    // ========================================================================
+    virtual bool IsParalysed() const;
 
     // ========================================================================
     // 根据游戏行为，可知 PredictTargetCoords 按目标当前位置与速度推算炮弹
@@ -314,8 +417,17 @@ public:
     // ========================================================================
     // TakeDamage implementation
     // ========================================================================
+    //  ★ 这里是**唯一**做装甲倍率与 Verses 结算的地方（对应 asm 1575590 一带的
+    //    GetTypeArmorMult / ArmorMultiplier / fdivr / GetTotalDamage）。
+    //    TechnoClass::ReceiveDamage 只负责"入口语义"（铁幕、忽略防御、写回
+    //    伤害值、死亡状态、受击还击），不再自己算一遍 —— 早先两处都算，
+    //    同一个伤害被缩放两次（50% Verses 实际只吃 25%）。
+    //
+    //    pFinalDamage 非空时回报实际扣掉的血量（缩放 + Verses 之后）。
     bool TakeDamage_Impl(int32 damage, ObjectClass* pSource,
-                         WarheadTypeClass* pWarhead);
+                         WarheadTypeClass* pWarhead,
+                         int32* pFinalDamage = nullptr,
+                         bool ignoreDefenses = false);
 
     // ------------------------------------------------------------------------
     // asm: eDamageState __thiscall TechnoClass_ReceiveDamage(
@@ -327,14 +439,16 @@ public:
     //    pDamage        —— 伤害量的指针（原地改写，返还最终值）
     //    typeSource     —— 伤害来源类型（0 = 普通武器）
     //    pWarhead       —— 弹头（Verses 倍率来源）
-    //    target         —— 命中点 / 目标网格坐标
+    //    pAttacker      —— 攻击者对象（原版形参写作 `int target`，实际是按指针用：
+    //                      受击还击要拿它当 ShouldRetaliate 的实参，也会对它调
+    //                      GetCoords()/GetTechnoType()。这里按真实语义写成指针）
     //    ignoreDefenses —— 非零时跳过装甲与铁幕减免
     //    arg10          —— 附加标志位
     //    pSourceHouse   —— 伤害来源所属方（用于仇恨与结算）
     //  返回 eDamageState。
     // ------------------------------------------------------------------------
     int32 ReceiveDamage(int32* pDamage, int32 typeSource,
-                        WarheadTypeClass* pWarhead, int32 target,
+                        WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                         int32 ignoreDefenses, int32 arg10,
                         HouseClass* pSourceHouse);
 
@@ -359,11 +473,12 @@ public:
     virtual int32 GetVeterancy() const;
     int32 Get_Experience() const;
 
-    // asm: void __thiscall Veterancy_AddValue(_TechnoClass *this, int ownerCost, int victimCost)
+    // asm: char __thiscall Veterancy_AddValue(float *this, int ownerCost, int victimCost)
+    //      (asm:1725745)
     //   Accumulates veterancy credit for destroying a victim of the given
-    //   cost:  Experience += victimCost * Rules-><veterancy ratio> / ownerCost,
-    //   clamped to the rules-side ceiling.  The original stores the running
-    //   total in a float; OpenYR folds it into the integer Experience pool.
+    //   cost:  Experience += victimCost / (ownerCost * Rules->VeteranRatio),
+    //   clamped to Rules->VeteranCap.  The original stores the running total
+    //   in a float; OpenYR folds it into the integer Experience pool.
     void AddVeterancyValue(int32 ownerCost, int32 victimCost);
 
     // asm: vt_TechnoClass.Enter_Idle_Mode (+0x484), called as (0, 1) when a
@@ -547,6 +662,23 @@ public:
     virtual void SetMission(Mission mission) { MissionClass::ForceMission(mission); }
     virtual Mission GetMission() const { return MissionClass::GetMission(); }
     virtual void QueueMission(Mission mission) { MissionClass::Queue_Mission(mission); }
+
+    // ------------------------------------------------------------------------
+    // asm: TechnoClass::Override_Mission  (asm:1574861, retn 0Ch)
+    //
+    //  Techno 层把"换任务"与"换目标"绑成一次操作：
+    //      LastTarget = Target;                    // 记下被顶掉的旧目标
+    //      MissionClass::Override_Mission(...);    // 任务槽照旧切换
+    //      SetTarget(target);                      // ★ 虚分派写目标
+    //
+    //  ★ 基类 MissionClass::Override_Mission 收下 target 却**什么也不做**
+    //    （汇编里它确实只碰 mission 槽）。真正的目标落地在这一层，所以任何
+    //    "Override_Mission(Attack, 敌人, ...)" 的调用都必须落到这里，否则
+    //    任务切过去了、目标还是空的，Mission_Attack 下一步就自己退回 Guard。
+    // ------------------------------------------------------------------------
+    virtual void Override_Mission(Mission mission, AbstractClass* target,
+                                  AbstractClass* destination) override;
+
     virtual void SetTarget(AbstractClass* /*pTarget*/) {}
     virtual AbstractClass* GetTarget() const { return nullptr; }
     virtual bool IsFiring() const { return false; }
@@ -671,9 +803,12 @@ public:
     void ExpireDrain();
 
     // ------------------------------------------------------------------------
-    // 根据游戏行为，可知 UpdateThreatToCell 负责把本单位当前的威胁值写进
-    //  它所在格子的威胁记录，供寻路与 AI 使用。
+    // asm: TechnoClass_UpdateThreatToCell (0x70F714, retn 4)
+    //   把威胁贡献从旧格搬到新格：Adjust_Threat(owner, -ThreatPosed) → 清
+    //   ThreatPosed → 重算 → 记下 → Adjust_Threat(owner, +threat)。
+    //   无参重载用自身所踩的格子顶替 asm 的显式 cell 参数。
     // ------------------------------------------------------------------------
+    void UpdateThreatToCell(CellClass* pCell);
     void UpdateThreatToCell();
 
  // TechnoClass_NotSubmerged: true when the object's height is
@@ -1174,10 +1309,12 @@ public:
     int32         field_1C4;           // +0x1C4  原版未命名字段（震屏 gate 检查）
     TechnoClass*  KilledBy;
 
-    // ── 说话气泡状态 ──────────────────────────────────────────────────────
-    // 根据游戏行为，可知单位正在显示气泡时 IsTalking 为真，气泡文本与结束
-    //  帧分别记在 TalkBubbleText / TalkBubbleEnd 上；LastTalkFrame 是说话
-    //  的最短间隔基准，避免连续触发刷屏。
+    // ── 说话气泡状态（占位，不再承载逻辑） ────────────────────────────────
+    //  原版的话泡状态是**全局**的（TalkBubbleType / Owner / Timer，见
+    //  Game/Externs.h），不是每个 Techno 各存一份。这四个字段是早期实现留下
+    //  的逐单位模型，现已无任何读写点；保留它们只是为了不改动 TechnoClass
+    //  的对象布局（布局一变，存档偏移与既有 CRC 全部错位）。
+    //  新代码一律走 TechnoClass::DisplayTalkBubble(int32)。
     bool          IsTalking;
     const wchar_t* TalkBubbleText;
     int32         TalkBubbleEnd;
@@ -1234,7 +1371,7 @@ public:
     // TemporalClass::Fire and cleared by TemporalClass::Detach / Update.
     TemporalClass* TemporalTargettingMe;
 
-    // ── asm: _TechnoClass.t.CaptureManager (+0x2C0) ───────────────────────
+    // ── asm: _TechnoClass.t.CaptureManager (+0x2BC) ───────────────────────
     // 根据游戏行为，可知具备心灵控制能力的单位（尤里、心灵控制塔等）在
     //  Init 时被装配一个 CaptureManagerClass，用来记录"我控制了谁"。TemporalClass
     //  的时间抹除与建筑摧毁时会通过它做连锁释放（KillNodes / ReleaseAll）。
@@ -1247,6 +1384,12 @@ public:
     //   vec_Parasites / vec_BombList 里登记。
     SpawnManagerClass*   SpawnManager;
     SlaveManagerClass*   SlaveManager;
+
+    // asm: _TechnoClass.t.SlaveOwner (+0x2DC) —— 反向链接：奴隶兵指向
+    //   拥有它的那台奴隶矿车。SlaveManagerClass_CTOR 在创建奴隶时写
+    //   `[slave+2DCh] = [manager+24h]`；LoseSlave / ReleaseSlaves 清零。
+    //   非空表示"我是别人的奴隶"，不能接受玩家下达的目的地/航点。
+    TechnoClass*         SlaveOwner;
     ParasiteClass*       Parasite;
     BombClass*           Bomb;
 
@@ -1290,8 +1433,9 @@ public:
     // ★ 二轮语义深化新增状态（仅补原版确有、此前未建模的槽位）
     // ========================================================================
 
-    // asm +0x508 TechnoClass::LastTarget —— Assign_Target 以它做"目标是否变化"的
-    //  比较基准；Limbo/Captured 在同一槽上缓存"当前对所在格贡献的威胁值"。
+    // asm +0x2B8 TechnoClass.LastTarget —— Assign_Target 以它做"目标是否变化"的
+    //  比较基准（Target 在 +0x2B4，两槽相邻）。注意 +0x508 是 ThreatPosed，
+    //  Limbo 在离开地图前对它做 Adjust_Threat(-ThreatPosed) 后清零。
     AbstractClass* LastTarget;
     // asm +0x50C —— Assign_Target 入口清零的锁定标志。
     bool           TargetLockActive;
@@ -1306,8 +1450,28 @@ public:
     // asm +0x2FC —— 整备补弹计数（Receive_Message case 28 逐次自增）。
     int32          RearmCount;
 
-    // asm +0x1C8 —— EMP / 瘫痪状态；Can_Fire 与 Response_Select 都会查它。
+    // asm +0x1C8  _TechnoClass.t.Deactivated —— Deactivate 置 1、Activate 清 0
+    //   的"本帧不可指挥"字节。TechnoClass_9C / CanSetWaypoint / Response_Select
+    //   都会查它。注意：Berzerk 是另一个字段，本树早期把两者混用，现已分开。
+    bool           Deactivated;
+
+    // asm _TechnoClass.t.EMPDurationRemaining —— EMP 脉冲打上的瘫痪帧数。
+    //   EMPulseClass_Initialize 写入，TechnoClass_Update 每帧递减；>0 时
+    //   vt+0x37C（IsUnderEMP）返回真。
+    int32          EMPDurationRemaining;
+
+    // asm +0x1C8 —— EMP / 狂化状态。本树用 IsDizzy 表示"狂化"（Berzerk）；
+    //   真正的 Deactivate 字节已拆到上面的 Deactivated。
     bool           IsDizzy;
+
+    // asm _TechnoClass.t.BehindAnim (+0x128) —— "身后层"动画，由
+    //   TechnoClass::DrawHidden 在 Rules->Behind 存在时 new 出并 Attach_To(this)。
+    // asm _TechnoClass.t.DeployingAnim (+0x12C) —— 展开/收起过程中的过渡动画；
+    //   DrawHidden 入口以它非空为"别画隐身影"的门控。
+    //   两个槽在二进制里紧邻 CurrentWeaponNumber 之后；本树把它们放在类尾，
+    //   因为工程没有按字节偏移存取的代码（无 reinterpret_cast<TechnoClass*>(+n)）。
+    AnimClass*      BehindAnim;
+    AnimClass*      DeployingAnim;
 
 protected:
     explicit TechnoClass(noinit_t) noexcept : RadioClass(noinit) {}

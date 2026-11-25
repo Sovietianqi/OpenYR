@@ -32,6 +32,7 @@ class TechnoTypeClass;
 class SuperWeaponTypeClass;
 class BaseClass;
 class BaseNodeClass;
+class WaypointPathClass;
 class FactoryClass;
 class CampaignClass;
 class BeaconClass;
@@ -297,14 +298,33 @@ public:
 
     // INI
     bool InitFromINI(class CCINIClass* pINI);
-    static bool LoadFromINIList(class CCINIClass* pINI);
+    // nInitialMoney —— 场景启动资金（[Basic] Money= / 内置默认）。房记录
+    //   刚构造时 Credits=0，必须在 InitFromINI 之前播种，否则缺省值会把
+    //   玩家开局资金写成 0。
+    static bool LoadFromINIList(class CCINIClass* pINI, int32 nInitialMoney = 0);
     static int32 FindIndexByName(const char* pName);
+
+    // 场景实体（.map 的 [Structures]/[Units]/[Infantry]）用的房主查找：
+    //   先按 InitialName 精确匹配；未命中再按 Country/房型 ID 兜底。
+    //
+    //   为什么需要兜底：原版在实体解析之前已经读过地图的 [Houses] 段，
+    //   房名就是地图里写的 "Americans"/"Russians"。本树目前还没接
+    //   [Houses]（HouseClass::Array 由 4.4 段直接建两套房，InitialName
+    //   是 "Player"/"Enemy"），于是真实地图的 owner 字段一个都对不上，
+    //   预置单位会全部被丢弃。按房型 ID 兜底是确定规则，不是猜测。
+    static int32 FindIndexByNameOrType(const char* pName);
 
     // Alliance
     void MakeAlly(HouseClass* pHouse);
     void MakeEnemy(HouseClass* pHouse);
     bool IsAlliedWith(HouseClass* pHouse) const;
     bool IsHostileTo(HouseClass* pHouse) const;
+
+    // asm HouseClass::Is_Ally 两个重载（asm:554728 / 554781）。判定顺序：
+    // 同一对象 → 同一 ActLikeIndex（同阵营的国家互为盟友）→ 盟友位图；
+    // ActLikeIndex 为 -1 的一律不结盟。第二重载先经 vt+0x3C 取拥有者。
+    bool Is_Ally(HouseClass* pHouse) const;
+    bool Is_Ally(TechnoClass* pTechno) const;
     static bool IsAllied(int32 house1, int32 house2);
 
     // ── Diplomacy (asm HouseClass_AlliedWith / _Belongs_To_Ally /
@@ -518,6 +538,23 @@ public:
     void Update_Factories_Timing();
 
     // ========================================================================
+    // asm: HouseClass::Update_Factories (0x509129, retn 0Ch)
+    //
+    //   void __thiscall HouseClass::Update_Factories(HouseClass *this,
+    //       eFactory factoryOf, BuildingTypeClass *bldType, int buildCat)
+    //
+    //   某类工厂的"可产性"刚刚变了（建筑落成 / 被拆 / 被占 / 恢复供电）时，
+    //   用它把该类工厂的生产队列与在制品重新过一遍：
+    //     * 队列里已经造不出来的条目直接摘掉；
+    //     * 在制品造不出来 -> Abandon + 重新开线（下一件顶上）；
+    //     * 在制品造得出来且被挂起 -> Unsuspend（电力/科技恢复后自动续产）。
+    //   factoryOf 取原版 eFactory 的 0/13/37 三档（飞机 / 步兵 / 载具），
+    //   其余值（1..12、14..36）都是建筑类（buildCat==5 时归防御）。
+    // ========================================================================
+    void Update_Factories(int32 factoryOf, BuildingTypeClass* bldType,
+                          int32 buildCat);
+
+    // ========================================================================
     // 根据游戏行为，可知 UpdateSWs 按帧推进本阵营所有超级武器的充能；
     //  UpdateAllSW 是"全部阵营一起推进"的外层入口。
     // ========================================================================
@@ -537,10 +574,23 @@ public:
     bool ShouldDisableCameo(TechnoTypeClass* pType) const;
 
     // ========================================================================
-    // 根据游戏行为，可知 PrerequisiteIsAvailable 判断本阵营是否已具备建造
-    //  某个项目所需的前置条件（逐条核对前置建筑清单的拥有情况）。
+    // asm: byte __thiscall HouseClass_PrerequisiteIsAvailable
+    //        (HouseClass *this, TechnoTypeClass *Techno,
+    //         VectorPtrBuildingTypeClass *vectorBuildings, int vectorLength)
+    //        (asm:577982, retn 0Ch)
+    //
+    //  按 Techno->Prerequisite 逐条核对：普通项要求对应 BuildingType 已在
+    //  vectorBuildings[0..vectorLength) 里；负数项是"类别前置"（-6..-1 分别
+    //  对应 PROC/TECH/RADAR/BARRACKS/FACTORY/POWER），只要该类别向量中
+    //  任一建筑出现在 vectorBuildings 里即算满足。
+    //
+    //  单参版本是既有调用点（ShouldDisableCameo）使用的"已拥有前置"判断，
+    //  两者语义不同，保留为不同重载。
     // ========================================================================
     bool PrerequisiteIsAvailable(TechnoTypeClass* pType) const;
+    bool PrerequisiteIsAvailable(TechnoTypeClass* pType,
+                                 DynamicVectorClass<BuildingTypeClass*>* pVectorBuildings,
+                                 int32 vectorLength) const;
 
     // ========================================================================
     // 根据游戏行为，可知 DoInfantrySelfHeal 与 DoUnitsSelfHeal 按帧给本阵营
@@ -557,10 +607,14 @@ public:
     bool CreateAirstrike(const CellStruct& target);
 
     // ========================================================================
-    // 根据游戏行为，可知 UpdateFlagCoords 负责把本阵营的旗帜重新挂到最新的
-    //  基地中心格上，让玩家一眼看到自己的基地在哪。
+    // UpdateFlagCoords —— 两个不同函数，共用名字：
+    //   1) UpdateFlagCoords()            项目侧"基地中心"重算（无 asm 对应）
+    //   2) UpdateFlagCoords(unit, what)  原版 asm:559477：
+    //        让 unit 放下旗帜；成功且它正是本阵营旗主时清 ObjectWithOurFlag；
+    //        what 非零时把旧 FlagCoords 所在格的旗标清掉并复位坐标。
     // ========================================================================
     void UpdateFlagCoords();
+    bool UpdateFlagCoords(TechnoClass* pUnit, int32 what);
 
     // ========================================================================
     // 根据游戏行为，可知 RegisterTechnoGain_PrereqCounters 在某个单位/建筑
@@ -569,6 +623,21 @@ public:
     // ========================================================================
     void RegisterTechnoGain_PrereqCounters(TechnoClass* pTechno);
     void RegisterObjectGain_FromFactory(TechnoClass* pTechno);
+
+    // ------------------------------------------------------------------------
+    // asm: TechnoClass_Unlimbo → HouseClass::RegisterTechnoGain 同族语义
+    //
+    //   对象真正落到图上时把它挂进本阵营的 Owned* 向量（建筑 / 步兵 / 载具 /
+    //   飞机）。原版这些向量是 AI 决策、胜负判定、建筑重建、以及
+    //   AI_Building 的"有没有海军船坞"扫描的唯一数据源；本树此前只有工厂
+    //   出货路径（RegisterObjectGain_FromFactory）会 Add，**任何非工厂产出
+    //   的落位对象都不在任何 Owned 表里**。
+    //
+    //   建筑若是 Rules->BuildConst 里的建造场（含 MCV 展开），还要登记进
+    //   OwnedConyards 并触发 AcquiredConyard —— 这是 AI 建造清单
+    //   （GenerateAIBuildList）的唯一入口。
+    // ------------------------------------------------------------------------
+    void RegisterTechnoGain(TechnoClass* pTechno);
 
     // ========================================================================
     // 根据游戏行为，可知 UnitFromFactory 是工厂完成产品时的统一出口：指定
@@ -691,6 +760,8 @@ public:
     // asm HouseClass_FirstBuildableTechno_FromVector (0x5051xx, retn 4):
     //   list 为 TechnoTypeClass* 向量。
     TechnoTypeClass* FirstBuildableTechno_FromVector(DynamicVectorClass<TechnoTypeClass*>* pList);
+    // 同一函数在 BuildingTypeClass* 向量上的入口（GenerateAIBuildList 用）。
+    BuildingTypeClass* FirstBuildableBuilding_FromVector(DynamicVectorClass<BuildingTypeClass*>* pList);
     // asm HouseClass_FindFirstAccessibleTechnoTypeFromArray (0x505320, retn 4).
     TechnoTypeClass* FindFirstAccessibleTechnoTypeFromArray(DynamicVectorClass<TechnoTypeClass*>* pList);
     bool DoWeNeedWalls();
@@ -711,8 +782,16 @@ public:
     void SpySat_Update();
     void SellOverlay(const CellStruct& cell);
     void CreateParadrop(const CellStruct& target);
-    CellStruct GetPlanningWaypointAt(int32 index);
-    int32 GetPlanningWaypointProperties(int32 index);
+    // asm: WaypointClass *__thiscall HouseClass_GetPlanningWaypointAt(HouseClass_old *this, wXY *a2)   (asm:571977)
+    //   在 12 条规划路线里按格坐标找节点，命中返回该节点（指向路线内部节点表），
+    //   找不到返回空。asm 返回 WaypointClass*，本工程节点类型是 CellStruct。
+    const CellStruct* GetPlanningWaypointAt(const CellStruct& cell);
+
+    // asm: char __thiscall HouseClass_GetPlanningWaypointProperties(HouseClass_old *this, WaypointClass *a2, int *idxPath, byte *idxWP)   (asm:572100)
+    //   同上查找，但输出"第几条路线 / 路线里的第几个节点"。
+    //   asm 返回 char：命中 1 且 *idxPath = 路线号、*idxWP = 节点号；
+    //   未命中返回 0 且 *idxPath = -1、*idxWP = 0。
+    bool GetPlanningWaypointProperties(const CellStruct& cell, int32* idxPath, uint8* idxWP);
     void AcquiredThreatNode(const CellStruct& cell);
     void Fire_PsyDom(const CellStruct& target);
     // asm: HouseClass_TryFindEligibleAITriggers (0x6F0AF2, retn 4)
@@ -762,8 +841,14 @@ public:
     TechnoClass* Find_Infantry(int32 idx, int32 distance);
     TechnoClass* Find_Aircraft(int32 idx, int32 distance);
     void DroppedFlag();
-    void CreateWaypointPath(const CellStruct& from, const CellStruct& to);
-    void CreateWaypointPath2(const CellStruct& from, const CellStruct& to, int32 hop);
+    // asm: void __thiscall HouseClass_CreateWaypointPath(HouseClass_old *this, int idxPath)   (asm:576504)
+    //   保证第 idxPath 条规划路线存在（不存在就 new 一条并登记）。
+    void CreateWaypointPath(int32 idxPath);
+
+    // asm: signed int __fastcall HouseClass_CreateWaypointPath2(HouseClass_old *this)   (asm:584877)
+    //   找出第一条"空路线"（节点数为 0）的槽位号，顺手把它建出来；
+    //   12 条路线全都非空时返回 -1。
+    int32 CreateWaypointPath2();
     void Update_AI_Production(int32 arg0 = -1);
     // ========================================================================
     // asm: HouseClass::AI_Build_Income (0x4FD980, __thiscall this) ——
@@ -831,11 +916,18 @@ public:
     int32 CountInstancesOfTeam(TeamTypeClass* pTeamType) const;
 
     // ------------------------------------------------------------------------
-    // 根据游戏行为，可知 CanAddPlanningWaypoint 负责判断本阵营能否再添加
-    //  一条规划路线：路线上限为 12 条，且候选槽位必须为空、已经没有任何
-    //  路径占用它。
+    // asm: char __fastcall HouseClass_CanAddPlanningWaypoint(HouseClass_old *this)   (asm:584940)
+    //   slot = +20Ch（NextPlanningWaypointSlot）
+    //   slot 越界（<0 或 >=0Ch）          -> false
+    //   p = +210h[slot]
+    //   p->WaypointCount(+38h) >= Rules+90h  -> false
+    //   p->[+24h] != -1                   -> false
+    //   其它                              -> true
+    // 其中 Rules+90h 即 RulesClass::MaxWaypointPathLength（[General] 段的
+    // 同名键，语义与比较方向完全对应）。
     // ------------------------------------------------------------------------
     bool CanAddPlanningWaypoint() const;
+
 
     // 根据游戏行为，可知间谍切断电力后调用它：把本阵营标记为"电力受损"，
     // 并按给定的持续帧数启动断电计时。
@@ -1056,11 +1148,14 @@ public:
     // ------------------------------------------------------------------------
     BaseClass           Base;
 
-    // 根据游戏行为，可知 PlanningWaypoints 是玩家在地图上画出的若干条
-    //  行军路线的槽位，共 12 条：每条路线可以是一条折线。AI 与玩家都用它
-    //  预先规划进攻或撤退的走法，路线为空时该槽位可以再被占用。
+    // ------------------------------------------------------------------------
+    // asm: HouseClass+210h —— 12 条行军规划路线的槽位（每条是一个
+    //   WaypointPathClass*，惰性建立）。+20Ch 则是"当前正在编辑的槽位号"，
+    //   即 NextPlanningWaypointSlot。
+    //   12 个槽位在构造时被清成空；CreateWaypointPath(2) 负责按需 new。
+    // ------------------------------------------------------------------------
     static constexpr int32 MaxPlanningPaths = 12;
-    void*               PlanningWaypoints[MaxPlanningPaths];
+    WaypointPathClass*  PlanningWaypoints[MaxPlanningPaths];
     int32               NextPlanningWaypointSlot;
 
     // ── Base outline bookkeeping (asm HouseClass+0x1460+0x5728 block) ──────
@@ -1249,10 +1344,9 @@ public:
     CDTimerClass TeamDelayTimer;
     int32 LastAirCombatTime, LastSpySatTime, LastIronCurtainTime, LastForceShieldTime;
 
-    // 根据游戏行为，可知规划路径点除对象表外还有一份坐标侧记录，供
-    // 查询与画线直接取格。
-    CellStruct PlanningWaypointCoords[8];
-    int32 PlanningWaypointCoordCount;
+    // （此处早期的 PlanningWaypointCoords[8] / PlanningWaypointCoordCount 是
+    //   自造的坐标侧副本，asm 里并不存在：节点只存放在每条
+    //   WaypointPathClass 的节点表里，故已删除。）
     int32 LastPsychicRevealTime, LastSonarTime, LastRadarTime, LastBuildingTime;
     int32 LastInfantryTime, LastVehicleTime, LastAircraftTime, LastSuperWeaponTime;
     int32 LastAirstrikeTime, LastParadropTime, LastSpyTime, LastEngineerTime;

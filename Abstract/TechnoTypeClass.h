@@ -29,6 +29,17 @@ public:
     static void Delete_All();
 
     virtual ~TechnoTypeClass();
+    // asm vt+0x2C (WhatAmI)。原版每个类型类都在自己的虚表里返回固定 ID；
+    //   本树此前只有 ObjectTypeClass 的 `return Object`，于是**所有**类型
+    //   对象（UnitType/InfantryType/BuildingType/AircraftType）都自称
+    //   Object——凡是按 WhatAmI 分类的地方（出厂建对象、建造前置、AI 选型）
+    //   全部分错支。这里按原版把 ID 逐层钉回去。
+    virtual AbstractType WhatAmI() const override { return AbstractType::TechnoType; }
+    // asm vt+0x40 —— 类型在自己那张类型表里的下标。AbstractClass 的默认
+    //   实现返回 -1，本树此前没有任何类型类覆写它，于是
+    //   `ToProduce = type->GetArrayIndex()` 恒写 -1，AI 的选型结果永远
+    //   是「没有可造项」。这里统一返回注册时记下的 ArrayIndex。
+    virtual int32 GetArrayIndex() const override { return ArrayIndex; }
     // IPersistStream (stream serialisation).  The original TechnoTypeClass_Save
     // chains to ObjectTypeClass_Save and then streams every vector/list member.
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
@@ -135,6 +146,9 @@ public:
     // from here once the unit reaches elite rank.  Mirrors
     // TechnoType_GetEliteWeapon addressing.
     WeaponStruct EliteWeapons[18];
+    // 精英武器槽的有效个数（原版由 Read_INI 从 ElitePrimary/EliteSecondary 推出，
+    //   子类曾各自重复声明一份，导致基类表与子类表分叉）。
+    int32       EliteWeaponCount;
     bool        HasTurret_;
     bool        CanCloak_;
     bool        IsVoxel_;

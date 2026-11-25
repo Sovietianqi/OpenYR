@@ -187,7 +187,8 @@ void BuildingTypeClass::Delete_All()
 // ============================================================================
 
 BuildingTypeClass::BuildingTypeClass() noexcept
-    : TechnoTypeClass(noinit)
+    : TechnoTypeClass()   // 走完整默认值（noinit 版会跳过 TechnoTypeClass 的
+                          //   全部字段初始化，Ammo / ROT / WeaponCount 等停在 0）
 {
     BuildingFoundation = 0x0101;  // 1x1 default foundation (packed B=1, W=1)
     Height             = 0;
@@ -267,6 +268,14 @@ BuildingTypeClass::BuildingTypeClass() noexcept
     IsAggressive       = false;
     IsUndeployableMember = false;
     IsSellable         = true;
+
+    // asm: BuildingTypeClass_CTOR —— AI 建造清单的默认参与位。
+    //   `AIBuildThis` 缺省为真（原版 AI 默认把所有可造建筑纳入规划），
+    //   `AIBasePlanningSide` 缺省 -1 表示"不限定阵营"。
+    //   本树此前两个字段都没初始化：未定义值让 GenerateAIBuildList 的
+    //   阵营过滤随机构成，AI 建造清单时常整个被跳过。
+    AIBuildThis        = true;
+    AIBasePlanningSide = -1;
     IsRepairable       = true;
     IsUnsellable       = false;
     IsUngarrisonable   = false;
@@ -601,7 +610,11 @@ FoundationData* BuildingTypeClass::GetFoundationData()
 // ============================================================================
 int32 BuildingTypeClass::GetArrayIndex() const
 {
-    return static_cast<int32>(reinterpret_cast<intptr_t>(field_DF8));
+    // ★ 这里必须返回**注册下标**，而不是 +0xDF8 那个节点原型指针：
+    //   HouseClass 的 AI 选型路径把本函数的返回值直接写进
+    //   BuildingTypeToProduce，随后按它去 BuildingTypeClass::Array 取项；
+    //   返回指针值只会越界取到垃圾。field_DF8 仅供 Base 系统使用。
+    return ArrayIndex;
 }
 
 // ============================================================================
@@ -889,7 +902,29 @@ bool BuildingTypeClass::LoadFromINI(CCINIClass* pINI)
     // ------------------------------------------------------------------
     // Factory / building-type classification
     // ------------------------------------------------------------------
-    IsFactory_         = pINI->ReadBool(section, "Factory",          IsFactory_);
+    // ★ asm/rules 语义：`Factory=` 的值是**类别字符串**而不是 bool
+    //   （GAPILE 是 `Factory=InfantryType`，GAWEAP 是 `Factory=UnitType`）。
+    //   本树此前用 ReadBool 读它（任何非零字符串都算 true），却从不给
+    //   TechnoTypeClass::Factory 这个枚举字段赋值 —— 于是
+    //   BuildingClass::Update_Factory 的第一道门
+    //   `Type->Factory == None → return` 对**所有**工厂建筑恒成立，
+    //   生产线永远开不起来。这里按类别字符串回填。
+    {
+        char facBuf[32] = {0};
+        pINI->ReadString(section, "Factory", "", facBuf, sizeof(facBuf));
+
+        AbstractType facKind = AbstractType::None;
+        if (facBuf[0] != '\0')
+        {
+            const char* p = facBuf;
+            if      (_strcmpi(p, "InfantryType") == 0) facKind = AbstractType::InfantryType;
+            else if (_strcmpi(p, "UnitType")     == 0) facKind = AbstractType::UnitType;
+            else if (_strcmpi(p, "AircraftType") == 0) facKind = AbstractType::AircraftType;
+            else if (_strcmpi(p, "BuildingType") == 0) facKind = AbstractType::BuildingType;
+        }
+        Factory = facKind;
+    }
+    IsFactory_         = (Factory != AbstractType::None);
     IsWeaponsFactory   = pINI->ReadBool(section, "WeaponsFactory",   IsWeaponsFactory);
     IsConstructionYard = pINI->ReadBool(section, "ConstructionYard", IsConstructionYard);
     IsRadar            = pINI->ReadBool(section, "Radar",            IsRadar);
@@ -1129,6 +1164,12 @@ bool BuildingTypeClass::LoadFromINI(CCINIClass* pINI)
     ConstructionYard = pINI->ReadBool(section, "ConstructionYard", ConstructionYard);
     NukeSilo = pINI->ReadBool(section, "NukeSilo", NukeSilo);
     Refinery = pINI->ReadBool(section, "Refinery", Refinery);
+    // asm: BuildingTypeClass_LoadFromINI 只读 "Refinery"（aRefinery, +0xC0B），
+    //   二进制里根本没有 "OreRefinery" 这个键。本树早期猜出来的 IsOreRefinery
+    //   既没人读 ini、也没人写，恒 false —— 结果所有"这栋楼是不是矿厂"的
+    //   判断（矿车找卸矿点、AI 采集车数量评估、雷达事件）全部失效。
+    //   这里把同一来源同步过来，保持两个字段语义一致。
+    IsOreRefinery = Refinery;
     WeaponsFactory = pINI->ReadBool(section, "WeaponsFactory", WeaponsFactory);
     LaserFencePost = pINI->ReadBool(section, "LaserFencePost", LaserFencePost);
     LaserFence = pINI->ReadBool(section, "LaserFence", LaserFence);
@@ -1816,7 +1857,13 @@ BuildingTypeClass* BuildingTypeClass::FindOrAllocate(const char* pID)
         strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
         newItem->ID[sizeof(newItem->ID) - 1] = '\0';
     }
-    if (newItem && Array) Array->Add(newItem);
+    if (newItem && Array)
+    {
+        Array->Add(newItem);
+        // asm: 类型构造末尾把"我在类型表里的下标"写进 +0x98（ArrayIndex）。
+        //   缺这一步时 GetArrayIndex() 恒 0/-1，AI 选型、工厂索引全部错位。
+        newItem->Set_ArrayIndex(Array->Count - 1);
+    }
     return newItem;
 }
 
@@ -1966,6 +2013,7 @@ BuildingClass* BuildingTypeClass::SpawnAtCoords(const CoordStruct& coord, HouseC
 {
     BuildingClass* pBuilding = new BuildingClass(pOwner);
     pBuilding->Type = this;
+    pBuilding->TechnoType = this;
     (void)coord;
     return pBuilding;
 }
@@ -1990,6 +2038,7 @@ BuildingClass* BuildingTypeClass::CreateBuilding(HouseClass* pOwner)
         return nullptr;
 
     pBuilding->Type = this;
+    pBuilding->TechnoType = this;
     return pBuilding;
 }
 

@@ -7,6 +7,9 @@
 #include "../Containers/VectorClass.h"
 #include "../Math/CoordStruct.h"
 
+class BuildingTypeClass;
+class TechnoTypeClass;
+
 class TeamClass {
 public:
     static DynamicVectorClass<TeamClass*>* Array;
@@ -81,6 +84,9 @@ private:
     void CleanupDeadMembers();
     void DoDisappear();
     CoordStruct ComputeFormationCenter();
+    // 坑位缺员且现成单位招不到时，向房主的对应产线下单造齐（原版
+    //   TeamClass_Update 的补员段 -> HouseClass_BeginProductionOf）。
+    void RequestProductionForSlot(int32 idx);
     // asm: AITeamClass_FindUnitToFollow (asm 0x6EB7xx): 为队伍确定一个"跟随锚点"
     //  ——优先取距离队伍锚点（spawnCell）最近、且仍在场上的成员；找不到就取
     //  第一个成员。结果分别写入 SpawnCell（若为空）与 FollowAnchor。
@@ -122,14 +128,16 @@ public:
     void GoToScriptAction(void* pParam);
 
     // ------------------------------------------------------------------------
-    // 根据游戏行为，可知下面一组是队伍级指令入口：侦察、集结、按路径点
-    // 攻击或潜入、挑选敌我建筑、跟随友军与老版精锐化兼容桩。
+    // 脚本动作表（asm Team_* 0x6EC98E..0x6F03xx）：
+    //   路径点攻击/潜入/巡逻、选敌我建筑、跟随友军、按类型索敌、超武传送等。
+    //   每个 proc 由 TeamClass_Update 按动作号调用；见 .cpp 内逐函数 asm 注解。
     // ------------------------------------------------------------------------
     void AttackWaypoint(void* pParam);
     void SetFlashing(void* pParam);
     void LoadOntoTransport(void* pParam);
     void GatherAtEnemyBase(void* pParam);
-    BuildingClass* PickFriendlyStructure(void* pParam);
+    BuildingClass* PickFriendlyStructure(BuildingTypeClass* pType, HouseClass* pHouse,
+                                         TechnoClass* pUnit, int32 flags, bool onlyHouseEnemy);
     void AssignNewMission(void* pParam);
     void Scout(void* pParam);
     void AttackStructureAtWaypoint(void* pParam);
@@ -139,14 +147,15 @@ public:
     void GatherAtFriendlyBase(void* pParam);
     void SpyStructureAtWaypoint(void* pParam);
     void AttackTargetType(void* pParam);
-    int32 GetTaskForceEntries(void* pParam);
+    void GetTaskForceEntries(DynamicVectorClass<TechnoTypeClass*>* pOut);
     void SetElite_old(void* pParam);
     void PlayAnimType(void* pParam);
     void FollowFriendlies(void* pParam);
     void ChronoSphereToStructure(void* pParam);
     void ChronoWarpToStructure(void* pParam);
     void PatrolToWaypoint(void* pParam);
-    BuildingClass* PickEnemyStructure(void* pParam);
+    BuildingClass* PickEnemyStructure(BuildingTypeClass* pType, HouseClass* pCaller,
+                                      TechnoClass* pUnit, int32 flags, bool onlyHouseEnemy);
 
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 TRUCKBtoTRUCKA 负责把队伍里型号为 TRUCKB 的载具

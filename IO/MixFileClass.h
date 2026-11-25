@@ -15,27 +15,37 @@
 // MIX files are Westwood's proprietary archive format used to bundle
 // game assets. The format consists of:
 //
-// [Header]
-//   uint16 Flags       - bit 0 = has checksum, bit 1 = encrypted
-//   uint16 FileCount   - number of files in the archive
-//   uint32 BodySize    - total size of the file data (excluding header)
+// Two header flavours exist; which one is in use is decided by the first
+// 16-bit word (asm MixFileClass_CTOR, asm.txt:913026):
 //
-// [Index Table] (FileCount entries)
+//   word[0] != 0  ->  plain (TS style)
+//       uint16 FileCount
+//       uint32 BodySize
+//
+//   word[0] == 0  ->  RA2 / YR style
+//       uint16 ZeroSentinel        (always 0)
+//       uint16 Flags               bit0 = has checksum, bit1 = index encrypted
+//       [if bit1] 80-byte RSA block (2 x 40 bytes, see below)
+//       uint16 FileCount           } plain, or the first 6 bytes of the
+//       uint32 BodySize            } Blowfish-ECB stream
+//
+// [Index Table] (FileCount entries, 12 bytes each, CRC-ascending)
 //   uint32 FileID      - CRC32 hash of the file name (case-insensitive)
-//   uint32 Offset      - offset from start of body to this file's data
+//   uint32 Offset      - offset from the END OF THE INDEX to the file data
 //   uint32 Size        - size of the file data
 //
+// When Flags bit1 is set, the {FileCount, BodySize} pair and the index table
+// form ONE continuous Blowfish-ECB stream that starts right after the 80-byte
+// RSA block; the tail of the last 8-byte block is zero padding.  The 56-byte
+// Blowfish key is not stored anywhere - it is recovered from the RSA block
+// with Key_0's public exponent (see "Blowfish key for RA2/YR MIX files").
+//
 // [File Data]
-//   Raw file data, possibly compressed with PKWare or LZO
+//   Raw file data (never encrypted), possibly compressed with PKWare or LZO.
 //
-// The MIX format supports two encryption/compression flavors:
-// 1. RA2 format: Blowfish encryption + PKWare compression
-// 2. TS format: PKWare compression only
-//
-// MIX files are chained in a linked list. The game searches for
-// files by iterating through all loaded MIX files.
-//========================================================================
-
+// IMPORTANT: BodySize is not consistent across archives (some include the
+// index, some do not), so this implementation measures the physical stream
+// length at open time and derives the data window from that.
 //========================================================================
 // MixHeader - MIX file header structure
 //========================================================================
@@ -234,12 +244,37 @@ public:
 
     //========================================================================
     // Blowfish key for RA2/YR MIX files
+    //
+    // This used to be an unresolved gap; it is now fully derived from the
+    // binary.  The chain is:
+    //
+    //  1. WinMain's Init_Keys (asm.txt:1435396) feeds
+    //       "[PublicKey]\n1=AihRvNoIbTn85FZRYNZRcT+i6KpU+maCsEqr3Q5q+LDB5tH7Tz2qQ38V"
+    //     to an INIClass and calls INIClass::Get_PKey(out, 1).
+    //  2. Get_PKey (asm.txt:654046) with arg_4 == 1 does NOT read a private
+    //     key: it DER-encodes the constant 0x10001 into the exponent slot and
+    //     reads the "PublicKey" UUBlock for the modulus.
+    //  3. The UUBlock is base64: 56 chars -> 42 bytes = DER INTEGER
+    //       tag 0x02, length 0x28, then 40 bytes of modulus
+    //       51BCDA086D39FCE4...3DAA437F15  (319 bits).
+    //     PKey::Decode_Modulus (asm.txt:1165729) stores that as a little-endian
+    //     bignum and writes Key_Voodoo3()-1 (318) to Key_0+0x200.
+    //  4. MixFileClass_CTOR (asm.txt:913144) hands &Key_0 to PKStraw_SetKey and
+    //     creates PKStraw with mode 1, so PKStraw_ReadNextBytes takes the
+    //     "raw key" branch: it reads (55/39 + 1) * 40 = 80 bytes from the
+    //     stream and RSA-recovers them through sub_632870 -> sub_5C8500.
+    //  5. Each 40-byte chunk c is transformed to c^e mod n (e = 65537), which
+    //     is *public-key signature recovery* - no private exponent needed.
+    //     The 80 recovered bytes are handed to BlowStraw in two 40-byte
+    //     pieces, and the first 56 of them are the Blowfish key.
+    //
+    // Every step above is a direct reading of the assembly; nothing is
+    // guessed.  The RSA parameters below are the decoded Key_0 fields.
     //========================================================================
-
-    static constexpr uint8 BlowfishKey[16] = {
-        0x3A, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
+    static constexpr int32 BlowfishKeySize = 56;
+    // Bytes consumed from the archive before the Blowfish stream starts:
+    // 4-byte leading header + 80-byte RSA key block.
+    static constexpr int32 BlowfishKeyBlockSize = 80;
 
 protected:
     // Internal: read the MIX header
@@ -247,9 +282,6 @@ protected:
 
     // Internal: read the index table
     bool ReadIndex();
-
-    // Internal: decrypt the MIX header (Blowfish)
-    bool DecryptHeader();
 
     // Internal: calculate CRC32 table
     static void InitCRCTable();
@@ -261,6 +293,15 @@ public:
     int32 CountFiles;
     int32 FileSize;
     int32 BodySize;
+    // True when the index table is sorted by FileID ascending, which is what
+    // the retail binary search assumes.  Archives that are not sorted fall back
+    // to a linear scan instead of returning wrong results.
+    bool IndexSorted;
+    // Bytes of file data that actually follow the index (FileSize -
+    // FileStartOffset).  The header's BodySize field is documented as "body
+    // size" but retail archives disagree on whether the index is included, so
+    // every bounds check uses this measured value instead of trusting it.
+    int32 DataSize;
     int32 FileStartOffset;
     MixIndexEntry* Headers;
     int32 field_24;
@@ -268,7 +309,18 @@ public:
     // asm: the physical size of the leading header block (10 bytes for the
     // RA2 flag-word flavour, 6 for the plain flavour).  Kept so the body start
     // offset and the cached-index pointer can be recomputed without re-parsing.
+    //
+    // For a Blowfish archive the header is *not* contiguous: 4 plain bytes,
+    // then the 80-byte RSA key block, then the encrypted {count, bodySize}
+    // pair.  HeaderSize therefore counts the whole prefix (4 + 80 + 6 = 90)
+    // while BlowfishStreamOffset records where the ciphertext actually starts
+    // (4 + 80 = 84), which is what the cached copy has to decrypt.
     int32 HeaderSize;
+    int32 BlowfishStreamOffset;
+
+    // Blowfish key recovered from the archive's RSA block (valid only while
+    // BlowfishStreamOffset != 0).
+    uint8 BlowfishKey[BlowfishKeySize];
 
     // The archive encryption key handed to the two-argument CTOR (borrowed,
     // not owned).  Only consulted while the encrypted path is active.

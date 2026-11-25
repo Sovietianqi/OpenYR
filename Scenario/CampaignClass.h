@@ -52,6 +52,7 @@ public:
     virtual HRESULT Load(IStream* pStm) override;
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
 
+    virtual AbstractType WhatAmI() const override { return AbstractType::Campaign; }
     virtual int32 Size() const override;
     virtual void ComputeCRC(CRCEngine& crc) const override;
     int32 GetCRC() const;

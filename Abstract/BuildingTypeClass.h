@@ -58,6 +58,7 @@ public:
     // lookup (DeployingAnim, RoofDeployingAnim, DoorAnim, UnderDoorAnim,
     // UnderRoofDoorAnim, Rubble, SpecialZOverlay).
     void Load2DArt(int32 idxTheater);
+    virtual AbstractType WhatAmI() const override { return AbstractType::BuildingType; }
     virtual AbstractType GetAbstractDerivationID() const override;
     virtual bool HasThisID(const char* pID) const override;
     virtual int32 GetCRC() const override;

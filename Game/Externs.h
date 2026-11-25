@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Definitions.h"
+#include "Math/Timer.h"
 #include <Containers/DynamicVectorClass.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,6 +206,14 @@ extern bool              g_bInGameLoop;
 extern bool              g_bMapLoaded;
 extern bool              g_bRulesLoaded;
 extern bool              g_bScenarioLoaded;
+
+// asm: gSWAllowed —— 会话是否允许超级武器（Rules->SuperWeaponsAllowed 的镜像）。
+//   由会话初始化写入，AI 建造列表与 FirstBuildable 读取。
+extern bool              gSWAllowed;
+
+// asm: ScenarioInit —— 场景是否处于初始化阶段（非零 = 是）。
+//   HouseClass::AcquiredConyard 在生成 AI 建造清单前后保存/清零/恢复它。
+extern int32             ScenarioInit;
 extern bool              g_bMultiplayerGame;
 extern bool              g_bCampaignGame;
 extern bool              g_bSkirmishGame;
@@ -373,10 +382,22 @@ extern bool              g_bBaseDefense;
 extern int               g_UnitResponse;
 extern int               g_RepairSellMode;
 
+// ── 话泡（Talk Bubble）全局状态 ───────────────────────────────────────────
+//
+//  asm .data 里是三个彼此独立的槽：
+//    TalkBubbleType  —— 当前话泡的帧号（TALKBUBL.SHP 里 1-based，0 表示无）
+//    TalkBubbleOwner —— 说这句话的 TechnoClass*（同一时刻只允许一个）
+//    TalkBubbleTimer —— TimerStruct（毫秒），Start=起跑时刻、TimeLeft=时长
+//
+//  写入点只有 TechnoClass::DisplayTalkBubble，读取点只有
+//  TechnoClass::DrawExtras（绘制侧）。定义在 Abstract/TechnoClass.cpp。
+extern int32             TalkBubbleType;
+extern TechnoClass*      TalkBubbleOwner;
+extern TimerStruct       TalkBubbleTimer;
+
 // ── Network sync globals ──────────────────────────────────────────────────
 
-extern uint32            g_NetworkCRC;
-extern bool              g_bNetworkSyncCheck;
+extern uint32            g_NetworkCRC;extern bool              g_bNetworkSyncCheck;
 extern int               g_NetworkLatency;
 extern int               g_NetworkMaxLatency;
 extern bool              g_bNetworkGameStarted;

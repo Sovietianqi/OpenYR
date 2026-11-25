@@ -1,4 +1,5 @@
 #include "Audio.h"
+#include "IO/FileSystem.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -698,7 +699,8 @@ bool AudioManager::ReadWAVFile(CCFileClass* pFile, AudioSampleData* pSampleData)
 bool Audio_ReadWAVFile(const char* filename, AudioSampleData* pSampleData) {
     if (!filename || !pSampleData) return false;
 
-    FILE* f = std::fopen(filename, "rb");
+    // 音频通常只存在于 audio(md).mix 里，必须走归档流而不是裸 fopen。
+    FILE* f = File_Open_Archive_Stream(filename);
     if (!f) return false;
 
     bool result = false;
@@ -926,15 +928,28 @@ bool AudioIndexTable::Load(const char* pFileName, const char* pDirectory)
 
     std::memset(Entries, 0, sizeof(AudioIndexEntry) * static_cast<size_t>(Capacity));
 
-    if (header[1] == IDX_VERSION) {
+    // 记录是定长 0x24：name[0x20] + u32 offset。必须整条读，只读 0x20
+    // 会让第二条起全部错位（名字变成上一条的 offset + 下一条名字前 28 字节）。
+    if (header[0] == 0 && header[1] == IDX_VERSION) {
+        uint8 record[IDX_ENTRY_SIZE];
         for (int32 i = 0; i < Capacity; ++i) {
-            if (indexFile.Read(Entries[i].Name, 0x20) != 0x20) {
+            if (indexFile.Read(record, IDX_ENTRY_SIZE) != IDX_ENTRY_SIZE) {
                 Clear();
                 return false;
             }
+            std::memcpy(Entries[i].Name, record, 0x20);
             Entries[i].Name[0x1F] = '\0';
-            Entries[i].Offset = 0;
+            Entries[i].Offset =
+                static_cast<uint32>(record[0x20]) |
+                (static_cast<uint32>(record[0x21]) << 8) |
+                (static_cast<uint32>(record[0x22]) << 16) |
+                (static_cast<uint32>(record[0x23]) << 24);
         }
+    } else {
+        // 版本不认识时不能假装解析成功：调用方会按名字查下标，
+        // 空名字表只会让它静默全部落空。
+        Clear();
+        return false;
     }
 
     Count = Capacity;
@@ -968,6 +983,13 @@ int32 AudioIndexTable::FindIndex(const char* pName) const
     return static_cast<int32>(pEntry - Entries);
 }
 
+uint32 AudioIndexTable::GetOffset(int32 index) const
+{
+    if (!Entries || index < 0 || index >= Count)
+        return 0;
+    return Entries[index].Offset;
+}
+
 const char* AudioIndexTable::GetName(int32 index) const
 {
     if (!Entries || index < 0 || index >= Count)
@@ -986,8 +1008,10 @@ int32 Audio_FindSampleIndex(const char* pName)
 
 bool Audio_LoadSampleIndex(const char* pFileName, const char* pDirectory)
 {
+    // 索引表在第一次加载时创建：原版是全局对象，这里用惰性构造表达同一
+    // 语义，避免静态初始化顺序问题。
     if (!g_pAudioIndexTable)
-        return false;
+        g_pAudioIndexTable = new AudioIndexTable();
 
     return g_pAudioIndexTable->Load(pFileName, pDirectory);
 }

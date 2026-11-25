@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <Abstract/MissionClass.h>
 #include <INI/INIClass.h>
 #include <IO/CRC.h>
@@ -221,6 +223,105 @@ void MissionClass::Update()
     if (!Alive)
         return;
 
+    // ── 任务采用段（原版 TechnoClass_Mission_Update 的 adopt 半）────────
+    //   QueueMission → Assign_Mission 只把目标写进 field_B4，NextMission 再把它
+    //   提升到 `what`（覆写槽），当前任务(+0xA8)始终不动 —— 原版由这一层
+    //   在合适的时机把挂起的任务正式装上。
+    {
+        // ★ 待办任务的唯一来源是 field_B4（+0xB4）。
+        //   QueueMission → Assign_Mission 只写 field_B4，原版靠 NextMission
+        //   （ReadyToNextMission 为真时）把它提上来。本树的 ReadyToNextMission
+        //   在多数任务下恒假，于是"排队的任务"永远停在 field_B4：矿车排了
+        //   Unload 不去卸、单位排了 Harvest 不去采 —— 所有通过 QueueMission
+        //   下达的指令都石沉大海。
+        //
+        //   ⚠ 不能把 `what`（+0xAC）当请求源：它是"返回到哪个任务"的过继槽
+        //   （Override_Mission / SuspendMission 写它），由 Start_Default_Mission
+        //   塞进去的 Guard 会一直留在那里。先前把它和 field_B4 并列当来源，
+        //   结果矿车满舱排了 Unload，下一帧 `what` 里的 Guard 又把请求顶掉 ——
+        //   DumpTiberium 整局零调用、AI 资金永远 0。
+        //
+        //   Mission::Sleep == 0 且 ForceMission 用"写 0"表示清空，所以待办
+        //   判定用 `> Sleep` 而不是 `>= 0`，避免把"已清空"误读成"排了 Sleep"。
+        //   三个槽都可能装着"下一个任务"，按优先级取：+0xAC（what，NextMission
+        //   从 +0xB4 提上来的正式请求，也是 Override_Mission 的返回任务）>
+        //   +0xB4（尚未提升的请求）> +0xB0（QueuedMission 直写路径）。
+        //   任何一处留着请求都必须被采用 —— 只认其中一个槽会让"已经提到 what
+        //   的请求"永远等不到采用（实测 what=16 而 CurrentMission=10 卡死）。
+        Mission next = Mission::None;
+        if (what != Mission::None)
+            next = what;
+        else if (field_B4 > static_cast<int32>(Mission::Sleep))
+            next = static_cast<Mission>(field_B4);
+        else if (QueuedMission != Mission::None)
+            next = QueuedMission;
+
+        if (next != Mission::None)
+        {
+            if (next == CurrentMission)
+            {
+                // 已经在跑同一个任务：把过继槽清掉，避免每帧重复进入。
+                what          = Mission::None;
+                QueuedMission = Mission::None;
+                field_B4      = -1;
+            }
+            else
+            {
+                // 只有当前任务处于"可被打断的空闲态"时才转正；正在移动 /
+                //   攻击 / 采集的对象不会被一个排队命令立刻拽走。
+                const bool interruptible =
+                    CurrentMission == Mission::None ||
+                    CurrentMission == Mission::Guard ||
+                    CurrentMission == Mission::AreaGuard ||
+                    CurrentMission == Mission::Sleep ||
+                    CurrentMission == Mission::Stop ||
+                    CurrentMission == Mission::Hunt ||
+                    // 采集不是"不可打断"的：舱满了必须能立刻转去卸矿，
+                    //   否则矿车会带着满舱在原地反复空采。
+                    CurrentMission == Mission::Harvest ||
+                    // 卸矿同理：卸空之后要能被"回矿"接走，否则矿车卸完就
+                    //   永久停在 Unload 上（货舱已空，任务永远返回 1）。
+                    CurrentMission == Mission::Unload;
+
+                // ★ Sleep / Guard / AreaGuard 都是"空闲归位"请求，不是任务指令。
+                //   原版把它们放在 what 里只是让单位有个默认态；只要当前已经
+                //   在做实事（Hunt/Attack/Harvest/Move/Unload…），它就不该把
+                //   任务顶掉。此前缺这道门，AI 队伍刚被强制装上 Hunt，下一帧
+                //   就被残留的 what=Guard 顶回 5 / what=Sleep 顶回 0，整队站桩。
+                const bool nextIsIdle =
+                    (next == Mission::Sleep || next == Mission::Guard
+                     || next == Mission::AreaGuard);
+                const bool curIsIdle =
+                    (CurrentMission == Mission::None
+                     || CurrentMission == Mission::Sleep
+                     || CurrentMission == Mission::Guard
+                     || CurrentMission == Mission::AreaGuard
+                     || CurrentMission == Mission::Stop);
+                if (nextIsIdle && !curIsIdle)
+                {
+                    what          = Mission::None;
+                    QueuedMission = Mission::None;
+                    field_B4      = -1;
+                    // ★ 只是"拒绝这条空闲归位请求"，不是"本帧不再干活"。
+                    //   原实现这里直接 return，把下面的计时器门与 AI_Mission()
+                    //   一起跳过了 —— 单位任务没被改回 Sleep，却整帧不执行
+                    //   任务步进，表现为"任务是对的但人不动"。清完槽继续往下走。
+                    next = Mission::None;
+                }
+
+                if (next != Mission::None && interruptible)
+                {
+                    CurrentMission = next;
+                    what           = Mission::None;
+                    QueuedMission  = Mission::None;
+                    field_B4       = -1;
+                    Commence();          // 立刻跑第一步，并把计时器复位
+                    return;
+                }
+            }
+        }
+    }
+
     // asm +14..+4C
     if (!MissionTimerExpired())
         return;
@@ -341,6 +442,8 @@ void MissionClass::Assign_Mission(Mission mission, bool start_mission)
 {
     const Mission current = what;
 
+
+
     // asm +8:  what == Wait && mission == Guard -> reject
     if (current == Mission::Wait && mission == Mission::Guard)
         return;
@@ -400,7 +503,11 @@ bool MissionClass::Queue_Mission(Mission mission)
 //   only promotes the *stash*, TechnoClass decides when to adopt it.
 bool MissionClass::NextMission()
 {
-    if (field_B4 == -1)                     // asm: [ecx+0B4h] == -1
+    // asm 只判 `== -1`。本树必须再加一道"<= Sleep"的界：
+    //   Mission::Sleep == 0 是合法任务号，任何 0 值的待办槽都是"空"而不是
+    //   "排了 Sleep"（ForceMission 历史上就留过 0，见那里的注释）。漏掉这道
+    //   界会把空槽提升成 what=Sleep，再把当前任务顶成 Sleep。
+    if (field_B4 == -1 || field_B4 <= static_cast<int32>(Mission::Sleep))
         return false;
 
     what = static_cast<Mission>(field_B4);  // what = field_B4
@@ -437,7 +544,20 @@ void MissionClass::ForceMission(Mission mission)
 
     CurrentMission = mission;                       // asm: [+0xA8] = mission
     QueuedMission  = Mission::None;                 // asm: [+0xB0] = -1
-    field_B4       = 0;                             // asm: [+0xB4] = 0
+    // ★ 过继槽必须一起清。
+    //   MissionClass::Update 的采用段把 `what`（+0xAC）当作最高优先级的
+    //   待装任务；ForceMission 若留着旧值（典型是 Start_Default_Mission 塞进
+    //   去的 Sleep/Guard），下一帧就会把刚强制装上的 Hunt 顶回 Sleep ——
+    //   于是 AI 队伍成员任务恒为 0，一步都不走。
+    what           = Mission::None;
+    // ★ 待办槽写 -1（空），不能照抄汇编的 `byte [+0xB4] = 0`。
+    //   本树用 -1 表示"没有排队任务"，而 Mission::Sleep == 0 是一个**合法
+    //   任务**。按汇编写 0 会留下一个"排了 Sleep"的幻影：只要之后有任何
+    //   一次 NextMission（Start_Default_Mission / InfantryClass / UnitClass /
+    //   TechnoClass 都会调），它就把 0 提升进 what，采用段再把它装成
+    //   CurrentMission —— 单位刚被强制装上 Hunt、打一轮，回头就变成 Sleep
+    //   站着不动（实测 AI 步兵队 m0 由 15 → 1 → 0）。
+    field_B4       = -1;                            // asm: [+0xB4] = 0 (byte)
     MissionStatus  = 0;                             // asm: [+0xB8] = 0
     CurrentMissionStartTime = FrameTimer::CurrentFrame; // asm: [+0xBC] = Frame
     field_C0       = 0;                             // asm: [+0xC0] = 0

@@ -1,7 +1,9 @@
 #include "LocomotionClass.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "../Map/MapClass.h"
 #include "../Rules/RulesClass.h"
@@ -1236,7 +1238,7 @@ void LocomotionClass::ILocomotion_DoTurn(DirStruct dir)
 
 Matrix3D* LocomotionClass::ILocomotion_ShadowMatrix()
 {
-    // asm: LocomotionClass_ILocomotion_ShadowPoint
+    // asm: LocomotionClass_ILocomotion_ShadowMatrix   (asm:749876)
     if (!Is_To_Have_Shadow()) {
         return nullptr;
     }
@@ -1245,8 +1247,10 @@ Matrix3D* LocomotionClass::ILocomotion_ShadowMatrix()
 
 Point2D LocomotionClass::ILocomotion_ShadowPoint(const Point2D& point)
 {
-    // asm: LocomotionClass_ILocomotion_ZGradient
-    // 摊平，倾斜造成的偏移由绘制层按地面高程自行处理。
+    // asm: LocomotionClass_ILocomotion_ShadowPoint   (asm:749986)
+    //   `xor esi,esi` → X 恒为 0；Y 取 Draw_AdjustForBuildingZ(
+    //   载体在 ILocomotion 虚槽 +0x1C8 的返回值)。该槽位尚未确证，
+    //   故这里 Y 暂返回 0，列入交付报告的未解决项。
     (void)point;
     return Point2D(0, 0);
 }
@@ -1267,23 +1271,77 @@ void LocomotionClass::ILocomotion_ZAdjust(int32 z)
 
 int32 LocomotionClass::ILocomotion_VisualCharacter()
 {
-    // asm: LocomotionClass_ILocomotion_DrawMatrix
-    // 特殊形态由派生类覆写。
+    // asm: LocomotionClass_ILocomotion_VisualCharacter   (asm:750527)
+    //   `xor eax,eax; retn 8`——基类恒返回 0，特殊形态由派生类覆写。
     return 0;
 }
 
-void LocomotionClass::ILocomotion_DrawMatrix(const RectangleStruct& rect)
+void LocomotionClass::ILocomotion_DrawMatrix(Matrix3D& outMatrix, int32* pFacing)
 {
-    // asm: LocomotionClass_ILocomotion_DrawPoint
-    (void)rect;
-    Dirty = true;
+    // asm: LocomotionClass_ILocomotion_DrawMatrix   (asm:749794, retn 0Ch)
+    //
+    //   void __stdcall DrawMatrix(LocomotionClass* self, Matrix3D* out, int32* pFacing)
+    //
+    //   sub esp,34h / call Matrix3D::Matrix3D        -> 局部矩阵 = 单位阵
+    //   mov edi,[arg0] / mov ecx,[edi+8] / add ecx,388h
+    //                                                -> 取 LinkedTo 的朝向状态
+    //   call Desired_Facing256                       -> a2 = 当前朝向（16 位 8.8）
+    //   eax>>10 / inc / shr 1 / and 1Fh / sub 8      -> 32 分度索引再减 8
+    //   fild / fmul dbl_7E4408(-PI/16) / call Matrix3D_5AF1A0
+    //                                                -> 绕竖直轴旋转
+    //   [pFacing] != -1 时 *pFacing = (*pFacing << 5) | 索引
+    //   rep movsd 12 个 dword 写回 outMatrix
+    //
+    // 本工程 TechnoClass 的朝向是 DirStruct（0..255），原版是 16 位 8.8 定点，
+    //   换算关系 v16 = v8 << 8，代入上面的公式即 (v8>>2 + 1) >> 1。
+    Matrix3D mtx;                       // asm Matrix3D::Matrix3D -> 单位矩阵
+
+    TechnoClass* pObject = LinkedTo;    // asm [edi+8]
+    if (pObject != nullptr)
+    {
+        const int32 facing16 = static_cast<int32>(pObject->PrimaryFacing.Value) << 8;
+
+        // asm: mov ecx,[eax] / shr 0Ah / inc / shr 1 / and 1Fh / sub 8
+        int32 dir = (((facing16 >> 10) + 1) >> 1) & 0x1F;
+        dir -= 8;
+
+        // asm: fild dir / fmul ds:dbl_7E4408 (-0.1963495408493621 = -PI/16)
+        const float angle = static_cast<float>(dir) * -0.1963495408493621f;
+        const float c = std::cos(angle);
+        const float s = std::sin(angle);
+
+        // asm Matrix3D_5AF1A0：对三行的前两列做同一旋转
+        //   m[i][0] = m0*c + m1*s
+        //   m[i][1] = m1*c - m0*s
+        for (int i = 0; i < 3; ++i)
+        {
+            const float m0 = mtx.row[i][0];
+            const float m1 = mtx.row[i][1];
+            mtx.row[i][0] = m0 * c + m1 * s;
+            mtx.row[i][1] = m1 * c - m0 * s;
+        }
+
+        if (pFacing != nullptr && *pFacing != -1)
+        {
+            // asm: shl eax,5 / mov [esi],eax ...
+            //      mov eax,[eax] / shr 0Ah / inc / shr 1 / and 1Fh / or ecx,eax
+            const int32 idx = (((facing16 >> 10) + 1) >> 1) & 0x1F;
+            *pFacing = (*pFacing << 5) | idx;
+        }
+    }
+
+    // asm: mov eax,[arg_4] / mov ecx,0Ch / rep movsd
+    outMatrix = mtx;
 }
 
-void LocomotionClass::ILocomotion_DrawPoint(const Point2D& point)
+void LocomotionClass::ILocomotion_DrawPoint(Point2D& point)
 {
-    // asm: int __thiscall LocomotionClass_CreateInstance(LocomotionClass **ppv, CLSID *rclsid, LPUNKNOWN pUnkOuter, int)   (asm:103082)
-    (void)point;
-    Dirty = true;
+    // asm: LocomotionClass_ILocomotion_DrawPoint   (asm:750540)
+    //   `mov eax,[esp+arg_4] / xor ecx,ecx / xor edx,edx
+    //    mov [eax],ecx / mov [eax+4],edx / retn 8`
+    //   入参是 out 槽，基类把落点的两个分量都写成 0；投影由派生移动器覆写。
+    point.X = 0;
+    point.Y = 0;
 }
 
 // ============================================================================
@@ -1342,9 +1400,22 @@ HRESULT LocomotionClass::FillVar(IStream* pStm)
     return S_OK;
 }
 
+// ----------------------------------------------------------------------------
+// asm: LocomotionClass_GetMaxSize   (asm:750425, retn 8)
+//
+//   HRESULT __stdcall GetMaxSize(LocomotionClass* this, uint64* pcbSize)
+//   {
+//       if (!pcbSize) return E_POINTER;          // mov eax,80004003h
+//       int32 n = this->vtbl[0x24/4]();          // 实例字节数
+//       *pcbSize = (uint64)(n + 4);              // 末尾四字节类别标记
+//       return S_OK;                             // xor eax,eax
+//   }
+//
+//   本树的 vtbl[+0x24] 对应 Size()（各派生类返回自己的 sizeof），故这里
+//   直接复用 GetSizeMax：`*pcbSize = Size() + 4`，判空返回 E_POINTER。
+// ----------------------------------------------------------------------------
 HRESULT LocomotionClass::GetMaxSize(uint64* pcbSize)
 {
-    // 根据游戏行为，可知序列化尺寸即实例尺寸加四字节类别标记。
     return GetSizeMax(pcbSize);
 }
 
@@ -1363,6 +1434,135 @@ ULONG LocomotionClass::ppv_AddRef2()
 
 int32 LocomotionClass::ILocomotion_4B6690() const
 {
-    // 根据游戏行为，可知该保留查询槽位固定返回 -1。
+    // asm: LocomotionClass_ILocomotion_4B6690   (asm:411668)
+    //   `or eax,0FFFFFFFFh; retn 4` —— 保留槽固定 -1（不是 0）。
+    return -1;
+}
+
+// ============================================================================
+// LocomotionClass::CLSIDs —— 真实 COM 类标识（asm 0x7E9A74 起连续 11 个 GUID）
+//
+//  asm 里每个 GetClassID 都是“判空 → 把 16 字节 GUID 原样拷进出参 → S_OK”，
+//  空指针返回 0x80004003 (E_POINTER)。下表逐字段抄自 .data 段：
+//      Drive    4A582741-9839-11D1-B709-00A024DDAFD1
+//      Hover    4A582742-...（Data2/3/4 与 Drive 相同）
+//      Tunnel   4A582743 / Walk 4A582744 / DropPod 4A582745
+//      Fly      4A582746 / Teleport 4A582747
+//      Mech     55D141B8-DB94-11D1-AC98-006008055BB5
+//      Ship     2BEA74E1-7CCA-11D3-BE14-00104B62A16C
+//      Jumpjet  92612C46-F71F-11D1-AC9F-006008055BB5
+//      Rocket   7B49766-E576-11D3-9BD9-00104B972FE8
+// ============================================================================
+namespace {
+struct GuidData {
+    uint32 Data1;
+    uint16 Data2;
+    uint16 Data3;
+    uint8  Data4[8];
+};
+
+const GuidData kLocoClsidTable[LocomotionClass::CLSIDs::Rocket + 1] = {
+    { 0x4A582741u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Drive
+    { 0x4A582742u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Hover
+    { 0x4A582743u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Tunnel
+    { 0x4A582744u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Walk
+    { 0x4A582745u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // DropPod
+    { 0x4A582746u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Fly
+    { 0x4A582747u, 0x9839u, 0x11D1u, { 0xB7, 0x09, 0x00, 0xA0, 0x24, 0xDD, 0xAF, 0xD1 } }, // Teleport
+    { 0x55D141B8u, 0xDB94u, 0x11D1u, { 0xAC, 0x98, 0x00, 0x60, 0x08, 0x05, 0x5B, 0xB5 } }, // Mech
+    { 0x2BEA74E1u, 0x7CCAu, 0x11D3u, { 0xBE, 0x14, 0x00, 0x10, 0x4B, 0x62, 0xA1, 0x6C } }, // Ship
+    { 0x92612C46u, 0xF71Fu, 0x11D1u, { 0xAC, 0x9F, 0x00, 0x60, 0x08, 0x05, 0x5B, 0xB5 } }, // Jumpjet
+    { 0x0B7B4976u, 0xE576u, 0x11D3u,{ 0x9B, 0xD9, 0x00, 0x10, 0x4B, 0x97, 0x2F, 0xE8 } }, // Rocket
+};
+
+const GuidData kZeroGuid = { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
+} // namespace
+
+const GUID& LocomotionClass::CLSIDs::Get(int32 id)
+{
+    static GUID s_guid;
+    const GuidData& src = (id >= 0 && id <= Rocket) ? kLocoClsidTable[id] : kZeroGuid;
+    s_guid.Data1 = src.Data1;
+    s_guid.Data2 = src.Data2;
+    s_guid.Data3 = src.Data3;
+    for (int32 i = 0; i < 8; ++i)
+        s_guid.Data4[i] = src.Data4[i];
+    return s_guid;
+}
+
+// ============================================================================
+// CLSIDs::FromString —— rules(md).ini 的 Locomotor= 解析
+//
+//   Type 类（[MTNK] 等）里写的是 COM 类标识，形如
+//     Locomotor={4A582741-9839-11D1-B709-00A024DDAFD1}
+//   也可能被写成裸名字。这里两种都收：先做 GUID 规范化比对，再退回名字表。
+//   解析失败返回 -1（调用方据此不装配行走逻辑）。
+// ============================================================================
+int32 LocomotionClass::CLSIDs::FromString(const char* nameOrGuid)
+{
+    if (nameOrGuid == nullptr || *nameOrGuid == '\0')
+        return -1;
+
+    // ---- 裸名字表（rules 里偶见，也方便内置兜底）--------------------------
+    static const char* const kNames[] = {
+        "Drive", "Hover", "Tunnel", "Walk", "DropPod",
+        "Fly", "Teleport", "Mech", "Ship", "Jumpjet", "Rocket"
+    };
+    for (int32 i = 0; i <= Rocket; ++i)
+    {
+        const char* a = nameOrGuid;
+        const char* b = kNames[i];
+        while (*a != '\0' && *b != '\0')
+        {
+            char ca = *a, cb = *b;
+            if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
+            if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 32);
+            if (ca != cb)
+                break;
+            ++a; ++b;
+        }
+        if (*a == '\0' && *b == '\0')
+            return i;
+    }
+
+    // ---- GUID 串比对：只比十六进制数字，忽略花括号/连字符/空白 -------------
+    if (*nameOrGuid != '{' && *nameOrGuid != '(')
+    {
+        // 既不是名字也不是 GUID 包裹形式
+        return -1;
+    }
+
+    char hex[33];
+    int32 n = 0;
+    for (const char* p = nameOrGuid; *p != '\0' && n < 32; ++p)
+    {
+        const char c = *p;
+        const bool isHex = (c >= '0' && c <= '9')
+                        || (c >= 'a' && c <= 'f')
+                        || (c >= 'A' && c <= 'F');
+        if (!isHex)
+            continue;
+        char u = c;
+        if (u >= 'a' && u <= 'f') u = static_cast<char>(u - 32);
+        hex[n++] = u;
+    }
+    hex[n] = '\0';
+    if (n != 32)
+        return -1;
+
+    for (int32 i = 0; i <= Rocket; ++i)
+    {
+        const GuidData& g = kLocoClsidTable[i];
+        char ref[33];
+        std::snprintf(ref, sizeof(ref), "%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X",
+                      static_cast<unsigned>(g.Data1),
+                      static_cast<unsigned>(g.Data2),
+                      static_cast<unsigned>(g.Data3),
+                      g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+                      g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+        if (std::strcmp(ref, hex) == 0)
+            return i;
+    }
+
     return -1;
 }

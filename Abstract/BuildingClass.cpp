@@ -22,6 +22,10 @@
 //                  a building type may carry.
 // =============================================================================
 
+#include <cstdio>
+#include <cstdlib>
+
+#include <AI/TagClass.h>
 #include <Abstract/BuildingClass.h>
 #include <Animations/AnimClass.h>
 #include <Game/SaveGameClass.h>
@@ -32,6 +36,7 @@
 #include <Houses/HouseClass.h>
 #include <Game/Game.h>
 #include <Core/Definitions.h>
+#include <Helpers/AsmMath.h>
 #include <Combat/WeaponTypeClass.h>
 #include <Combat/BulletTypeClass.h>
 #include <Map/MapClass.h>
@@ -1104,10 +1109,12 @@ int32 BuildingClass::GetWeaponRange(int32 weaponIndex) const
     if (weaponIndex < 0 || weaponIndex >= pType->WeaponCount) return 0;
     if (weaponIndex >= 2) return 0;
 
-    // The WeaponStruct holds a WeaponTypeClass pointer; its range is accessed
-    // via the type's Range field.  Here we use the type's GuardRange as a
-    // fallback for the firing range.
-    if (pType->GuardRange > 0) return pType->GuardRange;
+    // 射程取武器槽上的 WeaponType->Range（lepton）；没有武器时退回
+    //   GuardRange（rules 里按格写，需乘 256）。
+    const WeaponStruct& ws = pType->Weapons[weaponIndex];
+    if (ws.WeaponType != nullptr && ws.WeaponType->Range > 0)
+        return ws.WeaponType->Range;
+    if (pType->GuardRange > 0) return pType->GuardRange * 256;
     return 0;
 }
 
@@ -1925,15 +1932,34 @@ void BuildingClass::MissionSleep()
 }
 
 // ============================================================================
-// MissionConstruction - the build-up mission.  Two phases, matching the
-// binary's "mi_Construction" handler:
-//   1. First entry: latch the construction art (BState::Construction), mark
-//      the structure as not yet operational and start the build-up animation.
-//   2. A later entry: the build-up finished - become operational (BeginMode
-//      Idle) and bring the structure online.
+// Mission_Construction - the build-up mission.
+//
+//  asm 落点：MissionClass_Update 的 32 路函数指针表第 18 项
+//    `(this->*off_5B34E8[18])()` → 虚分派到本覆写。
+//  此前本类只写了非虚的 MissionConstruction()，不在任何虚表里，
+//  ExecuteMission 永远落到基类空实现（返回 1C2h），于是 MCV 展开后
+//  建筑永远停在 IsConstructed == false。
+//
+//  两个阶段与原版一致：
+//    1. 首次进入：切到 Construction 造型、标记"未建成"、起建造动画；
+//    2. 之后某一帧：建成 —— 切回 Idle 造型并上线。
+//
+//  ⚠ 原版的第二阶段由 BuildingTypeClass::SuperAnimTimers[BState] 的帧数
+//  驱动（GetAnimLengths，0x43EF50）。本树没有这张表，所以第二阶段在
+//  下一帧就到 —— 表现为"瞬间完工、没有升起动画"。这是表现差异，不是
+//  功能差异：建筑确实变成可用、可发电、可开火。表补上后把这里的门换成
+//  帧数比较即可。
 // ============================================================================
-void BuildingClass::MissionConstruction()
+int32 BuildingClass::Mission_Construction()
 {
+    static const bool s_dbg = (std::getenv("OPENYR_BLD_DBG") != nullptr);
+    if (s_dbg)
+    {
+        std::fprintf(stderr, "[BLDMIS] construction self=%p bstate=%d built=%d hp=%d\n",
+                     static_cast<void*>(this), (int)BState,
+                     (int)IsConstructed, (int)Health);
+    }
+
     CurrentMission = Mission::Construction;
 
     if (BState != BStateType::Construction)
@@ -1943,7 +1969,7 @@ void BuildingClass::MissionConstruction()
         IsConstructed = false;
         Animation.IsAnimating = true;
         UpdateAnimations();
-        return;
+        return 0x1C2;                  // MissionClass::MISSION_NOT_DONE
     }
 
     // Phase 2 - build-up finished.
@@ -1951,6 +1977,24 @@ void BuildingClass::MissionConstruction()
     Animation.IsAnimating = true;
     BeginMode(BStateType::Idle);
     GoOnline();
+
+    if (s_dbg)
+    {
+        std::fprintf(stderr, "[BLDMIS] construction-done self=%p bstate=%d built=%d\n",
+                     static_cast<void*>(this), (int)BState, (int)IsConstructed);
+    }
+
+    // ★ 必须离开本任务：BeginMode(Idle) 把 BState 推离 Construction，
+    //   若 CurrentMission 仍是 Construction，下一帧又会命中 Phase 1，
+    //   建筑会在"建成/在建"之间逐帧翻转。
+    CurrentMission = Mission::Stop;
+    return 0x1C2;
+}
+
+// 旧虚槽（保留以维持本类 vtable 槽位）：转发到真正的任务分派版本。
+void BuildingClass::MissionConstruction()
+{
+    (void)Mission_Construction();
 }
 
 // ============================================================================
@@ -1974,25 +2018,54 @@ void BuildingClass::MissionSelling()
 }
 
 // ============================================================================
-// MissionRepair - the repair mission.  Rather than healing directly, this
-// opens a paid repair run: the per-frame paid stepping (health, credits and
-// animation) is owned by Update_Repair, which reads the IsBeingRepaired latch
-// and the RepairStepTimer.  Arming the timer to 1 makes the first step fire
-// on the next frame.
+// Mission_Repair - the repair mission (jump-table slot 20).
+//
+//  和 Mission_Construction 同一类问题：原实现是非虚的 MissionRepair()，
+//  任务分派落不到它身上，选中建筑点"修理"没有任何反应。
+//
+//  这里只负责"开闸"：把 IsBeingRepaired 置起、把 RepairStepTimer 拨到 1，
+//  真正每帧扣钱回血在 Update_Repair()（它读同一个 latch）。维持任务期间
+//  每帧重入是幂等的。
+//
+//  ⚠ 满血/不可修理时必须离开 Repair：BuildingClass::Update 的在线判定是
+//     `GetMission() != Selling && != Repair`，停在 Repair 会把建筑判成断电。
 // ============================================================================
-void BuildingClass::MissionRepair()
+int32 BuildingClass::Mission_Repair()
 {
+    static const bool s_dbg = (std::getenv("OPENYR_BLD_DBG") != nullptr);
+    if (s_dbg)
+    {
+        std::fprintf(stderr, "[BLDMIS] repair self=%p hp=%d/%d repairing=%d\n",
+                     static_cast<void*>(this), (int)Health, (int)MaxHealth,
+                     (int)IsBeingRepaired);
+    }
+
     CurrentMission = Mission::Repair;
 
     if (!CanBeRepaired())
     {
         IsBeingRepaired = false;
-        return;
+        CurrentMission  = Mission::Stop;   // 不能停在 Repair（会判成断电）
+        return 0x1C2;
     }
 
-    IsBeingRepaired = true;
-    if (RepairStepTimer <= 0)
-        RepairStepTimer = 1;
+    // ★ 只在"从未修理 → 开始修理"的跃迁上拨一次计时器。
+    //   本函数每帧重入；若无条件 `if (RepairStepTimer <= 0) RepairStepTimer = 1;`，
+    //   Update_Repair 每帧都会看到它 > 0 而只做递减，永远走不到扣钱回血那一步
+    //   —— 表现为"任务在跑、IsBeingRepaired=1、血量纹丝不动"。
+    if (!IsBeingRepaired)
+    {
+        IsBeingRepaired = true;
+        if (RepairStepTimer <= 0)
+            RepairStepTimer = 1;
+    }
+    return 0x1C2;
+}
+
+// 旧虚槽（保留以维持本类 vtable 槽位）：转发到真正的任务分派版本。
+void BuildingClass::MissionRepair()
+{
+    (void)Mission_Repair();
 }
 
 // ----------------------------------------------------------------------------
@@ -2022,9 +2095,15 @@ void BuildingClass::MissionIdle()
 // ----------------------------------------------------------------------------
 void BuildingClass::UpdateMission()
 {
-    // If a mission is queued, switch to it.
-    if (QueuedMission != CurrentMission) {
+    // QueuedMission 的"空"值是 Mission::None(-1)，不是 Sleep(0)。
+    // 无条件比较（`if (QueuedMission != CurrentMission) CurrentMission = ...`）
+    // 会在任务分派把 CurrentMission 装上之后，下一次本函数进入时又被
+    // 空的 QueuedMission 覆盖回 None —— Mission_Construction / Mission_Repair
+    // 只能跑一帧就被打断，建筑永远回不到"已建成"或"在修理"。
+    if (QueuedMission != Mission::None && QueuedMission != CurrentMission)
+    {
         CurrentMission = QueuedMission;
+        QueuedMission  = Mission::None;
     }
 }
 
@@ -2160,6 +2239,24 @@ void BuildingClass::TakeDamage(int32 damage, TechnoClass* pSource,
 // OnDestroyed - called when the building's health reaches zero.  Triggers
 // the destruction sequence.
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// 建筑类型 -> 原版 eFactory 编号（HouseClass::Update_Factories 的第一个参数）。
+//   asm 的调用点直接搬 Type 里记着的 eFactory（+0xEB8）；本树把它建模成
+//   BuildingTypeClass::Factory（AbstractType 形态），这里做一次反查：
+//     0  Aircraft / 13 Infantry / 37 Vehicles / 其它 1..38 = Buildings。
+// ----------------------------------------------------------------------------
+static int32 Factory_Of_From_Type(BuildingTypeClass* pType)
+{
+    if (pType == nullptr)
+        return -1;
+
+    if (pType->Factory == AbstractType::AircraftType)      return 0;
+    if (pType->Factory == AbstractType::InfantryType)      return 13;
+    if (pType->Factory == AbstractType::UnitType)          return 37;
+    if (pType->Factory == AbstractType::BuildingType)      return 1;
+    return -1;
+}
+
 void BuildingClass::OnDestroyed()
 {
     IsConstructed = false;
@@ -2178,6 +2275,15 @@ void BuildingClass::OnDestroyed()
     if (Owner && Type) {
         Owner->RegisterLoss(static_cast<TechnoTypeClass*>(
             static_cast<void*>(Type)));
+
+        // asm: BuildingClass_Remove+567h —— 这栋楼是本房某类工厂的载体时，
+        //   先调用 HouseClass::Update_Factories(factoryOf, Type, buildCat)，
+        //   把该类产线重新过一遍：能力已失效的在制品会被 Abandon 并从队列
+        //   里摘掉，剩下的按优先级顶上。缺这一步，工厂建筑被拆/被占之后
+        //   队列里还挂着"永远造不出来"的条目，那条线就永久卡死。
+        const int32 factoryOf = Factory_Of_From_Type(Type);
+        if (factoryOf >= 0)
+            Owner->Update_Factories(factoryOf, Type, 0);
     }
 
     AfterDestruction();
@@ -2493,20 +2599,35 @@ void BuildingClass::PlaySomeAnim(int32 a2)
 
  // asm: char __thiscall BuildingClass_AddOverpowerer(BuildingClass *this, InfantryClass *inf)   (asm:209311)
 //
-//   Registers an infantry unit as an overpowerer of this structure (the Tesla
-//   trooper charge-up).  Duplicate entries are ignored.
+//  asm 逐句：
+//    ① 在 +0x66C 的向量里 FindIndex(inf)；命中就把它**从向量里删掉**
+//       （swap-remove：后续元素整体前移，Count--）。也就是说重复登记会被
+//       “挪到队尾”，而不是被忽略。
+//    ② 若 Count >= Capacity：先看 IsAllocated(+0xD) 与 Capacity；
+//       Capacity == 0 或已分配时，用 GrowthStep(+0x14) 走 vt[+8] 扩容。
+//    ③ 扩容成功后（或本就有空位）在末尾追加 inf，Count++。
+//  ★ 原实现写的是"命中就直接 return"，与 asm 的“先摘后加”不同：连续两次
+//    放电会让同一个步兵占两个槽位，从而被计成两份增幅。
 void BuildingClass::AddOverpowerer(InfantryClass* pInfantry)
 {
     if (pInfantry == nullptr)
         return;
 
+    // ① 先摘除已有的同项（asm: FindIndex → swap-remove）
     for (int32 i = 0; i < Overpowerers.Count; ++i)
     {
-        if (Overpowerers.GetItem(i) == pInfantry)
-            return;
+        if (Overpowerers.Items[i] == pInfantry)
+        {
+            Overpowerers.Remove(i);
+            break;
+        }
     }
+
+    // ②③ 追加到队尾（容量增长由 DynamicVectorClass::Add 负责）
     Overpowerers.Add(pInfantry);
-    IsOverpowered = true;
+
+    // 本项目用布尔镜像 asm 里“Overpowerers.Count != 0”的条件。
+    IsOverpowered = (Overpowerers.Count > 0);
 }
 
 // 根据游戏行为，可知 RemoveOverpowerer 负责下面这段逻辑。
@@ -2703,12 +2824,124 @@ bool BuildingClass::Unlimbo()
     if (!IsInLimbo)
         return false;
 
+    // ── 地基可用性检查（asm: BuildingClass_Unlimbo 的地基扫描段）──────────
+    //   原版落位前逐格确认地基范围没有被别的对象占住；被占则保持 limbo 并
+    //   返回失败，由调用方重新挑位置。缺这一段时两座建筑可以叠在同一格，
+    //   占用链与渲染都会错乱。
+    if (Type != nullptr && MapClass::Instance != nullptr)
+    {
+        const CellStruct baseCell = CellClass::Coord2Cell(GetCoords());
+        const int32 fx = Type->X_Foundation_Value();
+        const int32 fy = Type->Y_Foundation_Value(true);
+
+        for (int32 dy = 0; dy < fy; ++dy)
+        {
+            for (int32 dx = 0; dx < fx; ++dx)
+            {
+                const CellStruct probe(static_cast<int16>(baseCell.X + dx),
+                                       static_cast<int16>(baseCell.Y + dy));
+                CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+                if (pCell == nullptr)
+                    return false;              // 越界：原地基不可用
+                if (pCell->IsOccupied())
+                    return false;              // 已被占：交给调用方换位置
+            }
+        }
+    }
+
     IsInLimbo = false;
     Mark(MarkType::Down);
     GoOnline();
-    // asm: BuildingClass_Unlimbo -> ObjectClass::Unlimbo 尾部的 vec_Logics.Add
-    //   （L1049805）。覆写版必须自行登记主表，否则建筑不进逐帧驱动。
-    Register_Logic();
+    // asm: BuildingClass_Unlimbo -> ObjectClass::Unlimbo 尾部的收尾（L1049805）：
+    //   置 Alive、登记主表、交显示层。
+    FinalizeUnlimbo();
+
+    // asm: BuildingClass_Unlimbo 尾部把建筑交给阵营追踪表；建造场还要登记
+    //   进 vec_Conyards 并触发 AcquiredConyard（AI 建造清单的唯一入口）。
+    if (Owner != nullptr)
+    {
+        Owner->RegisterTechnoGain(this);
+
+        // asm (BuildingClass::Unlimbo+1024h 段): 非人类房落位后立刻在基地
+        //   节点表里盖章 —— `call BaseClass_Placed(&house->Base, Building)`。
+        //   缺这一步，AI 的建造清单不会收敛：Next_Buildable 每帧都返回同一
+        //   个节点，AI 会把同一座建筑反复造到钱花光（实测 21 座）。
+        if (!Owner->Is_Human())
+        {
+            Owner->Base.Placed(this);
+        }
+
+        // asm (BuildingClass::Unlimbo+1058h): 落位后重评该类工厂的产线。
+        //   `Update_Factories(factoryOf, Type, buildCat)` —— 新工厂上线要接管
+        //   队列里等着的订单，同时把"因为没厂而停摆"的产线唤醒。
+        //   本树没有 eFactory 参数，按建筑类型自己的 Factory 槽反推。
+        const int32 factoryOf = Factory_Of_From_Type(Type);
+        if (factoryOf >= 0)
+            Owner->Update_Factories(factoryOf, Type, 0);
+    }
+
+    // asm: BuildingClass_Unlimbo 尾部的 FreeUnit 生成段。
+    //   精炼厂（FreeUnit=HARV）落成时会附送一辆矿车 —— 这是本树唯一能让
+    //   AI 开局就拥有采集能力的路径：没有它，AI 把开局资金全砸在建筑上之后
+    //   既造不出矿车也没有任何收入，整局永久停摆。
+    if (Type != nullptr && Type->FreeUnit != nullptr && Owner != nullptr
+        && MapClass::Instance != nullptr && ScenarioInit == 0)
+    {
+        // 落点：建筑外一圈第一个空格；被占就向外扩到 4 环。
+        //   精炼厂常常与兵营/电厂紧挨着落位，出口环全被占时原版会另找一格；
+        //   只试一格会让 FreeUnit 静默丢失。
+        CellStruct spawnCell = FindExitCell(0, 0);
+        CellClass* pSpawn = MapClass::Instance->GetCellAt(spawnCell);
+        if (pSpawn == nullptr || pSpawn->IsOccupied())
+        {
+            pSpawn = nullptr;
+            const CellStruct base = CellClass::Coord2Cell(GetCoords());
+            for (int32 r = 1; r <= 4 && pSpawn == nullptr; ++r)
+            {
+                for (int32 dy = -r; dy <= r && pSpawn == nullptr; ++dy)
+                {
+                    for (int32 dx = -r; dx <= r && pSpawn == nullptr; ++dx)
+                    {
+                        const int32 adx = (dx < 0) ? -dx : dx;
+                        const int32 ady = (dy < 0) ? -dy : dy;
+                        if (((adx > ady) ? adx : ady) != r)
+                            continue;
+                        const CellStruct probe(static_cast<int16>(base.X + dx),
+                                               static_cast<int16>(base.Y + dy));
+                        CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+                        if (pProbe == nullptr || pProbe->IsOccupied())
+                            continue;
+                        spawnCell = probe;
+                        pSpawn = pProbe;
+                    }
+                }
+            }
+        }
+
+        if (pSpawn != nullptr)
+        {
+            UnitClass* pUnit = new UnitClass(Owner);
+            if (pUnit != nullptr)
+            {
+                UnitTypeClass* pUnitType = Type->FreeUnit;
+                pUnit->Type       = pUnitType;
+                pUnit->TechnoType = pUnitType;
+                pUnit->Health     = (pUnitType->Strength > 0) ? pUnitType->Strength : 200;
+                pUnit->MaxHealth  = pUnit->Health;
+                pUnit->Location   = CellClass::Cell2Coord(spawnCell);
+                pUnit->IsInLimbo  = true;
+                if (!pUnit->Unlimbo())
+                {
+                    GameDelete(pUnit);
+                }
+                else if (TheDisplay != nullptr)
+                {
+                    TheDisplay->Submit(pUnit);
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2750,9 +2983,18 @@ void BuildingClass::Mark(MarkType mark)
                 continue;
 
             if (mark == MarkType::Down)
-                pCell->Occupy_Down(this, false);
+            {
+                // 主格入占用链；其余占地格只登记 Occupier 槽。
+                //   （多格建筑只能挂在一条 NextObject 链上，见 Add_Occupier。）
+                if (dx == 0 && dy == 0)
+                    pCell->Occupy_Down(this, false);
+                else
+                    pCell->Add_Occupier(this);
+            }
             else
+            {
                 pCell->Remove_Occupier(this);
+            }
         }
     }
 
@@ -3252,6 +3494,14 @@ void BuildingClass::Draw(const Point2D& point, const RectangleStruct& rect)
     if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
         ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
 
+    // 原版 TechnoClass::DrawExtras：话泡等附加层（本树 Draw 不走 vtable）。
+    //   Draw 的入参是 const 引用，DrawExtras 要可写指针，这里做一次浅拷贝。
+    {
+        Point2D        tbPoint(point.X, point.Y);
+        RectangleStruct tbRect(rect.X, rect.Y, rect.Width, rect.Height);
+        DrawExtras(&tbPoint, &tbRect);
+    }
+
     if (g_bDebugMode)
         g_RenderDebugStats.DrawCalls++;
 }
@@ -3450,6 +3700,11 @@ void BuildingClass::DisguiseDetectorDeactivate(CellStruct cell)
 // ings don't move), GetMaxSpeed, and GetAcceleration.  The implementation is
 // deliberately a constant return because buildings have no locomotion state
 // to consult.
+//
+// asm 核对：asm 文件里没有 BuildingClass_AlwaysZero 这个符号，
+// BuildingClass 的 vftable（asm:2032688）也是一串未命名 dd 地址（文件不含
+// 地址列，无法把槽位反查回 proc）。能确定的只有语义：建筑没有移动/加速度
+// 状态，该槽必须恒定返回 0，这与现有实现一致。按 A 类保留，未改行为。
 // ----------------------------------------------------------------------------
 int32 BuildingClass::AlwaysZero()
 {
@@ -3559,6 +3814,12 @@ void BuildingClass::SetRallypoint(CellStruct* pTarget, bool bPlayEVA)
 // IsBuilding - always returns true.  This is the RTTI-style type check that
 // lets polymorphic callers confirm they are dealing with a BuildingClass
 // instance without dynamic_cast (which is disabled via -fno-rtti).
+//
+// asm 核对：原版没有 IsBuilding 这个虚槽，类型判别走 WhatAmI（vftable 槽
+// `WhatAmI`，见 asm:27120 的槽表项）返回的 eAbstractIDs；asm 文件里该 proc
+// 也没有独立符号名，只有槽位引用。本项目把"IsBuilding"做成显式谓词，对
+// BuildingClass 恒真（InfantryClass 覆写为恒假），属于工程自有的常量助手，
+// 无汇编可改。按 A 类保留。
 // ----------------------------------------------------------------------------
 bool BuildingClass::IsBuilding() const
 {
@@ -3897,7 +4158,7 @@ int32 BuildingClass::GetRangeOfRadial() const
     if (range <= 0)
         return 0;
 
-    return range / 256;
+    return range / 256;   // lepton -> 格
 }
 
 // ============================================================================
@@ -5106,6 +5367,288 @@ void BuildingClass::UpdateAnimsAndTurretAfterUpgrade()
 }
 
 // ============================================================================
+// 建筑落位选址（原版 BuildingClass::Place 的等价实现）
+//
+//  出厂落位对**建筑**产品和对单位产品是两件事：
+//    · 单位：出口格是"一格"，空着就能站；
+//    · 建筑：占的是 fx×fy 的整块地基，出口格旁边十有八九放不下 3x3，
+//      原版是让玩家（或 AI 的 Base 规划）在基地半径内挑一个整块可用的基点。
+//
+//  本函数就是那个"挑基点"：从 origin 起按同心环（切比雪夫半径 0..maxRadius）
+//  扫，第一个整块地基都过了 Is_Clear_To_Build 的基点即为结果。判定口径与
+//  CellClass::Is_Clear_To_Build 一致（地形可建 + 无对象 + 无坡度拒绝位），
+//  再叠一层 IsOccupied()（含 Occupier / 建筑占据位）。
+// ============================================================================
+static bool Foundation_Clear_For_New_Building(const CellStruct& base,
+                                              BuildingTypeClass* pType,
+                                              HouseClass* pOwner)
+{
+    if (MapClass::Instance == nullptr || pType == nullptr)
+        return false;
+
+    const int32 fx = pType->X_Foundation_Value();
+    const int32 fy = pType->Y_Foundation_Value(true);
+    if (fx <= 0 || fy <= 0)
+        return false;
+
+    for (int32 dy = 0; dy < fy; ++dy)
+    {
+        for (int32 dx = 0; dx < fx; ++dx)
+        {
+            const CellStruct probe(static_cast<int16>(base.X + dx),
+                                   static_cast<int16>(base.Y + dy));
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
+                return false;
+            if (pCell->IsOccupied())
+                return false;
+            // asm: a2 = -1 -> 走"地表是否允许承载建筑"那一路判定。
+            if (!pCell->Is_Clear_To_Build(-1, pType, pOwner))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool Find_Placement_Cell_Around(HouseClass* pOwner,
+                                       BuildingTypeClass* pType,
+                                       const CellStruct& origin,
+                                       int32 maxRadius,
+                                       CellStruct& outCell,
+                                       const CellStruct* pAvoid = nullptr)
+{
+    if (MapClass::Instance == nullptr || pType == nullptr)
+        return false;
+
+    const int32 fx = pType->X_Foundation_Value();
+    const int32 fy = pType->Y_Foundation_Value(true);
+
+    for (int32 r = 0; r <= maxRadius; ++r)
+    {
+        for (int32 dy = -r; dy <= r; ++dy)
+        {
+            for (int32 dx = -r; dx <= r; ++dx)
+            {
+                // 只扫本环（切比雪夫半径恰为 r 的那些格）。
+                const int32 adx = (dx < 0) ? -dx : dx;
+                const int32 ady = (dy < 0) ? -dy : dy;
+                const int32 cheb = (adx > ady) ? adx : ady;
+                if (cheb != r)
+                    continue;
+
+                CellStruct base;
+                base.X = static_cast<int16>(origin.X + dx);
+                base.Y = static_cast<int16>(origin.Y + dy);
+
+                // 不让新地基压住建造场的出厂格：AI 的整条建筑线都从那里
+                //   出兵，压住之后单位只能靠"外圈兜底"挤出来，队列一堵就
+                //   整条生产线 Abandon。
+                if (pAvoid != nullptr
+                    && pAvoid->X >= base.X && pAvoid->X < base.X + fx
+                    && pAvoid->Y >= base.Y && pAvoid->Y < base.Y + fy)
+                {
+                    continue;
+                }
+
+                if (Foundation_Clear_For_New_Building(base, pType, pOwner))
+                {
+                    outCell = base;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Rollout_Product —— 出厂落位（等价于 asm 里 KickOutUnit 虚槽的落地语义）
+//
+//  原版 BuildingClass_Update_Factory 在"产品已完成"时并不自己搬对象，而是
+//  调 vt+vt_BuildingClass.vt.r.m.o.KickOutUnit(product, &coords)，由建筑类
+//  的覆写把产品放到出口格：
+//      · 返回 2 —— 产品是建筑：就地找空位安放，立即播 CreateUnitSound；
+//      · 返回 1 —— 产品是单位/步兵/飞机：交给 900 帧出厂节流后再走一次；
+//      · 返回 0 —— 放不下（出口格被占 / 地形不允许），本帧放弃。
+//  本树此前完全没有这一步：产品造好后停在 limbo 里，既不进 vec_Logics 也
+//  不进显示层，等于"生产完成但永远不出厂"。这里按上述语义补齐。
+//
+//  落位统一走 ObjectClass 的落位链（Location ← 出口格、IsInLimbo ← true、
+//  Unlimbo()），从而一次性拿到 Alive / field_6C / vec_Logics / 显示层
+//  Submit / 所在格占用链这五件事——缺任何一件该单位都会被当成"不存在"。
+// ============================================================================
+int32 BuildingClass::Rollout_Product(TechnoClass* pProduct)
+{
+    if (pProduct == nullptr)
+        return 0;
+    if (MapClass::Instance == nullptr)
+        return 0;
+
+    TechnoTypeClass* pType = pProduct->GetType();
+    if (pType == nullptr)
+        return 0;
+
+    // 产品在出厂节流期间就被打掉了：直接按"已收尾"处理，让工厂释放，
+    //   否则 900 帧后会拿着一个已死对象再走一次落位。
+    if (pProduct->IsDead())
+        return 2;
+
+    const AbstractType what = pType->WhatAmI();
+
+    // ── 产品是建筑：在基地半径内挑一块整块可用的地基 ─────────────────────
+    if (what == AbstractType::BuildingType)
+    {
+        BuildingClass* pBuilding = static_cast<BuildingClass*>(pProduct);
+        if (!pBuilding->IsInLimbo && pBuilding->Is_On_Map())
+            return 2;                       // 已经在图上，视为已完成
+
+        BuildingTypeClass* pNewType =
+            static_cast<BuildingTypeClass*>(pProduct->GetType());
+        if (pNewType == nullptr)
+            return 0;
+
+        // 选点原点：本房建造场的主格。没有建造场（旧存档/脚本直造）时退回
+        // 本建筑自己的坐标，再退回出口格 —— 三级兜底，保证总有落点。
+        CellStruct origin = CellClass::Coord2Cell(GetCoords());
+        HouseClass* pOwner = pProduct->Owner;
+        CellStruct exitCell{-1, -1};
+        if (pOwner != nullptr)
+        {
+            for (int32 i = 0; i < pOwner->OwnedConyards.GetCount(); ++i)
+            {
+                BuildingClass* pYard = pOwner->OwnedConyards[i];
+                if (pYard != nullptr && !pYard->IsDead())
+                {
+                    origin   = CellClass::Coord2Cell(pYard->GetCoords());
+                    exitCell = pYard->FindExitCell(0, 0);
+                    break;
+                }
+            }
+        }
+
+        // 建筑不是"一格能站就算"，必须整块地基可用。搜索半径按基地规模给
+        // 12 格（原版 AI 基地扩张的实际上限；再远就不属于本基地了）。
+        CellStruct cell;
+        if (!Find_Placement_Cell_Around(pOwner, pNewType, origin, 12, cell,
+                                        &exitCell))
+        {
+            // 兜底：试一次出口格，仍不行才算放不下。
+            cell = FindExitCell(0, 0);
+            if (!Foundation_Clear_For_New_Building(cell, pNewType, pOwner))
+                return 0;
+        }
+
+        CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+        if (pCell == nullptr)
+            return 0;
+
+        CoordStruct coord = CellClass::Cell2Coord(cell);
+        coord.Z = pCell->Get_Ground_Height();
+
+        pBuilding->Set_Coord(coord);
+        pBuilding->IsInLimbo = true;
+        if (!pBuilding->Unlimbo())
+            return 0;                       // 障碍/地形不允许落位
+
+        // ★ 落图 ≠ 建成。
+        //   原版建筑落地后要跑"建造动画"这一段（BuildingClass::Place +
+        //   Mission::Construction），跑完才 IsConstructed=1 并上线供电。
+        //   少了这一步，AI 造出来的每一栋楼都永远停在"未建成"：
+        //     · OwnedBuildings 里全是 wip，精炼厂不算精炼厂（refs=0）、
+        //       发电厂不发电、兵营不能出兵；
+        //     · "本房已有该类型"这类去重判断全部失效，于是同一种楼被反复
+        //       造（实测 2 座建造场 / 2 座兵营 / 2 座电厂）。
+        //   实测经济链的断点就在这：没有精炼厂 → 矿车无处卸货 → 零收入。
+        pBuilding->Place(false);
+        pBuilding->QueueMission(Mission::Construction);
+
+        // asm: BuildingClass::Exit_Object 的 lct_KickOut_Building 分支 ——
+        //   建筑类产品一落地，AI 房要立刻做两件事：
+        //     mov [house+BuildingTypeToProduce], -1   ; 本项已交付
+        //     call HouseClass_Update_AI_Production(6) ; 事件 = 建造完成
+        //   不清 -1 的话 AI_Building 永远认为"还在造这一项"，同一条生产线
+        //   会把同一座建筑反复造到资金耗尽（实测 21 座后才停下）。
+        if (pOwner != nullptr && !pOwner->Is_Human())
+        {
+            pOwner->BuildingTypeToProduce = -1;
+            pOwner->Update_AI_Production(6);
+        }
+        return 2;
+    }
+
+    // ── 产品是单位 / 步兵 / 飞机：出口格落位 ────────────────────────────
+    //   注意这里比的是**类型**枚举（UnitType/InfantryType/AircraftType），
+    //   不是对象枚举（Unit/Infantry/Aircraft）——两套值在原版里是分开的
+    //   （如 Infantry=15 / InfantryType=16），混用会静默落到"不认识"分支。
+    if (what != AbstractType::UnitType
+        && what != AbstractType::InfantryType
+        && what != AbstractType::AircraftType)
+        return 0;
+
+    // 已落位的产品不再重复搬动：这一轮只做工厂侧收尾（返回 2，与建筑类
+    //   同一分派），从而把"完成登记 + 释放工厂"补齐。原版的第二次
+    //   KickOutUnit 调用走的正是这条路径。
+    if (!pProduct->IsInLimbo)
+        return 2;
+
+    CellStruct destCell = FindExitCell(0, 0);
+    CellClass* pCell = MapClass::Instance->GetCellAt(destCell);
+    if (pCell == nullptr)
+        return 0;
+
+    // 出口格仍被占：让调用方把节流计时器重新拉开，稍后再试。
+    //
+    //   ★ 原版这里是"本帧放不下就等下一轮"，但本树的生产线在 kicked==0 时
+    //     会被整条 Abandon（建筑侧解绑工厂、产品留在 limbo 泄漏）。基地里
+    //     建筑一多，出口格长期被占，等于每造一件装备就废掉一条生产线 ——
+    //     实测 AI 造完建筑后永远造不出矿车。这里按"就近另找一个空格"处理：
+    //     在出口格外扩 1..4 环扫可通行空格，都找不到才放弃。
+    if (pCell->IsOccupied())
+    {
+        const CellStruct base = CellClass::Coord2Cell(GetCoords());
+        bool found = false;
+        for (int32 r = 2; r <= 4 && !found; ++r)
+        {
+            for (int32 dy = -r; dy <= r && !found; ++dy)
+            {
+                for (int32 dx = -r; dx <= r && !found; ++dx)
+                {
+                    const int32 adx = (dx < 0) ? -dx : dx;
+                    const int32 ady = (dy < 0) ? -dy : dy;
+                    const int32 cheb = (adx > ady) ? adx : ady;
+                    if (cheb != r)
+                        continue;
+
+                    const CellStruct probe(static_cast<int16>(base.X + dx),
+                                           static_cast<int16>(base.Y + dy));
+                    CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+                    if (pProbe == nullptr || pProbe->IsOccupied())
+                        continue;
+                    if (!pProbe->Is_Clear_To_Build(-1, nullptr, nullptr))
+                        continue;
+
+                    destCell = probe;
+                    pCell = pProbe;
+                    found = true;
+                }
+            }
+        }
+        if (!found)
+            return 0;
+    }
+
+    CoordStruct coord = CellClass::Cell2Coord(destCell);
+    coord.Z = pCell->Get_Ground_Height();
+
+    pProduct->Set_Coord(coord);
+    pProduct->IsInLimbo = true;
+    if (!pProduct->Unlimbo())
+        return 0;
+
+    return 1;
+}
+
+// ============================================================================
 // asm: void __thiscall BuildingClass_Update_Factory(BuildingClass *this)   (asm:16531)
 //
 //  The factory line's per-frame driver.  Two phases, matching the binary:
@@ -5126,7 +5669,20 @@ void BuildingClass::UpdateAnimsAndTurretAfterUpgrade()
 // ============================================================================
 void BuildingClass::Update_Factory()
 {
-    static constexpr int32 FACTORY_ROLLOUT_LAG = 900;
+    // asm: lct_Unit
+    //      fld qword ptr [RulesData+5F8h]   ; RulesClass::PlacementDelay
+    //      fmul ds:double_900
+    //      call Float_To_Int_Floor
+    //   → PostFactoryLagTimer.TimeLeft = floor(PlacementDelay * 900)
+    //   原版 rules(md).ini 的 PlacementDelay=0.02 → 18 帧（约 0.6 秒）。
+    //   本树此前写死 900 帧（30 秒），出厂门一次卡半分钟。
+    int32 rolloutLag = 900;
+    if (RulesClass* pRules = RulesClass::Instance)
+    {
+        const double scaled = pRules->PlacementDelay * 900.0;
+        rolloutLag = (scaled > 0.0) ? static_cast<int32>(scaled) : 0;
+        if (rolloutLag > 900) rolloutLag = 900;
+    }
 
     // ---- A: discharge a completed product --------------------------------
     FactoryClass* pFactory = this->Factory;
@@ -5141,35 +5697,41 @@ void BuildingClass::Update_Factory()
         {
             TechnoClass* pProduct = pFactory->Get_Product();
 
-            // Find a free exit cell for the product.
-            bool canPlace = (pProduct != nullptr);
-            if (canPlace && MapClass::Instance != nullptr)
+            // asm: call [eax+vt_BuildingClass.vt.r.m.o.KickOutUnit]
+            const int32 kicked = Rollout_Product(pProduct);
+
+            if (kicked == 0)
             {
-                const CellStruct exitCell = this->FindExitCell(0, 0);
-                CellClass* pCell = MapClass::Instance->GetCellAt(exitCell);
-                if (pCell == nullptr || pCell->IsOccupied())
-                    canPlace = false;
+                // asm: no_kickout_wat —— 出口格不通就把这条线撤掉。
+                //   ★ 只撤单，不摘生产建筑：生产线对象与建筑是一对一绑定的
+                //     （见 B 段），摘掉指针会在下一帧 new 出第二个，旧的那个
+                //     留在全局工厂表里变成"有队列没人驱动"的僵尸 —— 实测同一
+                //     座 GACNST 身上挂了 4 个工厂对象，订单全进了僵尸。
+                pFactory->Abandon();
+                return;
             }
 
-            if (canPlace)
+            if (kicked == 2)
             {
-                // Roll-out sound at the structure's position.
+                // asm: 建筑类产品 —— 立即播 CreateUnitSound、登记、收尾。
                 if (this->Type != nullptr && this->Type->CreateUnitSound >= 0)
                 {
                     CoordStruct pos = GetCoords();
                     VocClass::PlayIndexAtPos(this->Type->CreateUnitSound, &pos);
                 }
 
-                // Owner bookkeeping and factory release.
                 if (this->Owner != nullptr)
                     this->Owner->RegisterObjectGain_FromFactory(pProduct);
                 pFactory->CompletedProduction();
-                this->Factory = nullptr;
+                // 同上：保留指针，下一条订单继续走这条线。
                 return;
             }
 
-            // Nothing left to roll out this frame - wait before retrying.
-            this->PostFactoryLagTimer = FACTORY_ROLLOUT_LAG;
+            // asm: lct_Unit —— 单位类产品走出厂节流（PlacementDelay*900）：
+            //   本帧只把单位放出去，工厂保持"已完成"，下一轮计时器到期后
+            //   的第二次 KickOutUnit 会因产品已不在 limbo 而返回 1，
+            //   再经下面这次收尾把工厂真正释放。
+            this->PostFactoryLagTimer = rolloutLag;
         }
     }
 
@@ -5181,23 +5743,77 @@ void BuildingClass::Update_Factory()
     // The house has production suspended, or the structure is busy.
     if (pHouse->ProductionSuspended)
         return;
+
+    // ── 资金恢复唤醒 ──────────────────────────────────────────────────────
+    //   FactoryClass::Update 在"本步应付 > 可用资金"时把 OnHold 置 1 并直接
+    //   返回，此后没有任何路径会把它清回去：原版靠 UI 的"继续生产"按钮与
+    //   HouseClass::Update_Factories 的完成唤醒，AI 没有 UI，于是资金一断
+    //   生产线就永久停摆（实测 AI 造完 4 座建筑后整局不动，矿车也造不出来，
+    //   因为造矿车同样要先有钱）。
+    //   这里按 OnHold 的原始语义把它当作"暂缓"：每帧重新看一眼钱，够付
+    //   下一步应付额就唤醒。等价于原版 loc_509275 的 Unsuspend 分支。
+    if (this->Factory != nullptr && this->Factory->IsSuspended())
+    {
+        const int32 stepCost = this->Factory->Get_Cost();
+        // stepCost <= 0 表示本步不需要再扣钱（Balance 已付清或为 0），
+        //   此时没有资金门槛，直接恢复；否则等资金够了再恢复。
+        if (stepCost <= 0 || pHouse->AvailableMoney() >= stepCost)
+        {
+            this->Factory->Unsuspend();
+        }
+        else
+        {
+            return;
+        }
+    }
+
     if (this->CurrentMission == Mission::Construction
         || this->CurrentMission == Mission::Selling)
         return;
     if (this->Type == nullptr || this->Type->Factory == AbstractType::None)
         return;
 
-    if (this->Factory != nullptr)
-    {
-        // A stalled factory with nothing on the line is abandoned and detached.
-        if (this->Factory->IsCompleted() || this->Factory->IsSuspended())
-            return;
-        if (this->Factory->Get_Product() == nullptr)
-        {
-            this->Factory->Abandon();
-            this->Factory = nullptr;
-        }
+    // ── 在线生产：有产品就交给 Update 推进 ────────────────────────────────
+    //   一条生产线与生产建筑一对一绑定、活到建筑死为止（原版 FactoryClass
+    //   也是随建筑持有的）。此前的实现是"一单一个工厂对象"：出厂后把
+    //   this->Factory 置空，下一单再 new 一个 —— 旧对象留在全局工厂表里，
+    //   带着没派完的队列和永远置位的 OnHold。实测同一座 GACNST 挂了 4 个
+    //   工厂对象、一座兵营挂了 5 个，Fetch_Factory 取到最新那个、而排队
+    //   （StartProduction 的弹出-再入队）会落到别的僵尸身上，结果就是
+    //   "队列越堆越长、进度一动不动"。
+    if (this->Factory != nullptr && this->Factory->Get_Product() != nullptr)
         return;
+
+    // 线空：沿用同一个工厂对象开下一单（不销毁、不新建）。
+    if (this->Factory == nullptr)
+    {
+        this->Factory = new FactoryClass(this, pHouse);
+        if (this->Factory == nullptr)
+            return;
+    }
+
+    // ── 主工厂限制 ────────────────────────────────────────────────────────
+    //   原版每个类别（建筑/步兵/载具/飞机/舰船）只有一个"主工厂"在开线
+    //   （HouseClass::PrimaryFactory 的五个槽）。本树此前让**每座**同类建筑
+    //   各开一条线：AI 建到 14 座建筑后同时跑 14 条生产线，每帧扣款把矿车
+    //   的收入立刻吃光，GAWEAP 永远建不完。
+    //   这里按"本房同类别建筑里的第一个存活者"认定主工厂，其余只做落位，
+    //   不开新线；主工厂被毁时下一个自动接管。
+    {
+        // 取"本房同类别建筑中的第一个存活者"：是它就开线，不是就让位。
+        BuildingClass* pFirstOfKind = nullptr;
+        for (int32 i = 0; i < pHouse->OwnedBuildings.Count; ++i)
+        {
+            BuildingClass* pOther = pHouse->OwnedBuildings[i];
+            if (pOther == nullptr || pOther->IsDead() || pOther->Type == nullptr)
+                continue;
+            if (pOther->Type->Factory != this->Type->Factory)
+                continue;
+            pFirstOfKind = pOther;
+            break;
+        }
+        if (pFirstOfKind != this)
+            return;
     }
 
     // With no factory, only an AI house with money auto-starts a run.
@@ -5216,15 +5832,10 @@ void BuildingClass::Update_Factory()
             return;
     }
 
-    FactoryClass* pNew = new FactoryClass(this, pHouse);
-    if (pNew == nullptr)
-        return;
-    this->Factory = pNew;
-
+    FactoryClass* pNew = this->Factory;
     if (!pNew->QueueProduction(pProduce))
     {
         pNew->Abandon();
-        this->Factory = nullptr;
         return;
     }
 
@@ -5376,15 +5987,39 @@ bool BuildingClass::Mi_Repair()
 }
 
 // ============================================================================
-// asm: int __thiscall BuildingClass_Mi_Missile(BuildingClass *this)   (asm:198286)
+// asm: BuildingClass_Mi_Missile (asm:198287 – asm:199453，1167 行，retn 4)
 //
-//  "导弹"使命的一步：这个使命在普通建筑上没有内容——原版把它留空，直接
-//  报告使命完成，让使命层切回待命。这里与原版一致，返回真表示使命结束。
+//  "Missile" 使命状态机，按 BuildingTypeClass.NukeSilo / EMPulseCannon 分流。
+//
+//  ── 本轮已实现：收尾返回值（asm:1151 的 `return:` 标签）──────────────────
+//       mov  ecx,esi
+//       call MissionClass::Get_Mission_Control_Data
+//       fld  qword ptr [eax+10h]        ; MissionControls[cur].Rate（+0x10）
+//       fmul ds:double_900              ; 900.0
+//       call Float_To_Int_Floor         ; eax = floor(Rate * 900)
+//       retn                            ; ← 返回值 = 下次调度延迟（帧）
+//  即"没有超武在打的普通建筑"这一步只是把 [MissionControl].Rate 换算成帧数
+//  返回。工程把该槽声明为 bool，故取"延迟是否非零"。
+//
+//  ── 未实现：三条超武支路，全部卡在同一处字段缺口 ────────────────────────
+//    * 取目标格一律是 `OwningPlayer + HouseClass.NukeTarget / EMPTarget`
+//      （asm:198354 / 198442 / 198648、以及 EMP 分支的 `[OwningPlayer+5780h]`）。
+//      这两个字段在二进制里是 wXY（各 4 字节，紧跟 IsBeingDrained、位于
+//      AlliesBitfield 之前，即 +0x5760 / +0x5764）；本头文件的 HouseClass
+//      没有它们，而 Houses/ 本轮禁改 —— 没有目标坐标，造弹/发射的输入不存在。
+//    * NukeSilo 分支还要写 BuildingClass.PsiWarnAnim 槽；该成员本类可加，
+//      但它只在有了 NukeTarget 之后才有意义（存的是预警动画）。
+//    * 各分支另需 BulletType_CreateBullet / BulletClass::Place / GetFLH 弹道、
+//      ObjectClass::Fire(cell)、Desired_Facing256 的朝向比较，
+//      以及若干由 SuperWeaponTypeClass 取武器/弹头的链式读取。
+//
+//  结论：三条超武支路等待 HouseClass 补齐 NukeTarget/EMPTarget 后再逐句移植；
+//  在此之前不做任何"自造目标点"的发射。
 // ============================================================================
 bool BuildingClass::Mi_Missile()
 {
-    // asm: int __thiscall BuildingClass_RGBModulate1(BuildingClass *this, int a1)   (asm:1598976)
-    return true;
+    // asm: `return:` —— floor([MissionControls[cur].Rate] * 900.0) 作为延迟
+    return static_cast<int32>(Float_To_Int_Floor(GetMissionRate() * 900.0)) != 0;
 }
 
 // ============================================================================
@@ -5778,7 +6413,8 @@ int32 BuildingClass::CreateFromINIList(INIClass* pINI)
         if (pOwnerName == nullptr || pTypeName == nullptr)
             continue;
 
-        const int32 ownerIndex = HouseClass::FindIndexByName(pOwnerName);
+        // 先按房名、再按房型 ID 兜底（见 HouseClass::FindIndexByNameOrType）。
+        const int32 ownerIndex = HouseClass::FindIndexByNameOrType(pOwnerName);
         if (ownerIndex < 0)
             continue;
 
@@ -5790,12 +6426,15 @@ int32 BuildingClass::CreateFromINIList(INIClass* pINI)
         if (pOwner == nullptr)
             continue;
 
-        // 血量、朝向、坐标。
+        // ★ 字段顺序以 asm 为准：owner,type,health,x,y,facing,tag,...
+        //
+        //   BuildingClass_CreateFromINIList（asm 0x44F8xx）：
+        //     field3 -> health（var_D4）
+        //     NewINIFormat >= 4：field4 -> X, field5 -> Y
+        //     之后才是朝向与 tag。此前把 facing 放在 field4，会导致所有
+        //     预置建筑落到地图左上角（x=0..255 的朝向值当成了横坐标）。
         const char* pField = std::strtok(nullptr, ",");
         const int32 health = (pField != nullptr) ? std::atoi(pField) : 0;
-
-        pField = std::strtok(nullptr, ",");
-        const int32 facingRaw = (pField != nullptr) ? std::atoi(pField) : 0;
 
         pField = std::strtok(nullptr, ",");
         const int32 x = (pField != nullptr) ? std::atoi(pField) : 0;
@@ -5803,12 +6442,23 @@ int32 BuildingClass::CreateFromINIList(INIClass* pINI)
         pField = std::strtok(nullptr, ",");
         const int32 y = (pField != nullptr) ? std::atoi(pField) : 0;
 
+        pField = std::strtok(nullptr, ",");
+        const int32 facingRaw = (pField != nullptr) ? std::atoi(pField) : 0;
+
+        // 第 7 字段：Tag（结构体行 OWNER,ID,HEALTH,X,Y,FACING,TAG,...）。
+        const char* pTagName = std::strtok(nullptr, ",");
+
         // 实例化并绑定类型。
         BuildingClass* pBuilding = new BuildingClass(pOwner);
         if (pBuilding == nullptr)
             continue;
 
         pBuilding->Type = pType;
+        // ★ 基类的 TechnoType 指向同一份类型。建筑侧只写 Type 会让
+        //   TechnoClass::AI() 第一行（TechnoType == nullptr → return）把整座
+        //   建筑跳过，ShouldRetaliate 也会在第一道门就返回假（探针里
+        //   canRetaliate=-1）。步兵侧 BuildInfantry 有同样的回填。
+        pBuilding->TechnoType = pType;
 
         // 朝向写回（256 分度）。
         pBuilding->SetDirection(DirStruct(static_cast<uint8>(facingRaw & 0xFF)));
@@ -5833,9 +6483,37 @@ int32 BuildingClass::CreateFromINIList(INIClass* pINI)
         }
         pBuilding->Location = pos;
 
-        // 上线并落图。
-        pBuilding->Unlimbo();
-        pBuilding->Place(false);
+        // 落图。Unlimbo 建立占用与格登记，ForceCreate 把"已建成 + 通电"
+        //   一步到位（地图预置建筑不该再播一遍起建动画）。
+        pBuilding->IsInLimbo = true;
+        if (!pBuilding->Unlimbo())
+        {
+            delete pBuilding;
+            continue;
+        }
+
+        CoordStruct forceCoord = pBuilding->Location;
+        pBuilding->ForceCreate(forceCoord, 0);
+
+        if (TheDisplay != nullptr)
+            TheDisplay->Submit(pBuilding);
+
+        // [Structures] 第 7 字段的 Tag：附着并登记（persistence=1 的判据来源）。
+        if (pTagName != nullptr && pTagName[0] != '\0' &&
+            _strcmpi(pTagName, "<none>") != 0 && _strcmpi(pTagName, "none") != 0)
+        {
+            // ★ 实体落位（Setup 的 4.x 段）早于 [Tags]/[Triggers] 的解析，
+            //   所以这里必须用 FindOrAllocate 先建占位实例；随后的
+            //   TagTypeClass::CreateInstance 会按同名复用并把 TagType 补上。
+            //   若地图没有 [Tags] 段而实体写了标签名，这个占位实例的
+            //   TagType 恒空，RaiseEvent 会直接返回 false —— 无害。
+            TagClass* pTag = TagClass::FindOrAllocate(pTagName);
+            if (pTag != nullptr)
+            {
+                pBuilding->Tag = pTag;
+                pTag->Assign_To_Object(pBuilding);
+            }
+        }
 
         ++created;
     }

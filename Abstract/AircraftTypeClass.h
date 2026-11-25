@@ -22,6 +22,7 @@ public:
     virtual ~AircraftTypeClass();
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual bool SaveToINI(CCINIClass* pINI) const override;
+    virtual AbstractType WhatAmI() const override { return AbstractType::AircraftType; }
     virtual AbstractType GetAbstractDerivationID() const override;
     virtual bool HasThisID(const char* pID) const override;
     virtual int32 GetCRC() const override;

@@ -297,11 +297,11 @@ bool TerrainClass::Is_Veinhole() const
 //   注册脏区 / Mark(1) / 重绘
 // ============================================================================
 int32 TerrainClass::ReceiveDamage(int32* pDamage, int32 typeSource,
-                                  WarheadTypeClass* pWarhead, int32 target,
+                                  WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                   int32 ignoreDefenses, int32 arg10,
                                   HouseClass* pSourceHouse)
 {
-    (void)typeSource; (void)target; (void)ignoreDefenses;
+    (void)typeSource; (void)pAttacker; (void)ignoreDefenses;
     (void)arg10; (void)pSourceHouse;
 
     // asm: mov eax,[esp+LandType] / test eax,eax / jnz ; 否则 retn 0

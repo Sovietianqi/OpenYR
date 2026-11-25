@@ -1,6 +1,10 @@
 #include <Abstract/TechnoClass.h>
 #include <Abstract/AircraftTypeClass.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+
 #include <Core/Memory.h>
 #include <Core/Macros.h>
 #include <Helpers/AsmMath.h>   // Float_To_Int_Floor (asm 0x7C5F10)
@@ -8,7 +12,9 @@
 #include <Combat/WarheadTypeClass.h>
 #include <Combat/BulletClass.h>
 #include <Combat/CaptureManagerClass.h>
+#include <Animations/AnimClass.h>   // DrawHidden: Rules->Behind 动画的 Attach_To
 #include <Houses/HouseClass.h>
+#include <Map/WaypointPathClass.h>
 #include <cwchar>
 #include <Game/SaveGameClass.h>
 #include <Game/Game.h>
@@ -19,13 +25,20 @@
 #include <Map/MapClass.h>
 #include <Scenario/ScenarioClass.h>
 #include <Rendering/TacticalClass.h>
+#include <Rendering/Surface.h>      // DrawExtras: 话泡 CC_Draw_Shape
+#include <Rendering/UnitArt.h>      // DrawExtras: 战术层绘制面
+#include <Rendering/ConvertClass.h> // DrawExtras: StandardPalette
+#include <Helpers/TimerHelpers.h>   // DisplayTalkBubble: SystemTimer::GetTime
 #include <Abstract/BuildingClass.h>
+#include <Locomotion/LocomotionClass.h>
+#include <Abstract/FootClass.h>     // Can_Be_Commanded: vt+0x37C -> IsParalysed()
 #include <Special/WaveClass.h>   // asm: TechnoClass_Fire 里 WaveClass_CTOR 的装配目标
 #include <Special/TemporalClass.h> // TemporalImUsing->Victim 需要完整类型
 #include <Special/SpawnManagerClass.h> // Assign_Target 里 SpawnManager->SetTarget 需要完整类型
 #include <Special/SlaveManagerClass.h> // TechnoClass_Update 后段的 SlaveManager->Update
 #include <Combat/BombClass.h>          // TechnoClass_Update 后段的 IvanBomb TimeToBlow/Detonate
 #include <AI/TagClass.h>          // Per_Cell_Process -> TagClass::RaiseEvent
+#include <AI/TeamTypeClass.h>     // ShouldRetaliate: Team->Type->Suicide
 #include <Game/ChainDebug.h>      // 逐帧调用链探针（#2/#3/#6/#7 验证）
 #include <cmath>
 
@@ -394,6 +407,19 @@ void TechnoClass::Update_Combat()
     //     其余非 OK → 本帧不开火（保留目标，下一帧重试）。
     {
         const int32 fireState = Can_Fire(pTarget, idxWeapon, 0);
+        static const bool s_bFireDbg = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+        if (s_bFireDbg)
+        {
+            CoordStruct a = GetCoords(), b;
+            pTarget->GetCoords(&b);
+            std::fprintf(stderr, "[FIRE] f=%d %s -> %s state=%d dist=(%d,%d,%d) ammo=%d/%d\n",
+                         (int)Game::GetCurrentFrame(),
+                         (TechnoType && TechnoType->get_ID()) ? TechnoType->get_ID() : "?",
+                         (pTarget->WhatAmI() == AbstractType::Infantry) ? "inf" : "obj",
+                         (int)fireState, (int)(b.X - a.X), (int)(b.Y - a.Y),
+                         (int)(b.Z - a.Z), (int)CurrentAmmo,
+                         (int)(TechnoType ? TechnoType->Ammo : -9));
+        }
         if (fireState != static_cast<int32>(FireError::OK))
         {
             // asm loc_6FA472（只对 fsCantAffect / fsCantCommand 丢目标）：
@@ -656,8 +682,16 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
         effectiveROF = 1;
 
     int32 currentFrame = Game::CurrentFrame;
-    if (currentFrame - LastFireFrame < effectiveROF)
+    // 注意：LastFireFrame 的"从未开火"哨兵是 INT_MIN，直接做减法会整型溢出
+    //   （0 - INT_MIN == INT_MIN，负数反而判成"已冷却完"）。先排除哨兵。
+    if (LastFireFrame >= 0 && currentFrame - LastFireFrame < effectiveROF)
+    {
+        static const bool s_bGateDbg = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+        if (s_bGateDbg)
+            std::fprintf(stderr, "[FIRE_GATE] f=%d last=%d rof=%d\n",
+                         (int)currentFrame, (int)LastFireFrame, (int)effectiveROF);
         return nullptr;
+    }
 
     // Arm the recharge timer (mirrored by Update_AI) and stamp the frame so
     // the next shot is gated on the same ROF window.
@@ -669,7 +703,15 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
     WeaponStruct* ws = TechnoType->GetWeapon(nWeaponIndex);
     WeaponTypeClass* pWeapon = (ws != nullptr) ? ws->WeaponType : nullptr;
     if (pWeapon == nullptr || pWeapon->Projectile == nullptr)
+    {
+        static const bool s_bFireDbg = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+        if (s_bFireDbg)
+            std::fprintf(stderr, "[FIRE_IMPL] weapon=%p proj=%p id=%s\n",
+                         static_cast<void*>(pWeapon),
+                         pWeapon ? static_cast<void*>(pWeapon->Projectile) : nullptr,
+                         (pWeapon && pWeapon->get_ID()) ? pWeapon->get_ID() : "?");
         return nullptr;
+    }
 
     CoordStruct source = GetFLH(nWeaponIndex, true);
 
@@ -679,6 +721,18 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
     BulletClass* pBullet = BulletClass::Fire(
         pWeapon->Projectile, pWeapon, source, targetPos, this,
         pWeapon->Damage, pWeapon->Warhead);
+
+    {
+        static const bool s_bFireDbg2 = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+        if (s_bFireDbg2)
+        {
+            std::fprintf(stderr, "[FIRE_IMPL] f=%d bullet=%p arr=%p count=%d\n",
+                         (int)Game::GetCurrentFrame(),
+                         static_cast<void*>(pBullet),
+                         static_cast<void*>(BulletClass::Array),
+                         BulletClass::Array ? (int)BulletClass::Array->Count : -1);
+        }
+    }
 
     // asm TechnoClass_Fire: 弹体持有目标指针（[bullet+10Ch]），供
     //   BulletClass_Update 的 Simulate_Homing/Simulate_Ballistic 追踪与
@@ -712,9 +766,16 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
         vel.Y = targetPos.Y - source.Y;
         vel.Z = targetPos.Z - source.Z;
 
-        const int32 shotSpeed = (pWeapon->Projectile->ProjectileSpeed > 0)
-                              ? pWeapon->Projectile->ProjectileSpeed
-                              : pBullet->GetSpeed();
+        // asm L1570412: `call [weapon+vt_GetSpeed]` —— 弹体速度取**武器**的
+        //   Speed（rules 里的 `Speed=`，经 ReadIntHundredth 换算），不是
+        //   弹体类型的 ProjectileSpeed（大多数弹体该键为 0）。取错会让速度
+        //   落到 0，Velocity 恒为零，BulletClass_Update 第一帧就按
+        //   "|v| < 8 → 已停滞" 判定命中，弹体在炮口原地起爆、打不到人。
+        int32 shotSpeed = pWeapon->GetSpeed();
+        if (shotSpeed <= 0)
+            shotSpeed = pWeapon->Projectile->ProjectileSpeed;
+        if (shotSpeed <= 0)
+            shotSpeed = 100;
         pBullet->SetMovement(source, vel, shotSpeed);
     }
 
@@ -743,8 +804,12 @@ BulletClass* TechnoClass::Fire_Impl(AbstractClass* pTarget, int32 nWeaponIndex)
 //    mov  [ebx],eax                                 ; *Damage = 结果
 // ============================================================================
 bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
-                                  WarheadTypeClass* pWarhead)
+                                  WarheadTypeClass* pWarhead,
+                                  int32* pFinalDamage, bool ignoreDefenses)
 {
+    if (pFinalDamage != nullptr)
+        *pFinalDamage = 0;
+
     if (damage <= 0)
         return false;
 
@@ -756,7 +821,7 @@ bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
     //   fdivr 的顺序是 Damage / (ArmorMult * ArmorMultiplier)，即把伤害按
     //   倍率缩小 —— 倍率越大承受伤害越低。
     int32 scaledDamage = damage;
-    if (Owner != nullptr && TechnoType != nullptr)
+    if (!ignoreDefenses && Owner != nullptr && TechnoType != nullptr)
     {
         // asm: HouseClass_GetTypeArmorMult（38 分支 switch，按 WhatAmI 分派）
         const double typeArmor = Owner->Get_Type_Armor_Mult(TechnoType);
@@ -768,8 +833,13 @@ bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
             scaledDamage = static_cast<int32>(Float_To_Int_Floor(
                                static_cast<double>(damage) / divisor));
     }
-    if (scaledDamage <= 0)
-        return false;
+    // asm: cmp dword ptr [ebx],1 / mov dword ptr [ebx],1 ——
+    //   ★ 这句在 ObjectClass_ReceiveDamage 里**不是全局门**：它位于
+    //     `if (WhatAmI()==eBuilding && !BuildingType->CanC4)` 分支内
+    //     （asm loc_5F5416..loc_5F5454），而且作用在 GetTotalDamage 的**结果**上
+    //     （护甲与 Verses 已经合完），不是作用在护甲除法之后。
+    //   旧实现把它当全局门放在 Verses 之前，厚甲单位挨 0 伤也会被抬成 1 点。
+    //   真正的保底只给"不装 C4 的建筑"，见下面 Verses 之后那一段。
 
     // Apply the warhead's armor-class multiplier (Verses[]).
     int32 finalDamage = scaledDamage;
@@ -780,8 +850,27 @@ bool TechnoClass::TakeDamage_Impl(int32 damage, ObjectClass* pSource,
         finalDamage = static_cast<int32>(Float_To_Int_Floor(
                           static_cast<double>(scaledDamage) * static_cast<double>(mult)));
     }
+
+    // asm loc_5F5416..loc_5F5454：建筑且 CanC4=假 → 伤害保底 1。
+    //   其余对象允许 0（"装甲/Verses 挡住了"，不是"至少掉 1 点"）。
+    if (finalDamage < 1 && WhatAmI() == AbstractType::Building)
+    {
+        const BuildingClass* pBld = static_cast<const BuildingClass*>(this);
+        if (pBld->Type != nullptr && !pBld->Type->CanC4)
+            finalDamage = 1;
+    }
+
     if (finalDamage <= 0)
         return false;
+
+    // asm: predmgHealth <= damage → damage = predmgHealth（loc_5F54C2）。
+    //   伤害不允许超过剩余血量：否则 *pFinalDamage 报的是"请求值"而不是
+    //   "真正扣掉的血"，击杀那一发会把 50 报成实际只剩 12 的情况。
+    if (finalDamage > Health)
+        finalDamage = Health;
+
+    if (pFinalDamage != nullptr)
+        *pFinalDamage = finalDamage;
 
     Health -= finalDamage;
 
@@ -886,13 +975,15 @@ void TechnoClass::Promote(int32 experience)
     Update_Veterancy();
 }
 
-// asm: void __thiscall Veterancy_AddValue(_TechnoClass *this, int ownerCost, int victimCost)  (asm:1595096)
+// asm: char __thiscall Veterancy_AddValue(float *this, int ownerCost, int victimCost)
+//      (asm:1725745)
 //
 //  Awards veterancy credit proportional to the victim's value relative to the
 //  killer's own value:
-//      Experience += victimCost * Rules->VeteranRatio / ownerCost
-//  then clamps the running total to Rules->VeteranCap.  `ownerCost` of zero is
-//  treated as one so a techless killer does not divide by zero.
+//      Experience += victimCost / (ownerCost * Rules->VeteranRatio)
+//  then clamps the running total to Rules->VeteranCap.  The original loads both
+//  costs as integers (fild) and divides by (ownerCost * ratio) - not by
+//  ownerCost with the ratio multiplied into the numerator.
 void TechnoClass::AddVeterancyValue(int32 ownerCost, int32 victimCost)
 {
     const double ratio = (RulesClass::Instance != nullptr)
@@ -900,9 +991,13 @@ void TechnoClass::AddVeterancyValue(int32 ownerCost, int32 victimCost)
     const double cap   = (RulesClass::Instance != nullptr)
                        ? RulesClass::Instance->VeteranCap : 0.0;
 
-    const double denom = (ownerCost != 0) ? static_cast<double>(ownerCost) : 1.0;
+    // 原版无除零分支；除数不可表示时保持原值。
+    const double denom = static_cast<double>(ownerCost) * ratio;
+    if (denom == 0.0)
+        return;
+
     double total = static_cast<double>(Experience)
-                 + static_cast<double>(victimCost) * ratio / denom;
+                 + static_cast<double>(victimCost) / denom;
 
     if (total > cap)
         total = cap;
@@ -923,22 +1018,26 @@ int32 TechnoClass::Get_Experience() const
 // ============================================================================
 // Is_Ally / Is_Enemy
 //
-//  Returns true if the supplied house is on the same team as this unit's
-//  owner.  The full binary walks the HouseClass alliance table; the
-//  standalone build treats "same owner" as "ally".
+//  asm 里没有独立的 TechnoClass 判定符号：每一处调用点都是
+//      mov ecx, Owner / call HouseClass::Is_Ally
+//  也就是把判定整体下放给 HouseClass（asm:554728 / 554781）。这里同样转发，
+//  不再用"同一个 Owner 指针"冒充盟友关系：同阵营国家（ActLikeIndex 相同）
+//  与写在盟友位图里的势力都必须算盟友。
 // ============================================================================
 bool TechnoClass::Is_Ally(HouseClass* pHouse) const
 {
-    if (pHouse == nullptr)
+    if (Owner == nullptr || pHouse == nullptr)
         return false;
-    return (pHouse == Owner);
+
+    return Owner->Is_Ally(pHouse);
 }
 
 bool TechnoClass::Is_Enemy(HouseClass* pHouse) const
 {
-    if (pHouse == nullptr)
+    if (Owner == nullptr || pHouse == nullptr)
         return false;
-    return (pHouse != Owner);
+
+    return !Owner->Is_Ally(pHouse);
 }
 
 bool TechnoClass::Is_Ally(TechnoClass* pTechno) const
@@ -1312,6 +1411,23 @@ CoordStruct TechnoClass::GetFLH(int32 nWeaponIndex, bool muzzle)
         }
     }
 
+    // art 里没给 PrimaryFireFLH 时（本树尚未解析 artmd 的 FLH 键）三个分量
+    //   全是 0，弹体就会从地面 0 高度射出。原版的炮口高度来自 art 的
+    //   `PrimaryFireFLH=`（步兵 ~90、载具 ~120 lepton）；缺这一层不仅观感
+    //   是"贴地打"，还会让 Damage_At_Cell 的地面高度门
+    //   （`floorHeight >= loc.Z → 跳过收集`）把命中格整个略过 —— 直接命中
+    //   打不掉血。这里补一个按类别的合理炮口高度。
+    if (fwd == 0 && lat == 0 && hgt == 0)
+    {
+        const AbstractType what = WhatAmI();
+        if (what == AbstractType::Infantry)
+            hgt = 90;
+        else if (what == AbstractType::Unit || what == AbstractType::Aircraft)
+            hgt = 120;
+        else if (what == AbstractType::Building)
+            hgt = 144;
+    }
+
     // asm: Desired_Facing256(&Facing, &out) —— 取当前朝向（256 分度）。
     const double angle = (static_cast<double>(PrimaryFacing.Value) / 256.0)
                        * (2.0 * 3.14159265358979323846);
@@ -1350,19 +1466,57 @@ int32 TechnoClass::EstimateDamage(AbstractClass* pTarget, int32 idxWeapon)
 }
 
 // ============================================================================
-// ShouldRetaliate — 是否应当还击
-// 原版: TechnoClass_ShouldRetaliate   (asm:0x7087F0 / 21278)
+// TechnoClass::Override_Mission — 换任务 + 换目标
+// 原版: TechnoClass::Override_Mission (asm:1574861, retn 0Ch)
 //
-//  asm 分支顺序（任一不满足即返回 false）：
-//    target 为空 / type->CanRetaliate 为假              → false
-//    [this+1CCh] 与 Owner 的门控（被 EMP/瘫痪）          → false （字段未建模）
-//    CaptureManager 存在且 OutOfSpareLinks()             → false
-//    Is_Ally(攻击方 Owner)                               → false
-//    攻击方对己方敌对（[ebp+0C8h]）                       → false （字段未建模）
-//    Combat_Damage(-1) <= 0                              → false
-//    SelectWeapon(target) 与射程判定                     → 不在射程则 false
-//  ★ 旧实现用“目标敌对 + 铁幕 + 任意武器 CanFire”近似，缺少 CanRetaliate 与
-//    CaptureManager 门控；此处按 asm 补齐。
+//   Techno 层在基类动作之外多两件事（逐条对应汇编）：
+//     mov eax,[esi+Target] / mov [esi+LastTarget],eax   ; 旧目标留档
+//     call MissionClass::Override_Mission               ; 任务槽切换
+//     call [vt+SetTarget](target)                       ; ★ 目标落地
+//
+//   基类那份只碰 currentMission / what / field_B4 三个字段，**目标根本不写**。
+//   所以任何"给我换个任务顺便换个目标"的调用都必须落到这里：只调基类会让
+//   任务切过去而目标仍是空的，Mission_Attack 下一帧发现没目标就退回 Guard。
+// ============================================================================
+void TechnoClass::Override_Mission(Mission mission, AbstractClass* target,
+                                   AbstractClass* destination)
+{
+    LastTarget = GetTarget();
+
+    MissionClass::Override_Mission(mission, target, destination);
+
+    SetTarget(target);
+}
+
+// ============================================================================
+// ShouldRetaliate — 是否应当还击
+// 原版: TechnoClass_ShouldRetaliate (asm:0x70886C .. 0x708B2C)
+//
+//  逐分支对应的门（任一不满足即返回 false）：
+//    target 为空 / type->CanRetaliate 为假                → false
+//    CaptureManager 存在且 OutOfSpareLinks()              → false
+//    本方是玩家、且身上已经有目标                          → false（玩家选择优先）
+//    MissionControl[当前任务].Retaliate 为假              → false
+//    Is_Ally(攻击方)                                      → false
+//    攻击方也认为本方是友军（attacker->Is_Ally(Owner)）    → false
+//    Combat_Damage(-1) <= 0（没武器）                      → false
+//    玩家单位的任务不在 {Guard, AreaGuard, Patrol, Sticky} → false
+//    已有队伍的 Suicide 队                                 → false
+//    非玩家、已有目标、且旧目标威胁 >= 攻击者威胁           → false（别丢西瓜）
+//    （asm 另有一道 `cmp [this+694h]`，本树无对应字段，未建模）
+//    当前武器对该攻击者的 Verses <= 0.01                   → false（打不动）
+//
+//  ★ 旧实现把"射程"当成还击前提（IsCloseEnoughToTarget 不满足即 false）。
+//    汇编里**没有这道门**：射程判定留给调用方 TechnoClass_ReceiveDamage
+//    （够不着时玩家单位改为散射、AI 单位照样转 Attack 去追）。旧写法导致
+//    "被远程单位打了不还手"——正是玩家最容易注意到的那类缺陷。
+//
+//  ★ 未建模的三处依赖（asm 里是三个指针 + 一个虚槽）：
+//      [this+2DCh] / [this+2D8h] / [this+2D0h]  —— 被寄生 / 被时空冻结 /
+//        被 EMP 之类的"不可行动"状态指针，本树无对应成员；
+//      [vt+2ACh]                                —— 一个返回 bool 的虚槽，
+//        语义未确认。
+//    这三处只会让返回值更保守（false），不会导致误判为可还击。
 // ============================================================================
 bool TechnoClass::ShouldRetaliate(TechnoClass* pAttacker)
 {
@@ -1379,8 +1533,22 @@ bool TechnoClass::ShouldRetaliate(TechnoClass* pAttacker)
     if (CaptureManager != nullptr && CaptureManager->OutOfSpareLinks())
         return false;
 
+    const bool human = (Owner != nullptr && Owner->Is_Human());
+
+    // asm: 玩家单位已有目标 → 不抢玩家自己挑的目标。
+    if (human && GetTarget() != nullptr)
+        return false;
+
+    // asm: MissionControl[mission].Retaliate（asm +8）
+    if (!CanRetaliate())
+        return false;
+
     // asm: 攻击方与本方同盟则不还击（原版用 HouseClass::Is_Ally）。
     if (Is_Ally(pAttacker->Owner))
+        return false;
+
+    // asm: 攻击方反过来也把本方当友军 → 不还击。
+    if (pAttacker->Is_Ally(Owner))
         return false;
 
     // asm: call Combat_Damage(-1) / test eax,eax / jle false
@@ -1388,16 +1556,74 @@ bool TechnoClass::ShouldRetaliate(TechnoClass* pAttacker)
     if (Combat_Damage(-1) <= 0)
         return false;
 
-    // asm: SelectWeapon(target) 后做 GetObjectFiringStateNoRange 判定；
-    //   本项目用 SelectWeapon + IsCloseEnoughToTarget 表达。
+    // asm: SelectWeapon(target) —— 没有可用武器槽就无从还击。
     const int32 idx = SelectWeapon(pAttacker);
     if (idx < 0)
         return false;
-    if (!IsCloseEnoughToTarget(pAttacker, idx))
-        return false;
+
+    // asm: 玩家单位只有站在 Guard/AreaGuard/Patrol/Sticky 上才会还击。
+    if (human)
+    {
+        const Mission m = GetMission();
+        if (m != Mission::Guard && m != Mission::AreaGuard
+            && m != Mission::Patrol && m != Mission::Sticky)
+            return false;
+    }
+
+    // asm: derivationFlags bit2 且队伍类型是 Suicide → 不还击。
+    //   Team 是 FootClass 的成员，TechnoClass 层只能按具体类型取。
+    //   ★ 必须显式列出"哪些子类真的是 FootClass"：建筑没有 Team，
+    //     按脚类去读 [this+Team] 是越界（建筑的类型同步进基类之后，
+    //     这一门会真的被执行到，不设类型门就会读到别的字段当 TeamType*）。
+    //   （field_14 的初值是 0xFF，见 ObjectClass 构造函数 —— 汇编里
+    //     AbstractClass_CTOR 直接写 0FFFFFFFFh，所以这一门是活门。）
+    if ((field_14 & 0x04) != 0
+        && (WhatAmI() == AbstractType::Unit || WhatAmI() == AbstractType::Infantry
+            || WhatAmI() == AbstractType::Aircraft))
+    {
+        const FootClass* pFoot = static_cast<const FootClass*>(this);
+        if (pFoot->Team != nullptr && pFoot->Team->Type != nullptr
+            && pFoot->Team->Type->Suicide)
+            return false;
+    }
+
+    // asm: 非玩家 + 已有目标 + 旧目标威胁评分 >= 攻击者 → 保持旧目标。
+    if (!human)
+    {
+        TechnoClass* pOld = static_cast<TechnoClass*>(GetTarget());
+        if (pOld != nullptr && pOld->TechnoType != nullptr)
+        {
+            const int32 oldThreat = EvalThreatRating(pOld, idx);
+            const int32 newThreat = EvalThreatRating(pAttacker, idx);
+            if (newThreat < oldThreat)
+                return false;
+        }
+    }
+
+    // asm 此处还有一道 `cmp ebp,[esi+694h]`（攻击者 == 某个挂靠对象指针）。
+    //   0x694 在本树没有对应成员（FootClass 的 Transporter 是另一个概念，
+    //   语义未确认），故不臆造对应关系；省掉这道门只会让单位更愿意还击，
+    //   不会把"打不了"的情况误判成"能打"。
+
+    // asm: 当前武器的弹头打在这个攻击者的护甲上 <= 0.01 倍 → 打不动，别去送。
+    {
+        WeaponStruct* pSlot = TechnoType->GetWeapon(idx);
+        if (pSlot != nullptr && pSlot->WeaponType != nullptr
+            && pAttacker->TechnoType != nullptr)
+        {
+            const float verses =
+                (pSlot->WeaponType->Warhead != nullptr)
+                ? pSlot->WeaponType->Warhead->GetDamageMultiplier(
+                      static_cast<int32>(pAttacker->TechnoType->Get_Armor()))
+                : 1.0f;
+            if (!(verses > 0.01f))
+                return false;
+        }
+    }
 
     return true;
 }
+
 
 // ============================================================================
 // IsRadarVisible — 雷达可见性
@@ -1474,20 +1700,157 @@ void TechnoClass::UpdateSight()
 
 // ============================================================================
 // DrawExtras / DrawHidden — 附加绘制
-// 原版: TechnoClass_DrawExtras（1379 行）/ DrawHidden（422 行）
+// 原版: TechnoClass_DrawExtras（asm:1552252–1553631，1380 行）
+//       TechnoClass_DrawHidden（asm:1600937–1601359，423 行）
+// ============================================================================
+// asm: TechnoClass_DrawExtras (asm:1552252 – 1553631，1172 指令，retn 12)
+//
+//   void __thiscall TechnoClass_DrawExtras(TechnoClass* this, a3, a4, a5)
+//     —— IDA 已给出 3 个 dword 形参（本项目头文件写成了 Point2D*/RectangleStruct*
+//        两个，签名本身与 asm 不符）。
+//
+//   逐块（IDA 标签 → 依赖）：
+//     1) `[this+field_3C9]` 非零即整支退出；
+//     2) BombVisible && IvanBomb：GetCoords→MapClass::Coord_Cell→sub_487950
+//        （格子是否可见）→ 投影 → BombClass_GetCurrentFrame →
+//        CC_Draw_Shape(TempSurface, Convert_MOUSEPAL, Rules->BOMBCURS_SHP,
+//        frame, pos, rect_mouseclass_vp, 0xE00, ...)；
+//     3) WhatAmI()==6（BuildingClass）且 IsBeingRepaired：投影 →
+//        OptionsClass::Normalize_Delay(0x0E)>>2 作帧序号 →
+//        CC_Draw_Shape(..., SHP_WRENCH, ...)；
+//     4) 未选中/共用控制等门控通过后 `[this+vt+0x454h](a3, a5)` 子绘制；
+//     5) 选中：按 WhatAmI 分支画选择框 —— 8 个角点经 Coord_Move /
+//        Vector3D_Add / sub_710700 求中心，再逐条折线
+//        `[TacticalMap+vt+0x60h](&p1, &p2)` 连起来；
+//     6) `[this+0x6Ch] > 0` 且（与玩家同盟 或 Rules+0x17E6）→
+//        `[this+vt+0x448h](a4, a5)`；
+//     7) 其余同类分支（loc_6F59FE/6F5B27/6F5C53/6F5D76）同构，只是角点
+//        半径与颜色不同。
+//
+//   ★ 本轮已落地的段落：**话泡**（原版函数尾部 loc_6F5E8D..lct_Out）。
+//
+//       cmp  TalkBubbleOwner, this     ; 只有当前说话者自己画
+//       jnz  lct_Out
+//       mov  eax, TalkBubbleType
+//       test eax, eax
+//       jle  lct_Out                   ; type <= 0 不画
+//       call sub_4F1B20                ; TimerStruct 剩余毫秒
+//       test eax, eax
+//       jle  lct_Out                   ; 已过期
+//       CC_Draw_Shape(TempSurface, StandardPalette, CCFile_TALKBUBL_SHP,
+//                     TalkBubbleType - 1, pos, boundingRect, 0x600,
+//                     0, 0, 0, 1000, 0, 0, 0, 0, 0)
+//
+//     0x600 = Centered | Transparent；brightness = 1000（原样）。
+//
+//   ★ 其余段落（炸弹图标 / 扳手 / 选择框折线）仍缺原语，保持不画：
+//     * 第 2 块要 Convert_MOUSEPAL —— 本工程没有这个调色板全局；
+//     * 第 3 块要 SHP_WRENCH 与 OptionsClass::Normalize_Delay —— 都没有；
+//     * 第 2/3 块的 sub_487950（格子可见性）也没有；
+//     * 第 4~7 块要 TechnoClass 的 vt+0x448 / vt+0x454 与本对象上的子绘制，
+//       以及 TacticalClass 的 vt+0x60 连线槽 —— 本树这两个类都没有按原版
+//       槽位重建 vtable（TacticalClass 只有 5 个 AbstractClass 覆写），
+//       按槽调用等于"猜函数"。
+//     * 选择框 / 血条已由各具体类 Draw() 末尾的 ObjectUI 调用覆盖。
 // ============================================================================
 void TechnoClass::DrawExtras(Point2D* pCoord, RectangleStruct* pRect)
 {
-    (void)pCoord;
-    (void)pRect;
-    // 血条/选择框等附加绘制交由显示层；此处保留扩展点。
+    // asm: cmp TalkBubbleOwner,ebp / jnz lct_Out
+    if (TalkBubbleOwner == this
+        && TalkBubbleType > 0
+        && TalkBubbleTimer.GetTimeLeft(SystemTimer::GetTime()) > 0)
+    {
+        SHPStruct* pShape = ObjectTypeClass::Get_TalkBubble_Shape();
+        Surface*   pSurface = UnitArt::GetTacticalSurface();
+        if (pShape != nullptr && pSurface != nullptr && pCoord != nullptr)
+        {
+            // asm: boundingRect 直接取 DrawExtras 的第二个形参。
+            Rectangle clip(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+            if (pRect != nullptr && pRect->Width > 0 && pRect->Height > 0)
+                clip = Rectangle(pRect->X, pRect->Y, pRect->Width, pRect->Height);
+
+            Point2D pos(pCoord->X, pCoord->Y);
+            const int32 frame = TalkBubbleType - 1;   // asm: dec eax
+
+            CC_Draw_Shape(pSurface, StandardPalette, pShape, frame, &pos, &clip,
+                          static_cast<BlitterFlags>(0x600),   // Centered|Transparent
+                          0, 0, 0,
+                          1000,                               // asm: push 3E8h
+                          0, nullptr, 0, 0, 0);
+        }
+    }
+
+    // 军衔角标（原版是独立 vtable 槽，由具体类 Draw 调用；本树统一收在
+    //   DrawExtras 末尾，位置与层级一致）。
+    DrawVeterancy(pCoord, pRect);
 }
 
+// ============================================================================
+// asm: TechnoClass_DrawHidden (asm:1600937 – 1601359，423 行，retn 8)
+//
+//   void __thiscall TechnoClass_DrawHidden(TechnoClass* this, Point2D* pCoord,
+//                                          RectangleStruct* pRect)
+//
+//   原版逐段（IDA 标签 → 语义）：
+//     1) [esi+vt+0x68](0,0) 非零 → 直接退出；
+//     2) [esi+0x12C]（_TechnoClass.t.DeployingAnim）非零 → 直接退出
+//        （展开/收起动画进行中不画隐身影）；
+//     3) Rules->Behind 非空：
+//          位置 = GetCoords();
+//          BehindAnim = new AnimClass(Rules->Behind, 位置, 0,1, 0x600, 0, 0);
+//          BehindAnim->Attach_To(this);
+//          if (!ShowHidden) BehindAnim->Invisible = 1;
+//        然后返回；
+//     4) Rules->Behind 为空：走"隐身影"分支 —— 依 Frame&8 取 0x0C/0x0A 作
+//        半宽，画 8（或 6）段 45° 斜线组成的闪烁带，逐段 X++/Y++ 平移，
+//        颜色取自当前玩家 ColorScheme(+0x308) 的色阶（sub_517440 插值）。
+//
+//   ★ 未能逐句复现的两处（见报告）：
+//      * 首句 vt+0x68 的门控槽：本树 vtable 未按原版槽位重建，无法定位；
+//      * ShowHidden：本树只有 GameOptionsClass::ShowHidden 字段、无全局单例；
+//      * 第 4 段闪烁带依赖 sub_517440（ColorScheme 色阶 ramp 插值）与
+//        StandardPalette 的 bpp 判定，本树未建模 ramp。
+//   因此本函数只落地第 2、3 段（可确证部分）。
+// ============================================================================
 void TechnoClass::DrawHidden(Point2D* pCoord, RectangleStruct* pRect)
 {
     (void)pCoord;
     (void)pRect;
-    // 隐形单位的特殊绘制（若可见于己方）。
+
+    // asm: mov eax,[esi+12Ch] / test eax,eax / jnz 退出
+    //   展开动画进行中不画。
+    if (DeployingAnim != nullptr)
+        return;
+
+    RulesClass* pRules = RulesClass::Instance;
+
+    // asm: mov ecx,RulesData / mov eax,[ecx+RulesClass.Behind] / test / jz 闪烁带
+    if (pRules == nullptr || pRules->Behind == nullptr)
+    {
+        // asm: loc_70F290 —— "隐身影"闪烁带；依赖 StandardPalette 的 bpp 判定
+        //   与 sub_517440 的色阶 ramp 插值，本树未建模，故不画。
+        return;
+    }
+
+    // asm: vt+0x48 = GetCoords(&pos)
+    CoordStruct pos;
+    GetCoords(&pos);
+
+    // asm: push 0(a8) / 0(ForcedZAdjust) / 600h(flags) / 1(loopCount) / 0(a4)
+    //      / &pos / AnimType( = Rules->Behind ) / new AnimClass
+    AnimClass* pAnim = new AnimClass(pRules->Behind, pos, 0, 1, 0x600, 0, false);
+
+    // asm: mov [esi+_TechnoClass.t.BehindAnim], eax / test eax,eax / jz 退出
+    BehindAnim = pAnim;
+    if (pAnim == nullptr)
+        return;
+
+    // asm: AnimClass::Attach_To(this)
+    pAnim->Attach_To(this);
+
+    // asm: mov al,ShowHidden / test / jnz 退出 ; [BehindAnim+Invisible] = 1
+    //   ShowHidden 在本树无全局单例可取（只有 GameOptionsClass 的字段），
+    //   该行暂不复现，动画保持默认可见。
 }
 
 // ============================================================================
@@ -1679,6 +2042,18 @@ CellStruct TechnoClass::Get_Cell_Ptr_Coord() const
 }
 
 // ============================================================================
+// asm: [this+21Ch] —— 归属房索引。
+//
+//   BaseClass::Placed 用它判断"这座建筑是不是本房基地的"，相等时才按
+//   (类型, 格子) 精确匹配节点并盖章。原版该槽在 TechnoClass 构造里由
+//   Owner 的房号写入；本树 Owner 是可空指针，取 -1 表示无主。
+// ============================================================================
+int32 TechnoClass::GetOwningHouseIndex() const
+{
+    return (Owner != nullptr) ? Owner->ArrayIndex : -1;
+}
+
+// ============================================================================
 // TechnoClass - small accessors and state probes
 // ============================================================================
 
@@ -1767,8 +2142,9 @@ bool TechnoClass::IsCrewed() const
     return TechnoType != nullptr && TechnoType->IsCrewed_;
 }
 
- // TechnoClass_IsFactory - the base-class answer is always false;
-// only BuildingClass overrides it.
+// asm: TechnoClass_IsFactory (asm:102415) — xor al, al / retn
+//
+//  A 类：基类恒定答"不是工厂"，BuildingClass 覆写该槽后才有真实答案。
 bool TechnoClass::IsFactory() const
 {
     return false;
@@ -1877,6 +2253,33 @@ bool TechnoClass::IsNotWarpingIn() const
     return WarpInTimer <= 0;
 }
 
+// ============================================================================
+// asm: TechnoClass_37C   (asm:1600595)   —— 虚表槽 0x37C
+//
+//     mov edx, [ecx + _TechnoClass.t.EMPDurationRemaining]
+//     xor eax, eax
+//     test edx, edx
+//     setnle al                  ; AL = (duration > 0)
+//     retn
+//
+//  EMP 是"倒数帧计时器"：脉冲命中时由 EMPulseClass_Initialize 写入脉冲时长，
+// TechnoClass_Update 每帧减一，归零那一帧才恢复动力/雷达。因此这里判 >0，
+// 而不是判 !=0（负数同样视为未瘫痪）。
+// ============================================================================
+bool TechnoClass::IsUnderEMP() const
+{
+    return EMPDurationRemaining > 0;
+}
+
+// ============================================================================
+// 虚表槽 0x380 —— Techno 层没有瘫痪计时器，基类实现恒假。
+// asm 里 Techno 对象的该槽指向 FootClass_IsParalysed；本树由 FootClass 覆写。
+// ============================================================================
+bool TechnoClass::IsParalysed() const
+{
+    return false;
+}
+
  // TechnoClass_IsDraining - true while a drain weapon
 // (e.g. the magnetron) is affecting this object.
 bool TechnoClass::IsDraining() const
@@ -1930,18 +2333,80 @@ bool TechnoClass::CanTraverse() const
     return TechnoType != nullptr;
 }
 
- // TechnoClass_CanSetWaypoint.  Only a player-owned object that
-// is not already running a script may accept a planning waypoint.
+// ============================================================================
+// asm: TechnoClass_CanSetWaypoint   (asm:1573857)   —— 虚表槽 0x0A0
+//      （结构体字段名 CanReceiveWaypoint，What_Action 用它决定 Move 光标）
+//
+// 逐指令还原（ecx = this）：
+//
+//     mov ecx,[esi+21Ch] / call HouseClass::Is_Player
+//     test al,al / jnz next / return false            ; 非玩家所属
+//     call [vt+37Ch]     ; IsUnderEMP  -> 真则 false
+//     cmp  [esi+2E4h],0  ; BunkerLinkedItem -> 非空则 false（在掩体里/占用掩体）
+//     call [vt+84h]      ; GetTechnoType
+//     mov  cl,[eax+0D54h]; TechnoTypeClass::Spawned -> 真则 false（子机）
+//     call [vt+380h]     ; IsParalysed -> 真则 false
+//     call [vt+1E0h]     ; IsNotWarping -> 假则 false
+//     cmp  [esi+2DCh],0  ; SlaveOwner -> 非空则 false（奴隶兵）
+//     mov  al,[esi+1C8h] ; Deactivated -> 真则 false
+//     mov  ecx,[esi+SpawnManager]
+//     test ecx,ecx / jz return true
+//     call CountSpecialSpawns ; <=0 则 return true
+//     n = SpawnManager->CountSpecialSpawns()
+//     if (n < GetTechnoType()->SpawnsNumber) return false
+//     return true
+//
+// 字段身份核对（IDA 结构里字段名与对象偏移差 4，因为 `_TechnoClass` 把
+// vtable 单独建模）：
+//   +0x2E4 = TechnoClass.BunkerLinkedItem（不是无名 field_2E4）
+//   +0x2DC = TechnoClass.SlaveOwner
+//   +0xD54 = TechnoTypeClass.Spawned（bool；紧随其后的 +0xD58 才是 Spawns 指针）
+// ============================================================================
 bool TechnoClass::CanSetWaypoint() const
 {
-    if (Owner == nullptr || !Owner->IsHumanPlayer)
+    // asm: mov ecx,[esi+21Ch] / call HouseClass::Is_Player
+    if (Owner == nullptr)
         return false;
 
-    if (IsBeingWarpedOut())
+    bool isPlayer = false;
+    if (Owner->Is_Player(&isPlayer) != S_OK || !isPlayer)
         return false;
 
-    if (PlanningToken != -1)
+    // asm: call [vt+37Ch]  —— EMP 计时器仍在走
+    if (IsUnderEMP())
         return false;
+
+    // asm: cmp [esi+2E4h],0 —— 在掩体里，或自己就是装着人的掩体
+    if (BunkerLinkedItem != nullptr)
+        return false;
+
+    // asm: call [vt+84h] / mov cl,[eax+0D54h] —— 子机（Spawned）由母舰调度
+    if (TechnoType != nullptr && TechnoType->Spawned)
+        return false;
+
+    // asm: call [vt+380h]  —— 瘫痪计时器（FootClass 覆写）
+    if (IsParalysed())
+        return false;
+
+    // asm: call [vt+1E0h]  —— ObjectClass::IsNotWarping（基类恒真）
+    if (!IsNotWarping())
+        return false;
+
+    // asm: cmp [esi+2DCh],0 —— 奴隶兵由奴隶矿车调度
+    if (SlaveOwner != nullptr)
+        return false;
+
+    // asm: mov al,[esi+1C8h]
+    if (Deactivated)
+        return false;
+
+    // asm: SpawnManager 在册且已放出子机、但还没放满 -> 拒绝
+    if (SpawnManager != nullptr && TechnoType != nullptr)
+    {
+        const int32 specialSpawns = SpawnManager->CountSpecialSpawns();
+        if (specialSpawns > 0 && specialSpawns < TechnoType->SpawnsNumber)
+            return false;
+    }
 
     return true;
 }
@@ -2050,8 +2515,12 @@ CellStruct TechnoClass::GetCellCoords() const
 }
 
 // TechnoClass_GetAntiAirValue / GetAntiArmorValue / GetAntiInfantryValue
- // ( / 0x41B54F / 0x41B557).  The base implementation scores zero
-// on every axis; the concrete combat units override these.
+//
+//  asm: TechnoClass_GetAntiAirValue      (asm:102440) — xor eax, eax / retn
+//  asm: TechnoClass_GetAntiArmorValue    (asm:102453) — xor eax, eax / retn
+//  asm: TechnoClass_GetAntiInfantryValue (asm:102466) — xor eax, eax / retn
+//
+//  A 类：三个函数在汇编里都只有一条清 EAX，基类在三条轴上统统记 0 分。
 int32 TechnoClass::GetAntiAirValue() const
 {
     return 0;
@@ -2067,16 +2536,18 @@ int32 TechnoClass::GetAntiInfantryValue() const
     return 0;
 }
 
- // asm: vt_TechnoClass.CanOccupyFire   (asm:?)
+// asm: TechnoClass_CanOccupyFire (asm:102575) — xor al, al / retn
 //
-//  Only garrisonable structures and the infantry inside them can fire from
-//  an occupied building, so the base implementation answers false.
+//  A 类：汇编即常量 false。只有可驻守的建筑和驻守其中的步兵能从建筑里开火，
+//  基类答"不能"。
 bool TechnoClass::CanOccupyFire() const
 {
     return false;
 }
 
- // TechnoClass_GetOccupantCount.  The base class holds nobody.
+// asm: TechnoClass_GetOccupantCount (asm:102599) — xor eax, eax / retn
+//
+//  A 类：基类不承载驻军，汇编直接返回 0。
 int32 TechnoClass::GetOccupantCount() const
 {
     return 0;
@@ -2086,19 +2557,25 @@ int32 TechnoClass::GetOccupantCount() const
 // TechnoClass - panic / idle / power batch
 // ============================================================================
 
- // TechnoClass_Panic (xx): the base class has no morale model, so
-// the no-argument panic entry point is empty.  FootClass overrides it.
+// asm: FootClass_Panic (asm:102830) — 裸 retn
+//
+//  B 类：基类默认空体。汇编里该槽在 FootClass 层的实现就是一条 retn，
+//  真正有士气模型的 InfantryClass 覆写它（InfantryClass_Panic, asm:635729）。
+//  TechnoClass 自身没有独立的 Panic 符号，故空体与汇编一致。
 void TechnoClass::Panic()
 {
 }
 
-// TechnoClass_Unpanic: the base class has no morale model, so this is empty.
+// asm: FootClass_Unpanic (asm:102841) — 裸 retn
+//
+//  B 类：同上，基类空体；InfantryClass_Unpanic (asm:635759) 覆写。
 void TechnoClass::Unpanic()
 {
 }
 
- // TechnoClass_IdleAction: the default idle action never
-// reports completion; missions that have an idle phase override it.
+// asm: TechnoClass_IdleAction (asm:102691) — xor al, al / retn
+//
+//  A 类：默认待命动作从不上报"完成"，汇编即常量 false。
 bool TechnoClass::IdleAction()
 {
     return false;
@@ -2117,8 +2594,9 @@ void TechnoClass::Enter_Idle_Mode(int32 a3, int32 a4)
     QueueMission(Mission::Guard);
 }
 
- // TechnoClass_IsPowerOnline (x): only structures carry power
-// state, so the base class reports "not online".
+// asm: TechnoClass_IsPowerOnline (asm:1574574) — xor al, al / retn
+//
+//  A 类：只有建筑带电力状态，基类汇编直接答"不在线"。
 bool TechnoClass::IsPowerOnline() const
 {
     return false;
@@ -2204,7 +2682,122 @@ bool TechnoClass::IsTemporalSource() const
     return TemporalImUsing->Victim != nullptr;
 }
 
- // asm: byte __thiscall TechnoClass_IsLegalWeapon(_TechnoClass *this, WeaponContainer *weap)   (asm:1598778)
+// ============================================================================
+// asm: TechnoClass_9C   (asm:1574440, retn)
+//
+//   逐指令（ecx = this）：
+//     mov al,[esi+1C8h] / test / jnz  -> false   ; Deactivated
+//     mov ecx,[esi+21Ch] / call HouseClass::Is_Player / test / jz -> false
+//     mov eax,[esi] / call [eax+3F4h]            ; GetWeapon_TurretChanger
+//     test eax,eax / jz -> false
+//     cmp dword ptr [eax],0 / jz -> false        ; 槽里的 WeaponType 为空
+//     mov edx,[esi] / call [edx+37Ch]            ; IsUnderEMP
+//     test al,al / jnz -> false
+//     mov al,1
+//
+//  +0x21C 是 Owner，+0x1C8 是 Deactivate 标志（TechnoClass_Activate 清 0、
+//  TechnoClass_Deactivate 置 1）。本树把该字节建模为 IsDizzy。
+//  0x37C 的实现在 FootClass 层（ParalysisTimer），因此只有 Unit / Infantry /
+//  Aircraft 三类才需要追加该判定；建筑/地形等没有瘫痪计时器。
+// ============================================================================
+void TechnoClass::Start_Default_Mission()
+{
+    // 只有任务还没确定的对象才需要启动；建筑等静止对象也会被 Entry 起来，
+    //   Guard 在建筑上的处理就是"原地不动"，与原版一致。
+    if (CurrentMission != Mission::None)
+        return;
+
+    QueueMission(Mission::Guard);          // Enter_Idle_Mode 已做过，幂等
+    if (ReadyToNextMission())
+        NextMission();                     // asm: call [vt+1ECh]
+}
+
+bool TechnoClass::Init_Locomotion()
+{
+    if (Locomotor != nullptr)
+        return true;
+
+    if (TechnoType == nullptr)
+        return false;
+
+    int32 id = LocomotionClass::CLSIDs::FromString(TechnoType->Locomotor);
+
+    // 类型没登记 Locomotor（内置兜底规则集里常见）时按 RTTI 给默认值。
+    // 原版每个 UnitType/InfantryType/AircraftType 都必须写，缺省即装配失败；
+    // 本树的 fallback 规则没有这些键，给默认值才不会让整局静止。
+    if (id < 0)
+    {
+        switch (WhatAmI())
+        {
+        case AbstractType::Unit:     id = LocomotionClass::CLSIDs::Drive; break;
+        case AbstractType::Infantry: id = LocomotionClass::CLSIDs::Walk;  break;
+        case AbstractType::Aircraft: id = LocomotionClass::CLSIDs::Fly;   break;
+        default: return false;      // 建筑等静止对象没有行走逻辑
+        }
+    }
+
+    LocomotionClass* pLoco = LocomotionClass::CreateInstance(id);
+    if (pLoco == nullptr)
+        return false;
+
+    pLoco->Link_To_Object(this);
+    Locomotor = pLoco;
+
+    // 足类另有同义字段 FootClass::Locomotion（原版两者是同一个 +0x674，
+    //  本树拆成了两个指针），逐帧行走与 Set_Destination 都读它，必须同步。
+    const AbstractType kind = WhatAmI();
+    if (kind == AbstractType::Unit || kind == AbstractType::Infantry
+        || kind == AbstractType::Aircraft)
+    {
+        static_cast<FootClass*>(this)->Locomotion = pLoco;
+    }
+
+    return true;
+}
+
+bool TechnoClass::Can_Be_Commanded() const
+{
+    if (Deactivated)                                    // asm: [esi+1C8h]
+        return false;
+
+    if (Owner == nullptr)                               // asm: [esi+21Ch]
+        return false;
+
+    bool isPlayer = false;
+    if (Owner->Is_Player(&isPlayer) != S_OK || !isPlayer)
+        return false;
+
+    WeaponStruct* pWeapon = GetTurretChangingWeapon();  // asm: [vt+3F4h]
+    if (pWeapon == nullptr)
+        return false;
+
+    if (pWeapon->WeaponType == nullptr)                 // asm: cmp [eax],0
+        return false;
+
+    // asm: call [vt+37Ch] —— EMP 计时器未走完就拒绝指挥。
+    if (IsUnderEMP())
+        return false;
+
+    return true;
+}
+
+// ============================================================================
+// asm: TechnoClass_374   (asm:1572021)   虚表槽 0x374
+//
+//   原版：把 mission 写进 NetworkEvent，交给 Networking_AddEvent_Noopt
+//   入 0x80 槽环形队列，全部客户端按序消费。本工程走直接分派（功能等价）：
+//   能收命令的个体把任务压进 MissionClass 队列，返回 true 让调用方播语音。
+// ============================================================================
+bool TechnoClass::DispatchMission(Mission mission)
+{
+    if (!Can_Be_Commanded())
+        return false;
+
+    Queue_Mission(mission);
+    return true;
+}
+
+// asm: byte __thiscall TechnoClass_IsLegalWeapon(_TechnoClass *this, WeaponContainer *weap)   (asm:1598778)
 //
 //  A weapon container is legal only when it is non-null and its first dword
 //  (the weapon id) is non-zero.
@@ -2376,39 +2969,92 @@ ObjectClass* TechnoClass::Greatest_Threat(int32 projFlags, int32 curThreat, int3
         break;
     }
 
-    // Phase 4 - walk the global Techno table and keep the highest-threat
-    // candidate that Evaluate_Object accepts.  A caller-supplied curThreat
-    // acts as the incumbent, so only strictly better targets are returned.
-    int32 bestThreat = curThreat;
+    // Phase 4 - 扫描半径内的格子，保留威胁评分最高者。
+    //
+    //   asm loc_6F9042..loc_6F9116：a4 为 0 时按"本单位武器的最大射程"推导
+    //   扫描半径（格）：
+    //       r = (max(GetWeaponRange(0), GetWeaponRange(1)) >> 8)
+    //         + (type->AirRangeBonus >> 8) + 1
+    //   随后 loc_6F93C1 起是 ±r 的方形环扫描，逐格调 Evaluate_Cell。
+    //   此前这里遍历的是全局 Techno 表、完全没有距离门：任何单位都会锁上
+    //   地图另一头的敌人，原地干瞪眼。
+    int32 radius = a4;
+    if (radius <= 0) {
+        int32 r0 = GetWeaponRange(0);
+        int32 r1 = GetWeaponRange(1);
+        const int32 bestRange = (r0 > r1) ? r0 : r1;
+        const int32 airBonus  = (TechnoType != nullptr)
+                              ? (TechnoType->AirRangeBonus * 256) : 0;
+        radius = (bestRange / 256) + (airBonus / 256) + 1;
+    }
+    if (radius <= 0)
+        radius = 1;
+    if (radius > 32)                       // 防御性上限，避免异常射程拖爆
+        radius = 32;
+
+    if (MapClass::Instance == nullptr)
+        return nullptr;
+
+    const CellStruct here = GetCellCoords();
+
+    int32 bestThreat = -1;
     ObjectClass* bestObject = nullptr;
 
-    if (TechnoClass::Array != nullptr) {
-        for (int32 i = 0; i < TechnoClass::Array->Count; ++i) {
-            TechnoClass* pCandidate = (*TechnoClass::Array)[i];
-            if (pCandidate == nullptr || pCandidate == this)
+    for (int32 dy = -radius; dy <= radius; ++dy) {
+        for (int32 dx = -radius; dx <= radius; ++dx) {
+            const CellStruct probe(static_cast<int16>(here.X + dx),
+                                   static_cast<int16>(here.Y + dy));
+            if (!MapClass::Instance->In_Radar(probe, false))
                 continue;
 
-            int32 threat = 0;
-            if (!Evaluate_Object(scanFlags, scanFlags, 0, pCandidate, &threat, -1, nullptr))
+            CellClass* pCell = MapClass::Instance->GetCellAt(probe);
+            if (pCell == nullptr)
                 continue;
 
-            if (threat > bestThreat) {
-                bestThreat = threat;
-                bestObject = pCandidate;
+            // 有界遍历：脏链/环会让"扫描一圈"变成死循环（实测链长 >513
+            // 时整帧卡死）。正常格子最多叠十几个对象，512 只是保险丝。
+            int32 chainGuard = 0;
+            for (ObjectClass* pObj = pCell->FirstObject; pObj != nullptr;
+                 pObj = pObj->NextObject)
+            {
+                if (++chainGuard > 512)
+                    break;
+                const AbstractType what = pObj->WhatAmI();
+                if (what != AbstractType::Unit && what != AbstractType::Infantry
+                 && what != AbstractType::Aircraft && what != AbstractType::Building)
+                    continue;
+                if (pObj == this)
+                    continue;
+
+                TechnoClass* pCandidate = static_cast<TechnoClass*>(pObj);
+                int32 threat = 0;
+                if (!Evaluate_Object(scanFlags, scanFlags, 0, pCandidate,
+                                     &threat, -1, nullptr))
+                    continue;
+
+                if (threat > bestThreat) {
+                    bestThreat = threat;
+                    bestObject = pCandidate;
+                }
             }
         }
     }
+
+
+    // asm loc_6F9363: cmp curThreat, BestThreat / jle —— 只有严格更优才换目标。
+    if (bestObject == nullptr || bestThreat <= curThreat)
+        return nullptr;
 
     return bestObject;
 }
 
 // ============================================================================
- // 根据游戏行为，可知 UpdatePowered 负责下面这段逻辑。
+// asm: TechnoClass::UpdatePowered —— 汇编里没有 TechnoClass 版本的同名 proc。
 //
-//  Re-evaluates the "am I still being fed power?" latch for a techno that
-//  depends on an external power source.  The base implementation carries no
-//  power consumer state, so it is a no-op; derived classes with real
-//  consumers (laser fence posts, prism towers) override it.
+//  唯一有符号的实体是 BuildingClass_UpdatePowered (asm:213345)，它是
+//  BuildingClass 对自己电力联动的处理（asm 里有实打实的字段读写与子调用）。
+//  基类 TechnoClass 的该槽在原版里没有任何可定位的实现，本项目据此外推为
+//  空体；为避免凭空造行为，保持 no-op。B 类（基类默认，BuildingClass 覆写）。
 // ============================================================================
 void TechnoClass::UpdatePowered()
 {
@@ -3197,22 +3843,50 @@ void TechnoClass::ExpireDrain()
 }
 
 // ============================================================================
- // asm: void __thiscall TechnoClass_UpdateThreatToCell(_TechnoClass *this, CellClass *this)   (asm:1601446)
+// asm: void __thiscall TechnoClass_UpdateThreatToCell(_TechnoClass *this,
+//                                                    CellClass *cell)
+//      (asm:1601447, retn 4)
 //
-//  把本单位当前的威胁值贡献给它所踩的格子。威胁值由 GetThreatValue 求出，
-//  随后通过格子的威胁调节入口写入，供寻路与 AI 做危险区评估。
+//  单位每跨一格就把"威胁贡献"从旧格搬到新格，分两步做：
+//     ① cell->Adjust_Threat(owner, -ThreatPosed)   把上次记下的量从格子摘掉
+//     ② ThreatPosed = 0
+//     ③ v = this->vt[+0x2C0]()                      重新求当前威胁（GetThreatValue）
+//     ④ ThreatPosed = v
+//     ⑤ cell->Adjust_Threat(owner, v)               加到新格
+//  Adjust_Threat 的两个实参顺序是 (HouseClass*, int32)，与 asm 的
+//  push threat / push house 一致。
+//
+//  ★ 原实现漏了①的"负向摘除"，也漏了把 ThreatPosed 清零后重算——它每次
+//    只加不减，同一格反复经过会把威胁值越堆越高，AI 把该格当成死亡区。
 // ============================================================================
-void TechnoClass::UpdateThreatToCell()
+void TechnoClass::UpdateThreatToCell(CellClass* pCell)
 {
-    CellClass* pCell = GetCell1();
     if (pCell == nullptr)
         return;
 
+    // ① 摘掉上一次的贡献
+    pCell->Adjust_Threat(Owner, -ThreatPosed);
+
+    // ② 清缓存
+    ThreatPosed = 0;
+
+    // ③ 重新求值（asm: call [eax+2C0h]）
     const int32 threat = GetThreatValue();
     if (threat == 0)
         return;
 
+    // ④ 记下
+    ThreatPosed = threat;
+
+    // ⑤ 加到新格
     pCell->Adjust_Threat(Owner, threat);
+}
+
+// 无参重载：原版调用点由调用方把 cell 显式传进来；本树里 Per_Cell_Process
+// 等钩子手上没有现成 cell 时，用它自己所踩的格子顶替，语义相同。
+void TechnoClass::UpdateThreatToCell()
+{
+    UpdateThreatToCell(GetCell1());
 }
 
 // ============================================================================
@@ -3310,9 +3984,12 @@ void TechnoClass::ClearPlanningNodes()
     if (pOwner == nullptr)
         return;
 
-    // 清掉本阵营名下的全部规划路线槽位。
-    for (int32 i = 0; i < HouseClass::MaxPlanningPaths; ++i)
+    // 清掉本阵营名下的全部规划路线槽位（路线对象由阵营持有，这里连对象一起
+    // 释放，避免只置空指针导致泄漏）。
+    for (int32 i = 0; i < HouseClass::MaxPlanningPaths; ++i) {
+        delete pOwner->PlanningWaypoints[i];
         pOwner->PlanningWaypoints[i] = nullptr;
+    }
 
     pOwner->NextPlanningWaypointSlot = 0;
 }
@@ -3320,171 +3997,272 @@ void TechnoClass::ClearPlanningNodes()
 // ============================================================================
 // asm: eDamageState __thiscall TechnoClass_ReceiveDamage(_TechnoClass *this, int *Damage, int TypeSource, WarheadTypeClass *WH, int target, int ignoreDefenses, int arg10, HouseClass_old *SourceHouse)   (asm:1575554)
 //
-//  单位承受伤害的统一入口，逐段对应汇编：
-//    1. 取 *Damage；ignoreDefenses 或 Damage<0 时直接跳过装甲结算
-//       （asm: jnz loc_701A3B / test al,al / jnz loc_701A3B）
-//    2. Damage /= House->GetTypeArmorMult(type) * this->ArmorMultiplier
-//       再 Float_To_Int_Floor（asm: fdivr / call Float_To_Int_Floor）
-//    3. 老兵/精锐装甲加成；Damage = max(Damage, 1)
-//    4. 铁幕（IronCurtained）→ Damage = 0
-//    5. 各种免疫（Radiation / Poison / Psychedelic ...）→ Damage = 0
-//    6. Damage *= Verses（GetTotalDamage(Damage, WH, Armor)）
-//    7. 转交 ObjectClass_ReceiveDamage(this, pDamage, typeSource, pWarhead,
-//       target, ignoreDefenses, arg10, pSourceHouse) 做最终结算
-//  本实现目前覆盖 1/2/6/7 四段核心链路，其余分支按铁律①留待后续逐段补齐。
+//  单位承受伤害的统一入口：
+//    1. 负数伤害（维修/治疗）直接放行，不参与装甲结算、不触发还击
+//       （asm: `test eax,eax / setl al / mov [var_B1],al`，var_B1 = Damage<0）；
+//    2. 装甲倍率 × Verses 的结算只有一份，在 TakeDamage_Impl 里
+//       （asm: GetTypeArmorMult / ArmorMultiplier / fdivr / GetTotalDamage）；
+//    3. 写回 *Damage = 实际扣掉的血量；
+//    4. 还活着的话走受击还击（asm loc_702A25）：
+//         ShouldRetaliate(攻击者) 为真 → Override_Mission(Attack, 攻击者, 0)
+//       玩家单位若连攻击者都看不到（超出 Sight）则不还击，改为散射
+//       （散射分支 loc_702BFE 本树未接入，见下方注释）。
+//
+//  ★ 旧实现把装甲倍率与 Verses 在 ReceiveDamage 里算了一遍，又交给
+//    TakeDamage_Impl 再算一遍 —— 同一发子弹被缩放两次（50% Verses 实际只吃
+//    25%）。现在只保留 TakeDamage_Impl 那一份。
 // ============================================================================
 int32 TechnoClass::ReceiveDamage(int32* pDamage, int32 typeSource,
-                                 WarheadTypeClass* pWarhead, int32 target,
+                                 WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                  int32 ignoreDefenses, int32 arg10,
                                  HouseClass* pSourceHouse)
 {
     (void)typeSource;
     (void)arg10;
+    (void)pSourceHouse;
 
     if (pDamage == nullptr)
         return 0;
 
-    int32 damage = *pDamage;
+    // asm ObjectClass_ReceiveDamage 开头：Health <= 0 → dsUnaffected。
+    //   尸体在摘表之前还会被弹片扫到；不拦这一下会二次 RegisterDestruction /
+    //   二次 Destroyed，经验与战损统计都会重复。
+    if (Health <= 0 || IsDead())
+        return 0;
 
-    // asm: test eax,eax / setl al / test cl,cl / jnz loc_701A3B
-    //  负数伤害与 ignoreDefenses 都跳过装甲倍率，直接进入后续结算。
-    if (damage > 0 && ignoreDefenses == 0)
+    const int32 requested = *pDamage;
+
+    // asm: var_B1 = (Damage < 0) —— 负伤害（维修）既不结算装甲也不触发还击。
+    if (requested <= 0)
+        return 0;
+
+    int32 finalDamage = 0;
+    TakeDamage_Impl(requested, pAttacker, pWarhead, &finalDamage,
+                    ignoreDefenses != 0);
+
+    // asm: mov [ebx],eax —— 把结算后的伤害写回调用方的变量。
+    *pDamage = finalDamage;
+
+    if (finalDamage <= 0)
+        return 0;                       // 被铁幕/免疫/护甲完全吃掉
+
+    // asm: eDamageState 的 4 = 死亡（AircraftClass 的坠毁判定就认这个值）。
+    //   1..3（绿/黄/红血条状态）需要 ConditionYellow/ConditionRed 阈值，
+    //   本树尚无消费方，一律按 0 = 无状态变化返回。
+    if (Health <= 0 || IsDead())
     {
-        // asm: call [eax+vt_TechnoClass.r.m.o.GetTechnoType]
-        //      mov ecx,[this+_FootClass.f.t.OwningPlayer]
-        //      call HouseClass_GetTypeArmorMult
-        //      fmul [this+_TechnoClass.t.ArmorMultiplier]
-        //      fdivr [esp+var_B0] / call Float_To_Int_Floor
-        if (Owner != nullptr && TechnoType != nullptr)
+        // 致命那一发也要留证：还击探针只在"没死"的分支里打印，击杀时这里
+        // 会先返回 4，日志里就只剩一串非致命命中 —— 伤害封顶的测试需要
+        // 看到"dmg 被裁到剩余血量"的那一发。
+        static const bool kRetalDbgLethal =
+            (std::getenv("OPENYR_RETAL_DBG") != nullptr);
+        if (kRetalDbgLethal)
         {
-            const double typeArmor = Owner->Get_Type_Armor_Mult(TechnoType);
-            const double divisor   = typeArmor * ArmorMultiplier;
-            if (divisor > 0.0)
-                damage = static_cast<int32>(Float_To_Int_Floor(
-                             static_cast<double>(damage) / divisor));
+            std::fprintf(stderr,
+                         "[RETAL] killed self=%p attacker=%p dmg=%d hp=%d"
+                         " mission=%d cell=(%d,%d)\n",
+                         static_cast<void*>(this), static_cast<void*>(pAttacker),
+                         (int)finalDamage, (int)Health,
+                         (int)GetMission(),
+                         (int)CellClass::Coord2Cell(GetCoords()).X,
+                         (int)CellClass::Coord2Cell(GetCoords()).Y);
         }
-
-        // asm: cmp dword ptr [ebx],1 / mov dword ptr [ebx],1  ; Damage = max(Damage,1)
-        if (damage < 1)
-            damage = 1;
+        return 4;
     }
 
-    // asm: loc_701D4D → call GetTotalDamage(potentialDamage, WH, Armor)
-    //      mov [ebx],eax  ; Damage *= Verses
-    if (damage > 0 && pWarhead != nullptr && TechnoType != nullptr)
+    // ── 受击还击（asm loc_702A25 .. loc_702B47）────────────────────────────
+    //   调试开关 OPENYR_RETAL_DBG=1：每次挨打打印一条还击判定，端到端
+    //   回归（tools/run_retaliation_test.sh）就靠这一行取证。
+    static const bool kRetalDbg = (std::getenv("OPENYR_RETAL_DBG") != nullptr);
+
+    const Mission missionBefore = GetMission();
+    const bool should = ShouldRetaliate(pAttacker);
+
+    if (kRetalDbg)
     {
-        const float mult = pWarhead->GetDamageMultiplier(
-                               static_cast<int32>(TechnoType->Get_Armor()));
-        damage = static_cast<int32>(Float_To_Int_Floor(
-                     static_cast<double>(damage) * static_cast<double>(mult)));
+        std::fprintf(stderr,
+                     "[RETAL] hit self=%p attacker=%p dmg=%d hp=%d canRetal=%d"
+                     " should=%d mission=%d tgt=%p cell=(%d,%d)\n",
+                     static_cast<void*>(this), static_cast<void*>(pAttacker),
+                     (int)finalDamage, (int)Health,
+                     (TechnoType != nullptr) ? (int)TechnoType->CanRetaliate : -1,
+                     (int)should, (int)missionBefore,
+                     static_cast<void*>(GetTarget()),
+                     (int)CellClass::Coord2Cell(GetCoords()).X,
+                     (int)CellClass::Coord2Cell(GetCoords()).Y);
     }
 
-    // asm: loc_701DCC → ObjectClass_ReceiveDamage(this, Damage, TypeSource, WH,
-    //      target, ignoreDefenses, arg10, SourceHouse) ；返回 eDamageState
-    *pDamage = damage;
-    const bool applied = this->TakeDamage_Impl(damage, nullptr, nullptr);
-    (void)target;
-    (void)pSourceHouse;
+    if (!should || pAttacker == nullptr)
+        return 0;
 
-    return applied ? damage : 0;
+    // asm: SelectWeapon(target) / IsCloseEnough(target, idx)
+    const int32 idx = SelectWeapon(pAttacker);
+    bool doAttack = true;
+
+    if (!IsCloseEnoughToTarget(pAttacker, idx))
+    {
+        // asm: 够不着时只有**玩家**单位会退回"散射"；AI 单位照样转 Attack
+        //       （它没有视野概念，靠命令去追）。
+        if (Owner != nullptr && Owner->Is_Human())
+        {
+            CoordStruct a{};
+            CoordStruct me{};
+            pAttacker->GetCoords(&a);
+            GetCoords(&me);
+
+            const double dx = static_cast<double>(a.X - me.X);
+            const double dy = static_cast<double>(a.Y - me.Y);
+            const double dz = static_cast<double>(a.Z - me.Z);
+            const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            // asm: (Sight + 0.5) * 256 与真实距离比较，看不见就不还击。
+            const double sight = (TechnoType != nullptr ? TechnoType->Sight : 0) + 0.5;
+            if (dist > sight * 256.0)
+                doAttack = false;
+        }
+    }
+
+    if (doAttack)
+    {
+        // asm: [vt+1F4](1, target, 0) = Override_Mission(Attack, target, 0)
+        //   必须走 TechnoClass 版覆写：它会把旧目标存进 LastTarget 并用
+        //   SetTarget() 虚分派写到派生类的目标槽上。直接调基类版本只会换
+        //   任务、目标仍为空，Mission_Attack 下一帧就自己退回 Guard。
+        Override_Mission(Mission::Attack, pAttacker, nullptr);
+
+        if (kRetalDbg)
+        {
+            std::fprintf(stderr,
+                         "[RETAL] switch self=%p mission=%d->%d target=%p\n",
+                         static_cast<void*>(this),
+                         (int)missionBefore, (int)GetMission(),
+                         static_cast<void*>(GetTarget()));
+        }
+    }
+    // asm loc_702BFE 的"不还击 → 散射"分支（MissionControl.Scatter 门 +
+    //   车辆 VeteranAbilities.Sight 门）本树尚未接入 Scatter 虚槽，暂缺。
+
+    return 0;
 }
 
 // ============================================================================
-// asm: void __thiscall TechnoClass_DrawVeterancy(_TechnoClass *this, dwXYZ *a2, int a3)   (asm:1591992)
+// asm: TechnoClass_DrawVeterancy (asm:1591992)
+//      void __thiscall(TechnoClass* this, Point2D* pos, Rectangle* bounds)
 //
-//  在单位头顶按军衔画出升阶标记：新兵不画，老兵画一枚，精锐画两枚。标记画
-//  在单位屏幕坐标的正上方，坐标由渲染层传入。没有军衔的普通单位直接返回。
+//  PIPS.SHP 上的军衔角标，一次只画一个：
+//      Veterancy_IsVeteran   -> frame 0x0E
+//      Veterancy_IsElite     -> frame 0x0F（优先级更高，覆盖 0x0E）
+//      Veterancy_IsPreRookie -> frame 0x13
+//      都不是                -> 直接返回
+//
+//  落点 = pos + (5, 2)；不是建筑（WhatAmI != 0x0F）时再 +（5, 4）。
+//  CC_Draw_Shape 用 0xE00（Alpha|Transparent|Centered）、Remap = -2、
+//  brightness = 1000。
+//
+//  注：asm 走 Veterancy 结构的三个浮点判据；本树 TechnoClass 直接用
+//  VeterancyLevel（0=Rookie / 1=Veteran / 2=Elite）承载，PreRookie 的
+//  "负经验"状态只在 Veterancy 容器里存在，单位上没有对应状态位，故不画
+//  0x13 帧。
 // ============================================================================
 void TechnoClass::DrawVeterancy(Point2D* pCoord, RectangleStruct* pRect)
 {
-    if (pCoord == nullptr) {
+    if (pCoord == nullptr)
         return;
+
+    int32 frame = -1;
+    if (this->VeterancyLevel == 1)
+        frame = 0x0E;                       // asm: Veterancy_IsVeteran
+    if (this->VeterancyLevel >= 2)
+        frame = 0x0F;                       // asm: Veterancy_IsElite
+
+    if (frame == -1)
+        return;
+
+    Point2D pos(pCoord->X + 5, pCoord->Y + 2);
+
+    // asm: call vt+0x2C（WhatAmI）/ cmp eax,0Fh / jz 跳过二次偏移
+    //   0x0F = AbstractType::Infantry（项目枚举与 asm 同值）。
+    //   步兵的角标紧贴脚点右下；载具/飞机/建筑的画布更大，再推 (5,4)。
+    if (this->WhatAmI() != AbstractType::Infantry) {
+        pos.X += 5;
+        pos.Y += 4;
     }
 
-    // asm: TechnoClass_DisplayTalkBubble
-    if (this->VeterancyLevel <= 0) {
+    SHPStruct* pShape = ObjectTypeClass::Get_Pips_Shape();
+    Surface*   pSurface = UnitArt::GetTacticalSurface();
+    if (pShape == nullptr || pSurface == nullptr)
         return;
-    }
 
-    (void)pRect;
+    Rectangle clip(0, 0, pSurface->GetWidth(), pSurface->GetHeight());
+    if (pRect != nullptr && pRect->Width > 0 && pRect->Height > 0)
+        clip = Rectangle(pRect->X, pRect->Y, pRect->Width, pRect->Height);
 
-    // asm: TechnoClass_DisplayTalkBubble
-    //  并排画在单位头上方。这里把绘制请求交给战术层，由它按当前缩放与
-    //  偏移落在正确位置。
-    if (TacticalClass::Instance == nullptr) {
-        return;
-    }
-
-    // asm: TechnoClass_DisplayTalkBubble
-    //  一段，横坐标保持居中。
-    const int32 markers = (this->VeterancyLevel >= 2) ? 2 : 1;
-    const int32 halfSpan = (markers - 1) * 8;
-
-    Point2D pos;
-    pos.X = pCoord->X - halfSpan;
-    pos.Y = pCoord->Y - 16;
-
-    Point2D offset;
-    offset.X = 0;
-    offset.Y = 0;
-
-    TacticalClass::Instance->ApplyMatrix_Pixel(&pos, &offset);
-
-    (void)markers;
+    CC_Draw_Shape(pSurface, StandardPalette, pShape, frame, &pos, &clip,
+                  static_cast<BlitterFlags>(0xE00),   // Alpha|Transparent|Centered
+                  -2,                                  // asm: push 0FFFFFFFEh
+                  0, 0,
+                  1000,                                // asm: push 3E8h
+                  0, nullptr, 0, 0, 0);
 }
 
 // ============================================================================
-// asm: TechnoClass_DisplayTalkBubble
+// asm: TechnoClass_DisplayTalkBubble (asm:1600862)
+//      void __fastcall TechnoClass_DisplayTalkBubble(_TechnoClass *this, int type)
 //
-//  让单位在头顶冒出一个气泡：内部先判断这次说话是否到了可以再显示的时候，
-//  过了间隔才真正把气泡挂上去；气泡文本由调用方给出，显示时长由文本长度
-//  决定。已经在说话的单位会被忽略，避免同一时间挂两个气泡。
+//  全局单槽话泡：同一时刻只有一个人说话，状态写在三个 .data 槽里。
+//
+//    this == null || type == 0  →  loc_70F194：Type=0、Owner=0、Timer 清零；
+//    否则：
+//      TalkBubbleType  = type
+//      TalkBubbleOwner = this
+//      TalkBubbleTimer = { TimeStart = now, TimeLeft = Rules->TalkBubbleTime }
+//      → 取本单位坐标并让该处可见（原版 MapClass::Sight_From）。
+//
+//  注意参数是**帧号**（1-based，TALKBUBL.SHP 的帧），不是文本：原版气泡
+//  里画的是图标（感叹号/问号/省略号），没有字符串。
 // ============================================================================
-bool TechnoClass::DisplayTalkBubble(const wchar_t* pText, int32 duration)
+int32        TalkBubbleType  = 0;
+TechnoClass* TalkBubbleOwner = nullptr;
+TimerStruct  TalkBubbleTimer;
+
+void TechnoClass::DisplayTalkBubble(int32 type)
 {
-    if (pText == nullptr) {
-        return false;
-    }
-
-    // 根据游戏行为，可知单位正忙（已经在显示气泡）时不再叠加新的气泡，
-    //  否则两个气泡会互相覆盖。
-    if (this->IsTalking) {
-        return false;
-    }
-
-    // 根据游戏行为，可知说话有最短间隔，短时间内连续触发只保留第一次，
-    //  避免刷屏。
-    const int32 now = Game::GetCurrentFrame();
-    if (this->LastTalkFrame != 0 && now - this->LastTalkFrame < 30) {
-        return false;
-    }
-
-    this->IsTalking      = true;
-    this->TalkBubbleText = pText;
-    this->TalkBubbleEnd  = now + (duration > 0 ? duration : 90);
-    this->LastTalkFrame  = now;
-
-    return true;
+    DisplayTalkBubble_Global(this, type);
 }
 
-// ============================================================================
-// 根据游戏行为，可知 UpdateTalkBubble 负责下面这段逻辑。
-//
-//  推进气泡的计时：到点之后把气泡状态清掉，让单位可以再次说话。每帧都会被
-//  调用，是 DisplayTalkBubble 的收尾环节。
-// ============================================================================
-void TechnoClass::UpdateTalkBubble()
+void TechnoClass::DisplayTalkBubble_Global(TechnoClass* pOwner, int32 type)
 {
-    if (!this->IsTalking) {
+    const int32 now = SystemTimer::GetTime();
+
+    // asm: test esi,esi / jz loc_70F194 —— this 为空；
+    //      test edx,edx / jz loc_70F194 —— type 为 0。
+    //   两条都走"收掉当前气泡"的路径。
+    if (pOwner == nullptr || type == 0)
+    {
+        TalkBubbleType  = 0;
+        TalkBubbleOwner = nullptr;
+        TalkBubbleTimer.Stop(now);
         return;
     }
 
-    // asm: void __fastcall TechnoClass_CreatePlanningToken(_TechnoClass *this)   (asm:1179213)
-    if (Game::GetCurrentFrame() >= this->TalkBubbleEnd) {
-        this->IsTalking      = false;
-        this->TalkBubbleText = nullptr;
-        this->TalkBubbleEnd  = 0;
-    }
+    TalkBubbleType  = type;
+    TalkBubbleOwner = pOwner;
+
+    // asm: mov edi,[RulesData+1800h] —— TalkBubbleTime，默认 0x12C (=300ms)。
+    int32 duration = 0x12C;
+    if (RulesClass::Instance != nullptr)
+        duration = static_cast<int32>(RulesClass::Instance->TalkBubbleTime);
+    TalkBubbleTimer.Start(duration, now);
+
+    // asm: [eax+48h](&coords, 2, PlayerPtr, 0,0,0, 1,1)
+    //      → MapClass::Sight_From(coords)
+    //   本树 Sight_From 为三参版本（coords / radius / house）；原版这条调用
+    //   只显式压入坐标，半径由引擎内定，这里取 1 格，语义上保证"话泡所在格
+    //   对说话者可见"，不额外扩大视野。
+    CoordStruct coords;
+    pOwner->GetCoords(&coords);
+    if (MapClass::Instance != nullptr && pOwner->Owner != nullptr)
+        MapClass::Instance->Sight_From(coords, 1, pOwner->Owner);
 }
 
 // ============================================================================
@@ -3977,7 +4755,7 @@ void TechnoClass::Die(TechnoClass* pKiller)
 // ============================================================================
 void TechnoClass::Recoil(int32 amount)
 {
-    // asm: TechnoClass_GetThreatPosed
+    // asm: TechnoClass_Recoil —— 后座量 <= 0 表示"不后座"，直接返回。
     if (amount <= 0) {
         return;
     }
@@ -4220,9 +4998,9 @@ WeaponStruct* TechnoClass::GetTurretChangingWeapon() const
 //       if (!Locomotor) RaiseError(0x80004003);
 //       Locomotor->Power_On();                ; call [locomotor_vt+58h]
 //   }
-//   if (this->field_1C8 && type->ActivateSound != -1)
+//   if (this->Deactivated && type->ActivateSound != -1)
 //       Sound_Effect(type->ActivateSound, &pos);
-//   this->field_1C8 = 0;
+//   this->Deactivated = 0;
 // 本项目用 ILocomotion::Power_On 对应 [vt+58h]，ActivateSound 播放对应 Sound_Effect。
 // ----------------------------------------------------------------------------
 void TechnoClass::Activate()
@@ -4239,6 +5017,9 @@ void TechnoClass::Activate()
         GetCoords(&pos);
         VocClass::PlayIndexAtPos(TechnoType->ActivateSound, &pos);
     }
+
+    // asm 末尾： mov byte ptr [esi+1C8h], 0
+    Deactivated = false;
 }
 
 // ----------------------------------------------------------------------------
@@ -4246,20 +5027,25 @@ void TechnoClass::Activate()
 //   call [vt+3D0h] / call [vt+150h]           ; 状态刷新 + 停用动作
 //   if (this && (flags & 4) && Locomotor)
 //       Locomotor->Power_Off();               ; call [locomotor_vt+5Ch]
-//   if (!this->field_1C8 && type->DeactivateSound != -1)
+//   if (!this->Deactivated && type->DeactivateSound != -1)
 //       Sound_Effect(type->DeactivateSound, &pos);
+//   this->Deactivated = 1;
 // ----------------------------------------------------------------------------
 void TechnoClass::Deactivate()
 {
     if (Locomotor != nullptr)
         Locomotor->Power_Off();
 
-    if (TechnoType != nullptr && TechnoType->DeactivateSound != -1)
+    // asm: mov al,[esi+1C8h] / test / jz —— 已经停用过就不再重复播音
+    if (!Deactivated && TechnoType != nullptr && TechnoType->DeactivateSound != -1)
     {
         CoordStruct pos;
         GetCoords(&pos);
         VocClass::PlayIndexAtPos(TechnoType->DeactivateSound, &pos);
     }
+
+    // asm 末尾： mov byte ptr [esi+1C8h], 1
+    Deactivated = true;
 }
 
 // ----------------------------------------------------------------------------
@@ -4489,8 +5275,22 @@ bool TechnoClass::Unlimbo()
     if (Owner != nullptr)
         Owner->RegisterTechnoGain_PrereqCounters(this);
 
+    // asm: TechnoClass_Unlimbo 尾部 —— 把对象挂进阵营的追踪向量。
+    //   缺这段时 OwnedBuildings / OwnedUnits 只在工厂出货路径被填充，
+    //   地图预置与 MCV 展开出来的对象全部缺席：AI 看不到自己的建造场，
+    //   胜负判定也算不到它们。
+    if (Owner != nullptr)
+        Owner->RegisterTechnoGain(this);
+
+    // asm: TechnoClass_Init 段 —— 按类型装配行走逻辑。原版在 Init 里做；
+    //   本树把 Init 拆进 Unlimbo，放在落位之后、进入待机之前。
+    Init_Locomotion();
+
     // asm: mov eax,[esi] / push 1 / push 1 / call [eax+484h] (Enter_Idle_Mode)
     Enter_Idle_Mode(1, 1);
+
+    // asm: if (vt+200h()) call [vt+1ECh] —— 把 Guard 提升为当前任务。
+    Start_Default_Mission();
 
     // asm loc_6F6EB3: cell = GetTargetCell(Location)
     if (MapClass::Instance != nullptr)
@@ -5453,6 +6253,7 @@ int32 TechnoClass::Can_Fire(AbstractClass* pTarget, int32 idxWeapon, int32 a3)
     if (pTarget == nullptr)
         return static_cast<int32>(FireError::Movement);
 
+
     // asm: mov eax,[esi+2DCh] / test / jnz loc_6FC86A
     if (CaptureManager != nullptr)
         return static_cast<int32>(FireError::Movement);
@@ -5683,6 +6484,34 @@ void TechnoClass::AI()
     if (TemporalTimer > 0 && !IsDizzy) --TemporalTimer;
     if (DrainTimer > 0)        --DrainTimer;
 
+    // (11) EMP 瘫痪计时（asm 1562944 段）
+    //   mov eax,[esi+EMPDurationRemaining] / test / jle return
+    //   dec eax / mov [esi+...],eax / jnz return     ; 只有归零那一帧做恢复
+    //   归零时：建筑 -> PingMore + 雷达刷新；脚类 -> 重新给 Locomotor 上电。
+    if (EMPDurationRemaining > 0)
+    {
+        if (--EMPDurationRemaining == 0)
+        {
+            if (WhatAmI() == AbstractType::Building)
+            {
+                BuildingClass* pBuilding = static_cast<BuildingClass*>(this);
+                const BuildingTypeClass* pType = pBuilding->Type;
+                if (pType != nullptr && !pType->InvisibleInGame)
+                {
+                    pBuilding->PingMore();              // asm: BuildingClass_PingMore
+                    // asm 末尾还置 Owner 的"雷达需要刷新"字节；本树 HouseClass
+                    // 没有该独立字节（只有 RadarDisabled/RadarVisible 状态位），
+                    // 直接调用它的消费者会把被打掉的雷达误开，故留空并记录。
+                }
+            }
+            else
+            {
+                if (Locomotor != nullptr)
+                    Locomotor->Power_On();              // asm: call [locomotor+58h]
+            }
+        }
+    }
+
     // 冒烟系统：受损时按档位推进
     UpdateRefinerySmokeSystems();
 }
@@ -5716,6 +6545,7 @@ bool TechnoClass::Evaluate_Object(int32 flags1, int32 flags2, int32 wantedDistan
 
     if (pTarget == nullptr || pTarget == this || pThreat == nullptr)
         return false;
+
 
     // asm: SelectWeapon(target) → chosen slot（用于任务/换塔单位）
     const int32 idx = SelectWeapon(pTarget);

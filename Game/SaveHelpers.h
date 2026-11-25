@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../COM/IUnknown.h"
+#include "../Containers/DynamicVectorClass.h"
 #include "../Core/Definitions.h"
 #include "../Core/Macros.h"
 
@@ -15,9 +16,11 @@ class AbstractClass;
 
 class Save {
 public:
-    static HRESULT Color(IStream* pStm, BOOL fClearDirty);
+    // asm: Save_Color —— 把一份 3 字节 RGB 原样写出。
+    static HRESULT Color(const void* pColor, IStream* pStm);
     static HRESULT VectorTerrainType(IStream* pStm, BOOL fClearDirty);
-    static HRESULT VectorInteger(IStream* pStm, BOOL fClearDirty);
+    // asm: Save_VectorInteger —— 先写计数（4 字节）再逐项写 int32。
+    static HRESULT VectorInteger(const DynamicVectorClass<int32>* pVec, IStream* pStm);
     static HRESULT VectorAnimType(IStream* pStm, BOOL fClearDirty);
     static HRESULT VectorSmudgeType(IStream* pStm, BOOL fClearDirty);
     static HRESULT VectorBuildingType(IStream* pStm, BOOL fClearDirty);

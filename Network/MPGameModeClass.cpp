@@ -1,4 +1,8 @@
 #include "MPGameModeClass.h"
+#include "Game/MPTeams.h"
+#include <cmath>
+#include <cstring>
+#include <cwchar>
 #include "SessionClass.h"
 #include "../Game/Externs.h"
 #include "../Scenario/ScenarioClass.h"
@@ -7,10 +11,25 @@
 #include "../Map/MapClass.h"
 #include "../INI/INIClass.h"
 #include "../Abstract/UnitClass.h"
+#include "../UI/StartSpotClass.h"
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdarg>
+#include <cstdio>
+#include <cmath>
 #include <new>
+
+// 原版的调试输出通道（WWDebugString, 0x7C5B10）。与其它子系统一致落到
+// stderr；开局分配相关的几条原文在 asm 里就是走这条通道。
+static void WWDebugString(const char* pFormat, ...)
+{
+    va_list args;
+    va_start(args, pFormat);
+    std::vfprintf(stderr, pFormat, args);
+    va_end(args);
+}
+
 
 // ============================================================
 // MPGameModeClass
@@ -45,7 +64,7 @@ MPGameModeClass::MPGameModeClass()
     , AlliesAllowedFlag(true), AIAllowedFlag(true)
     , MustAlly(false)
 {
-    for (int32 i = 0; i < MAX_TEAMS; ++i) {
+    for (int32 i = 0; i < MAX_MP_TEAMS; ++i) {
         TeamScores[i] = 0;
         TeamUnits[i] = 0;
         TeamBuildings[i] = 0;
@@ -209,7 +228,7 @@ void MPGameModeClass::UpdateAlliances() {
 
 void MPGameModeClass::SetTeam(int32 playerID, int32 team) {
     if (playerID < 0 || playerID >= MAX_MP_PLAYERS) return;
-    if (team < 0 || team >= MAX_TEAMS) return;
+    if (team < 0 || team >= MAX_MP_TEAMS) return;
     PlayerTeam[playerID] = team;
 }
 
@@ -219,7 +238,7 @@ int32 MPGameModeClass::GetTeam(int32 playerID) const {
 }
 
 void MPGameModeClass::UpdateScores() {
-    for (int32 i = 0; i < MAX_TEAMS; ++i) {
+    for (int32 i = 0; i < MAX_MP_TEAMS; ++i) {
         TeamScores[i] = 0;
         TeamUnits[i] = 0;
         TeamBuildings[i] = 0;
@@ -233,7 +252,7 @@ void MPGameModeClass::UpdateScores() {
         if (PlayerScores[i] < 0) PlayerScores[i] = 0;
 
         int32 team = PlayerTeam[i];
-        if (team >= 0 && team < MAX_TEAMS) {
+        if (team >= 0 && team < MAX_MP_TEAMS) {
             TeamScores[team] += PlayerScores[i];
             TeamUnits[team] += PlayerUnits[i];
             TeamBuildings[team] += PlayerBuildings[i];
@@ -249,7 +268,7 @@ int32 MPGameModeClass::GetPlayerScore(int32 playerID) const {
 }
 
 int32 MPGameModeClass::GetTeamScore(int32 team) const {
-    if (team < 0 || team >= MAX_TEAMS) return 0;
+    if (team < 0 || team >= MAX_MP_TEAMS) return 0;
     return TeamScores[team];
 }
 
@@ -665,7 +684,7 @@ void MPGameModeClass::ResetGame() {
         PlayerAlive[i] = true;
         PlayerEliminated[i] = false;
     }
-    for (int32 i = 0; i < MAX_TEAMS; ++i) {
+    for (int32 i = 0; i < MAX_MP_TEAMS; ++i) {
         TeamScores[i] = 0;
         TeamUnits[i] = 0;
         TeamBuildings[i] = 0;
@@ -727,22 +746,22 @@ int32 MPGameModeClass::GetPlayerBuildingCount(int32 playerID) const {
 }
 
 int32 MPGameModeClass::GetTeamKills(int32 team) const {
-    if (team < 0 || team >= MAX_TEAMS) return 0;
+    if (team < 0 || team >= MAX_MP_TEAMS) return 0;
     return TeamKills[team];
 }
 
 int32 MPGameModeClass::GetTeamLosses(int32 team) const {
-    if (team < 0 || team >= MAX_TEAMS) return 0;
+    if (team < 0 || team >= MAX_MP_TEAMS) return 0;
     return TeamLosses[team];
 }
 
 int32 MPGameModeClass::GetTeamUnitCount(int32 team) const {
-    if (team < 0 || team >= MAX_TEAMS) return 0;
+    if (team < 0 || team >= MAX_MP_TEAMS) return 0;
     return TeamUnits[team];
 }
 
 int32 MPGameModeClass::GetTeamBuildingCount(int32 team) const {
-    if (team < 0 || team >= MAX_TEAMS) return 0;
+    if (team < 0 || team >= MAX_MP_TEAMS) return 0;
     return TeamBuildings[team];
 }
 
@@ -1023,11 +1042,26 @@ bool MPGameModeClass::Scan_Place_Object(UnitClass& unit,
     return false;
 }
 
+// ----------------------------------------------------------------------------
+// asm: MPGameMode_ShouldTeam   (asm:986541)
+//
+//   ; char __thiscall MPGameMode_ShouldTeam(MPGameModeClass *this, int team)
+//   arg_0 = 队伍号（不是玩家席号）。
+//
+//     mov al,[ecx+3Fh]        ; MustAlly
+//     eax = team
+//     if (MustAlly && team == -2) return 0
+//     if (team < 0 || team > 3)   return 0
+//     return 1
+//
+//   -2 是"未编队"哨兵值：强制结盟模式下不允许游离队伍；其余模式只放行
+//   0..3 这四支队伍。
+// ----------------------------------------------------------------------------
 bool MPGameModeClass::ShouldTeam(int32 slot) const
 {
-    // asm: vt_MPGameModeClass.AllyTeams   (asm:?)
-    // 才参与组队。
-    return GetTeam(slot) > 0;
+    if (MustAlly && slot == -2)
+        return false;
+    return slot >= 0 && slot <= 3;
 }
 
 void MPGameModeClass::AllyTeams(int32 teamA, int32 teamB)
@@ -1045,15 +1079,88 @@ void MPGameModeClass::AllyTeams(int32 teamA, int32 teamB)
     }
 }
 
+// ----------------------------------------------------------------------------
+// asm: MPGameMode_StartingPositionsToHouseBases (vftable +0x80, 0x5D6B90)
+//
+//   char __thiscall(MPGameModeClass *this, char unused)   retn 4
+//   unused 只被读进 dl 后丢弃（死读）。
+//
+//   逐句（asm 行 988493-988565）：
+//     VecWXY vec ; Get_Starting_Locations(&vec)      ; 候选出生格
+//     for (i = 0 ; i < vec_Houses.length ; ++i):
+//       h = vec_Houses[i]
+//       if (h->[+0x34]->[+0x1A6]) continue           ; 该国家为 passive，跳过
+//       sp = h->StartingPosition                     ; +0x1602C，-2 = 未分配
+//       if (sp == 0FFFFFFFEh) continue
+//       h->SetBaseSpawnCell(vec[sp])
+//       Scenario->[0x1180 + sp*4] = i                ; HouseIndices[sp] = i
+//     释放 vec ; return 1
+//
+//   字段对应：
+//     h->[+0x34]        -> HouseClass::Type（本项目把 Country 并进了
+//                          HouseTypeClass）
+//     Type->[+0x1A6]    -> HouseTypeClass::MultiplayPassive（HouseTypeClass
+//                          结构里 Suffix/Prefix/Multiplay/MultiplayPassive
+//                          连续排列，+0x1A6 正是 MultiplayPassive）
+//     h->StartingPosition(+0x1602C) -> HouseClass::StartingSlot。原版把
+//                          "StartingSpotClass_GetStartSlot 的结果"存了两份：
+//                          +0x1602C 供本函数与同步日志读取，+0x16058 供
+//                          Assign_Houses 写入（见 asm 1330657
+//                          `mov [ebp+16058h], ecx`）；本项目只建模了
+//                          StartingSlot（赋值来源正是 Get_Start_Slot /
+//                          AISlots.StartSlots），两者同值，故这里读
+//                          StartingSlot。
+//     Scenario->[0x1180] -> ScenarioClass::HouseIndices[16]
+//
+//   原版对 sp 不做越界检查（vec[sp] 直接取）；本项目候选表是
+//   DynamicVectorClass，越界会断言，因此这里补 sp < Count 的防御。
+// ----------------------------------------------------------------------------
 void MPGameModeClass::StartingPositionsToHouseBases()
 {
-    // 根据游戏行为，可知开局把每个出生点登记成对应阵营的基地中心，
-    // 让 AI 与小地图第一时间有锚点。
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    if (pScen == nullptr) {
+        return;
+    }
+
+    // asm: lea ecx,[esp+vec] / call Get_Starting_Locations
+    DynamicVectorClass<CellStruct> cells;
+    pScen->GetStartingLocations(cells);
+
+    const int32 houseCount = HouseClass::ArrayCount;
+    for (int32 i = 0; i < houseCount; ++i) {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr) {
+            continue;
+        }
+
+        // asm: mov edx,[ecx+34h] / mov al,[edx+1A6h] / jnz next
+        if (pHouse->Type != nullptr && pHouse->Type->MultiplayPassive) {
+            continue;
+        }
+
+        // asm: mov esi,[ecx+StartingPosition] / cmp esi,0FFFFFFFEh / jz next
+        const int32 sp = pHouse->StartingSlot;
+        if (sp == -2) {
+            continue;
+        }
+        if (sp < 0 || sp >= cells.Count || sp >= 16) {
+            continue;                       // 防御：原版此处无边界检查
+        }
+
+        // asm: mov edx,[vec.data+esi*4] / push edx / call SetBaseSpawnCell
+        pHouse->Set_Base_Spawn_Cell(cells[sp]);
+
+        // asm: mov eax,Scenario / mov [eax+esi*4+1180h],edi
+        pScen->HouseIndices[sp] = i;
+    }
 }
 
 bool MPGameModeClass::MustAlly02() const
 {
-    // 根据游戏行为，可知二对二强制结盟由模式的 MustAlly 标志决定。
+    // asm: MPGameMode_MustAlly02   (asm:986509)
+    //   `mov al,[ecx+3Fh] / neg al / sbb eax,eax / and eax,2 / add eax,-2`
+    //   ——原版返回 HRESULT 形态：MustAlly 真 → 0（成功），假 → -2（E_FAIL）。
+    //   本槽在项目里声明为 bool，按"0 = 成功"投影成 MustAlly。
     return MustAlly;
 }
 
@@ -1062,116 +1169,122 @@ bool MPGameModeClass::MustAlly02() const
 // 配置应答槽位（对应 IDA 槽位名见各实现注记）
 // ============================================================================
 
-// 根据游戏行为，可知该槽位直接回读模式对象内的“允许电脑玩家”标志，
-// 大厅据此决定电脑玩家复选框是否可用。
+// asm: MPGameMode_AIAllowed   (asm:987214)
+//   `mov al,[ecx+MPGameModeClass.AIAllowed]; retn`——直接回读模式对象的
+//   字节标志（vtable 槽 AIPlayersAllowed 的默认实现）。
 bool MPGameModeClass::AIAllowed()
 {
     return AIAllowedFlag;
 }
 
-// asm: vt_MPGameModeClass.AlliesAllowed   (asm:?)
-// “允许”档位），否则返回 -2（拒绝码），两种取值之外不会出现。
+// asm: MPGameMode_AlliesAllowed   (asm:986525)
+//   `mov al,[ecx+3Ch] / neg al / sbb eax,eax / and eax,5 / add eax,-2`
+//   即标志非 0 → 5-2 = 3（允许档），为 0 → 0-2 = -2（拒绝码）。
 int32 MPGameModeClass::AlliesAllowed()
 {
     return AlliesAllowedFlag ? 3 : -2;
 }
 
 // ----------------------------------------------------------------------------
-// asm: MPSiege_AssignStartingPositions
+// asm: MPGameMode_AssignStartingPoints   (asm:988574)
 //
-//   ; char __thiscall MPSiege_AssignStartingPositions(MPGameMode *this, char a2)
-//   真实入口 ≈0x5CA820（由 loc_5CA83A = 函数+0x48 反推 ≈0x5CA7F2；
-//   符号名可靠，落在 0x5CA8xx 区间）。retn 4，一个 char 栈参数。
-//   DATA XREF: .rdata:MultiplayerSiege::`vftable' —— 是 MultiplayerSiege
-//   模式在 MPGameMode 上的虚槽，本项目的对应槽位就是 AssignStartingPoints。
+//   ; char __thiscall MPGameMode_AssignStartingPoints(MPGameModeClass *this, char a2)
+//   DATA XREF: .rdata:MultiplayerBattle::`vftable' —— 通用多人模式的出生点
+//   分配槽；本项目的对应槽位就是 AssignStartingPoints。
 //
-//   围城模式（Siege）的出生点分配：先取一份候选格列表，再按
-//   "攻击方 / 防守方"两组房主分别落到各自的基地出生格。
+//   与 StartingPositionsToHouseBases 的分工：那一个只认房主自带的
+//   StartingSlot，本函数给"在 Scenario->HouseIndices 里还没有登记"的房主
+//   现场挑一格。逐句（asm 行 988573-988745）：
 //
-//   逐句（asm 行 959998-960200）：
-//     Get_Starting_Locations(&vec)            (栈上就地构造 VecWXY)
-//     n = NameNodeTypes.length ; data = NameNodeTypes.data
-//     // 找到第一个「非 AI」（[house+6Bh] != 1）的条目
-//     for (i = 0 ; i < n ; ++i)
-//       if (data[i]->[+0x6Bh] != 1) break
-//     if (i >= n)  { 释放 vec ; return 0 }    // 一个真人玩家都没有
-//     runner = data[i]
-//     slot = runner->[+0x6Fh]                  // 该房主在 vec_Houses 的下标
-//     if (slot < 0 || slot >= vec_Houses.length) { 释放 vec ; return 0 }
-//     defender = vec_Houses[slot]
-//     if (defender->[+0x34]->[+0x1A6h])  { 释放 vec ; return 0 }  // 该房主不可用
-//     WWDebugString("Assigning Starting Points for Defending house %d (%s)")
-//     defender->SetBaseSpawnCell(vec[0])       // 防守方拿第一格
-//     // 其余所有「可用的、且不是 defender」的房主都算攻击方
-//     for (j = 0 ; j < vec_Houses.length ; ++j):
-//       h = vec_Houses[j]
-//       if (h->[+0x34]->[+0x1A6h]) continue      // 不可用
-//       if (h == defender)         continue
-//       WWDebugString("Assigning Starting Points for Attacking house %d (%s)", j, h->[+0x34]+0x24)
-//       cell = this->[vt+0xC4](j, &a2, &vec)     // 取该攻击方的出生格
-//       h->SetBaseSpawnCell(cell[0])
+//     VecWXY vec ; Get_Starting_Locations(&vec)
+//
+//     // ① 用 16 个槽的登记表拍一张"已占用"位图
+//     for (i = 0 ; i < 16 ; ++i)
+//       bytes[i] = (Scenario->HouseIndices[i] == -1) ? 0 : 1
+//
+//     // ② 逐个房主
+//     for (i = 0 ; i < vec_Houses.length ; ++i):
+//       h = vec_Houses[i]
+//       if (h->[+34h]->[+1A6h]) continue          // MultiplayPassive，跳过
+//       // 在 HouseIndices[0..0F] 里找值为 i 的槽（不 break，后命中覆盖）
+//       for (j = 0 ; j < 16 ; ++j) if (HouseIndices[j] == i) { found = 1 ; idx = j }
+//       if (!found):
+//         WWDebugString("Assigning Starting Points for house %d (%s)", i, h->[+34h]+0x24)
+//         Cell *c = this->[vt+0xC4](&a2, i, &vec, bytes)   // 现场挑一格
+//         h->SetBaseSpawnCell(*c)
+//       else:
+//         h->SetBaseSpawnCell(vec[idx])
 //     释放 vec ; return 1
 //
-//   【留白（铁律①）】vt+0xC4 是 MPGameMode 的一个虚槽，asm 调用形态为
-//     push &a2 / push j / push &vec / call [edx+0C4h]   （返回 VecWXY*）
-//   本项目把这一槽记作 SmthStartingHouses2，但现有声明
-//     virtual void SmthStartingHouses2(int32, DynamicVectorClass<CoordStruct>*, bool)
-//   与 asm 的 (char, VecWXY*, VecWXY*) 形态对不上（参数个数、类型、返回
-//   都与 asm 不符），不能直接挪用。此处保留调用点与签名备注，等该槽在
-//   真实类里确证后再接上；为避免误导，本函数先不做这步写入。
+//   字段对应：
+//     h->[+0x34]             -> HouseClass::Type
+//     Type->[+0x1A6]         -> HouseTypeClass::MultiplayPassive
+//                               （原版 CountryClass 视图把同一字节又叫
+//                                humanControlled；与 StartingPositionsToHouseBases
+//                                读的是同一个字段）
+//     Type+0x24              -> AbstractTypeClass 的 ID 串（get_ID()）
+//     Scenario->[0x1180+j*4] -> ScenarioClass::HouseIndices[16]
+//     vt+0xC4                -> MPGameModeClass::SmthStartingHouses2
+//     vec                    -> DynamicVectorClass<CellStruct>
 //
-//   Get_Starting_Locations（原版把候选格填进栈上的 VecWXY）与
-//   vec_Houses 的「+0x34 是 HouseType、+0x1A6 是不可用标志」两处取值，
-//   同样依赖尚未移植的设施；前者保留调用点，后者按项目 HouseClass
-//   的既有等价字段表达（见下）。
-//
-//   注：AsmComplex7 批注写成 void() 无参，与 asm 的 char(char) 不符。
+//   原版对 vec[idx] 不做越界检查；本项目候选表是动态数组，这里保留
+//   idx < Count 的防御（与 StartingPositionsToHouseBases 同一处理）。
 // ----------------------------------------------------------------------------
 void MPGameModeClass::AssignStartingPoints()
 {
-    // asm: lea ecx,[esp+38h+this] / call Get_Starting_Locations
-    //
-    // 【留白（铁律①）】这段本应复现 asm 的围城出生点分配，但它依赖的四组
-    // 设施在项目里都还没有等价物，逐条列出以便后续补齐：
-    //
-    //   ① Get_Starting_Locations —— 原版把候选出生格填进栈上就地构造的
-    //      VecWXY（VectorClass<Cell>），本项目无此设施、也无 VectorClass<Cell>。
-    //   ② NameNodeTypes[i]->[+0x6Bh] —— 该房主"是 AI"的标志。本项目
-    //      HouseClass 里没有对应字段，也没有 Is_AI() 谓词。
-    //   ③ HouseClass[+0x6Fh] —— 房主在 vec_Houses 里的下标。本项目房屋表是
-    //      定长数组 Houses[MAX_HOUSES]，没有这个 back-index。
-    //   ④ HouseClass[+0x34]->[+0x1A6h] —— HouseType 上的"不可用"标志。
-    //      本项目 HouseTypeClass 里没有该字段。
-    //   ⑤ MPGameMode 的 vt+0xC4 槽 —— 原版形态是
-    //        push &a2 / push idx / push &vec / call [edx+0C4h]  （返回 VecWXY*）
-    //      本项目把它记作 SmthStartingHouses2，但现有声明
-    //        virtual void SmthStartingHouses2(int32, DynamicVectorClass<CoordStruct>*, bool)
-    //      在参数个数、类型、返回值三处都与 asm 不符，不能挪用。
-    //
-    // 在 ①–⑤ 落地之前，这里只保留控制流的骨架注释，不做任何写入 ——
-    // 与其写一段"看起来像"的实现去误导后续工作，不如明确留白。
-    //
-    // 原控制流（asm 行 959998-960200）：
-    //   vec = Get_Starting_Locations()
-    //   runner = 第一个 NameNodeTypes[i] 且 data[i][+6Bh] != 1
-    //   if (无 runner)                       -> 释放 vec ; return 0
-    //   slot = runner[+6Fh]
-    //   if (slot < 0 || slot >= vec_Houses.length) -> 释放 vec ; return 0
-    //   defender = vec_Houses[slot]
-    //   if (defender[+34h][+1A6h])           -> 释放 vec ; return 0
-    //   WWDebugString("...Defending house %d (%s)")
-    //   defender->SetBaseSpawnCell(vec[0])
-    //   for (j = 0 ; j < vec_Houses.length ; ++j):
-    //     h = vec_Houses[j]
-    //     if (h[+34h][+1A6h]) continue
-    //     if (h == defender)  continue
-    //     WWDebugString("...Attacking house %d (%s)")
-    //     cell = this->[vt+0xC4](j, &a2, &vec)
-    //     h->SetBaseSpawnCell(cell[0])
-    //   释放 vec ; return 1
-    //
-    // 注：AsmComplex7 批注写成 void() 无参，与 asm 的
-    //     char __thiscall(MPGameMode* this, char a2) 不符。
+    ScenarioClass* pScen = ScenarioClass::Instance;
+    if (pScen == nullptr)
+        return;
+
+    // asm: lea ecx,[esp+2Ch+vec_Cells] / call Get_Starting_Locations
+    DynamicVectorClass<CellStruct> cells;
+    pScen->GetStartingLocations(cells);
+
+    // asm: 16 次 cmp [ecx],0FFFFFFFFh / mov [esp+eax+bytes],...
+    uint8 positionsTaken[0x10];
+    for (int32 i = 0; i < 0x10; ++i)
+        positionsTaken[i] = (pScen->HouseIndices[i] != -1) ? 1 : 0;
+
+    const int32 houseCount = HouseClass::ArrayCount;
+    for (int32 i = 0; i < houseCount; ++i)
+    {
+        HouseClass* pHouse = HouseClass::Array[i];
+        if (pHouse == nullptr)
+            continue;
+
+        // asm: mov ebp,[edi+34h] / mov al,[ebp+1A6h] / test al,al / jnz next
+        if (pHouse->Type != nullptr && pHouse->Type->MultiplayPassive)
+            continue;
+
+        // asm: cmp [ecx],esi / mov bl,1 / mov edx,eax —— 不 break，后命中覆盖
+        int32 slot = -1;
+        for (int32 j = 0; j < 0x10; ++j)
+        {
+            if (pScen->HouseIndices[j] == i)
+                slot = j;
+        }
+
+        if (slot < 0)
+        {
+            // asm: push country+24h / push esi / push aAssigningStart
+            //      call WWDebugString
+            const char* pName = (pHouse->Type != nullptr) ? pHouse->Type->get_ID() : "";
+            WWDebugString("Assigning Starting Points for house %d (%s)", i, pName);
+
+            // asm: push &bytes / push &vec / push esi / push &a2
+            //      call [edx+0C4h]  ->  返回 wXY*，取 [eax] 作为出生格
+            CellStruct picked(0, 0);
+            CellStruct* pCell = SmthStartingHouses2(&picked, i, &cells, positionsTaken);
+            if (pCell != nullptr)
+                pHouse->Set_Base_Spawn_Cell(*pCell);
+        }
+        else if (slot < cells.Count)
+        {
+            // asm: mov ecx,[vec.data] / mov edx,[ecx+edx*4] / push edx
+            //      call HouseClass_SetBaseSpawnCell
+            pHouse->Set_Base_Spawn_Cell(cells[slot]);
+        }
+    }
 }
 
 // asm: vt_MPGameModeClass.CreateMPTeams   (asm:?)
@@ -1230,26 +1343,172 @@ void MPGameModeClass::DrawTeamSelector()
     }
 }
 
-// 对应原版槽位 MPGameModeClass::SmthStartingHouses2：根据游戏行为，可知
-// 它为指定玩家槽位挑选一个未被占用的出生航点：先按占用情况跳过候选，
-// 再把选中的航点登记为该槽位出生点，并把航点中心的世界坐标追加到
-// 坐标表里供基地摆放使用。
-void MPGameModeClass::SmthStartingHouses2(int32 idxHouse, DynamicVectorClass<CoordStruct>* pCoords, bool positionsTaken)
+// ---------------------------------------------------------------------------
+// asm: MPGameMode_SmthStartingHouses2 (0x5D6820, vftable +0xC4)
+//
+//   __thiscall + `retn 10h` → 4 个参数（旧实现按 3 个写，签名就是错的）：
+//     [ebp+8]   outCell        结果写回的 CellStruct*
+//     [ebp+0Ch] idxHouse       要分配席位的房主索引
+//     [ebp+10h] cells          候选格表（+04 = 数组，+10h = 个数）
+//     [ebp+14h] positionsTaken 每格是否已占用的字节表
+//
+//   逻辑逐段对应：
+//     ① loc_5D68B4：扫 Scenario->HouseIndices[0..n) 找第一个 == -1 的槽。
+//     ② loc_5D692E（全占）：`Random2Class::operator()(0, n-1)` 随机挑一格；
+//        asm 之后还会查 vec_Houses[idxHouse] 是否人类、其 CSFName 能否在
+//        NameNodeTypes 里命中、命中节点 [+6Bh] 是否为 -1，把 byte_ABFDD4
+//        置 1（观战者标记）。
+//     ③ loc_5D69F2（有空槽）：
+//        - ABFDD4 已置 且 ABFDD5 未置 → 直接占这个空槽、置 ABFDD5；
+//        - 人类玩家命中同名节点 → 走过 loc_5D6B86，两个标记都置；
+//        - 否则 loc_5D6A85：在未占格中选"到所有已占格的距离和最大"的一格
+//          （逐对 `sqrt(dx*dx+dy*dy)` 取整后累加，取最大者）。
+//     ④ loc_5D6B3C：positionsTaken[slot]=1、HouseIndices[slot]=idxHouse、
+//        outCell = cells[slot]，返回 outCell。
+//
+//   ⚠ NameNodeTypes 的元素结构与本项目 MPTeams.h 的 `HouseClass**` 声明
+//   不一致（asm 里对元素用 `+4Bh/+4Fh/+6Bh` 取字段，又把它当 wchar_t* 传
+//   给 _wcscmp，说明元素是"内联了名字缓冲的会话节点"）。该表在单机流程里
+//   长度为 0，观战者分支不可达；这里保留结构、按长度判空，等会话节点结构
+//   建模后再按 +0x6B 取值。
+// ---------------------------------------------------------------------------
+namespace {
+
+// asm: byte_ABFDD4 / byte_ABFDD5 —— 观战者席位的一次性标记（A = 观战格已定，
+// B = 第二个观战格已用掉）。
+uint8 s_ObserverSlotFlagA = 0;
+uint8 s_ObserverSlotFlagB = 0;
+
+// asm: Scenario->HouseIndices 的"未登记"哨兵（0FFFFFFFFh）。
+constexpr int32 kHouseSlotUnset = -1;
+
+// 返回 true 表示 idxHouse 对应的人类玩家能在会话节点表里命中，且该节点的
+// [+0x6B] == -1（观战者 / 随机国家标记）。
+bool Is_Observer_House(int32 idxHouse)
 {
-    if (TheScenario == nullptr || TheSession == nullptr || pCoords == nullptr) {
-        return;
-    }
-    const int32 start = positionsTaken ? idxHouse : 0;
-    for (int32 idx = start; idx < TheScenario->MaxStartingPoints; ++idx) {
-        if (!TheScenario->IsDefinedWaypoint(idx)) {
+    const int32 nodeCount = NameNodeTypes_Length();
+    if (nodeCount <= 0)
+        return false;
+
+    HouseClass* pHouse = HouseClass::GetHouseByIndex(idxHouse);
+    if (pHouse == nullptr || !pHouse->Is_Human())
+        return false;
+
+    HouseClass** nodes = NameNodeTypes_Data();
+    if (nodes == nullptr)
+        return false;
+
+    for (int32 i = 0; i < nodeCount; ++i)
+    {
+        const uint8* pNode = reinterpret_cast<const uint8*>(nodes[i]);
+        if (pNode == nullptr)
             continue;
-        }
-        TheSession->SetPlayerStartingSpot(idxHouse, idx);
-        const CellStruct cell = TheScenario->GetWaypointCoords(idx);
-        CoordStruct world(cell.X * 256 + 128, cell.Y * 256 + 128, 0);
-        pCoords->Add(world);
-        return;
+
+        // asm: add eax,1602Ah / push eax —— 节点名与房子 CSFName 比较。
+        // 节点前 0x1602A 字节不全是名字，这里按"元素首字段即名字缓冲"读，
+        // 与 asm 把元素指针直接当 wchar_t* 的做法一致。
+        if (wcscmp(pHouse->CSFName, reinterpret_cast<const wchar_t*>(pNode)) != 0)
+            continue;
+
+        // asm: cmp dword ptr [edx+6Bh], 0FFFFFFFFh
+        int32 marker = 0;
+        std::memcpy(&marker, pNode + 0x6B, sizeof(marker));
+        return marker == -1;
     }
+    return false;
+}
+
+}   // namespace
+
+CellStruct* MPGameModeClass::SmthStartingHouses2(CellStruct* pOutCell, int32 idxHouse,
+                                                DynamicVectorClass<CellStruct>* pCells,
+                                                uint8* positionsTaken)
+{
+    if (pOutCell == nullptr || pCells == nullptr || positionsTaken == nullptr)
+        return pOutCell;
+
+    if (pCells->Items == nullptr || pCells->Count <= 0)
+        return pOutCell;
+
+    ScenarioClass* pScenario = ScenarioClass::Instance;
+    if (pScenario == nullptr || pScenario->HouseIndices == nullptr)
+        return pOutCell;
+
+    const int32 count = pCells->Count;
+
+    // ① 第一个未登记的槽
+    int32 freeSlot = 0;
+    while (freeSlot < count && pScenario->HouseIndices[freeSlot] != kHouseSlotUnset)
+        ++freeSlot;
+
+    int32 slot = -1;
+
+    if (freeSlot == count)
+    {
+        // ② 全占：随机挑一格。asm 先把两个标记清零再判观战者。
+        s_ObserverSlotFlagA = 0;
+        s_ObserverSlotFlagB = 0;
+
+        slot = pScenario->Random.Next(0, count - 1);   // asm: Random2Class(0, n-1)
+
+        if (Is_Observer_House(idxHouse))
+            s_ObserverSlotFlagA = 1;                    // asm: byte_ABFDD4 = 1
+    }
+    else if (s_ObserverSlotFlagA != 0 && s_ObserverSlotFlagB == 0)
+    {
+        // ③-1 观战者的第二个席位
+        slot = freeSlot;
+        s_ObserverSlotFlagB = 1;                        // asm: byte_ABFDD5 = 1
+    }
+    else if (Is_Observer_House(idxHouse))
+    {
+        // ③-2 loc_5D6B86：观战格，用当前空槽，两个标记都置
+        slot = freeSlot;
+        s_ObserverSlotFlagA = 1;
+        s_ObserverSlotFlagB = 1;
+    }
+    else
+    {
+        // ③-3 loc_5D6A85：选"到所有已占格距离和最大"的未占格。
+        //      asm 用 fild/fmul/faddp + float_sqrt + Float_To_Int_Floor，
+        //      即每对算 floor(sqrt(dx^2+dy^2)) 后累加。
+        int32 bestSum    = -1;
+        int32 bestSlot   = -1;
+
+        for (int32 b = 0; b < count; ++b)
+        {
+            if (positionsTaken[b] != 0)
+                continue;
+
+            int32 sum = 0;
+            for (int32 s = 0; s < count; ++s)
+            {
+                if (positionsTaken[s] == 0)
+                    continue;
+
+                const int32 dx = static_cast<int32>(pCells->Items[b].X) - pCells->Items[s].X;
+                const int32 dy = static_cast<int32>(pCells->Items[b].Y) - pCells->Items[s].Y;
+                sum += static_cast<int32>(std::sqrt(static_cast<double>(dx * dx + dy * dy)));
+            }
+
+            if (sum > bestSum)
+            {
+                bestSum  = sum;
+                bestSlot = b;
+            }
+        }
+
+        slot = bestSlot;
+    }
+
+    if (slot < 0 || slot >= count)
+        return pOutCell;
+
+    // ④ 收尾
+    positionsTaken[slot]              = 1;
+    pScenario->HouseIndices[slot]     = idxHouse;
+    *pOutCell                         = pCells->Items[slot];
+    return pOutCell;
 }
 
 // 对应原版槽位 MPGameModeClass::func10：根据游戏行为，可知开局前会遍历

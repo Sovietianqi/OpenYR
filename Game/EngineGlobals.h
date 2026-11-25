@@ -17,7 +17,11 @@ public:
     // ---- Get 族：全局资源访问器 ----
     static int32 CD_Index(int32 index);
     static void* File_From_Host(const char* pHost);
-    static void* Get_Grey_Remap_Ptr(int32 houseIndex);
+    // asm: Get_Grey_Remap_Ptr (0x4E12D0) 返回的是 **色系表下标**（首 dword
+    // = ColorScheme::ArrayIndex），不是指针 —— 四个调用点都紧跟着
+    // `mov edx,ColorScheme.data / mov edx,[edx+eax*4]`。参数在 asm 里不存在
+    //（名字 "Grey" 写死），保留只为对齐既有声明。
+    static int32 Get_Grey_Remap_Ptr(int32 houseIndex);
     static void* Starting_Locations();
     static const char* Get_String(const char* pKey);
     // asm: Get_Mono_ScreenPtr_5BC450 (0x5BC450) —— fastcall，ecx = 索引，

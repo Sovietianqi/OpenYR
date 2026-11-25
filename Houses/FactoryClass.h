@@ -77,6 +77,12 @@ public:
 
     // Progress
     void Update();
+    // ========================================================================
+    // HouseClass::Update_Factories（0x509129）的单厂实现：把"已经造不出来"的
+    //   队列条目摘掉、在制品放弃并续线、可造但被挂起的恢复生产。语义逐段写在
+    //   .cpp 里。
+    // ========================================================================
+    void Validate_Production();
     int32 GetBuildTimeFrames() const;
     // ========================================================================
     // asm: HouseClass_Update_Factories_Timing 内联体 —— 按在线产品重算本
@@ -102,6 +108,8 @@ public:
     bool Is_Producing() const { return ProductionEstimateFrames != 0; }
     // asm: FactoryClass+0x50 —— 队列里还有未开工的产品（>0 即"排队中"）。
     bool Has_Queued() const { return Queue.Count > 0; }
+    // 队列深度（诊断 + 队伍订单插队判定用）。
+    int32 GetQueueCount() const { return Queue.Count; }
 
     // Accessors
     BuildingClass*   GetFactoryBuilding() const { return Factory; }
@@ -120,6 +128,11 @@ public:
     // FactoryClass_GetSpecialItem (0x4CA150): the side-specific "special"
     //   item (a free bonus unit the house can build), cached at +0x68.
     int32 GetSpecialItem() const { return SpecialItem; }
+
+    // 诊断：把生产线的内部节拍一并打出来（OPENYR_TEAMDBG 用）。
+    int32 Get_EstimateFrames() const { return ProductionEstimateFrames; }
+    int32 Get_Balance() const { return Balance; }
+    bool  IsCompleteSuspended() const { return CompleteSuspended; }
 
     // Serialization / CRC
     bool Save(IStream* pStm) const;
@@ -141,6 +154,8 @@ public:
 
 private:
     bool PlaceProducedUnit(TechnoTypeClass* pType);
+    // QueueProduction 的 lct_BuildingType 开工段：让本线立刻开工造 pType。
+    bool Start_Specific(TechnoTypeClass* pType);
 
     // asm: [esi+0x24]
     int32            Progress;

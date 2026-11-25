@@ -5,13 +5,83 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <cerrno>
 #include <ctime>
 #include <cstdint>
+#include <cctype>
 #include <utime.h>
+
+// Defined near the CCFileClass section; declared here because Open() (which
+// owns the MIX probe) appears earlier in the translation unit.
+static bool CCFile_OnDiskExists(const char* pName);
+
+// ----------------------------------------------------------------------------
+// 磁盘路径解析
+//
+// 原版跑在大小写不敏感的 Windows 上，档名一律大写（RA2MD.MIX）。把这些数据
+// 拷到 Linux 上时，目录里可能是小写，或者用反斜杠分隔。这里按
+//   1) 原样（反斜杠转正斜杠）
+//   2) 文件名全大写
+//   3) 文件名全小写
+// 依次试，命中返回 true 并写出解析后的路径。写模式的调用方直接用原名，
+// 不做这个回退（避免把新建文件写到别的名字上）。
+// ----------------------------------------------------------------------------
+static bool Resolve_Disk_Path(const char* pName, char* pOut, size_t nOut)
+{
+    if (pName == nullptr || pName[0] == '\0' || nOut == 0)
+        return false;
+
+    char base[MAX_PATH_LEN];
+    size_t len = std::strlen(pName);
+    if (len >= sizeof(base))
+        return false;
+
+    for (size_t i = 0; i < len; ++i)
+        base[i] = (pName[i] == '\\') ? '/' : pName[i];
+    base[len] = '\0';
+
+    struct stat st;
+    if (::stat(base, &st) == 0 && S_ISREG(st.st_mode))
+    {
+        std::snprintf(pOut, nOut, "%s", base);
+        return true;
+    }
+
+    // 拆出目录部分与文件名部分，只改文件名的大小写。
+    char* slash = std::strrchr(base, '/');
+    const char* dirEnd = (slash != nullptr) ? slash + 1 : base;
+    const size_t dirLen = static_cast<size_t>(dirEnd - base);
+
+    char candidate[MAX_PATH_LEN];
+    for (int32 pass = 0; pass < 2; ++pass)
+    {
+        if (dirLen + std::strlen(dirEnd) >= sizeof(candidate))
+            break;
+
+        std::memcpy(candidate, base, dirLen);
+        size_t k = dirLen;
+        for (const char* q = dirEnd; *q != '\0' && k + 1 < sizeof(candidate); ++q, ++k)
+        {
+            const unsigned char c = static_cast<unsigned char>(*q);
+            candidate[k] = (pass == 0)
+                         ? static_cast<char>(std::toupper(c))
+                         : static_cast<char>(std::tolower(c));
+        }
+        candidate[k] = '\0';
+
+        if (::stat(candidate, &st) == 0 && S_ISREG(st.st_mode))
+        {
+            std::snprintf(pOut, nOut, "%s", candidate);
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // ============================================================================
 // RawFileClass implementation
@@ -75,7 +145,20 @@ bool RawFileClass::Open(FileAccessMode mode)
         break;
     }
 
-    Handle = std::fopen(FileName, pMode);
+    if (mode == FileAccessMode::Read)
+    {
+        // 读：允许大小写 / 分隔符回退（零售档名全大写，Linux 上常是小写）。
+        char resolved[MAX_PATH_LEN];
+        if (Resolve_Disk_Path(FileName, resolved, sizeof(resolved)))
+            Handle = std::fopen(resolved, pMode);
+        else
+            Handle = std::fopen(FileName, pMode);
+    }
+    else
+    {
+        // 写：直接用原名，绝不回退到另一个大小写变体。
+        Handle = std::fopen(FileName, pMode);
+    }
 
     // asm: RawFileClass_OpenFile resets the sub-file window: [this+0Ch] = 0 and
     // [this+10h] = -1 (size not yet known) then, on success, re-seeks.
@@ -424,31 +507,56 @@ CCFileClass::~CCFileClass()
 
 bool CCFileClass::Open(int32 mode)
 {
-    if (IsFileOpen)
-        Close();
+    Close();
 
     if (FileName[0] == '\0')
         return false;
 
+    // asm: CCFileClass_OpenFile (0x473CF0) is what the vtable exposes; the
+    // plain disk open lives in CDFileClass.  Every caller in the game goes
+    // through this entry, so the MIX probe has to happen here — otherwise a
+    // mounted archive is never consulted and every asset read fails on a
+    // machine that only has the retail .mix files.
+    //
+    // asm: test [mode], 2 -> jnz disk path (write never comes from a MIX).
+    if ((mode & 2) == 0 && !CCFile_OnDiskExists(FileName))
+    {
+        MixFileClass* pMix = MixFileClass::FindFileByName(FileName);
+        if (pMix != nullptr)
+        {
+            const MixIndexEntry* pEntry = pMix->GetIndexEntry(FileName);
+            if (pEntry != nullptr && pEntry->Size > 0)
+            {
+                int32 nSize = static_cast<int32>(pEntry->Size);
+                void* pData = pMix->GetFile(FileName, &nSize);
+                if (pData != nullptr)
+                {
+                    MixBuffer     = pData;
+                    MixBufferSize = nSize;
+                    MixBufferPos  = 0;
+                    AvailabilityCache = 1;
+                    return true;
+                }
+            }
+        }
+        // asm: lct_NotFoundInMixes -> CDFileClass_OpenFile
+    }
+
+    // asm mapping: 0/1 = read, 2 = write, 3 = read-write (see FileSystem.h).
     FileAccessMode accessMode = FileAccessMode::Read;
     switch (mode)
     {
-    case 0:
-        accessMode = FileAccessMode::Read;
-        break;
-    case 1:
+    case 2:
         accessMode = FileAccessMode::Write;
         break;
-    case 2:
+    case 3:
         accessMode = FileAccessMode::ReadWrite;
         break;
-    default:
+    default:                       // 0 and 1 both mean read
         accessMode = FileAccessMode::Read;
         break;
     }
 
-    // Try to open from MIX archive first, then fall back to raw file.
-    // The MIX archive lookup is handled by the CCFileClass layer above.
     bool bOpened = m_RawFile.Open(FileName, accessMode);
     if (bOpened)
     {
@@ -491,10 +599,14 @@ void CCFileClass::Close()
 
 int32 CCFileClass::Read(void* pBuffer, int32 nSize)
 {
-    if (!IsFileOpen || !pBuffer || nSize <= 0)
+    if (pBuffer == nullptr || nSize <= 0)
         return 0;
 
-    return m_RawFile.Read(pBuffer, nSize);
+    // A MIX-resident file lives in MixBuffer; the raw handle is null in that
+    // case, so the generic Read has to go through the residency path too.
+    // ReadNextBytes already handles both backends (buffer first, raw file
+    // second) and clamps to what remains.
+    return ReadNextBytes(pBuffer, nSize);
 }
 
 int32 CCFileClass::Write(const void* pBuffer, int32 nSize)
@@ -507,6 +619,11 @@ int32 CCFileClass::Write(const void* pBuffer, int32 nSize)
 
 int32 CCFileClass::Seek(int32 nOffset, int32 nOrigin)
 {
+    // MIX-resident files have no raw handle; MoveFilePointer owns the
+    // residency-buffer arithmetic (asm CCFileClass_MoveFilePointer 0x473FA0).
+    if (MixBuffer != nullptr)
+        return MoveFilePointer(nOffset, nOrigin);
+
     if (!IsFileOpen)
         return 0;
 
@@ -532,6 +649,9 @@ int32 CCFileClass::Seek(int32 nOffset, int32 nOrigin)
 
 int32 CCFileClass::GetSize()
 {
+    if (MixBuffer != nullptr)
+        return MixBufferSize;
+
     if (!IsFileOpen)
         return 0;
 
@@ -540,21 +660,22 @@ int32 CCFileClass::GetSize()
 
 bool CCFileClass::IsOpen() const
 {
-    return IsFileOpen;
+    return IsFileOpen || MixBuffer != nullptr;
 }
 
 bool CCFileClass::IsAvailable() const
 {
-    // Check if the file exists (in MIX or on disk)
-    if (IsFileOpen)
+    if (IsFileOpen || MixBuffer != nullptr)
         return true;
 
     if (FileName[0] == '\0')
         return false;
 
-    // Check if file exists on disk
-    struct stat st;
-    return (stat(FileName, &st) == 0 && S_ISREG(st.st_mode));
+    // MIX registry first, disk second (asm CCFileClass::Is_Available).
+    if (MixFileClass::FindFileByName(FileName) != nullptr)
+        return true;
+
+    return CCFile_OnDiskExists(FileName);
 }
 
 const char* CCFileClass::GetFileName() const
@@ -592,6 +713,9 @@ bool CCFileClass::Exists() const
 
 int64 CCFileClass::Size() const
 {
+    if (MixBuffer != nullptr)
+        return static_cast<int64>(MixBufferSize);
+
     if (FileName[0] == '\0')
         return 0;
 
@@ -1552,7 +1676,11 @@ const char* RAMFileClass::GetFileName() const
     return "UNKNOWN";
 }
 
-// asm: RAMFileClass_SetFileName (0x65C580) - a no-op that returns truthy.
+// asm: RAMFileClass_SetFileName (0x65C580)
+//     mov eax,[ecx] / call dword ptr [eax+4] / retn 4
+//   —— 纯转发：取自身 vtable 槽 1，交给基类的 SetFileName。
+//   本树的 RAMFileClass 是独立类（没有 FileClass 基类），没有可转发的槽；
+//   它的文件名不参与磁盘解析，故维持"接受即成功"的返回值语义。
 bool RAMFileClass::SetFileName(const char* /*pName*/)
 {
     return true;
@@ -1637,11 +1765,8 @@ bool CCFileClass::OpenEx(const char* pFilename, int32 nMode)
 // asm: BufferIOFileClass_FileExists -> RawFileClass_FileExists / hit cache
 static bool CCFile_OnDiskExists(const char* pName)
 {
-    if (pName == nullptr || pName[0] == '\0') {
-        return false;
-    }
-    struct stat st;
-    return ::stat(pName, &st) == 0 && S_ISREG(st.st_mode);
+    char resolved[MAX_PATH_LEN];
+    return Resolve_Disk_Path(pName, resolved, sizeof(resolved));
 }
 
 // asm: CCFileClass::Is_Available (0x473C40)  - vtable slot 5
@@ -1694,33 +1819,9 @@ bool CCFileClass::HasHandle()
 //  call succeeds without touching the disk.  A miss falls back to the disk.
 bool CCFileClass::OpenFile(int32 nMode)
 {
-    Close();
-
-    // asm: test [mode], 2 -> jnz lct_InGameDir (write path skips MIX lookup)
-    if ((nMode & 2) != 0) {
-        return Open(nMode);
-    }
-
-    if (!CCFile_OnDiskExists(FileName)) {
-        // asm: MixFileClass_FindFileByName over the whole registry.
-        MixFileClass* pMix = MixFileClass::FindFileByName(FileName);
-        if (pMix != nullptr) {
-            const MixIndexEntry* pEntry = pMix->GetIndexEntry(FileName);
-            if (pEntry != nullptr && pEntry->Size > 0) {
-                int32 nSize = static_cast<int32>(pEntry->Size);
-                void* pData = pMix->GetFile(FileName, &nSize);
-                if (pData != nullptr) {
-                    MixBuffer = pData;
-                    MixBufferSize = nSize;
-                    MixBufferPos = 0;
-                    AvailabilityCache = 1;
-                    return true;
-                }
-            }
-        }
-        // asm: lct_NotFoundInMixes -> CDFileClass_OpenFile
-    }
-
+    // vtable slot 7.  The retail implementation is the body that now lives in
+    // Open(); keeping this as a forwarder avoids the old mutual recursion
+    // (OpenFile -> Open -> OpenFile) that silently skipped the MIX probe.
     return Open(nMode);
 }
 
@@ -1925,4 +2026,50 @@ bool CCFileClass::Delete()
     }
 
     return FileSystem::DeleteFile(FileName);
+}
+
+// ============================================================================
+// File_Open_Archive_Stream
+//
+//  See the header: MIX first, loose file second, returned as a stdio stream so
+//  the PCX / FNT / PAL loaders keep their existing fseek/fread/fclose code.
+//  memfd_create keeps the payload in RAM; fclose() on the fdopen'd FILE*
+//  releases it, so callers never own the buffer.
+// ============================================================================
+std::FILE* File_Open_Archive_Stream(const char* pName)
+{
+    if (pName == nullptr || pName[0] == '\0')
+        return nullptr;
+
+    int32 nSize = 0;
+    void* pData = MixFileClass::RetrieveSized(pName, &nSize);
+    if (pData != nullptr)
+    {
+        if (nSize <= 0)
+        {
+            YRMemory::Deallocate(pData);
+            return nullptr;
+        }
+
+        const int fd = ::memfd_create("openyr-archive", 0);
+        if (fd >= 0)
+        {
+            const ssize_t written = ::write(fd, pData, static_cast<size_t>(nSize));
+            YRMemory::Deallocate(pData);
+
+            if (written == static_cast<ssize_t>(nSize))
+            {
+                ::lseek(fd, 0, SEEK_SET);
+                std::FILE* fp = ::fdopen(fd, "rb");
+                if (fp != nullptr)
+                    return fp;
+            }
+            ::close(fd);
+            return nullptr;
+        }
+
+        YRMemory::Deallocate(pData);
+    }
+
+    return std::fopen(pName, "rb");
 }

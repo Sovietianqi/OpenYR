@@ -99,6 +99,8 @@ FrameTimestep::PlanIteration(long long* pAccumUs,
 #include "Combat/BulletClass.h"
 #include "Houses/HouseClass.h"
 #include "AI/TeamTypeClass.h"
+#include "AI/ScriptTypeClass.h"
+#include "AI/ScriptClass.h"
 #include "AI/TeamClass.h"
 #include "AI/AITeamClass.h"
 #include "AI/AITriggerTypeClass.h"
@@ -111,6 +113,9 @@ FrameTimestep::PlanIteration(long long* pAccumUs,
 #include "Special/TiberiumClass.h"
 #include "Special/WaveClass.h"
 #include "Special/RadSiteClass.h"
+#include "Audio/AudioOutput.h"
+#include "Audio/AudioMixer.h"
+#include "Audio/VocClass.h"
 
 #include "Core/Definitions.h"
 #include "Core/Macros.h"
@@ -354,6 +359,188 @@ void Main_Loop()
 
     // asm L756905：扫 vec_VisibleObjects，把 IsDead() 的对象摘表并清理显示层记录。
     ObjectClass::VisibleObjects_DeleteDead();
+
+    // 调试用：OPENYR_MAX_FRAMES=N → 跑到 N 帧即请求关停（原版无此步）。
+    //   定步长回归要跑满全程，但调试单点行为时不必等两三分钟。
+    if (const char* pMaxFrames = std::getenv("OPENYR_MAX_FRAMES"))
+    {
+        char* endp = nullptr;
+        const long limit = std::strtol(pMaxFrames, &endp, 10);
+        if (endp != pMaxFrames && limit > 0
+            && static_cast<long>(Game::CurrentFrame) >= limit)
+            Game::ShutdownRequested = true;
+    }
+
+    // 调试探针（原版无此步）：OPENYR_TRACE=1 时每 600 帧打印一次对象状态
+    //   （坐标/任务/血量/行走），用于确认"任务 + 行走"真的在改变世界。
+    if (std::getenv("OPENYR_TRACE") != nullptr)
+    {
+        static int s_TraceFrame = 0;
+        if ((Game::GetCurrentFrame() - s_TraceFrame) >= 600)
+        {
+            s_TraceFrame = Game::GetCurrentFrame();
+            if (TechnoClass::Array != nullptr)
+            {
+                std::fprintf(stderr, "[TRACE] frame=%d technos=%d bullets=%d\n",
+                             static_cast<int>(Game::GetCurrentFrame()),
+                             static_cast<int>(TechnoClass::Array->Count),
+                             (BulletClass::Array != nullptr)
+                                 ? static_cast<int>(BulletClass::Array->Count) : -1);
+                for (int32 i = 0; i < TechnoClass::Array->Count; ++i)
+                {
+                    TechnoClass* pT = (*TechnoClass::Array)[i];
+                    if (pT == nullptr) continue;
+                    const CoordStruct c = pT->GetCoords();
+                    int32 loco = -1;
+                    CoordStruct dst(0, 0, 0);
+                    if (pT->WhatAmI() != AbstractType::Building)
+                    {
+                        FootClass* pF = static_cast<FootClass*>(pT);
+                        if (pF->Locomotion != nullptr)
+                        {
+                            loco = static_cast<int32>(pF->Locomotion->Is_Moving());
+                            dst  = pF->Locomotion->Destination();
+                        }
+                    }
+                    // tgt 走虚 GetTarget（派生类那一份），cur 是 FootClass 层的
+                    //   CurrentTarget。两者必须一致 —— 不一致就说明有人在绕过
+                    //   SetTarget 直接写字段，任务层读到的是空目标。
+                    const AbstractClass* pTgt = pT->GetTarget();
+                    const AbstractClass* pCur =
+                        (pT->WhatAmI() != AbstractType::Building)
+                            ? static_cast<FootClass*>(pT)->CurrentTarget : nullptr;
+                    int32 cargo = -1;
+                    if (pT->WhatAmI() == AbstractType::Unit)
+                        cargo = static_cast<UnitClass*>(pT)->HarvestAmount;
+                    std::fprintf(stderr,
+                        "   #%d %p %s hp=%d inlimbo=%d mission=%d at=(%d,%d,%d) moving=%d dest=(%d,%d) tgt=%p cur=%p cargo=%d owner=%p human=%d\n",
+                        i, static_cast<const void*>(pT),
+                        (pT->GetType() != nullptr) ? pT->GetType()->ID : "?",
+                        static_cast<int>(pT->Health), static_cast<int>(pT->IsInLimbo),
+                        static_cast<int>(pT->GetMission()), c.X, c.Y, c.Z,
+                        loco, dst.X, dst.Y, static_cast<const void*>(pTgt),
+                        static_cast<const void*>(pCur), (int)cargo,
+                        static_cast<void*>(pT->Owner),
+                        (pT->Owner != nullptr && pT->Owner->Is_Human()) ? 1 : 0);
+                }
+            }
+            // 矿石总量（每 600 帧一行）：观察生长/采空的收支。
+            {
+                int32 oreCells = 0;
+                int32 oreTotal = 0;
+                if (MapClass::Instance != nullptr)
+                {
+                    for (int32 i = 0; i < MapClass::Instance->CellCount; ++i)
+                    {
+                        const int32 v = MapClass::Instance->CellArray[i].Get_Tiberium_Value();
+                        if (v > 0) { ++oreCells; oreTotal += v; }
+                    }
+                }
+                std::fprintf(stderr, "   [ORE] cells=%d total=%d\n", oreCells, oreTotal);
+            }
+
+
+            // ── 队伍表（asm: vec_Teams）─────────────────────────────────
+            //   AI 触发器的产出落在这里：每支队伍的类型 / 成员数 / 当前任务 /
+            //   脚本行。用来确认"触发器→建队→募兵→出兵"这条链是否真的走通。
+            {
+                const int32 teamCount = (TeamClass::Array != nullptr)
+                                      ? TeamClass::Array->Count : -1;
+                std::fprintf(stderr, "   [TEAMS] f=%d count=%d\n",
+                             static_cast<int>(Game::GetCurrentFrame()), teamCount);
+                if (TeamClass::Array != nullptr)
+                {
+                    for (int32 t = 0; t < TeamClass::Array->Count; ++t)
+                    {
+                        TeamClass* pTeam = TeamClass::Array->GetItem(t);
+                        if (pTeam == nullptr) continue;
+                        const char* pTypeID = (pTeam->Type != nullptr
+                                               && pTeam->Type->ID != nullptr)
+                                            ? pTeam->Type->ID : "?";
+                        const int32 scriptLine = (pTeam->Script != nullptr)
+                                               ? pTeam->Script->GetCurrentLine() : -1;
+                        const int32 member0 = (pTeam->Members.Count > 0
+                                               && pTeam->Members[0] != nullptr)
+                                            ? static_cast<int32>(
+                                                  pTeam->Members[0]->GetMission()) : -1;
+                        const int32 tfMembers = (pTeam->Type != nullptr
+                                                 && pTeam->Type->TaskForce != nullptr)
+                                               ? pTeam->Type->TaskForce->Members.Count : -1;
+                        const bool hasScript = (pTeam->Type != nullptr
+                                                && pTeam->Type->ScriptType != nullptr);
+                        const int32 scrActions = (hasScript)
+                                               ? pTeam->Type->ScriptType->GetTotalActionCount() : -1;
+                        std::fprintf(stderr,
+                            "      team#%d %s members=%d mission=%d line=%d "
+                            "forming=%d missing=%d tfMem=%d scr=%d act=%d script=%p "
+                            "tgt=%p owner=%p dis=%d tr=%d\n",
+                            t, pTypeID, static_cast<int>(pTeam->Members.Count),
+                            member0, scriptLine,
+                            pTeam->IsForming ? 1 : 0,
+                            pTeam->IsMissingMembers ? 1 : 0,
+                            tfMembers, hasScript ? 1 : 0, scrActions,
+                            static_cast<void*>(pTeam->Script),
+                            static_cast<void*>(pTeam->ITarget),
+                            static_cast<void*>(pTeam->Owner),
+                            pTeam->JustDisappeared ? 1 : 0,
+                            pTeam->IsTransient ? 1 : 0);
+                    }
+                }
+            }
+
+            // 阵营 AI 选型状态（每房一行）：人类/科技/在造类型/资金。
+            for (int32 h = 0; h < HouseClass::ArrayCount; ++h)
+            {
+                HouseClass* pH = HouseClass::Array[h];
+                if (pH == nullptr) continue;
+                int32 stamped = 0;
+                for (int32 n = 0; n < pH->Base.NodeCount; ++n)
+                    if (pH->Base.Nodes[n].field_08 != 0) ++stamped;
+                std::fprintf(stderr,
+                    "   [AIH] f=%d #%d %p human=%d tech=%d money=%d infTo=%d bldTo=%d"
+                    " unitTo=%d state=%d cy=%d nodes=%d blds=%d units=%d n08=%d\n",
+                    Game::GetCurrentFrame(),
+                    h, static_cast<void*>(pH), pH->Is_Human() ? 1 : 0,
+                    (int)pH->TechLevel, (int)pH->AvailableMoney(),
+                    (int)pH->InfantryTypeToProduce, (int)pH->BuildingTypeToProduce,
+                    (int)pH->UnitTypeToProduce, (int)pH->AIBuildState,
+                    (int)pH->OwnedConyards.GetCount(),
+                    (int)pH->Base.NodeCount,
+                    (int)pH->OwnedBuildings.GetCount(),
+                    (int)pH->OwnedUnits.GetCount(), (int)stamped);
+                if (!pH->Is_Human())
+                {
+                    std::fprintf(stderr, "   [B]");
+                    for (int32 b = 0; b < pH->OwnedBuildings.GetCount() && b < 16; ++b)
+                    {
+                        BuildingClass* pB = pH->OwnedBuildings[b];
+                        std::fprintf(stderr, " %s", (pB && pB->Type) ? pB->Type->ID : "?");
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            // 生产线状态：进度 / 是否挂起 / 在线产品。OPENYR_TRACE 下才打。
+            if (FactoryClass::Array != nullptr)
+            {
+                for (int32 i = 0; i < FactoryClass::Array->Count; ++i)
+                {
+                    FactoryClass* pF = (*FactoryClass::Array)[i];
+                    if (pF == nullptr) continue;
+                    TechnoClass* pProd = pF->Get_Product();
+                    std::fprintf(stderr,
+                        "   [FAC] #%d %p prog=%d onhold=%d prod=%p hp=%d limbo=%d dead=%d mis=%d\n",
+                        i, static_cast<void*>(pF), static_cast<int>(pF->GetProgress()),
+                        pF->IsOnHold() ? 1 : 0,
+                        static_cast<void*>(pProd),
+                        (pProd != nullptr) ? (int)pProd->Health : -1,
+                        (pProd != nullptr) ? (int)pProd->IsInLimbo : -1,
+                        (pProd != nullptr) ? (int)pProd->IsDead() : -1,
+                        (pProd != nullptr) ? (int)pProd->GetMission() : -1);
+                }
+            }
+            std::fflush(stderr);
+        }
+    }
 
     // 调试探针（原版无此步）：OPENYR_CHAIN_DEBUG=1 时每 300 帧汇总一次
     // 「#2 TechnoClass::Update / #3 MissionClass::Update→Mission_* / #6
@@ -799,14 +986,25 @@ void Render_Frame()
 
 void Update_Audio()
 {
-    // In the original engine:
-    //   1. Process audio event queue
-    //   2. Start/stop sounds based on game events
-    //   3. Update 3D positional audio
-    //   4. Handle music track transitions
-    //   5. Process volume changes
-    //   6. Handle sound priority and culling
-    //   7. Process audio streaming
+    // ── 1. 打开输出后端（只在第一次进入时读环境变量）─────────────────────
+    //   未设置 OPENYR_AUDIO 时保持关闭：不做混音、不占槽位、不读时钟，
+    //   与加入音频之前的回归结果完全一致。
+    AudioOutput& output = AudioOutput::Instance();
+    output.InitFromEnv();
+
+    // ── 2. 混出本帧的采样并送后端（WAV 落盘 / SDL 队列）──────────────────
+    //   混音位置由采样推进，不由逻辑帧号推算，所以 15/30/60Hz 的逻辑节奏
+    //   都不会让声音变速。
+    output.Pump();
+
+    // ── 3. 推进播放中的声音对象：结束判定 + 3D 音量/声像跟随听者──────────
+    //   有混音器时，"是否播完"以混音器为准（见 VocClass::Update）。
+    if (VocManagerClass* pManager = VocManagerClass::GetInstance())
+        pManager->UpdateAll();
+
+    // ── 4. 主题音乐：ThemeClass 目前只维护播放列表与曲目状态，没有流
+    //       后端（原版走 AudioStream + 独立的流线程）。此处不伪造播放，
+    //       待音乐流接入后在此驱动曲目切换。
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

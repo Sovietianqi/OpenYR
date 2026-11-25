@@ -32,6 +32,12 @@ public:
     //   返回 true 表示解析完成（含"读不到下一个块 ID"的提前收尾）。
     static bool Parse_File(const char* pFname);
 
+    // asm: StringTable_LoadFile（asm.txt:1674603，WinMain+1EB3 调用）
+    //   原版启动时传的是 "ra2md.str"：函数把扩展名截掉再补 ".csf"，
+    //   也就是真正打开 ra2md.csf。这里保留同样的语义（含 Loaded 幂等门），
+    //   否则调用方得自己记住「传 str、开 csf」这个反直觉的约定。
+    static bool Load_File(const char* pName);
+
     // asm: CSF_Data1 —— 字符串指针数组（长度 ArrayLen）
     static void** Data1;
     // asm: CSF_Data2 —— 第二组字符串指针数组（长度 ArrayLen）
@@ -46,6 +52,13 @@ public:
     static void*  ListB1CF88;
     // asm: bool_StringTable_Loaded
     static bool   Loaded;
+
+    // asm: MainCSF —— 最近一次成功起始解析的 CSF 文件名（`const char*`）。
+    //   StringTable_LoadFile 在空指针检查之后、真正解析之前写它
+    //   （asm `mov MainCSF, ecx`）。Game_EnableJabber 靠它在 Jabber 开关
+    //   变化后按**同一份** CSF 重建字符串表，所以这里必须是加载入口的记录，
+    //   不能由调用方随手塞。
+    static const char* MainCSF;
 
     // asm: MaxCSFLabelLen —— 已见标签串的最大字节长度（含结尾 0）
     static int32  MaxLabelLen;

@@ -71,18 +71,31 @@ public:
 
     // asm: AITriggerTypeClass_HouseOwns / _EnemyOwns / _CivilianHouseOwns
     //   —— 对目标/自己/平民阵营持有的 ConditionObject 计数并比较。
-    bool OwnerHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
-    bool CivilianHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
-    bool EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
+    //   pCountOut 仅供 OPENYR_TRIGDBG 探针取"本次被测量的原始数值"，默认不写。
+    bool OwnerHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse, int32* pCountOut = nullptr) const;
+    bool CivilianHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse, int32* pCountOut = nullptr) const;
+    bool EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* TargetHouse, int32* pCountOut = nullptr) const;
     bool HouseCredits(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
     bool IronCurtainCharged(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
     bool ChronoSphereCharged(HouseClass* CallingHouse, HouseClass* TargetHouse) const;
 
     // asm: AITriggerTypeClass_CompareHouseMoney / _IronCurtainPercentReady /
     //   _ChronospherePercentReady —— 具体条件分支实现。
-    bool CompareHouseMoney(HouseClass* pHouse) const;
+    bool CompareHouseMoney(HouseClass* pHouse, int32* pCountOut = nullptr) const;
     bool IronCurtainPercentReady(HouseClass* pHouse) const;
     bool ChronospherePercentReady(HouseClass* pHouse) const;
+
+    // asm 0x41E92B / 0x41E965（ConditionType 2 / 3）：目标阵营的
+    //   (PowerOutput - PowerDrain) 与固定阈值比较（<100 / <0），不吃 params。
+    bool PowerSurplusBelow(HouseClass* pHouse, int32 threshold, int32* pCountOut = nullptr) const;
+
+    // 条件对象在指定阵营的持有数（asm: objCondition->WhatAmI() 分派到
+    //   OwnedBuilding/Vehicle/Infantry/Aircraft 四张 CounterClass）。
+    int32 CountConditionObject(const HouseClass* pHouse) const;
+
+    // params 的两个 dword（asm: params.arg [+0xE4] 与 params.cond [+0xE8]）。
+    int32 ComparatorType() const;
+    int32 ComparatorOperand() const;
 
     // 计数/比较辅助（对 ConditionObject 计数后套用比较器）。
     bool EvaluateBuildingCount(HouseClass* pHouse) const;

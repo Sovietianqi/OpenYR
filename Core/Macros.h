@@ -37,6 +37,9 @@ public: \
 #define E_POINTER -2
 #define E_NOTIMPL -3
 #define E_NOINTERFACE -4
+// 原版是 0x80070057；本树的 HRESULT 统一用“负小整数”替身（见上），
+// 取值只要互不相同即可，不与系统 COM 混用。
+#define E_INVALIDARG -5
 
 #define VARIANT_BOOL int32
 #define VARIANT_TRUE 1

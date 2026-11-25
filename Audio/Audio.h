@@ -260,6 +260,7 @@ public:
 
     int32 FindIndex(const char* pName) const;
     const char* GetName(int32 index) const;
+    uint32      GetOffset(int32 index) const;
 
     int32 GetCount() const { return Count; }
     bool  IsLoaded() const { return Entries != nullptr; }

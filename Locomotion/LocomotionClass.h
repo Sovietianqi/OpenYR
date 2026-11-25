@@ -24,6 +24,17 @@ public:
         static constexpr int32 Ship = 8;
         static constexpr int32 Jumpjet = 9;
         static constexpr int32 Rocket = 10;
+
+        // 真实 CLSID 表（asm 0x7E9A74 起的 11 个 GUID）。
+        // 上面的小整数只是**内部索引**，不是 GUID 的 Data1；两者必须分开，
+        // 否则 QueryInterface / 存档里写出的 COM 类标识全是错的。
+        static const GUID& Get(int32 id);
+
+        // rules(md).ini 的 `Locomotor=` 写的是 GUID 串，如
+        //   {4A582741-9839-11D1-B709-00A024DDAFD1}
+        // 也接受裸名字（"Drive"/"Walk"/…，大小写不敏感）。
+        // 无法识别时返回 -1。
+        static int32 FromString(const char* nameOrGuid);
     };
 
     virtual HRESULT QueryInterface(REFIID iid, LPVOID* ppvObject) override { return E_FAIL; }
@@ -36,10 +47,9 @@ public:
     // 根据游戏行为，可知移位面板的保留查询槽位固定返回 -1。
     virtual int32 ILocomotion_4B6690() const;
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override { return S_OK; }
- // 根据游戏行为，可知 GetMaxSize 负责下面这段逻辑。
-    //
-    //  Serialised size of a locomotion object: the instance's own Size() plus
-    //  the four-byte class tag.  A null output pointer yields E_POINTER.
+    // asm: LocomotionClass_GetMaxSize (asm:750425)
+    //   判空 → E_POINTER(80004003h)；否则 *pcbSize = Size() + 4（末尾四字节
+    //   类别标记），返回 S_OK。LocomotionClass::GetMaxSize 转调此处。
     virtual HRESULT GetSizeMax(uint64* pcbSize) override {
         if (pcbSize == nullptr)
             return E_POINTER;
@@ -51,7 +61,16 @@ public:
     virtual ~LocomotionClass() = default;
     virtual int32 Size() = 0;
 
-    virtual HRESULT Link_To_Object(void* pointer) override { return S_OK; }
+    // asm: ILocomotion::Link_To_Object —— 把 COM 对象绑到载体上。
+    //   此前这里是空实现，只有非虚的 LinkToObject(FootClass*) 真正写
+    //   Owner/LinkedTo；而 CreateInstance 之后走的是虚槽，于是所有行走
+    //   逻辑的 Owner 恒为 null，Process 第一句 `if (!Owner) return` 就退出，
+    //   单位"有 locomotion 但一步不动"。
+    virtual HRESULT Link_To_Object(void* pointer) override
+    {
+        LinkToObject(static_cast<FootClass*>(pointer));
+        return S_OK;
+    }
     virtual bool Is_Moving() override { return IsMoving; }
     virtual CoordStruct Destination() override { return Dest; }
     // asm: LocomotionClass_ILocomotion_HeadToCoord   (asm:750696)
@@ -212,8 +231,11 @@ public:
     virtual int32     ILocomotion_ZGradient();
     virtual void      ILocomotion_ZAdjust(int32 z);
     virtual int32     ILocomotion_VisualCharacter();
-    virtual void      ILocomotion_DrawMatrix(const RectangleStruct& rect);
-    virtual void      ILocomotion_DrawPoint(const Point2D& point);
+    // asm: LocomotionClass_ILocomotion_DrawMatrix (asm:749794, retn 0Ch)
+    //   生成载体的模型矩阵并写回 outMatrix，同时把 32 分度朝向索引
+    //   或进 *pFacing（-1 表示调用方不关心）。
+    virtual void      ILocomotion_DrawMatrix(Matrix3D& outMatrix, int32* pFacing);
+    virtual void      ILocomotion_DrawPoint(Point2D& point);
 
     //========================================================================
     // 根据游戏行为，可知下面是移动器的公用管理入口：按类别号创建对应

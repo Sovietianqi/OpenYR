@@ -16,6 +16,7 @@
 #include "../Map/MapClass.h"
 #include "../Map/CellClass.h"
 #include "../Math/CoordStruct.h"
+#include "../Particles/ParticleSystemClass.h"
 #include "../Scenario/ScenarioClass.h"
 #include "../Core/Definitions.h"
 #include "../Rules/RulesClass.h"
@@ -1360,6 +1361,10 @@ bool ActionClass::CreateBuilding(int32 coords, int32 a3, int32 a4, int32 a5)
         return false;
 
     pBuilding->Type  = pType;
+    // ★ 基类的 TechnoType 也要指向同一份类型：建筑侧只写 Type 会让
+    //   TechnoClass::AI() 的第一行（TechnoType == nullptr → return）直接
+    //   把整座建筑跳过，索敌/计时器/开火全部不跑。
+    pBuilding->TechnoType = pType;
     pBuilding->Owner = HouseClass::Player;
 
     CoordStruct at = CellClass::Cell2Coord(wp);
@@ -1748,10 +1753,10 @@ bool ActionClass::TalkBubbleOfTeam(HouseClass* pHouse, int32 a3,
     TeamTypeClass* pTT = static_cast<TeamTypeClass*>(TeamType);
     if (pTT == nullptr)
     {
-        // asm: loc_6E4067 —— 队伍类型为空时，原版以 ecx=0 调用
-        //   TechnoClass_DisplayTalkBubble；该调用真正读取的是 edx（话泡类型）
-        //   而非单位本身，等价于“按类型生成一个无宿主话泡”。本项目没有对应的
-        //   无宿主话泡入口，且语义上无队伍可冒泡，故直接判成功返回。
+        // asm: loc_6E4067 —— 队伍类型为空时以 ecx = 0 调用
+        //   TechnoClass_DisplayTalkBubble。函数体第一句就是 `test esi,esi /
+        //   jz 清空`，因此这条调用等价于"收掉当前话泡"。
+        TechnoClass::DisplayTalkBubble_Global(nullptr, 0);
         return true;
     }
 
@@ -1770,12 +1775,11 @@ bool ActionClass::TalkBubbleOfTeam(HouseClass* pHouse, int32 a3,
                 continue;
 
             // asm: mov ecx,[eax+54h] —— 队伍实例上的首个 TechnoClass。
+            TechnoClass* pTechno = nullptr;
             if (pTeam->GetMemberCount() > 0)
-            {
-                TechnoClass* pTechno = pTeam->GetMember(0);
-                if (pTechno != nullptr)
-                    pTechno->DisplayTalkBubble(nullptr, ActionIndex);
-            }
+                pTechno = pTeam->GetMember(0);
+
+            TechnoClass::DisplayTalkBubble_Global(pTechno, ActionIndex);
             break;
         }
     }
@@ -2937,22 +2941,75 @@ bool ActionClass::PauseForSeconds(HouseClass* pHouse, int32 a3,
 //   new(sizeof(ParticleSystemClass)) ; ParticleSystemClass_CTOR(
 //       unk_A83D6C[+0x90], &coords, Target=0, Owner=0, &stru_B0E6A0, 0)
 //
-// 注：本项目 ParticleSystemClass 构造无参，粒子类型/坐标由 Initialize()
-//     与 SetPosition() 承载；stru_B0E6A0 的 warhead 参数尚未建模。
+// ============================================================================
+// ActionClass_LightningStrikeAt_unused (0x6E0040)
+//
+// asm 逐句：
+//   push ecx
+//   mov  eax, [ecx+44h]                ; this->Waypoint（参数栈完全没有被读）
+//   lea  ecx, [esp+0]                  ; &dest
+//   push eax / push ecx
+//   mov  ecx, Scenario                 ; ScenarioClass::Instance
+//   call Scenario_GetWaypointCoords
+//   mov  edx, [eax]                    ; 取回 CellStruct（X/Y 两个 int16）
+//   push edx
+//   call LightningStorm_Strike
+//   mov  al, 1
+//   retn 10h
+//
+// 这是个孤儿函数（原版名字就带 _unused），没有任何调用点；但行为完全可
+// 确证：路点号来自 this->Waypoint，落点由 Scenario 解析，然后打一道闪电。
+// 栈参数按 asm 未被读取，这里明确忽略。
 // ============================================================================
 void ActionClass::LightningStrikeAt_unused(const CoordStruct& pos)
 {
-    (void)pos;
+    (void)pos;   // asm: retn 10h，但函数体从不读栈参数
+
+    const CellStruct cell = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+    SuperClass::LightningStorm_Strike(cell);
 }
 
 // ============================================================================
 // ActionClass_RemoveParticleSystemsAt_unused (0x6E00D0)
 //
-// asm: 遍历粒子系统表，删除落在 +0x44 路点处的系统（AL=1）。
+// asm 逐句：
+//   mov  eax, [ecx+44h] / Scenario_GetWaypointCoords(&dest, Waypoint)
+//   target = [eax]                       ; CellStruct
+//   for (i = 0; i < vec_ParticleSystems.length; ++i)
+//       ps = vec_ParticleSystems.data[i]
+//       if (ps->byte[0x90] == 0) continue           ; 未激活
+//       c = ps->vt[0x1B8](&tmp)                     ; 系统所在格
+//       if (c->X != target.X || c->Y != target.Y) continue
+//       ps->vt[0xF8]()                              ; 撤下
+//   return 1
 //
-// 注：传入的 pos 是调用点已结算好的世界坐标（与 Spawn 共用落点）。
+// 本工程：IsActiveSystem() 对应 [ps+0x90]，Position 对应 vt[0x1B8] 的
+// 坐标语义（MapClass::Remove_Particle_Anim 已按同一映射落地），Stop()
+// 对应 vt[0xF8]。
 // ============================================================================
 void ActionClass::RemoveParticleSystemsAt_unused(const CoordStruct& pos)
 {
-    (void)pos;
+    (void)pos;   // asm 只读 this->Waypoint
+
+    const CellStruct target = ScenarioClass::Instance->GetWaypointCoords(Waypoint);
+
+    DynamicVectorClass<ParticleSystemClass*>* vec = ParticleSystemClass::Array;
+    if (vec == nullptr) {
+        return;
+    }
+
+    // 倒序遍历：Stop() 会把系统移出登记表，正序会漏项。
+    for (int32 i = vec->Count - 1; i >= 0; --i) {
+        ParticleSystemClass* pSystem = vec->Items[i];
+        if (pSystem == nullptr || !pSystem->IsActiveSystem()) {
+            continue;
+        }
+
+        const CellStruct cell = CoordMath::CoordToCell(pSystem->Position);
+        if (cell.X != target.X || cell.Y != target.Y) {
+            continue;
+        }
+
+        pSystem->Stop();
+    }
 }

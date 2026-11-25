@@ -275,14 +275,32 @@ public:
     bool Load(const char* filename);
     bool IsWAVFile(const uint8* data, int32 size);
     bool IsVOCFile(const uint8* data, int32 size);
+    // asm: RA2/YR 的语音与音效来自 .aud（Westwood 容器 + IMA/WW ADPCM）。
+    //   AudFile.h 负责容器与解码，VocClass 只接管 PCM 结果。
+    bool IsAUDFile(const uint8* data, int32 size);
     bool ParseWAV(const uint8* data, int32 size);
     bool ParseVOC(const uint8* data, int32 size);
+    bool ParseAUD(const uint8* data, int32 size);
     bool ParseRaw(const uint8* data, int32 size);
     bool AllocateVocData(const uint8* data, int32 dataSize);
     void Unload();
 
     void Play();
     void Stop();
+
+    // -------------------------------------------------------------------
+    // 采样库直取
+    //
+    // 零售素材里声音不在散落文件里，而是 audio.bag 中的一块，靠 audio.idx
+    // 按名索引。LoadFromAudioBank 把"名字 -> 字节 -> 解码 -> PCM"这段接通；
+    // FindOrLoadShared 在进程内缓存同一个名字的 VocClass，避免每次播报都
+    // 重新解一遍 ADPCM（EVA 短句重播频率很高）。
+    // -------------------------------------------------------------------
+    bool LoadFromAudioBank(const char* pName);
+    bool LoadFromAudioBankByIndex(int32 index);
+    static VocClass* FindOrLoadShared(const char* pName);
+    static VocClass* FindOrLoadByIndex(int32 index);
+    static void      ClearSharedCache();
     void Pause();
     void Resume();
     void Update();

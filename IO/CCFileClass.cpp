@@ -63,7 +63,7 @@ CCFileClass* CCFile_Open_For_Write(const char* pFilename)
     if (!pFile)
         return nullptr;
 
-    if (!pFile->Open(1)) // 1 = Write
+    if (!pFile->Open(2)) // 2 = Write (asm: test [mode],2)
     {
         delete pFile;
         return nullptr;
@@ -83,7 +83,7 @@ CCFileClass* CCFile_Open_For_ReadWrite(const char* pFilename)
     if (!pFile)
         return nullptr;
 
-    if (!pFile->Open(2)) // 2 = ReadWrite
+    if (!pFile->Open(3)) // 3 = ReadWrite
     {
         delete pFile;
         return nullptr;

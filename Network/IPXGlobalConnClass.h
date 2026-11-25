@@ -28,10 +28,10 @@
 //     9. ack 表逐格写 -1
 //    10. [+0D8h] = 0
 //
-//   ⚠ 留白：本批次只落地类骨架、构造与 StripGlobalPacket 的类归属。
-//   asm 里 IPXConnClass 的基类布局（[+4Ch] 的地址结构、[+68h] 的名称缓冲
+//   ⚠ 留白：asm 里 IPXConnClass 的基类布局（[+4Ch] 的地址结构、[+68h] 的名称缓冲
 //   等）OpenYR 侧的 ConnectionClass 尚未按字节对齐，因此下面的偏移字段以
-//   具名成员的形式记录，实际填值逻辑等 ConnectionClass 定案后再接。
+//   具名成员的形式记录。StripGlobalPacket 用到的接收队列（原版挂在连接对象
+//   +0x38 上）改由本类的 ReceiveQueue 持有，其余逻辑逐句对齐 asm。
 // ============================================================================
 class IPXGlobalConnClass : public IPXConnectionClass {
 public:
@@ -57,6 +57,21 @@ public:
     //   本函数是虚表项，被 Networking 层按虚派发调用。
     // ------------------------------------------------------------------------
     virtual void StripGlobalPacket(int32 maxAgeSeconds);
+
+    // ------------------------------------------------------------------
+    // 全局包接收队列。
+    //
+    //   原版这条队列挂在「连接对象」上（[this+4] -> +0x38 计数，
+    //   sub_48B9E0 取第 i 个包、sub_48B890 删除第 i 个包），包体是
+    //   { +04 接收时刻, +0C -> +04 发送者 id }。本工程 ConnectionClass
+    //   没有这层结构，队列改由本类持有，字段含义与 asm 一一对应。
+    // ------------------------------------------------------------------
+    struct GlobalPacket
+    {
+        int32 Time;      // 包 +0x04 —— 接收时刻（tick）
+        int32 Sender;    // 包 +0x0C -> +0x04 —— 发送者 id
+    };
+    VectorClass<GlobalPacket> ReceiveQueue;   // asm: [conn+0x38]
 
     // ------------------------------------------------------------------
     // 布局（偏移取自 asm 构造函数）

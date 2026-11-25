@@ -137,13 +137,27 @@ public:
     // ------------------------------------------------------------------------
     void Map_Preview_Download();
 
-    // asm: ModemHost_StartGame —— 点"开始"之后的建场入口
+    // asm: ModemHost_StartGame (0x5BAC40) —— 点"开始"之后的建场入口
+    //   缺口：握手要求对话框里已填好的玩家表（0x85 节点数组）与 GO/回执
+    //   载荷结构，两者都在未建模的拨号会话协议里；如实返回 false。
     virtual bool Host_Start_Game();
-    // asm: ModemHost_SignOff —— 挂断
+    // asm: ModemHost_SignOff (0x5B9F50) —— 已落地：发 0x66 挂断包（0xFA 字节）、
+    //   0x12C tick 内等同一席位回执；TXT_SIGNING_OFF 的模态提示与
+    //   sub_5F0040 的会话清理属窗口层/拨号会话（缺口）。
     virtual void SignOff();
 
 protected:
     // --- 窗口系统（无实体，默认"无窗口"） -----------------------------------
+    //   asm 依据与缺口逐条列在 ModemClass.cpp 的实现处：
+    //     Dialog_Show       asm: ModemHost_Dialog (0x5B7990) 的
+    //                         Dialog_Show(0xF1, sub_5B7970, 0)
+    //     Dialog_End        asm: ModemHost_Dialog (0x5B7990) +0x14E
+    //     Get_Dlg_Item      asm: ModemHost_SignOff (0x5B9F50) 等处的 GetDlgItem
+    //     Send_Dlg_Message  asm: 各处 SendMessageA
+    //     Set_Window_Long   asm: ModemHost_Dialog (0x5B7990) +0x3A
+    //     Show_Window       asm: 各处 ShowWindow(hWnd, nCmdShow)
+    //   缺口：本工程没有 Win32 窗口层与拨号对话框资源（模板 id 0xF1 不存在），
+    //   因此这六个入口如实返回"无窗口 / 无控件"，不伪造成功。
     virtual void* Dialog_Show(int32 id, void* pProc, void* pParam);
     virtual void  Dialog_End();
     virtual void* Get_Dlg_Item(void* hDlg, int32 id);
@@ -153,12 +167,24 @@ protected:
     virtual void  Copy_Guest_Name(void* pDst, const void* pSrc, int32 a3);
 
     // --- 对话框内部处理器 ---------------------------------------------------
-    virtual void Host_Init();          // asm: sub_5B82F0
-    virtual void Wnd_Init(void* hWnd); // asm: sub_622800
-    virtual int32 Is_Quit_Requested(); // asm: sub_623120
-    virtual void Process_Host();       // asm: sub_5B9F30(state, 0)
-    virtual int32 Process_Host2();     // asm: sub_5BA060(state, 0)
-    virtual void Blit_Dialog();        // asm: sub_532100(0)
+    //   Host_Init          asm: sub_5B82F0 (0x5B82F0) —— 已落地：RulesClass
+    //                      多人默认值灌回会话；对话框文本段属窗口层（缺口）。
+    //   Wnd_Init           asm: sub_622800 (0x622800) —— 装窗口过程；无窗口（缺口）。
+    //   Is_Quit_Requested  asm: sub_623120 (0x623120) —— 已落地：Call_Back +
+    //                      Main_Loop 泵，退出判据用 GameIsQuitting 承接。
+    //   Process_Host       asm: sub_5B9F30 (0x5B9F30) —— 已落地：服务收发队列 +
+    //                      每 0x28ms 发一次 0xFA 字节心跳包（首双字 0x69）。
+    //   Process_Host2      asm: sub_5BA060 (0x5BA060) —— 已落地"把已到达的包
+    //                      全部取走"；0x64/0x68/0x6D 三个包型的分派体属于
+    //                      拨号会话协议（缺口），因此一律返回 0（不退出）。
+    //   Blit_Dialog        asm: sub_532100 (0x532100) —— 已落地焦点判定；
+    //                      GScreen 隐藏表面的 blit 未建模（缺口）。
+    virtual void Host_Init();
+    virtual void Wnd_Init(void* hWnd);
+    virtual int32 Is_Quit_Requested();
+    virtual void Process_Host();
+    virtual int32 Process_Host2();
+    virtual void Blit_Dialog();
 
 public:
     void*  Hwnd;                 // +0x00

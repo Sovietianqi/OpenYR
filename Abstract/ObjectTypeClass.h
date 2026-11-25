@@ -41,6 +41,16 @@ public:
     // each guarded by a "already resident" check so a second call is a no-op.
     static void One_Time();
 
+    // asm: CCFile_TALKBUBL_SHP（byte_AC148B）的读取口。
+    //   TechnoClass::DrawExtras 画话泡时直接取这个句柄；未调用 One_Time 或
+    //   素材缺失时返回 nullptr。返回的句柄由 ObjectTypeClass 持有，调用方
+    //   不得释放。
+    static SHPStruct* Get_TalkBubble_Shape();
+
+    // asm: CCFile_PIPS_SHP（byte_AC1489）—— 老兵/精锐军衔标记（帧 0x0E/0x0F）
+    //   与其它 pips 共用的素材。返回的句柄由 ObjectTypeClass 持有。
+    static SHPStruct* Get_Pips_Shape();
+
     // ------------------------------------------------------------------
     // Construction / destruction
     // ------------------------------------------------------------------

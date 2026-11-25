@@ -44,7 +44,7 @@ DynamicVectorClass<WeaponTypeClass*>* WeaponTypeClass::Array = nullptr;
 // Constants
 // =============================================================================
 static const int32   WEAPON_MAX_BURST          = 10;
-static const int32   WEAPON_MAX_RANGE          = 50;     // cells
+static const int32   WEAPON_MAX_RANGE          = 50 * 256; // cells -> leptons
 static const int32   WEAPON_MAX_ROF            = 100000; // frames
 static const int32   WEAPON_MIN_DAMAGE         = 0;
 static const int32   WEAPON_MIN_SPEED          = 1;
@@ -486,11 +486,21 @@ bool WeaponTypeClass::LoadFromINIList(CCINIClass* pINI) {
     if (!pINI->SectionExists(sectionName)) return false;
 
     // ── Integer properties ──────────────────────────────────────────────
+    //
+    //   asm 1793243：`call CCINIClass::Get_Lepton` —— Range / MinimumRange
+    //   在引擎内部一律是 **lepton**（1 格 = 256）。原实现直接读整数，得到
+    //   的是"格"，与所有拿 lepton 距离去比的地方（IsCloseEnoughToTarget /
+    //   BulletClass 的飞行上限 / BuildingClass 的 `range / 256`）全部对不上，
+    //   表现为"单位到位了也永远判定射程不足"。
+    static const int32 kLeptonsPerCell = 256;
     Damage         = pINI->ReadInteger(sectionName, "Damage", Damage);
     ROF            = pINI->ReadInteger(sectionName, "ROF", ROF);
-    Range          = pINI->ReadInteger(sectionName, "Range", Range);
+    Range          = pINI->ReadInteger(sectionName, "Range", Range / kLeptonsPerCell)
+                     * kLeptonsPerCell;
     Burst          = pINI->ReadInteger(sectionName, "Burst", Burst);
-    MinimumRange   = pINI->ReadInteger(sectionName, "MinimumRange", MinimumRange);
+    MinimumRange   = pINI->ReadInteger(sectionName, "MinimumRange",
+                                       MinimumRange / kLeptonsPerCell)
+                     * kLeptonsPerCell;
     Speed          = pINI->ReadInteger(sectionName, "Speed", Speed);
 
     // Clamp values to sane ranges.
@@ -803,9 +813,9 @@ int32 WeaponTypeClass::CalculateROF(TechnoClass* pSource) const {
 // =============================================================================
 // IsInRange - Check whether the target is within maximum weapon range
 //
-// Range is stored in cells; one cell equals 256 leptons.  The check uses
-// 3D Euclidean distance so that altitude differences (aircraft vs ground)
-// are accounted for.
+// Range is stored in leptons (1 cell = 256), matching CCINIClass::Get_Lepton.
+// The check uses 3D Euclidean distance so that altitude differences
+// (aircraft vs ground) are accounted for.
 // =============================================================================
 bool WeaponTypeClass::IsInRange(CoordStruct source, CoordStruct target) const {
     if (Range <= 0) return false;
@@ -818,8 +828,7 @@ bool WeaponTypeClass::IsInRange(CoordStruct source, CoordStruct target) const {
                  + static_cast<int64>(dy) * dy
                  + static_cast<int64>(dz) * dz;
 
-    int32 rangeLeptons = Range * 256;
-    int64 rangeSq = static_cast<int64>(rangeLeptons) * rangeLeptons;
+    int64 rangeSq = static_cast<int64>(Range) * Range;
 
     return distSq <= rangeSq;
 }
@@ -839,8 +848,7 @@ bool WeaponTypeClass::IsAboveMinimumRange(CoordStruct source, CoordStruct target
     int64 distSq = static_cast<int64>(dx) * dx
                  + static_cast<int64>(dy) * dy;
 
-    int32 minRangeLeptons = MinimumRange * 256;
-    int64 minRangeSq = static_cast<int64>(minRangeLeptons) * minRangeLeptons;
+    int64 minRangeSq = static_cast<int64>(MinimumRange) * MinimumRange;
 
     return distSq >= minRangeSq;
 }

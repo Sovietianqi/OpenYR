@@ -22,6 +22,7 @@ public:
     static void Delete_All();
 
     virtual ~UnitTypeClass();
+    virtual AbstractType WhatAmI() const override { return AbstractType::UnitType; }
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual bool SaveToINI(CCINIClass* pINI) const override;
     virtual AbstractType GetAbstractDerivationID() const override;
@@ -133,10 +134,11 @@ public:
     bool        IsCanBeSabotaged;
     bool        IsCanBeStolen;
     bool        IsCanBeHijacked;
-    int32       WeaponCount;
-    WeaponStruct Weapons[2];
-    int32       EliteWeaponCount;
-    WeaponStruct EliteWeapons[2];
+    // 注意：Weapons / EliteWeapons / WeaponCount 全部继承自 TechnoTypeClass
+    //   （原版只有一份 18 槽武器表）。这里曾经重复声明过一份 2 槽的表，
+    //   结果 Read_INI 写基类那份、战斗代码读子类这份，两边永远对不上：
+    //   所有步兵/载具的 GetWeaponRange 返回 0、自动索敌半径为 1 格、
+    //   有武器的单位也永远打不出子弹。
     bool        HasTurret;
     bool        CanCloak;
     bool        IsVoxel;

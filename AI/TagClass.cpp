@@ -8,6 +8,8 @@
 #include "../Scenario/ScenarioClass.h"
 #include "../Game/Game.h"
 #include "../INI/INIClass.h"
+#include "../Map/MapClass.h"
+#include "../Map/CellClass.h"
 #include "../Math/Timer.h"
 
 #include <cstring>
@@ -347,6 +349,31 @@ void TagClass::ProcessTagEvents() {
 }
 
 // ----------------------------------------------------------------------------
+// SpringCellTag - [CellTags] 的每格判定。
+//   asm: FootClass_UpdatePosition 在写回新格后取 CellClass::AttachedTag，
+//   非空则 TagClass_RaiseEvent(kind=1 /*EnteredBy*/, obj, cell, 0, 0)。
+//   这一步此前完全缺失：ReadCellTags 把标签挂上格子，却没有任何消费方。
+// ----------------------------------------------------------------------------
+void TagClass::SpringCellTag(CellStruct cell, AbstractClass* pObject)
+{
+    if (MapClass::Instance == nullptr) return;
+
+    CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+    if (pCell == nullptr) return;
+
+    TagClass* pTag = pCell->AttachedTag;
+    if (pTag == nullptr) return;
+
+    static const bool s_Dbg = (std::getenv("OPENYR_TRIGDBG") != nullptr);
+    if (s_Dbg) {
+        std::fprintf(stderr, "[CELLTAG] frame=%d cell=(%d,%d) tag=%s\n",
+                     (int)Game::CurrentFrame, (int)cell.X, (int)cell.Y,
+                     (pTag->Name[0] != '\0') ? pTag->Name : "?");
+    }
+    pTag->RaiseEvent(1, pObject, cell, false, nullptr);
+}
+
+// ----------------------------------------------------------------------------
 // Assign_To_Object - record that a map object references this tag. Used by the
 // editor/RTTI layer to track tag usage; duplicates are ignored.
 // ----------------------------------------------------------------------------
@@ -358,6 +385,12 @@ void TagClass::Assign_To_Object(AbstractClass* pObject) {
         }
     }
     AssignedObjects.Add(pObject);
+
+    if (std::getenv("OPENYR_TRIGDBG") != nullptr) {
+        std::fprintf(stderr, "[TAGATTACH] tag=%s count=%d obj=%p\n",
+                     (Name[0] != '\0') ? Name : "?", (int)AssignedObjects.Count,
+                     static_cast<void*>(pObject));
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -528,6 +561,14 @@ bool TagClass::RaiseEvent(int32 eventKind, AbstractClass* pTagObject, CellStruct
     bool doTagReplacement = false;
     bool timeToDie = false;
 
+    static const bool s_Dbg = (std::getenv("OPENYR_TRIGDBG") != nullptr);
+    if (s_Dbg) {
+        std::fprintf(stderr, "[TAGRAISE] tag=%s kind=%d repeat=%d trigs=%d assigned=%d obj=%p\n",
+                     (Name[0] != '\0') ? Name : "?", (int)eventKind,
+                     (int)TagType->Repeating, (int)TriggerList.Count,
+                     (int)AssignedObjects.Count, static_cast<void*>(pTagObject));
+    }
+
     IsExecuting = true;
 
     for (int32 i = 0; i < TriggerList.Count; ++i) {
@@ -547,7 +588,27 @@ bool TagClass::RaiseEvent(int32 eventKind, AbstractClass* pTagObject, CellStruct
             timeToDie = true;
             doTagReplacement = true;
         } else if (repeat == 1) {
-            if (field_2C == 1) {
+            // ── persistence=1（半持久）──────────────────────────────────────
+            // 语义：附着在本标签上的对象**全部被摧毁之后**，才允许触发一次。
+            //
+            // asm 用 TagClass+0x2C 计数：对象死亡时 `dec [ecx+2Ch]`，再
+            // `cmp [ecx+2Ch],0` 决定是否开火。本树的 field_2C 从来没有
+            // 初始化方（恒 0）也没有递减方，`field_2C == 1` 永远不成立 ——
+            // 这个模式此前完全不会触发。
+            //
+            // 这里改用权威表 AssignedObjects 直接判定"除当前上抛对象外是否
+            // 还有活着的附着对象"，与计数器功能等价，且不依赖计数的初始化
+            // 时机。AssignedObjects 为空（例如格子标签，没有附着对象）时
+            // 视为"没有需要等待的对象"，立即触发。
+            bool othersAlive = false;
+            for (int32 k = 0; k < AssignedObjects.Count; ++k) {
+                AbstractClass* pOther = AssignedObjects.GetItem(k);
+                if (pOther == nullptr || pOther == pTagObject) continue;
+                ObjectClass* pOtherObj = static_cast<ObjectClass*>(pOther);
+                if (!pOtherObj->IsDead()) { othersAlive = true; break; }
+            }
+
+            if (!othersAlive) {
                 pTrigger->FireActions(pTagObject, loc);
                 pTrigger->Poof();
                 timeToDie = true;

@@ -1,5 +1,9 @@
 #include "VocClass.h"
+#include "AudFile.h"
 #include "Audio.h"
+#include "AudioMixer.h"
+#include "AudioOutput.h"
+#include "AudioSampleBank.h"
 #include "../IO/CCFileClass.h"
 #include "../IO/FileSystem.h"
 #include "../INI/INIClass.h"
@@ -7,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 
 // ============================================================
 // SoundDefinition
@@ -202,6 +207,10 @@ bool VocClass::Load(const char* filename) {
         result = ParseWAV(fileData, fileSize);
     } else if (IsVOCFile(fileData, fileSize)) {
         result = ParseVOC(fileData, fileSize);
+    } else if (IsAUDFile(fileData, fileSize)) {
+        // .aud 必须在"裸数据兜底"之前判：否则整段压缩流会被当成 16 位 PCM
+        //   直接播出去（噪声），而且 Duration / 采样率全错。
+        result = ParseAUD(fileData, fileSize);
     } else {
         result = ParseRaw(fileData, fileSize);
     }
@@ -262,6 +271,32 @@ bool VocClass::ParseVOC(const uint8* data, int32 size) {
     return AllocateVocData(data + dataOffset, dataSize);
 }
 
+bool VocClass::IsAUDFile(const uint8* data, int32 size) {
+    return Is_AUD_Data(data, size);
+}
+
+// ----------------------------------------------------------------------------
+// ParseAUD —— Westwood .aud（头 + IMA/WW ADPCM 负载）解码为 PCM。
+//   解码逻辑在 Audio/AudFile.cpp（纯函数，可单测）；这里只负责把结果装进
+//   VocClass 的样本缓冲，并回填采样率 / 声道 / 位深 / 时长。
+// ----------------------------------------------------------------------------
+bool VocClass::ParseAUD(const uint8* data, int32 size) {
+    if (data == nullptr || size < 12)
+        return false;
+
+    AudDecoded dec = Decode_AUD(data, size);
+    if (!dec.Ok) {
+        return false;
+    }
+
+    SampleRate    = dec.SampleRate;
+    Channels      = dec.Channels;
+    BitsPerSample = dec.BitsPerSample;
+    Format        = VocType::PCM;      // 已解码，后续按 PCM 播放
+
+    return AllocateVocData(dec.PCM.data(), static_cast<int32>(dec.PCM.size()));
+}
+
 bool VocClass::ParseRaw(const uint8* data, int32 size) {
     SampleRate = 22050;
     Channels = 1;
@@ -286,8 +321,161 @@ bool VocClass::AllocateVocData(const uint8* data, int32 dataSize) {
     return true;
 }
 
-void VocClass::Unload() {
-    if (VocData) {
+// ----------------------------------------------------------------------------
+// 采样库直取
+//
+// 不把无法识别的字节当裸 PCM：bag 里混有非音频条目时，按裸 PCM 播出去
+// 就是一段噪声，属于"假成功"。认不出格式一律返回 false，由调用方走
+// 失败分支。
+// ----------------------------------------------------------------------------
+bool VocClass::LoadFromAudioBank(const char* pName)
+{
+    if (pName == nullptr || pName[0] == '\0')
+        return false;
+
+    uint32 bytes = 0;
+    const uint8* p = AudioSampleBank::Instance().Get(pName, &bytes);
+    if (p == nullptr || bytes == 0)
+        return false;
+
+    Unload();
+
+    const int32 n = static_cast<int32>(bytes);
+    if (IsWAVFile(p, n))
+        return ParseWAV(p, n);
+    if (IsVOCFile(p, n))
+        return ParseVOC(p, n);
+    if (IsAUDFile(p, n))
+        return ParseAUD(p, n);
+
+    return false;
+}
+
+bool VocClass::LoadFromAudioBankByIndex(int32 index)
+{
+    uint32 bytes = 0;
+    const uint8* p = AudioSampleBank::Instance().GetByIndex(index, &bytes);
+    if (p == nullptr || bytes == 0)
+        return false;
+
+    Unload();
+
+    const int32 n = static_cast<int32>(bytes);
+    if (IsWAVFile(p, n))
+        return ParseWAV(p, n);
+    if (IsVOCFile(p, n))
+        return ParseVOC(p, n);
+    if (IsAUDFile(p, n))
+        return ParseAUD(p, n);
+
+    return false;
+}
+
+namespace
+{
+    struct SharedSample
+    {
+        char      Name[0x20];
+        VocClass* Voc;
+    };
+
+    std::vector<SharedSample>& SharedCache()
+    {
+        static std::vector<SharedSample> s_Cache;
+        return s_Cache;
+    }
+
+    // 下标 -> 实例（[SoundList] 的 SampleIndex 就是 audio.idx 下标）。
+    std::vector<int32>&     IndexCacheKeys()
+    {
+        static std::vector<int32> s_Keys;
+        return s_Keys;
+    }
+
+    std::vector<VocClass*>& IndexCacheVoc()
+    {
+        static std::vector<VocClass*> s_Voc;
+        return s_Voc;
+    }
+}
+
+VocClass* VocClass::FindOrLoadShared(const char* pName)
+{
+    if (pName == nullptr || pName[0] == '\0')
+        return nullptr;
+
+    std::vector<SharedSample>& cache = SharedCache();
+    for (size_t i = 0; i < cache.size(); ++i)
+    {
+        if (_strcmpi(cache[i].Name, pName) == 0)
+            return cache[i].Voc;
+    }
+
+    VocClass* pVoc = new VocClass();
+    if (pVoc == nullptr)
+        return nullptr;
+
+    if (!pVoc->LoadFromAudioBank(pName))
+    {
+        delete pVoc;
+        return nullptr;
+    }
+
+    SharedSample entry;
+    std::strncpy(entry.Name, pName, sizeof(entry.Name) - 1);
+    entry.Name[sizeof(entry.Name) - 1] = '\0';
+    entry.Voc = pVoc;
+    cache.push_back(entry);
+
+    return pVoc;
+}
+
+VocClass* VocClass::FindOrLoadByIndex(int32 index)
+{
+    if (index < 0)
+        return nullptr;
+
+    // 下标 -> 实例的缓存。[SoundList] 的 SampleIndex 就是 audio.idx 的下标，
+    // 同一发子弹的 Report 会被反复触发，不能每次都重解 ADPCM。
+    std::vector<int32>&      keys = IndexCacheKeys();
+    std::vector<VocClass*>&  vocs = IndexCacheVoc();
+
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        if (keys[i] == index)
+            return vocs[i];
+    }
+
+    VocClass* pVoc = new VocClass();
+    if (pVoc == nullptr)
+        return nullptr;
+
+    if (!pVoc->LoadFromAudioBankByIndex(index))
+    {
+        delete pVoc;
+        return nullptr;
+    }
+
+    keys.push_back(index);
+    vocs.push_back(pVoc);
+    return pVoc;
+}
+
+void VocClass::ClearSharedCache()
+{
+    std::vector<SharedSample>& cache = SharedCache();
+    for (size_t i = 0; i < cache.size(); ++i)
+        delete cache[i].Voc;
+    cache.clear();
+
+    std::vector<VocClass*>& vocs = IndexCacheVoc();
+    for (size_t i = 0; i < vocs.size(); ++i)
+        delete vocs[i];
+    vocs.clear();
+    IndexCacheKeys().clear();
+}
+
+void VocClass::Unload() {    if (VocData) {
         std::free(VocData);
         VocData = nullptr;
     }
@@ -309,12 +497,34 @@ void VocClass::Play() {
     CurrentPosition = 0;
     PlaybackTimer = 0;
     CurrentLoop = 0;
+
+    // 真正把采样交给混音器。没有启用的输出后端时不占用混音槽位，
+    // 否则声音永远不推进、槽位只增不减。
+    if (!AudioOutput::Instance().IsEnabled())
+        return;
+
+    // 每次 Play 都新开一路，不掐断同宿主的其它路：原版同一音效可以有多条
+    // 实例同时发声（上限由 [Sound] 的 Limit 控制），把它们互相掐掉会让
+    // 每帧重复触发的音效（动画/武器）听上去像机关枪。
+    // 需要"重播"语义的调用方（EVA 换句）会先显式 Stop()。
+    AudioMixer& mixer = AudioMixer::Instance();
+
+    // Volume 0..255、Pan 0..128（64 为正中）→ 0..1 增益、-1..1 声像。
+    const float gain = static_cast<float>(Volume) / 255.0f;
+    const float pan  = static_cast<float>(Pan) / 64.0f - 1.0f;
+
+    mixer.AddVoice(this, VocData, static_cast<uint32>(VocSize),
+                   SampleRate, Channels, BitsPerSample,
+                   gain, pan, IsLooping);
 }
 
 void VocClass::Stop() {
     IsPlaying = false;
     CurrentPosition = 0;
     PlaybackTimer = 0;
+
+    if (AudioOutput::Instance().IsEnabled())
+        AudioMixer::Instance().StopVoicesByOwner(this);
 }
 
 void VocClass::Pause() {
@@ -329,6 +539,22 @@ void VocClass::Resume() {
 
 void VocClass::Update() {
     if (!IsPlaying || !IsLoaded) return;
+
+    // 有输出后端时，混音器才是"播到哪/播完没有"的权威：
+    // 它按输出采样率推进，比这里的 60Hz 计时准确，也不会在混音器
+    // 已经播完时还留着 IsPlaying=true。
+    if (AudioOutput::Instance().IsEnabled()) {
+        if (!AudioMixer::Instance().IsOwnerPlaying(this)) {
+            Stop();
+            return;
+        }
+        // 位置仍按时间推进，供 GetCurrentPosition()/进度类调用方使用。
+        ++PlaybackTimer;
+        CurrentPosition = (PlaybackTimer * SampleRate * Channels * BitsPerSample / 8) / 60;
+        if (CurrentPosition >= VocSize)
+            CurrentPosition = IsLooping ? 0 : VocSize;
+        return;
+    }
 
     ++PlaybackTimer;
     CurrentPosition = (PlaybackTimer * SampleRate * Channels * BitsPerSample / 8) / 60;
@@ -348,12 +574,19 @@ void VocClass::SetVolume(int32 volume) {
     Volume = volume;
     if (Volume < 0) Volume = 0;
     if (Volume > 255) Volume = 255;
+
+    // 播放中改音量要立刻反映到混音器，否则要等下一次 Play 才生效。
+    if (IsPlaying && AudioOutput::Instance().IsEnabled())
+        AudioMixer::Instance().SetOwnerVolume(this, static_cast<float>(Volume) / 255.0f);
 }
 
 void VocClass::SetPan(int32 pan) {
     Pan = pan;
     if (Pan < 0) Pan = 0;
     if (Pan > 128) Pan = 128;
+
+    if (IsPlaying && AudioOutput::Instance().IsEnabled())
+        AudioMixer::Instance().SetOwnerPan(this, static_cast<float>(Pan) / 64.0f - 1.0f);
 }
 
 void VocClass::SetFrequency(int32 frequency) {
@@ -737,12 +970,33 @@ namespace
     int32  g_SoundNameCount = 0;
 }
 
+// ----------------------------------------------------------------------------
+// asm: VocClass_FindIndexOfName   (asm:1728684, retn 0)
+//
+//   int __fastcall VocClass_FindIndexOfName(const char* name)
+//   {
+//       if (!name) return -1;                       // test edi,edi / jz
+//       for (i = 0; i < VocClass.length; ++i) {
+//           voc = VocClass.data[i];
+//           const char* n = voc->name ? VocClass_GetName(voc) : "Invalid Voc";
+//           if (_strcmpi(n, name) == 0) return i;    // 大小写不敏感
+//       }
+//       return -1;
+//   }
+//
+//   两个细节按 asm 对齐：
+//     1) 只判空指针，**不**判空字符串 —— 原名没有 `!*name` 这道门；
+//     2) 名字槽为空时拿字面量 "Invalid Voc" 参与比较，而不是跳过。
+//   本项目用等价的 g_SoundNames 注册表承载同名数组。
+// ----------------------------------------------------------------------------
 int32 VocClass::FindIndexOfName(const char* pName)
 {
-    if (!pName || !*pName) return -1;
+    if (!pName) return -1;
+
     for (int32 i = 0; i < g_SoundNameCount; ++i)
     {
-        if (g_SoundNames[i] && !_strcmpi(g_SoundNames[i], pName))
+        const char* entry = g_SoundNames[i] ? g_SoundNames[i] : "Invalid Voc";
+        if (!_strcmpi(entry, pName))
             return i;
     }
     return -1;
@@ -1166,13 +1420,27 @@ void VocClass::CreateFromINIList(CCINIClass* pINI)
         if (pINI->ReadString("SoundList", pKeyName, "", buffer, sizeof(buffer)) <= 0)
             continue;
 
-        SoundDefinition* pDef = FindExistingSound(pKeyName);
+        // [SoundList] 的键是**下标**，值是音效名（同时是它自己的段名）：
+        //     0=GenericClick
+        //     [GenericClick]
+        //     Sounds=...
+        // 把键当名字用会去找 [0] 段，零售 soundmd.ini 里没有这个段，
+        // 于是每个定义都读不到 Sounds=，所有音效永久静音。
+        char soundName[0x100];
+        std::strncpy(soundName, buffer, sizeof(soundName) - 1);
+        soundName[sizeof(soundName) - 1] = '\0';
+        if (char* pSpace = std::strpbrk(soundName, " \t\r\n"))
+            *pSpace = '\0';
+        if (soundName[0] == '\0')
+            continue;
+
+        SoundDefinition* pDef = FindExistingSound(soundName);
         if (pDef == nullptr) {
             pDef = new SoundDefinition();
             if (!pDef)
                 continue;
-            pDef->SetName(pKeyName);
-            RegisterSoundName(pKeyName);
+            pDef->SetName(soundName);
+            RegisterSoundName(soundName);
             if (!g_pSoundDefinitions->Add(pDef)) {
                 delete pDef;
                 continue;
@@ -1729,6 +1997,47 @@ namespace {
 bool g_SoundEffectEnabled = true;      // asm: byte_8464AC
 }
 
+namespace
+{
+// 把一条 SoundDefinition 的样本真正送进混音器。
+//   gainUnits : 0..16384 的线性增益（距离衰减 × 定义音量）
+//   pan       : 0..0x4000 声像（0x2000 正中）
+// Limit 语义按原版：[Sound] 的 Limit 是同一音效的同时发声数上限，默认 3；
+// 单帧内被反复触发的音效（每帧刷新的动画音效）靠它去重。
+void Play_Definition_Sample(SoundDefinition* pDef, int32 gainUnits, int32 pan)
+{
+    if (pDef == nullptr || pDef->SampleCount <= 0)
+        return;
+    if (!AudioOutput::Instance().IsEnabled())
+        return;
+
+    static int32 s_NextSample = 0;
+    const int32 pick = pDef->SampleIndex[s_NextSample % pDef->SampleCount];
+    ++s_NextSample;
+
+    VocClass* pSample = VocClass::FindOrLoadByIndex(pick);
+    if (pSample == nullptr)
+        return;
+
+    const int32 limit = (pDef->Limit > 0) ? pDef->Limit : 1;
+    if (AudioMixer::Instance().CountOwnerVoices(pSample) >= limit)
+        return;                        // 已达同时发声上限，丢弃本次
+
+    float gain = static_cast<float>(gainUnits) / 16384.0f;
+    if (pDef->Volume > 0)
+        gain *= static_cast<float>(pDef->Volume) / 16384.0f;
+    if (gain > 1.0f) gain = 1.0f;
+
+    int32 vol = static_cast<int32>(gain * 255.0f);
+    if (vol < 0)   vol = 0;
+    if (vol > 255) vol = 255;
+
+    pSample->SetVolume(vol);
+    pSample->SetPan(pan / 128);        // 0..0x4000 -> 0..128
+    pSample->Play();
+}
+}
+
 bool VocClass::Get_Sound_Effect_Enabled()
 {
     return g_SoundEffectEnabled;
@@ -1748,6 +2057,13 @@ void* VocClass::Sound_Effect(int32 index, const CoordStruct* pPos,
 
     // asm: test ecx,ecx / jl loc_750A0F ; cmp ecx,VocClass.length / jge
     SoundDefinition* pDef = GetSound(index);
+
+    static const bool s_AudioDbg = (std::getenv("OPENYR_AUDIODBG") != nullptr);
+    if (s_AudioDbg)
+        std::fprintf(stderr, "[SFX] index=%d def=%s samples=%d\n",
+                     index, (pDef != nullptr) ? pDef->GetName() : "(null)",
+                     (pDef != nullptr) ? pDef->SampleCount : -1);
+
     if (pDef == nullptr)
         return nullptr;                     // edi 保持 0，下面只做 write-back
 
@@ -1814,6 +2130,14 @@ void* VocClass::Sound_Effect(int32 index, const CoordStruct* pPos,
                 pInst->Owner    = pDef;
                 pInst->Voice    = reinterpret_cast<void*>(static_cast<intptr_t>(units)); // StrX_4061D0
                 pInst->Argument = pan;                        // StrX_406270
+
+                // 真正出声。原版这一步是"把样本塞进该实例的语音通道"，
+                // 本工程等价为：按 [SoundList] 登记的下标从 audio.bag 取
+                // PCM，解码后用衰减后的音量/声像开一路混音。
+                //
+                // 多个样本时按轮转顺序取（原版是随机挑一条）；这里不用
+                // rand()，因为逻辑随机流参与 CRC，音频选择不该扰动它。
+                Play_Definition_Sample(pDef, units, pan);
             }
         }
         else if (pHandle != nullptr)
@@ -1826,6 +2150,15 @@ void* VocClass::Sound_Effect(int32 index, const CoordStruct* pPos,
                 --g_StaticSoundCount;
             pHandle = nullptr;
         }
+    }
+
+    else
+    {
+        // asm: loc_750AA5 —— 定义上没有静态坐标（绝大多数武器/动画音效），
+        // 不做距离衰减，按满音量直接发声。漏掉这个分支的后果是"所有没有
+        // 坐标的普通音效永远不响"，而它们恰恰占了 Sound_Effect 调用的绝对
+        // 多数（每帧刷新的动画音效也在其中）。
+        Play_Definition_Sample(pDef, 0x4000, 0x2000);
     }
 
     // asm: test ebp,ebp / jz loc_750AB3 / push edi / StrX_4060F0(ebp, esi, edi)

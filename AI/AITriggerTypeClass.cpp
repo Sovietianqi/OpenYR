@@ -8,6 +8,7 @@
 #include "../Abstract/UnitTypeClass.h"
 #include "../Abstract/AircraftTypeClass.h"
 #include "../Abstract/BuildingTypeClass.h"
+#include "../Abstract/BuildingClass.h"
 #include "../Houses/HouseClass.h"
 #include "../Houses/HouseTypeClass.h"
 #include "../Rules/RulesClass.h"
@@ -15,11 +16,46 @@
 #include "../INI/INIClass.h"
 #include "../IO/CRC.h"
 #include "../Core/SwizzleManagerClass.h"
+#include "../Game/Game.h"
 
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+
+namespace {
+
+// ── OPENYR_TRIGDBG=1 时的条件判定探针（默认关闭）────────────────────────
+//   每 300 帧一个窗口，每窗口最多 20 行，避免刷爆 1200 帧的日志。
+bool TrigDebugOn() {
+    static const bool on = (std::getenv("OPENYR_TRIGDBG") != nullptr);
+    return on;
+}
+
+int32 s_trigDbgBucket = -1;
+int32 s_trigDbgLines  = 0;
+
+void TraceTriggerCondition(const AITriggerTypeClass* pTrigger, int32 condType,
+                           int32 comparator, int32 operand, int32 measured,
+                           const void* pObject, bool result) {
+    if (!TrigDebugOn()) return;
+
+    const int32 bucket = Game::CurrentFrame / 300;
+    if (bucket != s_trigDbgBucket) {
+        s_trigDbgBucket = bucket;
+        s_trigDbgLines  = 0;
+    }
+    if (s_trigDbgLines >= 20) return;
+    ++s_trigDbgLines;
+
+    // 走 stderr：与项目其余诊断开关（OPENYR_AIDBG 等）一致，不污染 stdout 的
+    //   正常统计行。
+    std::fprintf(stderr, "[TRIG] trig=%s cond=%d cmp=%d op=%d count=%d obj=%p result=%d\n",
+                 pTrigger ? pTrigger->get_ID() : "?",
+                 condType, comparator, operand, measured, pObject, result ? 1 : 0);
+}
+
+}  // namespace
 
 DynamicVectorClass<AITriggerTypeClass*>* AITriggerTypeClass::Array = nullptr;
 
@@ -52,7 +88,7 @@ AITriggerTypeClass* AITriggerTypeClass::FindOrAllocate(const char* pID) {
 //   params 清零；Team1/Team2/objCondition = nullptr。
 // ---------------------------------------------------------------------------
 AITriggerTypeClass::AITriggerTypeClass(const char* pID) noexcept
-    : AbstractTypeClass(pID), ConditionType(AITriggerCondition::HouseOwns),
+    : AbstractTypeClass(pID), ConditionType(AITriggerCondition::None),
       IsGlobal(0), OwnerHouseType(AITriggerHouseType::None), IsEnabled(true),
       HouseIndex(-1), SideIndex(-1), TechLevel(0), unknown_B4(0),
       Weight_Current(1.875), Weight_Minimum(1.875), Weight_Maximum(1.875),
@@ -190,7 +226,11 @@ bool AITriggerTypeClass::LoadFromINI(CCINIClass* pINI) {
 
     char buffer[0x200];
     buffer[0] = '\0';
-    if (pINI->ReadString("AITriggerTypes", this->Name, "", buffer, sizeof(buffer)) <= 0) {
+    // asm: INIClass_GetString(ini, "AITriggerTypes", this->ID [+0x24], ...)
+    //   —— 查表用的键是**对象的 ID**（形如 "0x01000001"），不是显示名。
+    //   原实现用 this->Name 查表，而 Name 此时还是空的（它就是被读出来的
+    //   第一字段），于是每一条触发器都读不到自己的行。
+    if (pINI->ReadString("AITriggerTypes", this->ID, "", buffer, sizeof(buffer)) <= 0) {
         return false;   // 该 ID 在段中不存在
     }
     if (buffer[0] == '\0') return false;
@@ -229,24 +269,32 @@ bool AITriggerTypeClass::LoadFromINI(CCINIClass* pINI) {
     if (!tok) return false;
     ConditionType = static_cast<AITriggerCondition>(atoi(tok));
 
-    // 5. ConditionObject（依次查 Infantry/Unit/Aircraft/Building 类型）
+    // 5. ConditionObject（asm 依次查 Infantry / Unit / Aircraft / Building 四张表）
+    //
+    //   ★ 原实现只查了步兵表 + 一个不存在的 TechnoTypeClass::Find 兜底，
+    //     于是 [AITriggerTypes] 里最常见的条件对象（如 GAWEAP 这样的建筑）
+    //     一律解析成 nullptr，HouseOwns 计数恒 0、条件恒不成立。
     tok = strtok_r(nullptr, ",", &ctx);
     if (!tok) return false;
     {
         char name[0x18];
         strncpy(name, tok, sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
-        ConditionObject = nullptr;
-        int32 idx = InfantryTypeClass::FindIndex(name);
-        if (idx != -1) {
-            ConditionObject = InfantryTypeClass::FindByIndex(idx);
-        } else {
-            // Unit/Aircraft 无 FindIndex 时按 ID 直查。
-            ConditionObject = TechnoTypeClass::Find(name);
-        }
+
+        ConditionObject = InfantryTypeClass::Find(name);
+        if (ConditionObject == nullptr)
+            ConditionObject = UnitTypeClass::Find(name);
+        if (ConditionObject == nullptr)
+            ConditionObject = AircraftTypeClass::Find(name);
+        if (ConditionObject == nullptr)
+            ConditionObject = BuildingTypeClass::Find(name);
     }
 
-    // 6. params 十六进制串（asm 每两字符解码一字节，最多 32 字节）
+    // 6. params 十六进制串（asm 逐两字符解码一字节，最多 32 字节）
+    //
+    //   ★ 解码必须严格"两个字符一字节"：原先用 strtoul 一次吞掉整个串，
+    //     "0400" 会被读成 0x400 → 只落一个 0x00，比较器与操作数全丢，
+    //     随后 Conditions[0] 保持 {0,0} 使每条条件都判 false。
     tok = strtok_r(nullptr, ",", &ctx);
     if (!tok) return false;
     {
@@ -255,9 +303,24 @@ bool AITriggerTypeClass::LoadFromINI(CCINIClass* pINI) {
         for (const char* p = tok; *p && n < static_cast<int32>(sizeof(Params)); ) {
             while (*p == ' ' || *p == '\t') ++p;
             if (!*p) break;
-            Params[n++] = static_cast<uint8>(strtoul(p, const_cast<char**>(&p), 16));
+            char pair[3] = { p[0], (p[1] != '\0') ? p[1] : '0', '\0' };
+            Params[n++] = static_cast<uint8>(strtoul(pair, nullptr, 16));
+            p += (p[1] != '\0') ? 2 : 1;
         }
     }
+
+    // params 逐字节落在 +0xE4 起的 32 字节缓冲（asm LoadFromINI 0x41F859
+    //   `mov byte ptr [edi+ebp+params.arg], al`，edi = 0..0x1F）。
+    //   条件函数读的是两个 **dword**：
+    //     0x41EB9B HouseOwns   : mov ecx,[this+params.cond] → 比较器 switch
+    //     0x41EB9F             : mov ecx,[this+params.arg]  → 比较操作数
+    //     0x41F253 CompareHouseMoney 同上成对出现
+    //   params.arg 就是缓冲首地址（+0xE4），params.cond 紧随其后（+0xE8），
+    //   于是布局是 4 组 8 字节的 (操作数, 比较器) 对，条件分支只取第 0 组。
+    //   ★ 原实现把前两个 **字节** 当比较器/操作数，只能解析 "0400" 这类短串；
+    //     按 asm 的 dword 语义，"> 0" 应写成 "0000000004000000"。
+    Conditions[0].ComparatorOperand = ComparatorOperand();
+    Conditions[0].ComparatorType    = ComparatorType();
 
     // 7. Weight / Min / Max
     tok = strtok_r(nullptr, ",", &ctx);
@@ -448,31 +511,69 @@ bool AITriggerTypeClass::ConditionMet(HouseClass* CallingHouse, HouseClass* Targ
     // 技术等级门槛：触发类型 techLevel > 本房 techLevel → 失败。
     if (TechLevel > CallingHouse->TechLevel) return false;
 
-    // 按 ConditionType 分派（asm switch 顺序）。
+    // ── 条件分派（asm 0x41E8F0 .. 0x41E9E1）─────────────────────────────
+    //   mov eax,[this+98h]        ; eax = ConditionType
+    //   test ebx,ebx / jz ...     ; ebx = targetHouse
+    //   inc eax / cmp eax,8 / ja default / jmp off_41EACC[eax*4]
+    //   跳转表（0x41EACC）：无条件, HouseOwns, EnemyOwns, 电力<100, 电力<0,
+    //                       Credits, IronCurtain, Chronosphere, Civilian
+    //   即 ConditionType = -1,0,1,2,3,4,5,6,7；≥8 全部走 default(false)。
+    //
+    //   ★ 现存枚举把 2..5 写作 CivilianOwns/HouseCredits/IronCurtainReady/
+    //     ChronosphereReady，与 asm 有两位偏移。GetCRC（0x41E63F）只在
+    //     ConditionType ∈ {0,1,4,7} 时把 params 混进 CRC，而真正吃 params 的
+    //     分支正是 HouseOwns/EnemyOwns/Credits/Civilian —— 与跳转表交叉一致。
+    //     故此处一律按 asm 的数值语义分派，不使用枚举名做判据。
+    const int32 condType = static_cast<int32>(ConditionType);
+    const int32 comparator = ComparatorType();
+    const int32 operand = ComparatorOperand();
+    int32 measured = 0;
     bool condResult = false;
-    switch (ConditionType) {
-        case AITriggerCondition::HouseOwns:
-            condResult = OwnerHouseOwns(CallingHouse, TargetHouse);
-            break;
-        case AITriggerCondition::EnemyOwns:
-            condResult = EnemyHouseOwns(CallingHouse, TargetHouse);
-            break;
-        case AITriggerCondition::CivilianOwns:
-            condResult = CivilianHouseOwns(CallingHouse, TargetHouse);
-            break;
-        case AITriggerCondition::HouseCredits:
-            condResult = CompareHouseMoney(CallingHouse);
-            break;
-        case AITriggerCondition::IronCurtainReady:
-            condResult = IronCurtainPercentReady(CallingHouse);
-            break;
-        case AITriggerCondition::ChronosphereReady:
-            condResult = ChronospherePercentReady(CallingHouse);
-            break;
-        default:
-            condResult = OwnerHouseOwns(CallingHouse, TargetHouse);
-            break;
+
+    if (TargetHouse == nullptr) {
+        // asm 0x41E9??：没有目标房时不进跳转表 —— ConditionType==1 仍走
+        //   EnemyOwns(Owner, nullptr)，ConditionType==-1 恒真，其余 false。
+        condResult = (condType == 1) ? EnemyHouseOwns(CallingHouse, nullptr, &measured)
+                                     : (condType == -1);
+    } else {
+        switch (condType) {
+            case -1:   // asm 跳转表 [0]：无条件，直接进入队伍判定。
+                condResult = true;
+                break;
+            case 0:    // asm 0x41E90F case 1 → AITriggerTypeClass_HouseOwns
+                condResult = OwnerHouseOwns(CallingHouse, TargetHouse, &measured);
+                break;
+            case 1:    // asm 0x41E91D case 2 → AITriggerTypeClass_EnemyOwns
+                condResult = EnemyHouseOwns(CallingHouse, TargetHouse, &measured);
+                break;
+            case 2:    // asm 0x41E92B case 3：PowerOutput - PowerDrain < 100
+                condResult = PowerSurplusBelow(TargetHouse, 100, &measured);
+                break;
+            case 3:    // asm 0x41E965 case 4：PowerOutput - PowerDrain < 0
+                condResult = PowerSurplusBelow(TargetHouse, 0, &measured);
+                break;
+            case 4:    // asm 0x41E9?? case 5 → AITriggerTypeClass_CompareHouseMoney
+                condResult = CompareHouseMoney(TargetHouse, &measured);
+                break;
+            case 5:    // asm case 6 → IronCurtainPercentReady(this, a2=CallingHouse)
+                measured = -1;   // 该分支判的是"就绪百分比"，没有计数值
+                condResult = IronCurtainPercentReady(CallingHouse);
+                break;
+            case 6:    // asm case 7 → ChronospherePercentReady(this, a2=CallingHouse)
+                measured = -1;
+                condResult = ChronospherePercentReady(CallingHouse);
+                break;
+            case 7:    // asm case 8 → AITriggerTypeClass_CivilianHouseOwns
+                condResult = CivilianHouseOwns(CallingHouse, TargetHouse, &measured);
+                break;
+            default:   // asm 0x41E9E1 default：ConditionType ≥ 8 → 恒 false
+                condResult = false;
+                break;
+        }
     }
+
+    TraceTriggerCondition(this, condType, comparator, operand, measured,
+                          ConditionObject, condResult);
 
     if (!condResult) return false;
 
@@ -494,37 +595,59 @@ bool AITriggerTypeClass::ConditionMet(HouseClass* CallingHouse, HouseClass* Targ
 }
 
 // ---------------------------------------------------------------------------
+// 条件对象在某个阵营的持有数。
+//   asm HouseOwns 0x41EB00：先 objCondition->WhatAmI()（vtbl+0x2Ch），
+//   再用 byte_41EC48 映射到 4 张 CounterClass：
+//     AbstractType 7(BuildingType)→OwnedBuildingTypes、40(UnitType)→
+//     OwnedVehicleTypes、16(InfantryType)→OwnedInfantryTypes、
+//     3(AircraftType)→OwnedAircraftTypes，其余 → 0；objCondition==nullptr → 0。
+//   HouseClass::CountOwnedNow 已按同一张表分派，直接复用。
+// ---------------------------------------------------------------------------
+int32 AITriggerTypeClass::CountConditionObject(const HouseClass* pHouse) const {
+    if (pHouse == nullptr || ConditionObject == nullptr) return 0;
+    return pHouse->CountOwnedNow(ConditionObject);
+}
+
+// ---------------------------------------------------------------------------
+// params 的两个 dword。
+//   asm 条件分支统一用 `mov ecx,[this+params.cond]` 作比较器（0..5，越界走
+//   default→false），用 `mov ecx,[this+params.arg]` 作操作数。params.arg
+//   就是 LoadFromINI 逐字节写入的缓冲首地址（+0xE4），params.cond 在 +0xE8。
+// ---------------------------------------------------------------------------
+int32 AITriggerTypeClass::ComparatorType() const {
+    int32 value = 0;
+    std::memcpy(&value, Params + 4, sizeof(value));
+    return value;
+}
+
+int32 AITriggerTypeClass::ComparatorOperand() const {
+    int32 value = 0;
+    std::memcpy(&value, Params + 0, sizeof(value));
+    return value;
+}
+
+// ---------------------------------------------------------------------------
 // asm: AITriggerTypeClass_HouseOwns(this, Owner, target)
 //   对 target 持有的 ConditionObject 计数，按 params 比较器判定。
 // ---------------------------------------------------------------------------
-bool AITriggerTypeClass::OwnerHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* TargetHouse) const {
+bool AITriggerTypeClass::OwnerHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* TargetHouse, int32* pCountOut) const {
     if (!TargetHouse) return false;
 
-    int32 count = 0;
-    if (ConditionObject) {
-        count = TargetHouse->CountOwnedNow(ConditionObject);
-    }
-
-    int32 comparator = Conditions[0].ComparatorType;
-    int32 operand = Conditions[0].ComparatorOperand;
-    return EvaluateComparator(count, comparator, operand);
+    const int32 count = CountConditionObject(TargetHouse);
+    if (pCountOut) *pCountOut = count;
+    return EvaluateComparator(count, ComparatorType(), ComparatorOperand());
 }
 
 // ---------------------------------------------------------------------------
 // asm: AITriggerTypeClass_EnemyOwns(this, Owner, target)
-//   对 Owner（呼叫方）持有的 ConditionObject 计数后比较。
+//   对 Owner（呼叫方）持有的 ConditionObject 计数后比较（target 未使用）。
 // ---------------------------------------------------------------------------
-bool AITriggerTypeClass::EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
+bool AITriggerTypeClass::EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/, int32* pCountOut) const {
     if (!CallingHouse) return false;
 
-    int32 count = 0;
-    if (ConditionObject) {
-        count = CallingHouse->CountOwnedNow(ConditionObject);
-    }
-
-    int32 comparator = Conditions[0].ComparatorType;
-    int32 operand = Conditions[0].ComparatorOperand;
-    return EvaluateComparator(count, comparator, operand);
+    const int32 count = CountConditionObject(CallingHouse);
+    if (pCountOut) *pCountOut = count;
+    return EvaluateComparator(count, ComparatorType(), ComparatorOperand());
 }
 
 // ---------------------------------------------------------------------------
@@ -532,8 +655,10 @@ bool AITriggerTypeClass::EnemyHouseOwns(HouseClass* CallingHouse, HouseClass* /*
 //   在全局房表中找到阵营为 "Civilian" 的房子，对其持有的 ConditionObject
 //   计数后比较。
 // ---------------------------------------------------------------------------
-bool AITriggerTypeClass::CivilianHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* /*TargetHouse*/) const {
-    if (HouseClass::Array == nullptr) return false;
+bool AITriggerTypeClass::CivilianHouseOwns(HouseClass* /*CallingHouse*/, HouseClass* /*TargetHouse*/, int32* pCountOut) const {
+    // asm 0x41ECAD: 以 vec_Houses.length 为循环上界；找不到平民房时直接返回
+    //   结果变量初值 0（不套比较器）。
+    if (HouseClass::ArrayCount <= 0) return false;
 
     HouseClass* civilian = nullptr;
     for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
@@ -545,27 +670,18 @@ bool AITriggerTypeClass::CivilianHouseOwns(HouseClass* /*CallingHouse*/, HouseCl
             break;
         }
     }
-    if (!civilian) return false;
+    if (civilian == nullptr) return false;
 
-    int32 count = 0;
-    if (ConditionObject) {
-        count = civilian->CountOwnedNow(ConditionObject);
-    }
-
-    int32 comparator = Conditions[0].ComparatorType;
-    int32 operand = Conditions[0].ComparatorOperand;
-    return EvaluateComparator(count, comparator, operand);
+    const int32 count = CountConditionObject(civilian);
+    if (pCountOut) *pCountOut = count;
+    return EvaluateComparator(count, ComparatorType(), ComparatorOperand());
 }
 
 // ---------------------------------------------------------------------------
-// asm: AITriggerTypeClass_HouseCredits（条件 3）
+// asm: AITriggerTypeClass_HouseCredits（历史转发，当前无调用方）
 // ---------------------------------------------------------------------------
 bool AITriggerTypeClass::HouseCredits(HouseClass* CallingHouse, HouseClass* /*TargetHouse*/) const {
-    if (!CallingHouse) return false;
-    int32 credits = CallingHouse->Credits;
-    int32 comparator = Conditions[0].ComparatorType;
-    int32 operand = Conditions[0].ComparatorOperand;
-    return EvaluateComparator(credits, comparator, operand);
+    return CompareHouseMoney(CallingHouse);
 }
 
 // ---------------------------------------------------------------------------
@@ -580,16 +696,34 @@ bool AITriggerTypeClass::ChronoSphereCharged(HouseClass* CallingHouse, HouseClas
 }
 
 // ---------------------------------------------------------------------------
-// asm: AITriggerTypeClass_CompareHouseMoney(this, House)
-//   House->Get_Credits() 与 params 比较器逐档比较。
+// asm: AITriggerTypeClass_CompareHouseMoney(this, House, arg_4)
+//   0x41F1E5: `mov ecx,[eax+IHouse.IHouse] / add eax,24h / call [ecx+18h]`
+//   —— 走 IHouse 第 6 个虚槽取 AvailableMoney（= 矿石价值×IncomeMult +
+//   Money，见 0x4Fxxxx HouseClass_IHouse_AvailableMoney），再与 params 比较。
 // ---------------------------------------------------------------------------
-bool AITriggerTypeClass::CompareHouseMoney(HouseClass* pHouse) const {
+bool AITriggerTypeClass::CompareHouseMoney(HouseClass* pHouse, int32* pCountOut) const {
     if (pHouse == nullptr) return false;
 
-    const int32 credits = pHouse->Credits;
-    const int32 comparator = Conditions[0].ComparatorType;
-    const int32 operand = Conditions[0].ComparatorOperand;
-    return EvaluateComparator(credits, comparator, operand);
+    const int32 money = pHouse->IHouse_Available_Money();
+    if (pCountOut) *pCountOut = money;
+    return EvaluateComparator(money, ComparatorType(), ComparatorOperand());
+}
+
+// ---------------------------------------------------------------------------
+// asm 0x41E92B（ConditionType 2）/ 0x41E965（ConditionType 3）
+//   mov eax,[ebx+24h] / push ebp / call [eax+24h]   ; IHouse vtbl+0x24
+//   mov ecx,[ebp]     / push ebp / call [ecx+20h]   ; IHouse vtbl+0x20
+//   sub eax,edx / fild / fcomp num_100 | double_0 / 结果 = (差值 < 阈值)
+//   槽位 6=AvailableMoney(0x18)、7=AvailableStorage(0x20)、8=PowerOutput
+//   (0x20+4)、9=PowerDrain —— 因此两个分支量的是目标阵营的电力盈余，
+//   阈值写死在代码里，不读 params（GetCRC 也只在 0/1/4/7 混 params）。
+// ---------------------------------------------------------------------------
+bool AITriggerTypeClass::PowerSurplusBelow(HouseClass* pHouse, int32 threshold, int32* pCountOut) const {
+    if (pHouse == nullptr) return false;
+
+    const int32 surplus = pHouse->PowerOutput - pHouse->PowerDrain;
+    if (pCountOut) *pCountOut = surplus;
+    return surplus < threshold;
 }
 
 // ---------------------------------------------------------------------------

@@ -40,7 +40,8 @@ public:
     // asm: TagTypeClass_CreateFromINIList / TagTypeClass_SaveToINIList
     // 场景 [Tags] 段的整体读写：每个键名是一条标签的 ID 或十六进制句柄，
     // 值是该标签的命令串。
-    void CreateFromINIList(CCINIClass* pINI);
+    // asm 里是 __fastcall 自由函数，与实例无关。
+    static void CreateFromINIList(CCINIClass* pINI);
     void SaveToINIList(CCINIClass* pINI);
 
     TagTypeClass(const char* pID) noexcept;

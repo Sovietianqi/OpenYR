@@ -1259,6 +1259,8 @@ bool AircraftClass::NeedToReturn() const {
 // Target management
 // ----------------------------------------------------------------
 void AircraftClass::SetTarget(AbstractClass* pTarget) {
+    // FootClass 层那一份同步写：基类的 UpdateTargeting / Mission_Enter 读它。
+    FootClass::SetTarget(pTarget);
     unknown_7FC = static_cast<DWORD>(reinterpret_cast<uintptr_t>(pTarget));
 }
 
@@ -1267,6 +1269,7 @@ AbstractClass* AircraftClass::GetTarget() const {
 }
 
 void AircraftClass::ClearTarget() {
+    FootClass::SetTarget(nullptr);
     unknown_7FC = 0;
     // Also clear the strafe/kamikaze target.
     unknown_7F8 = 0;
@@ -1866,14 +1869,13 @@ bool AircraftClass::Can_Fire_At(TechnoClass* pTarget, int32 weaponIndex) const {
 
 int32 AircraftClass::GetWeaponRange(int32 weaponIndex) const {
     if (!Type) return 0;
-    // Default range: 5 cells in leptons.
-    int32 defaultRange = 5 * 256;
+    // 默认 5 格（lepton）。
+    const int32 defaultRange = 5 * 256;
     if (weaponIndex < 0 || weaponIndex >= Type->WeaponCount) return defaultRange;
-    // The weapon struct contains a WeaponTypeClass pointer; the actual range
-    // would come from that. For now, use the guard range from the type.
-    if (reinterpret_cast<TechnoTypeClass*>(Type)->GuardRange > 0) {
-        return reinterpret_cast<TechnoTypeClass*>(Type)->GuardRange;
-    }
+    // 有真实武器槽时用武器射程（lepton）；否则退回默认值。
+    const WeaponStruct& ws = Type->Weapons[weaponIndex];
+    if (ws.WeaponType != nullptr && ws.WeaponType->Range > 0)
+        return ws.WeaponType->Range;
     return defaultRange;
 }
 
@@ -1899,7 +1901,7 @@ void AircraftClass::MuzzleFlash(int32 weaponIndex) {
     if (weaponIndex < 0 || weaponIndex >= Type->WeaponCount) return;
     // Record the fire frame for animation timing.
     // In the original game, this spawns a muzzle flash particle.
-    LastFireFrame = 0;  // Would use Game::CurrentFrame
+    LastFireFrame = Game::CurrentFrame;
 }
 
 void AircraftClass::OnFired(int32 weaponIndex) {
@@ -2048,6 +2050,10 @@ void AircraftClass::Draw(Point2D& point, RectangleStruct& rect) {
 
     if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
         ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
+
+    // 原版 TechnoClass::DrawExtras：话泡等附加层（本树 Draw 不走 vtable）。
+    //   机体在高处，话泡要跟着机身走，所以传 bodyPoint 而不是地面 point。
+    DrawExtras(&bodyPoint, &rect);
 
     if (g_bDebugMode)
         g_RenderDebugStats.DrawCalls++;
@@ -2569,11 +2575,13 @@ bool AircraftClass::Limbo() {
 
 bool AircraftClass::Unlimbo() {
     if (!IsInLimbo) return false;
+    Init_Locomotion();          // 按类型装配行走逻辑（TechnoClass_Init 段）
+    Start_Default_Mission();    // 落位后启动默认 Guard 任务
     IsInLimbo = false;
     TakeOff();
-    // asm: AircraftClass_Unlimbo -> ObjectClass::Unlimbo 尾部的 vec_Logics.Add
-    //   （L1049805）；本类覆写了 Unlimbo，故须自行登记主表。
-    Register_Logic();
+    // asm: AircraftClass_Unlimbo -> ObjectClass::Unlimbo 尾部的收尾（L1049805）：
+    //   置 Alive、登记主表、交显示层。
+    FinalizeUnlimbo();
     return true;
 }
 
@@ -3888,12 +3896,12 @@ bool AircraftClass::StartMission()
 //   表示被摧毁，则播放坠毁特效并触发 Crash / UnInit。
 // ----------------------------------------------------------------------------
 int32 AircraftClass::ReceiveDamage(int32* pDamage, int32 typeSource,
-                                   WarheadTypeClass* pWarhead, int32 target,
+                                   WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                    int32 ignoreDefenses, int32 arg10,
                                    HouseClass* pSourceHouse)
 {
     int32 result = TechnoClass::ReceiveDamage(pDamage, typeSource, pWarhead,
-                                              target, ignoreDefenses, arg10,
+                                              pAttacker, ignoreDefenses, arg10,
                                               pSourceHouse);
 
     if (result == 4 || result == 5)

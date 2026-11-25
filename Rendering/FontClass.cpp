@@ -8,6 +8,7 @@
 // ============================================================================
 
 #include "FontClass.h"
+#include "IO/FileSystem.h"
 
 #include <cstring>
 #include <cstdio>
@@ -115,7 +116,7 @@ bool FontClass::Load_From_File(const char* pFilename)
 
     // Open the file in binary mode and read its entire contents.
     FILE* pFile = nullptr;
-    pFile = std::fopen(pFilename, "rb");
+    pFile = File_Open_Archive_Stream(pFilename);
     if (!pFile) {
         return false;
     }

@@ -124,7 +124,8 @@ void AircraftTypeClass::Delete_All()
 // ============================================================================
 
 AircraftTypeClass::AircraftTypeClass() noexcept
-    : TechnoTypeClass(noinit)
+    : TechnoTypeClass()   // 走完整默认值（noinit 版会跳过 TechnoTypeClass 的
+                          //   全部字段初始化，Ammo / ROT / WeaponCount 等停在 0）
 {
     Fighter       = false;
     Strafe        = false;
@@ -776,7 +777,13 @@ AircraftTypeClass* AircraftTypeClass::FindOrAllocate(const char* pID)
         strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
         newItem->ID[sizeof(newItem->ID) - 1] = '\0';
     }
-    if (newItem && Array) Array->Add(newItem);
+    if (newItem && Array)
+    {
+        Array->Add(newItem);
+        // asm: 类型构造末尾把"我在类型表里的下标"写进 +0x98（ArrayIndex）。
+        //   缺这一步时 GetArrayIndex() 恒 0/-1，AI 选型、工厂索引全部错位。
+        newItem->Set_ArrayIndex(Array->Count - 1);
+    }
     return newItem;
 }
 
@@ -798,9 +805,13 @@ void AircraftTypeClass::LoadRotorArt()
 
 AircraftClass* AircraftTypeClass::CreateAircraft(HouseClass* pOwner)
 {
-    // 根据游戏行为，可知机型工厂先造机体检索对象再把型表挂上。
+    // asm: AircraftTypeClass_CreateAircraft (asm:104362)
+    //   `new AircraftClass(size)` → `AircraftClass_CTOR(this /*Type*/, pOwner)`
+    //   原版构造函数同时接收机型与所有者；本树的 AircraftClass 构造函数只有
+    //   owner 形参，因此 Type 在构造完成后由工厂挂上——语义等价，构造期间的
+    //   字段初始化不依赖 Type（Image/Shadow 由 Resolve_SHP_References 另行绑定）。
     AircraftClass* pAir = new AircraftClass(pOwner);
-    if (pAir)
+    if (pAir != nullptr)
         pAir->Type = this;
     return pAir;
 }

@@ -275,7 +275,8 @@ public:
     // 根据游戏行为，可知 LAT 给出本格的地表平均类型（贴图分组编号），寻路
     //  与放置判定拿它判断相邻格是否同组。
     // ========================================================================
-    int32 LAT() const;
+    // 原版是 __thiscall（非 const）：会改写本格 TileType。
+    int32 LAT();
     bool IsShrouded() const;
     bool IsFogged() const;
     bool IsRevealed() const;
@@ -623,11 +624,34 @@ public:
     // ------------------------------------------------------------------------
     bool Spread_Tiberium(bool a2);
 
+    // ------------------------------------------------------------------------
+    // asm: sub_483710 —— CellClass::Grow_Tiberium（本节新增）
+    //
+    //   if (!Scenario->TiberiumGrowth) return false;
+    //   idx = Is_Overlay_Idx_Tiberium(Overlay); if (idx == -1) return false;
+    //   tib = vec_Tiberiums[idx]; if (!tib) return false;
+    //   if (OverlayFrame >= tib->MaxDensity - 1) return false;   // 已经长满
+    //   if (cell->field_11C) return false;                       // 格上有对象
+    //   if (tib->GrowthPercentage <= 1e-5) return false;
+    //   sub_487190(cell, idx, 1);                                // 密度 +1
+    //
+    //   本树把"密度阶段"建模成 TiberiumValue（0..12），MaxDensity 取 12。
+    // ------------------------------------------------------------------------
+    bool Grow_Tiberium();
+
     // Occupier management
     int32 Get_Occupier_Count() const;
     ObjectClass* Get_Occupier() const;
     void Add_Occupier(ObjectClass* pObj);
     void Remove_Occupier(ObjectClass* pObj);
+
+    // 本格步兵数（权威计数，表驱动；与 FirstObject 链解耦）。
+    //   原版每格允许最多 3 名步兵，超出即不可进入；链在单位被外力挪格时
+    //   会留下残链，数不准，故单独维护。
+    int32 Infantry_Count() const;
+
+    // CellArray 重新分配后清空占用旁表（旧格指针已失效）。
+    static void Clear_Occupancy_Cache();
 
     // ------------------------------------------------------------------------
     // asm: void __thiscall CellClass::Occupy_Down(CellClass *this, ObjectClass *Content, char bridge)   (asm:3559)
@@ -639,6 +663,11 @@ public:
     //   (vtable +0xC0 / +0xF0 placement notification).
     // ------------------------------------------------------------------------
     void Occupy_Down(ObjectClass* pContent, bool bridge);
+
+    // asm: CellClass::AddContent —— 与 Occupy_Down 同一张占用链，但只做
+    //   "挂链 + 计数"，不改 Occupier 槽、不做 SetLocation 归位。
+    //   对象的落位收尾（ObjectClass::FinalizeUnlimbo）用它登记占用。
+    void AddContent(ObjectClass* pObj, bool alt);
 
     // Occupier type checks
     bool Has_Unit() const;
@@ -807,13 +836,15 @@ public:
     //   the two per-cell side effects onto CellClass so the trigger layer can
     //   reach them without dragging in the whole event/balloon pipeline:
     //
-    //     Show_Talk_Bubble  - raise a dialogue balloon carrying the text over
-    //                         whatever techno occupies this cell.
     //     Make_Occupiers_Berzerk - drive every ground-layer techno on the cell
     //                         berserk (the "GoBerzerk" trigger action).
     //     LastRadarEventTime - frame stamp of the last radar event raised here.
+    //
+    //   话泡（TalkBubble）**不在**这里：原版 0x68 动作直接
+    //   TechnoClass_DisplayTalkBubble(type)，话泡是全局单槽，与格子无关。
+    //   早期实现曾有一个 Show_Talk_Bubble(文本) 的格子入口，asm 中并不存在，
+    //   已删除。
     // ------------------------------------------------------------------------
-    void  Show_Talk_Bubble(const char* pText);
     void  Make_Occupiers_Berzerk();
 
     // ========================================================================
@@ -1145,7 +1176,13 @@ inline bool CellClass::IsRough() const {
 }
 
 inline bool CellClass::IsOccupied() const {
-    return Occupier != nullptr || HasAltFlag(AltCellFlags::ContainsBuilding);
+    // 原版 CellClass::IsOccupied 的判据是 GetContent() != nullptr ——
+    //   FirstObject 链上有任何对象就算占住（步兵可以叠放，所以链长不限于 1）。
+    //   本树此前只查 Occupier 槽，于是"站着一个兵/一辆车"的格子仍然报空闲，
+    //   建筑可以压到单位身上、出厂口会把产品叠进已有单位。
+    return FirstObject != nullptr
+        || Occupier != nullptr
+        || HasAltFlag(AltCellFlags::ContainsBuilding);
 }
 
 inline bool CellClass::IsPassable() const {

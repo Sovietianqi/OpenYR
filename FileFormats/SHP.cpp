@@ -279,8 +279,10 @@ BYTE* SHPStruct::GetPixels(int32 idxFrame)
 
     const SHPFrame& frame = pFile->GetFrameHeader(idxFrame);
 
-    // Pixel data immediately follows the frame header array in the file
-    // The frame header Offset points to the pixel data relative to file start
+    // The frame record's Offset is rebased by Parse_Raw_Data() to point at the
+    // pixel payload inside the contiguous SHPFile block (original files store
+    // the frame-header offset there instead, which is why every reader has to
+    // go through the rebased copy rather than the raw file image).
     BYTE* pBase = reinterpret_cast<BYTE*>(pFile);
     BYTE* pPixels = pBase + frame.Offset;
 
@@ -1099,47 +1101,27 @@ void SHPClass::CacheFrame(int32 frameIndex)
     if (!pCache)
         return;
 
-    // Get pixel data from raw file data
-    BYTE* pSrcData = nullptr;
-    int32 srcDataSize = 0;
+    // Get pixel data from the parsed SHPStruct.
+    //
+    // This used to read `m_pRawData + frame.Offset + sizeof(SHPFrame)`, which
+    // is wrong twice over: Parse_Raw_Data() frees the raw file image once the
+    // contiguous SHPFile block is built, and the frame record's Offset is
+    // rebased onto that block (it points at the pixels, not at the header).
+    // The result was that every frame came back as all-zero pixels.
+    //
+    // Get_Decoded_Pixels() already implements both cases correctly: plain
+    // frames return a pointer into the SHPFile block, compressed frames are
+    // decoded once into the struct's own cache.
+    const BYTE* pSrcData = m_pSHP->Get_Decoded_Pixels(frameIndex);
 
-    if (m_pRawData && frame.Offset < static_cast<uint32>(m_RawDataSize))
-    {
-        // The pixel data starts after the 16-byte frame header
-        pSrcData = m_pRawData + frame.Offset + sizeof(SHPFrame);
-        srcDataSize = m_RawDataSize - frame.Offset - static_cast<int32>(sizeof(SHPFrame));
-        if (srcDataSize < 0)
-            srcDataSize = 0;
-    }
-
-    if (!pSrcData || srcDataSize <= 0)
+    if (pSrcData == nullptr)
     {
         std::memset(pCache, 0, static_cast<size_t>(pixelCount));
         m_pFrameCache[frameIndex] = pCache;
         return;
     }
 
-    // Check if compressed
-    if ((frame.Flags & 0x0002) != 0)
-    {
-        // LCW compressed - decompress
-        bool success = DecompressLCW(pSrcData, srcDataSize, pCache, pixelCount);
-        if (!success)
-        {
-            // Decompression failed - fill with zeros
-            std::memset(pCache, 0, static_cast<size_t>(pixelCount));
-        }
-    }
-    else
-    {
-        // Uncompressed - copy directly
-        int32 copySize = (srcDataSize < pixelCount) ? srcDataSize : pixelCount;
-        std::memcpy(pCache, pSrcData, static_cast<size_t>(copySize));
-        if (copySize < pixelCount)
-        {
-            std::memset(pCache + copySize, 0, static_cast<size_t>(pixelCount - copySize));
-        }
-    }
+    std::memcpy(pCache, pSrcData, static_cast<size_t>(pixelCount));
 
     m_pFrameCache[frameIndex] = pCache;
 }

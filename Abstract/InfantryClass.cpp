@@ -1,3 +1,4 @@
+#include <AI/TagClass.h>
 #include <Abstract/InfantryClass.h>
 #include <Game/SaveGameClass.h>
 #include <Abstract/InfantryTypeClass.h>
@@ -234,10 +235,8 @@ bool InfantryClass::IsCloseEnough(AbstractClass* pTarget, int32 idxWeapon) const
     // Compute the straight-line distance (in leptons) between the two.
     int32 distance = myPos.DistanceFrom(targetPos);
 
-    // Get the effective weapon range.  GetWeaponRange returns the range in
-    // cells; convert to leptons (1 cell = 256 leptons) for comparison.
-    int32 range = GetWeaponRange(idxWeapon);
-    int32 rangeInLeptons = range * LeptonsPerCell;
+    // GetWeaponRange 直接返回 lepton（WeaponTypeClass::Range 本身即 lepton）。
+    int32 rangeInLeptons = GetWeaponRange(idxWeapon);
 
     // Prone infantry effectively have a shorter reach.
     if (IsProneNow) {
@@ -261,8 +260,8 @@ bool InfantryClass::IsCloseEnoughToAttack(AbstractClass* pTarget) const
     // The attack range is slightly larger than the primary weapon range to
     // allow melee / point-blank attacks even when the target is just outside
     // the nominal firing distance.  Use weapon index 0 (primary weapon).
-    int32 range = GetWeaponRange(0);
-    int32 attackRange = range * LeptonsPerCell + (LeptonsPerCell / 2);
+    int32 range = GetWeaponRange(0);            // 已是 lepton
+    int32 attackRange = range + (LeptonsPerCell / 2);
 
     // Dogs and other melee units use a very short attack range.
     if (IsDog) {
@@ -570,7 +569,9 @@ void InfantryClass::FireDeathWeapon(int32 additionalDamage)
     }
 
     // Record the fire frame for animation / ROF gating.
-    SetLastFireFrame(0); // would use Game::CurrentFrame in the full engine
+    //   原版写的是当前帧；写死 0 会让 TechnoClass::Fire_Impl 的
+    //   `Frame - LastFireFrame < ROF` 门在开局 20 帧内恒成立，永远不开火。
+    SetLastFireFrame(Game::CurrentFrame);
 
     // Apply the warhead's special effects if present.
     WarheadTypeClass* pWarhead = pWeapon->Warhead;
@@ -951,9 +952,13 @@ bool InfantryClass::IsSleeping() const {
 //    * 最后把 -1 写入 +0x5E0 并调用 TechnoClass::Assign_Target(target)。
 // ============================================================================
 void InfantryClass::SetTarget(AbstractClass* pTarget) {
-    // 同一目标不重复处理。
+    // 同一目标不重复处理。即便提前返回，也要补齐 FootClass 层：
+    // 历史路径可能只写了一份字段，两边分叉。
     if (pTarget == TargetObj)
+    {
+        FootClass::SetTarget(pTarget);
         return;
+    }
 
     // 仅在自身可移动时按姿态复位动画序列。
     if (this->GetCurrentSpeed() > 0)
@@ -967,6 +972,8 @@ void InfantryClass::SetTarget(AbstractClass* pTarget) {
     }
 
     // 记下目标并同步瞄准/开火状态。
+    // FootClass 层那一份也必须写：UpdateTargeting / Mission_Enter 读它。
+    FootClass::SetTarget(pTarget);
     TargetObj = pTarget;
     if (pTarget) {
         IsAiming = true;
@@ -981,6 +988,7 @@ AbstractClass* InfantryClass::GetTarget() const {
 }
 
 void InfantryClass::ClearTarget() {
+    FootClass::SetTarget(nullptr);
     TargetObj = nullptr;
     IsAiming = false;
     IsFiringNow = false;
@@ -1327,41 +1335,35 @@ bool InfantryClass::Can_Fire_At(TechnoClass* pTarget, int32 weaponIndex) const {
 int32 InfantryClass::GetWeaponRange(int32 weaponIndex) const {
     if (!Type) return 0;
 
-    // Select the appropriate weapon table based on veterancy.
-    int32 weaponCount = Type->WeaponCount;
-    WeaponStruct* pWeaponTable = Type->Weapons;
-
-    // Elite units use the elite weapon table.
-    if (VeterancyLevel >= 2 && Type->EliteWeaponCount > 0) {
-        weaponCount = Type->EliteWeaponCount;
-        pWeaponTable = Type->EliteWeapons;
+    // 精英单位改用精英武器表（原版按军衔切表）。
+    if (VeterancyLevel >= 2 && Type->EliteWeaponCount > 0)
+    {
+        const WeaponStruct& es = Type->EliteWeapons[weaponIndex];
+        if (es.WeaponType != nullptr)
+            return es.WeaponType->Range;
     }
 
-    if (weaponIndex < 0 || weaponIndex >= weaponCount) return 0;
+    // 常规表：走 GetWeapon()（会按 Primary/Secondary 别名补齐 0/1 号槽）。
+    WeaponStruct* pSlot = Type->GetWeapon(weaponIndex);
+    if (pSlot == nullptr || pSlot->WeaponType == nullptr) return 0;
 
-    WeaponTypeClass* pWeapon = pWeaponTable[weaponIndex].WeaponType;
-    if (!pWeapon) return 0;
-
-    return pWeapon->Range;
+    return pSlot->WeaponType->Range;
 }
 
 int32 InfantryClass::GetWeaponDamage(int32 weaponIndex) const {
     if (!Type) return 0;
 
-    int32 weaponCount = Type->WeaponCount;
-    WeaponStruct* pWeaponTable = Type->Weapons;
-
-    if (VeterancyLevel >= 2 && Type->EliteWeaponCount > 0) {
-        weaponCount = Type->EliteWeaponCount;
-        pWeaponTable = Type->EliteWeapons;
+    if (VeterancyLevel >= 2 && Type->EliteWeaponCount > 0)
+    {
+        const WeaponStruct& es = Type->EliteWeapons[weaponIndex];
+        if (es.WeaponType != nullptr)
+            return es.WeaponType->Damage;
     }
 
-    if (weaponIndex < 0 || weaponIndex >= weaponCount) return 0;
+    WeaponStruct* pSlot = Type->GetWeapon(weaponIndex);
+    if (pSlot == nullptr || pSlot->WeaponType == nullptr) return 0;
 
-    WeaponTypeClass* pWeapon = pWeaponTable[weaponIndex].WeaponType;
-    if (!pWeapon) return 0;
-
-    return pWeapon->Damage;
+    return pSlot->WeaponType->Damage;
 }
 
 CoordStruct InfantryClass::GetFireCoords(int32 weaponIndex) const {
@@ -1476,8 +1478,8 @@ void InfantryClass::MuzzleFlash(int32 weaponIndex) {
         }
     }
 
-    // Record the fire frame for ROF gating.
-    SetLastFireFrame(0);
+    // Record the fire frame for ROF gating.（原版是当前帧，见上）
+    SetLastFireFrame(Game::CurrentFrame);
 
     // Briefly raise the fear level of nearby enemy infantry (suppression
     // effect) - this is a light-weight model of the morale system.
@@ -1673,6 +1675,9 @@ void InfantryClass::Draw(Point2D& point, RectangleStruct& rect) {
 
     if (MaxHealth > 0 && Health > 0 && Health < MaxHealth)
         ObjectUI::DrawHealthBar(pSurface, box, Health * 100 / MaxHealth);
+
+    // 原版 TechnoClass::DrawExtras：话泡等附加层（本树 Draw 不走 vtable）。
+    DrawExtras(&point, &rect);
 
     if (g_bDebugMode)
         g_RenderDebugStats.DrawCalls++;
@@ -2468,8 +2473,17 @@ bool InfantryClass::Unlimbo() {
     // registration is restored, and its combat / movement AI resumes.
     if (!IsInLimbo) return false; // not in limbo
 
-    // Flag as no longer in-limbo.
-    IsInLimbo = false;
+    // ★ 必须先走基类落位链。
+    //   本函数此前是"自己实现一遍"：只置 IsInLimbo=false、登记格子占用、
+    //   装行走逻辑、起默认任务 —— 把 TechnoClass::Unlimbo 里那一整段公共
+    //   收尾全跳过了。实测后果：
+    //     · 步兵从不进 OwnedInfantry（阵营表里一个兵都没有，
+    //       AI 兵力统计 / 胜负判定 / 侧边栏计数全错）；
+    //     · 弹匣不灌满（Can_Fire 的 Ammo 门让首发永远打不出来）；
+    //     · 未走 ObjectClass 的落位（Alive/显示层/逻辑表登记）。
+    //   地图上 11 名 E1 全是"活着但不存在于任何阵营名下"的幽灵单位。
+    if (!TechnoClass::Unlimbo())
+        return false;
 
     // Re-register as the occupier of the current cell.
     if (MapClass::Instance) {
@@ -2482,15 +2496,17 @@ bool InfantryClass::Unlimbo() {
         }
     }
 
+    Init_Locomotion();          // 按类型装配行走逻辑（TechnoClass_Init 段）
+    Start_Default_Mission();    // 落位后启动默认 Guard 任务
     // Return to the ready posture.
     PlayAnim(Sequence::Ready, false, false);
 
     // Force a redraw so the sprite reappears on the map.
     Mark(MarkType::Up);
 
-    // asm: InfantryClass_Unlimbo -> ObjectClass::Unlimbo 尾部的 vec_Logics.Add
-    //   （L1049805）。覆写版必须自行登记主表，否则步兵不进逐帧驱动。
-    Register_Logic();
+    // asm: InfantryClass_Unlimbo -> ObjectClass::Unlimbo 尾部的收尾（L1049805）：
+    //   置 Alive、登记主表、交显示层。覆写版必须自行补齐。
+    FinalizeUnlimbo();
 
     return true;
 }
@@ -3042,6 +3058,9 @@ void InfantryClass::Infiltrate(BuildingClass* pBuilding) {
 
 
 void InfantryClass::Detach_Target() {
+    // 与 SetTarget 走同一份存储：Detach 是"目标被销毁时解除关联"，不该
+    // 触发姿态复位，所以直接写 FootClass 层的字段，而不是走 SetTarget。
+    FootClass::SetTarget(nullptr);
     TargetObj = nullptr;
     IsAiming = false;
     IsFiringNow = false;
@@ -3049,6 +3068,7 @@ void InfantryClass::Detach_Target() {
 
 void InfantryClass::Attach_Target(AbstractClass* pTarget) {
     if (pTarget) {
+        FootClass::SetTarget(pTarget);
         TargetObj = pTarget;
         IsAiming = true;
     }
@@ -4321,7 +4341,7 @@ void InfantryClass::CreateFromINIList(INIClass* pINI)
 
         // 所有者。
         HouseClass* pOwner = nullptr;
-        const int32 ownerIdx = HouseClass::FindIndexByName(ownerName);
+        const int32 ownerIdx = HouseClass::FindIndexByNameOrType(ownerName);
         if (ownerIdx >= 0)
             pOwner = HouseClass::GetHouseByIndex(ownerIdx);
         if (pOwner == nullptr) continue;
@@ -4333,6 +4353,12 @@ void InfantryClass::CreateFromINIList(INIClass* pINI)
         InfantryClass* pInf = pType->CreateInfantry(pOwner);
         if (pInf == nullptr) continue;
 
+        // ★ 字段顺序以 asm 为准：owner,type,health,x,y,subcell,facing,...
+        //
+        //   InfantryClass_CreateFromINIList（asm 0x9A4xxx）在 X/Y 之后读的
+        //   那个小整数是**格内站位号**（0..2，查 subcell 偏移表 0x89E9F0），
+        //   不是世界高度 Z。此前把它当 Z 传给 Put，步兵会按 0..2 的高度
+        //   落位，且同格三人完全重叠。
         tok = std::strtok(nullptr, ",");
         int32 health = tok ? std::atoi(tok) : 256;
 
@@ -4341,12 +4367,32 @@ void InfantryClass::CreateFromINIList(INIClass* pINI)
         tok = std::strtok(nullptr, ",");
         int32 y = tok ? std::atoi(tok) : 0;
         tok = std::strtok(nullptr, ",");
-        int32 z = tok ? std::atoi(tok) : 0;
+        int32 subCell = tok ? std::atoi(tok) : 0;
+
+        // ★ 第 7 字段是 MISSION（名字，不是数字），第 8 才是 FACING，第 9 是 TAG。
+        //   ModEnc [Infantry]：OWNER,ID,HEALTH,X,Y,SUB_CELL,MISSION,FACING,TAG,...
+        //   此前把 MISSION（一串字母）当 facing 用 atoi 解析，步兵朝向恒为 0。
+        const char* pMissionName = std::strtok(nullptr, ",");   // mission（名字）
         tok = std::strtok(nullptr, ",");
         int32 facing = tok ? std::atoi(tok) : 0;
+        const char* pTagName = std::strtok(nullptr, ","); // tag
 
-        // 放回地图。
-        pInf->Put(CoordStruct(x, y, z), 0);
+        // 放回地图（Z 由 Put 按地面高度补齐）。
+        //
+        //   ★ X/Y 是**格号**，Put 收的是世界坐标（lepton）。此前直接
+        //   `Put(CoordStruct(x, y, 0))` 把格号当 lepton，18 号格变成地图
+        //   原点附近 18 lepton 处 —— 预置步兵全部堆在左上角（Trace 里
+        //   `at=(18,18,0)` 就是这个症状）。载具侧一直走 CellClass::ConvertCoords，
+        //   这里补上同一套换算。
+        CoordStruct pos(x, y, 0);
+        if (MapClass::Instance != nullptr)
+        {
+            CellClass* pCell = MapClass::Instance->GetCellAt(
+                CellStruct(static_cast<int32>(x), static_cast<int32>(y)));
+            if (pCell != nullptr)
+                pCell->ConvertCoords(&pos);
+        }
+        pInf->Put(pos, subCell);
 
         // 应用血量（原版以 0..256 的比例存储）。
         if (health > 0)
@@ -4356,8 +4402,35 @@ void InfantryClass::CreateFromINIList(INIClass* pINI)
                 (static_cast<int64>(maxHp) * health) / 256);
         }
 
-        // 应用朝向（0..255 的对合值）。
-        pInf->SetFacing(DirStruct(static_cast<short>(facing * 2)));
+        // 朝向：地图里本来就是 0..255 的 256 分度值，直接写，不要再乘 2
+        //   （乘 2 会超出 uint8 回绕，朝向随机跳）。
+        pInf->SetFacing(DirStruct(static_cast<uint8>(facing & 0xFF)));
+
+        // [Infantry] 第 7 字段的 Mission：覆盖 Unlimbo 默认的 Guard。
+        if (pMissionName != nullptr && pMissionName[0] != '\0' &&
+            _strcmpi(pMissionName, "<none>") != 0 && _strcmpi(pMissionName, "none") != 0)
+        {
+            const Mission m = MissionControlClass::FindIndex(pMissionName);
+            if (m != Mission::Guard && m != Mission::Sleep)
+                pInf->ForceMission(m);
+        }
+
+        // [Infantry] 第 9 字段的 Tag：附着并登记（persistence=1 的判据来源）。
+        if (pTagName != nullptr && pTagName[0] != '\0' &&
+            _strcmpi(pTagName, "<none>") != 0 && _strcmpi(pTagName, "none") != 0)
+        {
+            // ★ 实体落位（Setup 的 4.x 段）早于 [Tags]/[Triggers] 的解析，
+            //   所以这里必须用 FindOrAllocate 先建占位实例；随后的
+            //   TagTypeClass::CreateInstance 会按同名复用并把 TagType 补上。
+            //   若地图没有 [Tags] 段而实体写了标签名，这个占位实例的
+            //   TagType 恒空，RaiseEvent 会直接返回 false —— 无害。
+            TagClass* pTag = TagClass::FindOrAllocate(pTagName);
+            if (pTag != nullptr)
+            {
+                pInf->Tag = pTag;
+                pTag->Assign_To_Object(pInf);
+            }
+        }
     }
 }
 
@@ -4485,7 +4558,9 @@ int32 InfantryClass::Mission_Attack()
     }
 
     // ---- 4) 通用攻击 -----------------------------------------------------
-    return MissionClass::Mission_Attack();
+    //   asm 的 InfantryClass_Attack 尾段是 `jmp FootClass_Attack`：
+    //   接近目标 → 进射程 → 交给 Update_Combat 开火。
+    return FootClass::Mission_Attack();
 }
 
 // ----------------------------------------------------------------------------
@@ -4567,7 +4642,10 @@ int32 InfantryClass::Mission_Hunt()
         return 1;
     }
 
-    return MissionClass::Mission_Hunt();
+    // asm 尾段退到 FootClass 层：OffYR 把"往敌方要害推进"统一实现在
+    //   FootClass::Mission_Hunt（MissionClass 的默认体是 not-done 空实现，
+    //   退到基类会让 AI 步兵永远站在原地）。
+    return FootClass::Mission_Hunt();
 }
 
 // ----------------------------------------------------------------------------

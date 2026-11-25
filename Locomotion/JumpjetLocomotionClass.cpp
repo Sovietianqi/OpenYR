@@ -46,16 +46,12 @@ JumpjetLocomotionClass::~JumpjetLocomotionClass()
 
 HRESULT JumpjetLocomotionClass::GetClassID(CLSID* pClassID)
 {
-    if (pClassID) {
-        pClassID->Data1 = static_cast<uint32>(LocoID);
-        pClassID->Data2 = 0;
-        pClassID->Data3 = 0;
-        for (int32 i = 0; i < 8; ++i) {
-            pClassID->Data4[i] = 0;
-        }
-        return S_OK;
-    }
-    return E_FAIL;
+    // asm: 判空失败返回 80004003h (E_POINTER)，否则把 16 字节 GUID 原样拷出。
+    if (pClassID == nullptr)
+        return E_POINTER;
+
+    *pClassID = CLSIDs::Get(LocoID);
+    return S_OK;
 }
 
 int32 JumpjetLocomotionClass::Size()

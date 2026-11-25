@@ -1,9 +1,13 @@
 #include "DriveLocomotionClass.h"
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
 
 #include <cmath>
 #include <cstdlib>
 
 #include "../Map/MapClass.h"
+#include "../AI/TagClass.h"
 #include "../Combat/WarheadTypeClass.h"
 #include "../Abstract/InfantryClass.h"
 
@@ -13,6 +17,53 @@
 // body rotation, crush logic for infantry, building collision, slope
 // handling, and bridge traversal.
 // ============================================================================
+
+// ============================================================================
+// 载具格子占用登记（CellClass::Occupier 槽 + 地面 FirstObject 链）
+//
+//   步兵侧（WalkLocomotionClass）在跨格时就地调用 Add_Occupier/Remove_Occupier，
+//   载具侧此前只走 MapClass::MarkCellOccupied —— 那个函数把"本格当前 Occupier"
+//   再登记一遍，而载具从来没登记过 Occupier，于是整条调用恒为空转：格子链上
+//   看不到坦克，FootClass::Can_Enter_Cell 就放行步兵走进坦克所在的格。
+//
+//   这里按"上次登记的格"做差量同步：格号没变就什么都不做，变了才
+//   Remove 旧格 + Add 新格。不改任何公共类的成员布局 —— 上次登记的格存在
+//   本文件内的旁表里（与 AI/TeamClass.cpp 的 TeamBirthFrames() 同一手法）。
+//
+//   为什么停车/到达不注销：格子占用表达的是"这一格里站着东西"。停着的坦克
+//   仍然占格，注销它等于把坦克重新变透明，步兵又会开进去 —— 那正是本次要修
+//   的毛病。所以到达与 Stop_Moving 只把登记"迁到当前格"，绝不留旧格残链；
+//   只有载体离场（Limbo / 销毁 / 移动器换绑）才真正摘除。
+// ============================================================================
+
+namespace {
+
+struct VehicleCellRecord
+{
+    ObjectClass* Owner;   // 登记时的载体（载体先于移动器消失时用来对账）
+    CellStruct   Cell;    // 上一次登记到哪一格
+};
+
+std::unordered_map<const DriveLocomotionClass*, VehicleCellRecord>& VehicleCells()
+{
+    static std::unordered_map<const DriveLocomotionClass*, VehicleCellRecord> table;
+    return table;
+}
+
+// 对象是否已挂在本格的地面链上。
+bool OnGroundChain(CellClass* pCell, ObjectClass* pObj)
+{
+    if (pCell == nullptr || pObj == nullptr)
+        return false;
+    for (ObjectClass* p = pCell->First_Object(false); p != nullptr; p = p->NextObject)
+    {
+        if (p == pObj)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
 
 DriveLocomotionClass::DriveLocomotionClass()
     : LocomotionClass()
@@ -45,6 +96,10 @@ DriveLocomotionClass::DriveLocomotionClass()
 
 DriveLocomotionClass::~DriveLocomotionClass()
 {
+    // 移动器没了就没人能再维护这格登记：先把载体从它最后登记的格子上摘掉，
+    //   否则格子链上会留一个指向"再也走不动"的载体的条目，步兵绕路绕到死。
+    ReleaseCellOccupation();
+
     if (Piggybackee) {
         Piggybackee = nullptr;
     }
@@ -52,16 +107,12 @@ DriveLocomotionClass::~DriveLocomotionClass()
 
 HRESULT DriveLocomotionClass::GetClassID(CLSID* pClassID)
 {
-    if (pClassID) {
-        pClassID->Data1 = static_cast<uint32>(LocoID);
-        pClassID->Data2 = 0;
-        pClassID->Data3 = 0;
-        for (int32 i = 0; i < 8; ++i) {
-            pClassID->Data4[i] = 0;
-        }
-        return S_OK;
-    }
-    return E_FAIL;
+    // asm: 判空失败返回 80004003h (E_POINTER)，否则把 16 字节 GUID 原样拷出。
+    if (pClassID == nullptr)
+        return E_POINTER;
+
+    *pClassID = CLSIDs::Get(LocoID);
+    return S_OK;
 }
 
 int32 DriveLocomotionClass::Size()
@@ -95,6 +146,23 @@ HRESULT DriveLocomotionClass::End_Piggyback(ILocomotion** pointer)
 
 void DriveLocomotionClass::Move_To(CoordStruct to)
 {
+    // 已经在目的地上了：不要再"重新出发"。
+    //   任务层每一步都会重新 SetDestination(目标建筑坐标)，而建筑坐标是个
+    //   固定点；单位开到点后若不短路，每帧都会被重新点亮 IsDriving，于是
+    //   Is_Moving() 永远为真 —— 上层"到了就转任务"的判据（Mission_Harvest
+    //   的卸矿分支、AI 的运输线）全部失效，矿车就顶着卸矿站在厂里却永远
+    //   不卸货。
+    if (CurrentCoord.DistanceFrom(to) == 0)
+    {
+        Destination = CoordStruct(0, 0, 0);
+        Dest        = to;
+        IsDriving   = false;
+        IsMoving    = false;
+        IsRotating  = false;
+        SpeedAccum  = 0;
+        return;
+    }
+
     Destination = to;
     Dest = to;
     IsDriving = true;
@@ -116,6 +184,131 @@ void DriveLocomotionClass::Stop_Moving()
     IsRotating = false;
     IsRocking = false;
     SpeedAccum = 0;
+
+    // ★ 目的地必须一起清。
+    //   ILocomotion::Is_Moving 的判据是 `Destination != (0,0,0)`（asm:372），
+    //   只清 IsDriving 会让"已经停下"的车永远报告"在移动"：AI 的
+    //   "行进途中不重算路径"判据因此永久成立，单位停在原地一帧也推不动
+    //   （实测 AI 坦克在 (5252,4890) 从 f=600 卡到 f=1800）。到达分支
+    //   （StepTowardsDestination）本来就是这么清的，停止分支漏了。
+    Destination = CoordStruct(0, 0, 0);
+    HeadToCoord = CoordStruct(0, 0, 0);
+    Dest        = CoordStruct(0, 0, 0);
+
+    // 停车保留占用：位置不变就把登记迁到当前格（原地停车时是同格 no-op）。
+    SyncCellOccupation();
+}
+
+// ============================================================================
+// SyncCellOccupation - 把本载体的格子占用登记同步到当前坐标所在格。
+//
+//   与步兵侧 WalkLocomotionClass 的跨格处理对称：旧格 Remove_Occupier、
+//   新格 Add_Occupier，一格一辆（原版载具占 1 格，多格是建筑的事）。
+//   只在格号真正变化时动链，避免每帧重复 Add/Remove。
+// ============================================================================
+
+void DriveLocomotionClass::SyncCellOccupation()
+{
+    auto& table = VehicleCells();
+    auto it = table.find(this);
+
+    if (Owner == nullptr || MapClass::Instance == nullptr)
+    {
+        // 载体已经没了/地图不在：不能再解引用，只清旁表（格子侧由
+        //   ObjectClass 的析构走 RemoveContent 收尾）。
+        if (it != table.end())
+            table.erase(it);
+        return;
+    }
+
+    const CellStruct cell = CoordMath::CoordToCell(CurrentCoord);
+
+    if (it == table.end() || it->second.Owner != Owner)
+    {
+        // 首次登记，或移动器被换绑到另一个载体。
+        //   换绑时旧载体已不属于本移动器，按旧指针去注销会误伤，只补新登记。
+        CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+        if (pCell == nullptr)
+            return;
+
+        if (!OnGroundChain(pCell, Owner) && Owner->NextObject != nullptr)
+        {
+            // 载体的链指针指着别的格：Unlimbo 只在"落位那一格"挂过链，
+            //   Limbo/Unlimbo 换格时不会迁移，于是 NextObject 非空但本格链
+            //   里没有它，Add_Occupier 的挂链条件（NextObject 必须为空）就
+            //   永远不成立。就近三格内找一遍残链并摘掉，只做一次。
+            for (int32 dx = -1; dx <= 1; ++dx)
+            {
+                for (int32 dy = -1; dy <= 1; ++dy)
+                {
+                    const CellStruct probe(static_cast<int16>(static_cast<int32>(cell.X) + dx),
+                                           static_cast<int16>(static_cast<int32>(cell.Y) + dy));
+                    CellClass* pProbe = MapClass::Instance->GetCellAt(probe);
+                    if (pProbe != nullptr && pProbe != pCell && OnGroundChain(pProbe, Owner))
+                        pProbe->Remove_Occupier(Owner);
+                }
+            }
+        }
+
+        pCell->Add_Occupier(Owner);
+        table[this] = VehicleCellRecord{Owner, cell};
+        return;
+    }
+
+    if (it->second.Cell == cell)
+    {
+        // 同格的常规情形：什么都不做。但要防一类"外力抹除"——
+        //   UnitClass::SetCoords 在每次写坐标前都会 UnmarkAllOccupationBits
+        //   旧格，而它的重新标记走 MarkCellOccupied，只能把"本格当前
+        //   Occupier"再登记一遍：坦克正是本格 Occupier 时，Unmark 把自己
+        //   摘掉之后，Mark 已经读不到任何 Occupier 了，登记就被抹成空的。
+        //   每帧补一次，保证"我这一格里确实登记着我"这个不变式。
+        CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+        if (pCell != nullptr
+            && pCell->Get_Occupier() != Owner
+            && !OnGroundChain(pCell, Owner))
+        {
+            pCell->Add_Occupier(Owner);
+        }
+        return;
+    }
+
+    // 跨格：旧格注销 + 新格登记。
+    CellClass* pOldCell = MapClass::Instance->GetCellAt(it->second.Cell);
+    if (pOldCell != nullptr)
+        pOldCell->Remove_Occupier(Owner);
+
+    CellClass* pNewCell = MapClass::Instance->GetCellAt(cell);
+    if (pNewCell != nullptr)
+        pNewCell->Add_Occupier(Owner);
+
+    it->second.Cell = cell;
+
+    // 跨格即"进入新格"：若该格挂有 [CellTags]，向标签上抛 EnteredBy。
+    TagClass::SpringCellTag(cell, Owner);
+}
+
+// ============================================================================
+// ReleaseCellOccupation - 摘掉本载体的占用登记（离场用）。
+// ============================================================================
+
+void DriveLocomotionClass::ReleaseCellOccupation()
+{
+    auto& table = VehicleCells();
+    auto it = table.find(this);
+    if (it == table.end())
+        return;
+
+    // 只有"当前 Owner 就是登记时的那个指针"才敢解引用；载体的析构会把
+    //   Owner 置空/换人，这时按旧指针调 Remove_Occupier 就是悬空访问。
+    if (Owner != nullptr && it->second.Owner == Owner && MapClass::Instance != nullptr)
+    {
+        CellClass* pCell = MapClass::Instance->GetCellAt(it->second.Cell);
+        if (pCell != nullptr)
+            pCell->Remove_Occupier(Owner);
+    }
+
+    table.erase(it);
 }
 
 // ============================================================================
@@ -241,6 +434,12 @@ bool DriveLocomotionClass::Is_Moving_Now()
 
 bool DriveLocomotionClass::Process()
 {
+    // 每帧先把占用登记对齐到当前坐标所在格：
+    //   * 停着的车也要保住自己那一格（步兵不能开进来）；
+    //   * 被外力挪格（卸载落位 / 传送 / Force_Track）后，下一帧就能自愈，
+    //     不会在旧格留一条永远不会走开的残链。
+    SyncCellOccupation();
+
     UpdateDrive();
     return IsDriving || IsRotating || IsRocking;
 }
@@ -388,9 +587,21 @@ void DriveLocomotionClass::StepTowardsDestination(int32 effectiveSpeed)
             CurrentCoord = Destination;
             if (Owner) {
                 Owner->SetCoords(CurrentCoord);
+                Owner->CachedLocation = CurrentCoord;
             }
             IsDriving = false;
-            IsMoving = false;
+            IsMoving  = false;
+
+            // 到达即把占用登记迁到落点格：Destination 清掉之后单位就停在
+            //   这里，登记必须跟着走，否则旧格留残链、新格没有它。
+            SyncCellOccupation();
+
+            // 到达即清目的地/朝往点。原版 ILocomotion::Is_Moving 的判据是
+            //   `Destination != (0,0,0)`（asm:372），不清就会永远报"在动"：
+            //   单位明明到了，AI 与动画层却始终把它当行进中。
+            Destination = CoordStruct(0, 0, 0);
+            HeadToCoord = CoordStruct(0, 0, 0);
+            SpeedAccum  = 0;
             break;
         }
     }
@@ -474,6 +685,10 @@ void DriveLocomotionClass::UpdatePosition()
         if (Owner) {
             Owner->SetCoords(CurrentCoord);
         }
+
+        // 逐格推进后立刻同步：本帧可能连推多格（SpeedAccum 累积），
+        //   每跨一格都要把登记从旧格搬到新格。
+        SyncCellOccupation();
     }
 }
 
@@ -547,18 +762,43 @@ void DriveLocomotionClass::CheckCrush()
                 continue;
             }
 
-            ObjectClass* occupant = MapClass::Instance->GetCellOccupier(cell);
-            if (!occupant) {
+            CellClass* pCell = MapClass::Instance->GetCellAt(cell);
+            if (pCell == nullptr) {
                 continue;
             }
 
-            if (occupant->WhatAmI() == AbstractType::Infantry) {
-                InfantryClass* infantry = static_cast<InfantryClass*>(occupant);
+            // 碾压目标必须走地面链来找，不能只查 Occupier 槽：
+            //   Occupier 只有一个槽，坦克自己一登记就会把同格的步兵从槽里
+            //   挤掉（Add_Occupier 无条件写槽），只查槽等于"坦克压到人身上
+            //   时反而看不见人"。链是登记的唯一权威，槽再补查一遍以覆盖
+            //   只进了槽、没挂链的外力落位对象。
+            ObjectClass* pSlotOccupier = pCell->Get_Occupier();
+
+            auto crushInfantry = [&](ObjectClass* pObj) {
+                if (pObj == nullptr || pObj == Owner) {
+                    return;
+                }
+                if (pObj->WhatAmI() != AbstractType::Infantry) {
+                    return;
+                }
+                InfantryClass* infantry = static_cast<InfantryClass*>(pObj);
                 if (Destroyer) {
                     infantry->TakeDamage(10000, static_cast<ObjectClass*>(nullptr), WarheadTypeClass::GetDefault());
                 } else if (Crusher) {
                     infantry->TakeDamage(250, Owner, WarheadTypeClass::GetDefault());
                 }
+            };
+
+            crushInfantry(pSlotOccupier);
+
+            for (ObjectClass* pObj = pCell->First_Object(false);
+                 pObj != nullptr;
+                 pObj = pObj->NextObject)
+            {
+                if (pObj == pSlotOccupier) {
+                    continue;                   // 上面已经处理过
+                }
+                crushInfantry(pObj);
             }
         }
     }
@@ -690,29 +930,24 @@ Move DriveLocomotionClass::Can_Enter_Cell(CellStruct cell)
 }
 
 // ============================================================================
-// Mark_All_Occupation_Bits - Vehicle footprint marking.
+// Mark_All_Occupation_Bits - 载具的格子占用标记（单格）。
+//
+// asm: FootClass_ImbueLocomotor+15C → call [vt+ILocomotion::Mark_All_Occupation_Bits]
+//   原版由移动器在落位/离场时把"自己占住的格子"标上/抹掉。本树此前转给
+//   MapClass::MarkCellOccupied(cell, occupied)，而该函数只能操作"本格当前的
+//   Occupier"——载具从没登记过 Occupier，于是 Up/Down 都是空转。这里直接走
+//   权威的 Add_Occupier / Remove_Occupier（与步兵同一套 API）。
+//
+//   载具占 1 格（原版坦克占 1 格；3x3 是建筑地基的事），所以不再按 3x3
+//   邻格标记——那一圈标记本来也只是把邻格现有 Occupier 再登记一遍。
 // ============================================================================
 
 void DriveLocomotionClass::Mark_All_Occupation_Bits(MarkType mark)
 {
-    CellStruct cell = CoordMath::CoordToCell(CurrentCoord);
-    bool occupy = (mark == MarkType::Up);
-
-    MapClass::Instance->MarkCellOccupied(cell, occupy);
-
-    for (int32 dx = -1; dx <= 1; ++dx) {
-        for (int32 dy = -1; dy <= 1; ++dy) {
-            if (dx == 0 && dy == 0) {
-                continue;
-            }
-            CellStruct adj;
-            adj.X = static_cast<int16>(static_cast<int32>(cell.X) + dx);
-            adj.Y = static_cast<int16>(static_cast<int32>(cell.Y) + dy);
-            if (adj.X >= 0 && adj.X < 512 && adj.Y >= 0 && adj.Y < 512) {
-                MapClass::Instance->MarkCellOccupied(adj, occupy);
-            }
-        }
-    }
+    if (mark == MarkType::Up)
+        SyncCellOccupation();
+    else
+        ReleaseCellOccupation();
 }
 
 // ============================================================================

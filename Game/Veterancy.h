@@ -7,8 +7,11 @@
 class HouseClass;
 
 // ------------------------------------------------------------------------
-// 根据游戏行为，可知经验等级以浮点累计值维护：阈值之上越级，
-// 击杀经验按成本比折算后累加。
+// 经验值容器（asm: Veterancy_* 系列，0x74FFxx 段）。
+//
+// 原版用一个 float 存经验：Rookie 0 / Veteran 1.0 / Elite 2.0，
+// SetRookie(true) 写 -0.25（把"该升老兵"的判断推迟到下一次结算），
+// 三个 Set* 都带一个 bool：true 写对应值，false 清 0。
 // ------------------------------------------------------------------------
 class Veterancy {
 public:
@@ -17,10 +20,14 @@ public:
     bool IsElite() const;
     bool IsVeteran() const;
     bool IsPreRookie() const;
-    void SetRookie();
-    void SetVeteran();
-    void SetElite();
-    void AddValue(float victimCost, float ownerCost);
+    void SetRookie(bool value);
+    void SetVeteran(bool value);
+    void SetElite(bool value);
+
+    // asm: Veterancy_AddValue(this, int ownerCost, int victimCost)
+    //   Value += victimCost / (ownerCost * Rules->VeteranRatio)，再钳到
+    //   Rules->VeteranCap。
+    void AddValue(int32 ownerCost, int32 victimCost);
 
     float Value;
 };

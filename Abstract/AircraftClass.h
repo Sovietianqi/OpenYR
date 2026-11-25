@@ -338,6 +338,7 @@ public:
     //  GetClassID 把本类的 CLSID 写进出参并返回 S_OK；GetUIName 取类型名。
     // ========================================================================
     virtual TechnoTypeClass* GetType() const override;
+    virtual AbstractType WhatAmI() const override { return AbstractType::Aircraft; }
     virtual AircraftTypeClass* Get_Aircraft_Type() const;
     virtual int32 Size() const override;
     virtual AbstractType GetAbstractDerivationID() const;
@@ -368,7 +369,7 @@ public:
     bool StartMission();
     int32 ReceivedRadioCommand(int32 cmd, int32 arg0, int32 a4);
     int32 ReceiveDamage(int32* pDamage, int32 typeSource,
-                        WarheadTypeClass* pWarhead, int32 target,
+                        WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                         int32 ignoreDefenses, int32 arg10,
                         HouseClass* pSourceHouse);
     virtual bool Put(const CoordStruct& coords, int32 a2) override;

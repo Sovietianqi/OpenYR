@@ -61,7 +61,7 @@ public:
     //   仅当弹头 Wood 且类型非 Immune 时才结算；死亡时按 SpawnsTiberium / 点火
     //   分支处理。
     virtual int32 ReceiveDamage(int32* pDamage, int32 typeSource,
-                                WarheadTypeClass* pWarhead, int32 target,
+                                WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                 int32 ignoreDefenses, int32 arg10,
                                 HouseClass* pSourceHouse);
 

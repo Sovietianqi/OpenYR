@@ -243,56 +243,78 @@ void RateTimer::Reset()
 }
 
 // =============================================================================
-// TimerStruct - Simple countdown timer
+// TimerStruct - 绝对时刻计时器（asm sub_4F1B20，12 字节）
 //
-// A lightweight countdown timer that decrements once per frame.
-// Used for short-duration events such as:
-// - Animation frame timing
-// - Sound effect duration tracking
-// - Temporary state transitions
+// 与旧实现（单 Value 每帧自减）不同：这里存的是**起跑时刻**与**总时长**，
+// 剩余量每次按墙钟现算。原版全场只有这一种 TimerStruct 语义。
 // =============================================================================
 
 TimerStruct::TimerStruct()
-    : Value(0)
+    : TimeStart(-1)     // -1 = 未起跑，GetTimeLeft 直接返回 TimeLeft
+    , LastCheck(0)
+    , TimeLeft(0)
 {
 }
 
 TimerStruct::TimerStruct(int32 v)
-    : Value(v)
+    : TimeStart(-1)
+    , LastCheck(0)
+    , TimeLeft(v)
 {
 }
 
-// Start the timer with the specified duration.
 void TimerStruct::Start(int32 duration)
 {
-    if (duration < 0) duration = 0;
-    Value = duration;
+    Start(duration, SystemTimer::GetTime());
 }
 
-// Stop the timer by resetting to zero.
+// asm: DisplayTalkBubble 尾部——TimeStart/LastCheck 同时写当前时刻。
+void TimerStruct::Start(int32 duration, int32 now)
+{
+    TimeStart = now;
+    LastCheck = now;
+    TimeLeft  = duration;
+}
+
 void TimerStruct::Stop()
 {
-    Value = 0;
+    Stop(SystemTimer::GetTime());
 }
 
-// Check if time remains on the timer.
+// asm: loc_70F194 —— TimeStart 仍写当前时刻，TimeLeft 归零。
+void TimerStruct::Stop(int32 now)
+{
+    TimeStart = now;
+    LastCheck = now;
+    TimeLeft  = 0;
+}
+
+int32 TimerStruct::GetTimeLeft() const
+{
+    return GetTimeLeft(SystemTimer::GetTime());
+}
+
+// asm: sub_4F1B20
+int32 TimerStruct::GetTimeLeft(int32 now) const
+{
+    if (TimeStart == -1)
+        return TimeLeft;
+
+    const int32 elapsed = now - TimeStart;
+    if (elapsed >= TimeLeft)
+        return 0;
+
+    return TimeLeft - elapsed;
+}
+
 bool TimerStruct::HasTimeLeft() const
 {
-    return Value > 0;
+    return GetTimeLeft() > 0;
 }
 
-// Check if the timer has expired.
 bool TimerStruct::Expired() const
 {
-    return Value <= 0;
-}
-
-// Advance the timer by one frame.
-void TimerStruct::Update()
-{
-    if (Value > 0) {
-        --Value;
-    }
+    return GetTimeLeft() <= 0;
 }
 
 // =============================================================================

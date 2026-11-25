@@ -19,11 +19,15 @@ HoverLocomotionClass::~HoverLocomotionClass()
 {
 }
 
+// asm: HoverLocomotionClass_GetClassID (0x517070, retn 8)
+//   判空失败返回 80004003h (E_POINTER)，否则拷出 CLSID_HoverLocomotionClass
+//   = 4A582742-9839-11D1-B709-00A024DDAFD1。
 HRESULT HoverLocomotionClass::GetClassID(CLSID* pClassID)
 {
-    // 根据游戏行为，可知悬浮移位以自己的 CLSID 应答。
-    if (pClassID)
-        *pClassID = CLSID();
+    if (pClassID == nullptr)
+        return E_POINTER;
+
+    *pClassID = CLSIDs::Get(LocoID);
     return S_OK;
 }
 

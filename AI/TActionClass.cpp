@@ -245,7 +245,11 @@ int32 TActionClass::ParseTokens(const char* const* tokens, int32 count, int32* p
         ++consumed;
     }
 
-    ActionKind  = static_cast<TAction>(kind);
+    // asm 的 kind 是 1-based（switch(kindAction - 1) 才是跳转表下标），
+    //   TAction 枚举存的是**下标**。INI 里读到 11（Text message）要落成
+    //   TAction::TextTrigger(10)，否则整条动作链错位一位：写 "Winner is"
+    //   会执行成 "Loser is"。
+    ActionKind  = static_cast<TAction>(kind > 0 ? kind - 1 : 0);
     ActionIndex = selector;
     P3_Value = values[0];
     P4_Value = values[1];
@@ -320,7 +324,7 @@ bool TActionClass::SaveToINI(CCINIClass* pINI) {
 
     char out[0x200];
     snprintf(out, sizeof(out), "%d,%d,%s,%d,%d,%d,%d,%d",
-             static_cast<int32>(ActionKind), selector, pName,
+             static_cast<int32>(ActionKind) + 1, selector, pName,
              P3_Value, P4_Value, P5_Value, P6_Value, P7_Value);
 
     pINI->WriteString("Actions", ID, out);
@@ -772,10 +776,17 @@ void TActionClass::Action_PlayMovie() {
 void TActionClass::Action_TextTrigger() {
     // case 10 (lct_TriggerAction_TextTrigger)：显示文本框（field_90 = CSF 索引）。
     if (ScenarioClass::Instance) {
+        // asm: 读 [ecx+field_90]（= 本类的 P7_Value，由 ParseTokens 的
+        //   selector 0/11 分支写入 atoi(第三段)）。原来读 P3_Value 会恒为 0。
         snprintf(ScenarioClass::Instance->MissionTimerText,
                  sizeof(ScenarioClass::Instance->MissionTimerText),
-                 "MSG:%d", P3_Value);
+                 "MSG:%d", P7_Value);
         ScenarioClass::Instance->VariablesChanged = true;
+        if (std::getenv("OPENYR_TRIGDBG") != nullptr) {
+            std::fprintf(stderr, "[TRIGTEXT] frame=%d text=\"%s\"\n",
+                         (int)Game::CurrentFrame,
+                         ScenarioClass::Instance->MissionTimerText);
+        }
     }
 }
 
@@ -1473,18 +1484,32 @@ void TActionClass::Action_FlashTeam() {
 }
 
 void TActionClass::Action_TalkBubble() {
-    // case 104 (lct_TriggerAction_TalkBubble)：让队伍类型首个实例冒话泡。
-    // asm: TeamTypeClass_FindFirstInstance → 取该队首个 TechnoClass 调
-    //      TechnoClass_DisplayTalkBubble(type)。参见 SW/ActionClass::TalkBubbleOfTeam。
-    if (!TeamType || !TeamClass::Array) return;
+    // case 104 (lct_TriggerAction_TalkBubble)
+    //
+    // asm（asm:1506635）：
+    //   mov ecx,[cAction+TeamType]
+    //   test ecx,ecx / jz loc_6DF5B9     → this=0, type=0（清掉当前话泡）
+    //   call TeamTypeClass_FindFirstInstance
+    //   test eax,eax / jz 结束            → 该类型尚无实例，什么也不做
+    //   mov edx,[cAction+field_90]        → 话泡帧号
+    //   mov ecx,[eax+FirstUnitInTeam]     → 队里第一个 Techno
+    //   call TechnoClass_DisplayTalkBubble
+    if (!TeamType) {
+        TechnoClass::DisplayTalkBubble_Global(nullptr, 0);
+        return;
+    }
+    if (!TeamClass::Array) return;
+
     for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
         TeamClass* pTeam = TeamClass::Array->GetItem(i);
         if (pTeam == nullptr || pTeam->Type != TeamType) continue;
-        if (pTeam->GetMemberCount() > 0) {
-            TechnoClass* pTechno = pTeam->GetMember(0);
-            if (pTechno) pTechno->DisplayTalkBubble(nullptr, P3_Value);
-        }
-        break;
+
+        TechnoClass* pTechno = nullptr;
+        if (pTeam->GetMemberCount() > 0)
+            pTechno = pTeam->GetMember(0);
+
+        TechnoClass::DisplayTalkBubble_Global(pTechno, P3_Value);
+        return;   // asm: 只处理 FindFirstInstance 找到的那一支
     }
 }
 
@@ -2407,6 +2432,7 @@ bool TActionClass::CreateBuilding(int32 a1, int32 a3, int32 a4, int32 a5) {
     if (pBuilding == nullptr) return false;
 
     pBuilding->Type  = pType;
+    pBuilding->TechnoType = pType;
     pBuilding->Owner = HouseClass::Player;
 
     // Cell centre plus the cell's ground height.

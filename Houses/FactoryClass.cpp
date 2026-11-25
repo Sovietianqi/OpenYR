@@ -6,6 +6,8 @@
 // ============================================================================
 
 #include "FactoryClass.h"
+#include <cstdio>
+#include <cstdlib>
 #include "../Houses/HouseClass.h"
 #include "../Abstract/BuildingClass.h"
 #include "../Abstract/BuildingTypeClass.h"
@@ -91,28 +93,63 @@ static TechnoClass* Create_Product(TechnoTypeClass* pType, HouseClass* pOwner)
 
     switch (pType->WhatAmI())
     {
+        // ★ 原版 TechnoClass_CTOR 把新对象以 **limbo** 状态交出（IsInLimbo=1），
+        //   出厂时再由 Unlimbo 落位。本树 ObjectClass 的构造默认是 0，若不
+        //   在这里补上，产品会被当成"已经在图上"，出厂路径直接跳过落位，
+        //   结果就是"造完了但战场上没有这个单位"。
+        //   血量同理：原版 CTOR 末尾按 Type->Strength 灌 Health/MaxHealth，
+        //   本树 CTOR 执行时 Type 还是空的，不补就会以 0 血出厂 ——
+        //   对象第一帧就被 IsDead() 判死并回收，画面上什么都看不到。
         case AbstractType::UnitType:
         {
             UnitClass* p = new UnitClass(pOwner);
-            if (p != nullptr) p->Type = static_cast<UnitTypeClass*>(pType);
+            if (p != nullptr)
+            {
+                p->Type = static_cast<UnitTypeClass*>(pType);
+                p->TechnoType = pType;
+                p->Health    = (pType->Strength > 0) ? pType->Strength : 200;
+                p->MaxHealth = p->Health;
+                p->IsInLimbo = true;
+            }
             return p;
         }
         case AbstractType::InfantryType:
         {
             InfantryClass* p = new InfantryClass(pOwner);
-            if (p != nullptr) p->Type = static_cast<InfantryTypeClass*>(pType);
+            if (p != nullptr)
+            {
+                p->Type = static_cast<InfantryTypeClass*>(pType);
+                p->TechnoType = pType;
+                p->Health    = (pType->Strength > 0) ? pType->Strength : 200;
+                p->MaxHealth = p->Health;
+                p->IsInLimbo = true;
+            }
             return p;
         }
         case AbstractType::AircraftType:
         {
             AircraftClass* p = new AircraftClass(pOwner);
-            if (p != nullptr) p->Type = static_cast<AircraftTypeClass*>(pType);
+            if (p != nullptr)
+            {
+                p->Type = static_cast<AircraftTypeClass*>(pType);
+                p->TechnoType = pType;
+                p->Health    = (pType->Strength > 0) ? pType->Strength : 200;
+                p->MaxHealth = p->Health;
+                p->IsInLimbo = true;
+            }
             return p;
         }
         case AbstractType::BuildingType:
         {
             BuildingClass* p = new BuildingClass(pOwner);
-            if (p != nullptr) p->Type = static_cast<BuildingTypeClass*>(pType);
+            if (p != nullptr)
+            {
+                p->Type = static_cast<BuildingTypeClass*>(pType);
+                p->TechnoType = pType;
+                p->Health    = (pType->Strength > 0) ? pType->Strength : 200;
+                p->MaxHealth = p->Health;
+                p->IsInLimbo = true;
+            }
             return p;
         }
         default:
@@ -272,34 +309,60 @@ bool FactoryClass::QueueProduction(TechnoTypeClass* pType)
     }
 
     if (goStart)
-    {
-        // asm: lct_BuildingType: mov byte ptr [esi+5Dh],1 / [+0x70]=1
-        IsDifferent = true;
-        OnHold = true;
-        // asm: [esi+24h]=0；重置计时器 [+0x38]=0 / [+0x2C]=Frame / [+0x34]=0
-        Progress = 0;
-        ProductionEstimateFrames = 0;
-        ProductionStartFrame = Game::CurrentFrame;
-        ProductionDuration = 0;
-
-        // asm: edx=[edi] / call [edx+8Ch] = 创建产品对象 -> [+0x58]
-        CurrentProduction = Create_Product(pType, Owner);
-        CurrentType = pType;
-
-        // asm: [+0x6C] = owner；应付金额 [+0x60] / 原始金额 [+0x64]
-        if (Owner != nullptr && CurrentType != nullptr)
-        {
-            OriginalBalance = static_cast<int32>(
-                CurrentType->Cost * Owner->Get_Cost_Mult(CurrentType));
-            Balance = OriginalBalance;
-        }
-
-        // asm: return ([+0x58] != 0)
-        return (CurrentProduction != nullptr);
-    }
+        return Start_Specific(pType);
 
     // asm: loc_4C9D3B: 播放"无法建造"音效（音效层未落桩）-> return 0
     return false;
+}
+
+// ============================================================================
+// asm: loc_4C9Dxx（QueueProduction 的 lct_BuildingType 开工段）
+//
+//   "让这条线立刻开工造 pType"：置 +0x5D/+0x70、清进度与计时器、按类型虚表
+//   +0x8Ch 造出在制品、按房主造价倍率算应付总额。QueueProduction 在"线空"
+//   时走这里，StartProduction 从队列弹出一项后也走这里 —— 后者原本是绕回
+//   HouseClass::BeginProductionOf 再进 QueueProduction，而那时队列还有货，
+//   QueueProduction 会把它**再塞回队列**，形成"弹出-入队"死循环（实测队列
+//   永远堆到上限 100、进度一动不动）。
+// ============================================================================
+bool FactoryClass::Start_Specific(TechnoTypeClass* pType)
+{
+    if (pType == nullptr)
+        return false;
+
+    // asm: lct_BuildingType: mov byte ptr [esi+5Dh],1 / [+0x70]=1
+    IsDifferent = true;
+    OnHold = true;
+    // ★ +0x71（CompleteSuspended）必须在这里清掉。
+    //   构造时它是 1（asm: mov byte ptr [esi+71h],1），语义是"生产线已完工、
+    //   等玩家取货"。开一张新产品意味着这个语义不再成立；不清的话 Update
+    //   开头的 `OnHold && CompleteSuspended -> return` 会让这条线永久停摆。
+    CompleteSuspended = false;
+    // asm: [esi+24h]=0；重置计时器 [+0x38]=0 / [+0x2C]=Frame / [+0x34]=0
+    Progress = 0;
+    ProductionEstimateFrames = 0;
+    ProductionStartFrame = Game::CurrentFrame;
+    ProductionDuration = 0;
+
+    // asm: edx=[edi] / call [edx+8Ch] = 创建产品对象 -> [+0x58]
+    CurrentProduction = Create_Product(pType, Owner);
+    CurrentType = pType;
+
+    // asm: [+0x6C] = owner；应付金额 [+0x60] / 原始金额 [+0x64]
+    if (Owner != nullptr && CurrentType != nullptr)
+    {
+        OriginalBalance = static_cast<int32>(
+            CurrentType->Cost * Owner->Get_Cost_Mult(CurrentType));
+        Balance = OriginalBalance;
+    }
+    else
+    {
+        Balance = 0;
+        OriginalBalance = 0;
+    }
+
+    // asm: return ([+0x58] != 0)
+    return (CurrentProduction != nullptr);
 }
 
 // ============================================================================
@@ -361,15 +424,12 @@ void FactoryClass::StartProduction()
         return;                                // asm: test eax,eax / jl loc_4CA60F
 
     // asm: mov cl,[edi+Naval] ; BuyIsNaval
-    const bool isNaval = pType->IsNaval;
-
-    // asm: HouseClass_BeginProductionOf([+6Ch], WhatAmI(), isNaval, idx, 1)
-    if (Owner != nullptr)
-    {
-        Owner->BeginProductionOf(pType, 1);
-        (void)isNaval;                         // 语义已由 BeginProductionOf 内部消费
-    }
-
+    //   HouseClass_BeginProductionOf([+6Ch], WhatAmI(), isNaval, idx, 1)
+    //   ★ 这里不能绕回 BeginProductionOf：那条路会进 QueueProduction，而此刻
+    //     队列里还有货，QueueProduction 判定"队列非空"就会把它再塞回队尾，
+    //     变成"弹出→入队"的死循环（队列堆到上限 100、进度永不启动）。
+    //     原版这一支的语义就是"用刚弹出的这一项直接开工"，等价于开工程。
+    Start_Specific(pType);
     CurrentType = pType;
 }
 
@@ -532,13 +592,24 @@ bool FactoryClass::Unsuspend_Ex(int32 a2)
         span = 0;                              // asm: loc_4C9F56 xor edi,edi
     }
 
-    // asm: cmp eax,edi / jl loc_4C9FA6 ; eax = 产品进度
-    const int32 progress = Progress;
-    if (progress < span)
+    // asm: cmp edi,eax / jle loc_4C9FA6
+    //   ★ 这里是"本步应付(span) vs 房主可用资金"，不是"进度 vs span"。
+    //   写成进度那一版会让 Unsuspend 在**几乎每次**恢复时都走进 CompleteSuspended
+    //   分支（进度 0..54 恒小于金额几百），生产线随即被"已完成"标记钉死。
+    const int32 available = (Owner != nullptr) ? Owner->GetAvailableMoney() : 0;
+    if (span > available)
+    {
+        // 付不起本步：保持挂起，等资金恢复后再来。
+        OnHold = true;
         return false;
+    }
 
-    // asm: mov byte ptr [esi+71h],1
-    CompleteSuspended = true;
+    // ★ 恢复成功就不要置 CompleteSuspended。
+    //   这个标志的语义是"已完工、等取货"，Update 开头见到
+    //   `OnHold && CompleteSuspended` 就直接返回。恢复生产线时置它，
+    //   等于刚唤醒就把自己重新钉死 —— 实测 AI 房一旦断过钱，
+    //   所有生产线就再也不动了。
+    CompleteSuspended = false;
 
     // asm: test al,al(=a2) / jz loc_4C9F9C
     if (a2 != 0)
@@ -689,6 +760,80 @@ void FactoryClass::Recalc_Build_Estimate()
 }
 
 // ============================================================================
+// FactoryClass::Validate_Production —— HouseClass::Update_Factories 的单厂实现
+//
+//   asm: HouseClass::Update_Factories (0x509129) 逐段作用在"某类工厂"上：
+//
+//     ① 队列清理：
+//          for (i = QueuedObjects.length - 1; i >= 0; --i)
+//              if (!QueuedObjects[i]->FindFactory(1,1,0,House))
+//                  QueuedObjects.Remove(i);
+//        —— 参数 (overridePrereqs=1, overridePower=1, overrideBuildLimit=0)
+//        是"忽略建造上限、但仍要科技/前置/电力"。本树的前置/电力模型在
+//        HouseClass::Can_Produce_Type 里（归属/科技等级/可建位），直接复用。
+//
+//     ② 在制品复查：
+//          if (CurrentProduction) {
+//              if (!type->FindFactory(1,1,0)) { Abandon(); StartProduction(); }
+//              else if (!type->FindFactory(1,1,1)) Suspend(0);      // 超建造上限
+//              else if (CompleteSuspended && !byte_71) Unsuspend(0);
+//          }
+//        本树还没有 BuildLimit 计数（FindFactory 的第三个布尔），② 的
+//        "超上限挂起"分支先按"能不能造"等价处理：造不出来就挂起，恢复后
+//        自动续产。
+//
+//     ③ 空线销毁：asm 在 CurrentProduction 与队列都空时 delete 本工厂。本树
+//        的 FactoryClass 由 BuildingClass 持有（BuildingClass::Factory），
+//        在这里 delete 会留下悬垂指针，故不做销毁 —— 工厂随建筑走。
+// ============================================================================
+void FactoryClass::Validate_Production()
+{
+    if (Owner == nullptr)
+        return;
+
+    // ① 队伍清理：从尾往头扫，删掉"已经造不出来"的条目。
+    for (int32 i = Queue.Count - 1; i >= 0; --i)
+    {
+        TechnoTypeClass* pQueued = Queue[i];
+        if (pQueued == nullptr || !Owner->Can_Produce_Type(pQueued))
+        {
+            Queue.Remove(i);
+            IsDifferent = true;
+        }
+    }
+
+    // ② 在制品复查。
+    if (CurrentType != nullptr)
+    {
+        const bool producible = Owner->Can_Produce_Type(CurrentType);
+
+        if (!producible)
+        {
+            // 造不出来了：放弃当前件（含退款），立刻把下一件顶上。
+            Abandon();
+            StartProduction();
+            return;
+        }
+
+        if (OnHold && !CompleteSuspended)
+        {
+            // 之前因资金/电力挂起，现在又能造了 —— 恢复。
+            Unsuspend();
+        }
+    }
+
+    // ③ 空线续产（实测缺口）。
+    //    线空但队列里还有货时必须顶上一件，否则整条线停在这里：队列只增
+    //    不减，BeginProductionOf 每次都因"队列满"被拒，AI 永远造不出东西。
+    //    原版这一支在 HouseClass_Update_Factories 里（`else if (Queue.Count)
+    //    StartProduction()`），本树的调用点在 BuildingClass 的逐帧工厂校验里。
+    if (CurrentProduction == nullptr && CurrentType == nullptr && Queue.Count > 0)
+    {
+        StartProduction();
+    }
+}
+
+// ============================================================================
 // asm: _sub_4CA180_unused (0x4CA180)
 //
 //   int __thiscall sub_4CA180(FactoryClass *this)
@@ -723,8 +868,47 @@ int32 FactoryClass::Get_Cost() const
 void FactoryClass::Update()
 {
     // asm: mov al,[esi+70h] / test / jnz loc_4C9C3B  ; 挂起 -> 直接返回
+    //
+    //   ★ 资金不足造成的 OnHold（Update 里 span > available 那一支）在原版
+    //     由 UI 的"继续生产"按钮或 HouseClass::Update_Factories 的完成唤醒
+    //     清掉。AI 两样都没有，于是钱一断生产线就永久停摆 —— 而且这条线
+    //     往往连建筑侧引用都已经被 Abandon 摘掉，此时任何外部唤醒都摸不到
+    //     它（实测 AI 造完建筑后 unitTo 一直是矿车，却再也造不出来）。
+    //   这里让工厂自己每帧重试：CompleteSuspended 为假说明不是"玩家手动
+    //   暂停"，而是资金暂缓，钱够付下一步就自行恢复。
     if (OnHold)
-        return;
+    {
+        if (CompleteSuspended)
+            return;
+
+        const int32 stepCost = Get_Cost();
+        const int32 money = (Owner != nullptr) ? Owner->GetAvailableMoney() : 0;
+        if (stepCost > 0 && money < stepCost)
+            return;
+
+        OnHold = false;
+    }
+
+    // ★ 节拍引导（实测缺口，见下）。
+    //   生产线开工有两条入口，两条都把 +0x38（建时估计）清成 0：
+    //     ① QueueProduction 的开工分支（lct_BuildingType: [+38h]=0）；
+    //     ② 本函数上面的"资金暂缓自动恢复"分支（只清 OnHold，不重算建时）。
+    //   而 Update 的节拍门是 `remaining != 0 || ProductionEstimateFrames == 0`
+    //   → 只要 +0x38 还是 0 就每帧直接返回，进度永远停在 0。
+    //   原版这条路径由 HouseClass_Update_Factories_Timing 每帧按在线产品重算
+    //   +0x38 兜住；本树该函数的唯一调用点在 Update_Power 里，而 Update_Power
+    //   被 RecheckItems 门住（只在断电恢复时置位），实测 AI 房电力从不变化 →
+    //   永不刷新。结果是"有钱、有队列、有在线产品，但一条都造不出来"。
+    //   这里在工厂自己身上补一次引导：有在线产品而节拍为 0 时，按
+    //   TechnoClass::GetBuildTime/54 定好节拍并重置窗口起点，等价于
+    //   "开工即定拍"。
+    if (CurrentProduction != nullptr && ProductionEstimateFrames == 0)
+    {
+        const int32 est = Scale_Build_Time(Get_Product_Build_Time(CurrentProduction));
+        ProductionEstimateFrames = est;
+        ProductionStartFrame = Game::CurrentFrame;
+        ProductionDuration = est;
+    }
 
     // asm: mov eax,[esi+58h] / test / jnz loc_4C9B49
     //      mov ecx,[esi+68h] / test / jz loc_4C9C3B   ; 无产品且无特殊项
@@ -741,13 +925,15 @@ void FactoryClass::Update()
         return;
 
     // asm: FrameTimerClass_Get_Remaining(+0x2C) / test eax / jnz loc_4C9BBA
+    //   Get_Remaining 返回**还剩多少帧**：非 0 = 节拍未到 → 本帧不推进。
+    //   旧实现把判断写反（到期才 return），于是生产线的节拍完全倒置。
     const int32 remaining = (ProductionStartFrame == -1)
         ? ProductionDuration
         : ((Game::CurrentFrame - ProductionStartFrame) >= ProductionDuration
                ? 0
                : (ProductionDuration - (Game::CurrentFrame - ProductionStartFrame)));
 
-    if (remaining == 0 || ProductionEstimateFrames == 0)
+    if (remaining != 0 || ProductionEstimateFrames == 0)
     {
         // asm: loc_4C9BBA: mov byte ptr [esi+28h],0 ; return
         AdvancedThisFrame = false;
@@ -782,15 +968,21 @@ void FactoryClass::Update()
     if (span >= Balance)
         span = Balance;
 
-    // asm: eax = [+0x6C] 上的进度查询
-    const int32 productProgress = Progress;
+    // asm: mov eax,[esi+6Ch] / add eax,HouseClass_old.IHouse / push eax
+    //      mov ecx,[eax] / call [ecx+18h]        ← Owner->GetAvailableMoney()
+    //      cmp edi,eax / jle loc_4C9BF1
+    //   ★ 这里比较的是"本步应付金额(edi) vs 房主可用资金(eax)"，不是进度。
+    //   旧实现把它读成了进度，于是进度 0 < span 恒成立 → 每帧都判"付不起"
+    //   并把 OnHold 置回 1，生产线永远停在 0。
+    const int32 available = (Owner != nullptr) ? Owner->GetAvailableMoney() : 0;
 
     // asm: cmp edi,eax / jle short loc_4C9BF1
-    if (span > productProgress)
+    if (span > available)
     {
-        // asm: mov eax,[esi+24h] / mov [esi+OnHold],bl(=1) / dec eax / [esi+24h]=eax
+        // asm: mov eax,[esi+24h] / mov [esi+OnHold],bl(=1)
         OnHold = true;
-        Progress -= 1;
+        if (Progress > 0)
+            Progress -= 1;                 // asm: dec eax / mov [esi+24h],eax
     }
     else
     {
@@ -881,10 +1073,12 @@ bool FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
     if (pCell == nullptr)
         return false;
 
-    CoordStruct exitCoord(static_cast<int32>(exitCell.X) * 256,
-                          static_cast<int32>(exitCell.Y) * 256,
-                          pCell->Get_Ground_Height());
+    CoordStruct exitCoord = CellClass::Cell2Coord(exitCell);
+    exitCoord.Z = pCell->Get_Ground_Height();
 
+    // 统一落位流程：设坐标 → 标记在 limbo（Unlimbo 的前置条件）→ 走虚
+    //   Unlimbo。此前这里只 `SetCoords`，对象既没有 Alive/field_6C，也没有
+    //   进 vec_Logics 和显示层，等价于"造出来了但世界上不存在"。
     switch (pType->WhatAmI())
     {
         case AbstractType::UnitType:
@@ -894,7 +1088,13 @@ bool FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
             {
                 pUnit->Type = static_cast<UnitTypeClass*>(pType);
                 pUnit->Owner = Owner;
-                pUnit->SetCoords(exitCoord);
+                pUnit->Set_Coord(exitCoord);
+                pUnit->IsInLimbo = true;
+                if (!pUnit->Unlimbo())
+                {
+                    delete pUnit;
+                    return false;
+                }
                 Owner->UnitFromFactory(pUnit, Factory, false);
             }
             break;
@@ -906,7 +1106,13 @@ bool FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
             {
                 pInf->Type = static_cast<InfantryTypeClass*>(pType);
                 pInf->Owner = Owner;
-                pInf->SetCoords(exitCoord);
+                pInf->Set_Coord(exitCoord);
+                pInf->IsInLimbo = true;
+                if (!pInf->Unlimbo())
+                {
+                    delete pInf;
+                    return false;
+                }
                 Owner->UnitFromFactory(pInf, Factory, false);
             }
             break;
@@ -918,7 +1124,13 @@ bool FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
             {
                 pAircraft->Type = static_cast<AircraftTypeClass*>(pType);
                 pAircraft->Owner = Owner;
-                pAircraft->SetCoords(exitCoord);
+                pAircraft->Set_Coord(exitCoord);
+                pAircraft->IsInLimbo = true;
+                if (!pAircraft->Unlimbo())
+                {
+                    delete pAircraft;
+                    return false;
+                }
                 Owner->UnitFromFactory(pAircraft, Factory, false);
             }
             break;
@@ -929,9 +1141,16 @@ bool FactoryClass::PlaceProducedUnit(TechnoTypeClass* pType)
             if (pBuilding != nullptr)
             {
                 pBuilding->Type = static_cast<BuildingTypeClass*>(pType);
+                pBuilding->TechnoType = static_cast<BuildingTypeClass*>(pType);
                 pBuilding->Owner = Owner;
-                pBuilding->SetCoords(exitCoord);
-                pBuilding->Place(true);
+                pBuilding->Set_Coord(exitCoord);
+                pBuilding->IsInLimbo = true;
+                if (!pBuilding->Unlimbo())
+                {
+                    delete pBuilding;
+                    return false;
+                }
+                Owner->UnitFromFactory(pBuilding, Factory, false);
             }
             break;
         }

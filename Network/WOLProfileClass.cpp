@@ -150,7 +150,7 @@ bool SaveDefaultPersona(const char* pPersona)
 {
     CCFileClass file(FILE_NAME);
     if (!file.Exists()) {
-        file.Open(1);
+        file.Open(2);   // 创建：asm 写模式是 2
         file.Close();
     }
 

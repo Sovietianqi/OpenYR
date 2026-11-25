@@ -41,6 +41,12 @@ public:
     virtual bool Is_Piggybacking() override { return Piggybackee != nullptr; }
 
     void UpdatePosition();
+    // 载具所在格的占用登记同步（CellClass::Occupier 槽 + 地面 FirstObject 链）。
+    //   只在格号变化时做"旧格注销 + 新格登记"，每帧最多一次旁表查询。
+    //   不动类布局：上次登记的格存在 DriveLocomotionClass.cpp 内的文件级旁表里。
+    void SyncCellOccupation();
+    // 彻底摘除本移动器的占用登记（载体离场 / 销毁 / Limbo）。
+    void ReleaseCellOccupation();
     void RotateTowards(DirStruct targetDir);
     bool IsOnBridge() const;
     bool CheckBridge();

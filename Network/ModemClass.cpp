@@ -1,9 +1,14 @@
 #include "ModemClass.h"
 
 #include "../Game/Game.h"
+#include "../Game/Externs.h"
+#include "../Game/MainLoop.h"
+#include "../Game/GameInit.h"
 #include "../IO/FileSystem.h"
+#include "../Rules/RulesClass.h"
 #include "Networking.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -17,6 +22,31 @@
 // 窗口/对话框层在本项目没有实体，所有落到窗口系统的动作用 protected 虚口
 // 承接，默认实现返回"无窗口"（见头文件降级点说明）。
 // ============================================================================
+
+namespace
+{
+// 引擎调试输出通道（原版 WWDebugString）。
+void WWDebugString(const char* pFormat, ...)
+{
+    if (pFormat == nullptr)
+        return;
+    va_list args;
+    va_start(args, pFormat);
+    std::vfprintf(stderr, pFormat, args);
+    va_end(args);
+}
+
+// asm: dword_A8EA70 —— 拨号连接的全局槽。原版是一个 Modem 连接对象的
+// 地址；本工程取 Networking 的第 0 号连接（与 Map_Preview_Download 同一做法）。
+ConnectionClass* ModemConnection()
+{
+    NetworkingClass* pNet = NetworkingClass::GetInstance();
+    if (pNet == nullptr || pNet->Connections.GetCount() <= 0)
+        return nullptr;
+    return pNet->Connections[0];
+}
+} // namespace
+
 
 ModemClass* ModemClass::Instance = nullptr;      // asm: dword_ABF10C
 char  ModemClass::GuestName[0x40] = { 0 };       // asm: word_A8B380
@@ -49,15 +79,55 @@ ModemClass::ModemClass() noexcept
 ModemClass::~ModemClass() = default;
 
 // ----------------------------------------------------------------------------
-// 无窗口系统的默认实现（降级点，见头文件）
+// 窗口 / 对话框层的降级边界
+//
+//   这一层在原版是 Win32：CreateDialogParam + GetDlgItem + SendMessageA +
+//   ShowWindow + SetWindowLongA。本工程没有窗口层，也没有拨号资源脚本
+//   （拨号对话框模板不在资源表里），因此下面这几个入口如实返回
+//   "没有窗口 / 没有控件"，不伪造任何成功状态。调用方（Host_Dialog /
+//   Guest_ReadDialog）按 asm 已有的 `if (!hWnd) goto exit_fail` 分支处理。
+//
+//   逐个对应 asm 里的直接调用：
+//     Dialog_Show       asm: ModemHost_Dialog (0x5B7990) 里
+//                            Dialog_Show(0xF1, sub_5B7970, 0)
+//     Dialog_End        asm: ModemHost_Dialog+0x14E / ModemHost_SignOff+0x13A
+//     Get_Dlg_Item      asm: ModemHost_SignOff (0x5B9F50) 等处的 GetDlgItem
+//     Send_Dlg_Message  asm: 各处 SendMessageA
+//     Set_Window_Long   asm: ModemHost_Dialog+0x3A 的 SetWindowLongA(hWnd,8,state)
+//     Show_Window       asm: 各处 ShowWindow(hWnd, nCmdShow)
 // ----------------------------------------------------------------------------
-void* ModemClass::Dialog_Show(int32, void*, void*) { return nullptr; }
-void  ModemClass::Dialog_End() {}
-void* ModemClass::Get_Dlg_Item(void*, int32) { return nullptr; }
-int32 ModemClass::Send_Dlg_Message(void*, int32, int32, int32) { return 0; }
-void  ModemClass::Set_Window_Long(void*, int32, void*) {}
-void  ModemClass::Show_Window(int32) {}
-void  ModemClass::Copy_Guest_Name(void* pDst, const void* pSrc, int32)
+void* ModemClass::Dialog_Show(int32 /*id*/, void* /*pProc*/, void* /*pParam*/)
+{
+    return nullptr;                 // 没有对话框模板 -> 无窗口
+}
+
+void ModemClass::Dialog_End()
+{
+    // asm: EndDialog / DestroyWindow；无窗口可销毁。
+}
+
+void* ModemClass::Get_Dlg_Item(void* /*hDlg*/, int32 /*id*/)
+{
+    return nullptr;                 // 无窗口 -> 永远取不到控件
+}
+
+int32 ModemClass::Send_Dlg_Message(void* /*hWnd*/, int32 /*msg*/,
+                                   int32 /*wParam*/, int32 /*lParam*/)
+{
+    return 0;                       // 无控件 -> 消息无处可投递
+}
+
+void ModemClass::Set_Window_Long(void* /*hWnd*/, int32 /*idx*/, void* /*val*/)
+{
+    // asm: SetWindowLongA(hWnd, 8, state) —— 把状态块挂到窗口用户数据上
+}
+
+void ModemClass::Show_Window(int32 /*cmd*/)
+{
+    // asm: ShowWindow(hWnd, nCmdShow)；0 = 隐藏，5 = 显示
+}
+
+void ModemClass::Copy_Guest_Name(void* pDst, const void* pSrc, int32)
 {
     // asm: sub_735090(dst, src, -1) —— 第三参 -1 表示"拷到 NUL 为止"
     if (pDst != nullptr && pSrc != nullptr)
@@ -65,15 +135,308 @@ void  ModemClass::Copy_Guest_Name(void* pDst, const void* pSrc, int32)
                       static_cast<const char*>(pSrc));
 }
 
-void  ModemClass::Host_Init() {}
-void  ModemClass::Wnd_Init(void*) {}
-int32 ModemClass::Is_Quit_Requested() { return 0; }
-void  ModemClass::Process_Host() {}
-int32 ModemClass::Process_Host2() { return 0; }
-void  ModemClass::Blit_Dialog() {}
+// ----------------------------------------------------------------------------
+// asm: sub_5B82F0 (0x5B82F0) —— ModemHost.InitDialog
+//
+//   byte_82C938 == 1 时，先把 RulesClass 里的多人默认值灌回会话：
+//     gMoney            = Rules->Money
+//     gBases            = Rules->Bases
+//     gBridgeDestruction= Rules->BridgeDestruction
+//     gCrates           = Rules->Crates
+//     gAIPlayers        = 0
+//     gUnitCount        = Rules->UnitCount
+//     Session::ShortGame= 0
+//     gSWAllowed        = Rules->SuperWeaponsAllowed
+//     gGameSpeed        = Options
+//     gBuildOffAlly     = Rules->BuildOffAlly
+//     gMultiEngineer    = 0
+//   随后是对话框文本填充（名称 0x5C1 / 颜色 0x405 / 国家 0x667 ...），
+//   那一段需要控件句柄，属于窗口层（缺口，见上）。
+//
+//   byte_82C938（"上一次会话退出、需要按规则复位"的旗子）在本工程没有
+//   置位点，这里以静态量承接，初值取 1，即首次进入时按 asm 复位一次。
+// ----------------------------------------------------------------------------
+namespace
+{
+bool s_ScenarioFlagsRestore = true;     // asm: byte_82C938
+} // namespace
 
-bool ModemClass::Host_Start_Game() { return false; }
-void ModemClass::SignOff() {}
+void ModemClass::Host_Init()
+{
+    std::printf("ModemHost.InitDialog(enter)\n");   // asm: aModemhost_init
+
+    if (s_ScenarioFlagsRestore)
+    {
+        s_ScenarioFlagsRestore = false;
+        // asm: nullsub_36(&ScenarioFlagsBackup) —— 场景旗标备份的回收
+
+        RulesClass* pRules = RulesClass::Instance;
+        SessionClass* pSession = SessionClass::GetInstance();
+
+        if (pSession != nullptr)
+        {
+            if (pRules != nullptr)
+            {
+                pSession->Credits = pRules->Money;                       // gMoney
+                pSession->Bases = pRules->Bases;                         // gBases
+                pSession->BridgesDestroyable = pRules->BridgeDestruction;
+                pSession->Crates = pRules->Crates;                       // gCrates
+                pSession->AIPlayers = 0;                                 // gAIPlayers
+                pSession->UnitCount = pRules->UnitCount;                 // gUnitCount
+                pSession->ShortGame = false;                             // Session::ShortGame
+                pSession->SuperWeapons = pRules->SuperWeaponsAllowed;    // gSWAllowed
+                gSWAllowed = pSession->SuperWeapons;                     // asm: 同一个全局
+                pSession->GameSpeed = pRules->GameSpeed;                 // gGameSpeed
+                pSession->BuildOffAlly = pRules->BuildOffAlly;           // gBuildOffAlly
+                pSession->MultiEngineer = false;                         // gMultiEngineer
+            }
+            else
+            {
+                pSession->AIPlayers = 0;
+                pSession->ShortGame = false;
+                pSession->MultiEngineer = false;
+            }
+        }
+    }
+
+    // asm: GetDlgItem(hDlg,0x5C1) + WM_LIMITTEXT(0xC5,0x13) + WM_SETTEXT(0x4B2)
+    //      + "Name: %ls" 等文本回填。控件层缺失，见上。
+    std::printf("Name: %s\n", GuestName);
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_622800 (0x622800) —— 给对话框装窗口过程/回调。
+//   窗口层缺失，无对象可装。
+// ----------------------------------------------------------------------------
+void ModemClass::Wnd_Init(void* /*hWnd*/)
+{
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_623120 (0x623120) —— ModemHost.Dialog 的"是否该退出"查询：
+//     Call_Back()                                  ; 心跳
+//     if (Session == null || Session == 5 || byte_A8D60E || dword_A8DAB4)
+//         { Call_Back() ; return 0 }
+//     if (sub_55CBF0()) return 0
+//     if (Main_Loop() == true) return 1
+//     Call_Back() ; return 0
+//
+//   本工程的 Main_Loop 是 void，用 GameIsQuitting 承接它"返回真"的语义
+//   （GameInit 在退出路径上把它置 1）。
+// ----------------------------------------------------------------------------
+int32 ModemClass::Is_Quit_Requested()
+{
+    Call_Back();                                     // asm: call sub_5D4D50 -> Call_Back
+
+    SessionClass* pSession = SessionClass::GetInstance();
+    if (pSession == nullptr || pSession->SessionType == 5)
+    {
+        Call_Back();
+        return 0;
+    }
+
+    // asm: byte_A8D60E / dword_A8DAB4 两个"会话暂停/已结束"旗标；本工程
+    // 分别对应 GameState 的暂停与结束。
+    if (pSession->GameState == GameSessionState::Paused ||
+        pSession->GameState == GameSessionState::Ended)
+    {
+        Call_Back();
+        return 0;
+    }
+
+    Main_Loop();                                     // asm: call Main_Loop
+
+    if (GameIsQuitting)                              // asm: Main_Loop 返回真
+        return 1;
+
+    Call_Back();
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_5B9F30 (0x5B9F30) —— ModemHost 空闲服务
+//
+//   sub_5F1C60(conn)                                ; 服务收发队列
+//   if (byte[this+9] == 1) {                        ; 刚进/刚刷新
+//       if (now - [this+0Ch] > 0x1E) {
+//           sub_5BA660(this)                        ; 重画状态
+//           [this+0Ch] = now ; byte[this+9] = 0
+//       }
+//   }
+//   if (now - [this+1Ch] > 0x28) {                  ; 每 40ms 一次心跳
+//       pkt[0xFA] 清零 ; *(u32*)pkt = 0x69         
+//       pkt[0x18] = byte(dword_A8DB30)              ; 本机席位
+//       *(u32*)(pkt+0x9A) = sub_5F1EE0(conn)        ; 序号
+//       sub_5F1BF0(conn, pkt, 0xFA, 0)              ; 发送
+//       [this+1Ch] = now
+//   }
+// ----------------------------------------------------------------------------
+void ModemClass::Process_Host()
+{
+    ConnectionClass* pConn = ModemConnection();
+
+    if (pConn != nullptr)
+        pConn->Service_Send_Queue();                 // asm: sub_5F1C60
+
+    const int32 now = static_cast<int32>(Game::GetTickCount());
+
+    if (Field09 == 1)
+    {
+        if (now - StartTick > 0x1E)
+        {
+            // asm: sub_5BA660(this) —— 状态面板重绘（窗口层缺失）
+            StartTick = now;
+            Field09 = 0;
+        }
+    }
+
+    if (now - Field1C > 0x28)
+    {
+        uint8 packet[0xFA];
+        std::memset(packet, 0, sizeof(packet));
+        *reinterpret_cast<uint32*>(packet) = 0x69;   // asm: mov [esp+var_FC],69h
+        packet[0x18] = static_cast<uint8>(Field20);   // asm: var_E4 <- byte A8DB30
+        const uint32 seq = (pConn != nullptr)
+            ? pConn->SequenceNumber : 0;              // asm: sub_5F1EE0
+        std::memcpy(packet + 0x9A, &seq, sizeof(seq));// asm: var_62
+
+        if (pConn != nullptr)
+            pConn->SendPacket(packet, 0xFA);          // asm: sub_5F1BF0
+
+        Field1C = now;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_5BA060 (0x5BA060) —— ModemHost 收包处理
+//
+//   循环 sub_5F1C30(conn, &pkt, &len)：收到包就按首字节分派——
+//   0x64('d') / 0x68('h') / 0x6D('m')，并对"自己是发送者"的回环包打折；
+//   任一分支要求退出时返回 1。等待超时会弹 TXT_SYSTEM_NOT_RESPONDING。
+//
+//   本工程没有拨号传输层，也没有那三类包的载荷结构；这里如实做的是
+//   "把连接上已到达的包全部取走并计数"，不伪造分派结果，返回 0（不退出）。
+// ----------------------------------------------------------------------------
+int32 ModemClass::Process_Host2()
+{
+    ConnectionClass* pConn = ModemConnection();
+    if (pConn == nullptr)
+        return 0;
+
+    uint8 buffer[0x400];
+    int32 received = 0;
+    for (;;)
+    {
+        const int32 len = pConn->ReceivePacket(buffer, sizeof(buffer));
+        if (len <= 0)
+            break;
+        ++received;
+
+        // asm: cmp [pkt], 64h/68h/6Dh —— 三个包型的分派体未在本层还原
+        //   （载荷结构属于 ModemHost/ModemGuest 的会话协议）。
+        WWDebugString("ModemHost: received %d-byte packet (type %02Xh)\n",
+                      len, len > 0 ? buffer[0] : 0);
+    }
+
+    (void)received;
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// asm: sub_532100 (0x532100) —— 对话框重绘
+//     if (!FocusGained && !arg) return;
+//     FocusGained = 0; sub_52FEC0(0, 1); GScreenClass::Do_Blit(DSurface_Hidden,...)
+//   本工程有 TheGScreen，但没有"隐藏表面"这一层；这里保留焦点判定与
+//   焦点位的清除，blit 本身因目标表面缺失而跳过（如实不做）。
+// ----------------------------------------------------------------------------
+namespace
+{
+bool s_FocusGained = false;      // asm: FocusGained
+} // namespace
+
+void ModemClass::Blit_Dialog()
+{
+    if (!s_FocusGained)
+        return;                  // asm: test al,al / jz retn
+
+    s_FocusGained = false;       // asm: mov FocusGained,0
+    // asm: sub_52FEC0(0,1) —— 焦点切换的电影/界面服务，本工程无对应入口
+    // asm: GScreenClass::Do_Blit(DSurface_Hidden, 0, 0) —— 隐藏表面未建模
+}
+
+// ----------------------------------------------------------------------------
+// asm: ModemHost_StartGame (0x5BAC40)
+//
+//   依次：检查剧本可用人数（sub_5E6520(gScenarioIndex)）够不够；
+//   为每个玩家建 0x85 的名牌节点；拼 "go" 包（0xFA 字节）并发送；
+//   弹 TXT_SENDING_GO；随后 0x708 tick 内等待对端 GO 回执，
+//   期间 Call_Back + 会话服务；失败弹 TXT_WAITING_GO。
+//
+//   缺口：这段握手要求"对话框里已填好的玩家表"（0x85 节点数组）与
+//   "GO/回执"的载荷结构，两者都在未建模的拨号会话协议里；本工程也没有
+//   拨号传输层可发。函数如实返回 false（开局未完成），Host_Dialog 会按
+//   asm 原样回到等待循环。
+// ----------------------------------------------------------------------------
+bool ModemClass::Host_Start_Game()
+{
+    std::printf("ModemHost.StartGame(enter)\n");     // asm: aModemhost_start
+    return false;
+}
+
+// ----------------------------------------------------------------------------
+// asm: ModemHost_SignOff (0x5B9F50)
+//
+//   1) pkt[0xFA] 清零 ; *(u32*)pkt = 0x66
+//      pkt[0x18] = byte(dword_A8DB30) ; pkt[0x1D] = byte(gPlayerColor)
+//      sub_5F1BF0(conn, pkt, 0xFA, 0)              ; 广播挂断
+//   2) Get_String("TXT_SIGNING_OFF") -> MsgBox（模态提示，窗口层缺失）
+//   3) 0x12C tick 内循环 Call_Back + sub_5D4D50 + sub_5F1C60 + sub_5F1EA0，
+//      直到收到同一席位回的 0x66 包
+//   4) sub_5F0040（会话清理）; Dialog_End
+// ----------------------------------------------------------------------------
+void ModemClass::SignOff()
+{
+    ConnectionClass* pConn = ModemConnection();
+
+    uint8 packet[0xFA];
+    std::memset(packet, 0, sizeof(packet));
+    *reinterpret_cast<uint32*>(packet) = 0x66;       // asm: mov [esp+var_1F8],66h
+    packet[0x18] = static_cast<uint8>(Field20);       // asm: var_1E0
+    packet[0x1D] = static_cast<uint8>(PlayerColor);   // asm: var_1DB
+
+    if (pConn != nullptr)
+        pConn->SendPacket(packet, 0xFA);              // asm: sub_5F1BF0
+
+    // asm: Get_String("TXT_SIGNING_OFF") + MsgBox —— 模态提示（窗口层缺失）
+
+    const int32 start = static_cast<int32>(Game::GetTickCount());
+    if (pConn != nullptr)
+    {
+        uint8 reply[0x400];
+        for (;;)
+        {
+            const int32 elapsed = static_cast<int32>(Game::GetTickCount()) - start;
+            if (elapsed >= 0x12C)                     // asm: cmp esi,12Ch / jnb
+                break;
+
+            Call_Back();                              // asm: call Call_Back
+            pConn->Service_Send_Queue();              // asm: sub_5D4D50 / 5F1C60
+
+            const int32 len = pConn->ReceivePacket(reply, sizeof(reply));
+            if (len <= 0)
+                continue;
+
+            if (len >= 4 && *reinterpret_cast<uint32*>(reply) == 0x66)
+            {
+                if (reply[0x18] == packet[0x18])      // 同一席位回的挂断包
+                    break;
+            }
+        }
+    }
+
+    // asm: sub_5F0040 —— 会话清理（本工程无拨号会话对象）
+    Dialog_End();                                     // asm: call Dialog_End
+}
 
 // ============================================================================
 // asm: ModemHost_Dialog (0x5B7990)

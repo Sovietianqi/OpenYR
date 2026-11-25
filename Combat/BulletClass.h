@@ -100,7 +100,7 @@ public:
     int32 Simulate_Homing(bool& preciseHit, bool& mustDetonate);
     // asm (Update loc_467A2B..467B7A): floor / cell / occupant collision.
     //   Returns the hit flag (0/1/2); `exactHit` marks a precise collision.
-    int32 Resolve_Ballistic_Hit(const CoordStruct& prev, const CoordStruct& next,
+    int32 Resolve_Ballistic_Hit(const CoordStruct& prev, CoordStruct& next,
                                 bool& exactHit);
     // asm 247553..247785 (sub_468BB0): ground / cliff / wall grounding test;
     //   snaps `pos` onto the struck object/floor when it returns true.

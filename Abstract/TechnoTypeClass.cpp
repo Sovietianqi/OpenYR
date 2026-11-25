@@ -87,17 +87,64 @@ void TechnoTypeClass::Delete_Array()
 
 TechnoTypeClass* TechnoTypeClass::Find(const char* pID)
 {
-    if (Array == nullptr || pID == nullptr)
+    if (pID == nullptr || pID[0] == '\0')
         return nullptr;
 
-    for (int32 i = 0; i < Array->Count; ++i)
+    if (Array != nullptr)
     {
-        TechnoTypeClass* item = Array->Items[i];
-        if (item == nullptr)
-            continue;
-        if (!_strcmpi(item->ID, pID))
-            return item;
+        for (int32 i = 0; i < Array->Count; ++i)
+        {
+            TechnoTypeClass* item = Array->Items[i];
+            if (item == nullptr)
+                continue;
+            if (!_strcmpi(item->ID, pID))
+                return item;
+        }
     }
+
+    // ★ 兜底：四张具体类型表。
+    //
+    //   TechnoTypeClass::Array 在本树里从未被填充（各子类的 FindOrAllocate 只把
+    //   自己挂进各自的表），于是按 ID 查 MTNK / E1 / GAPOWR 一律返回 nullptr。
+    //   受影响的是所有"按名字引用类型"的数据通路：TaskForce 成员、脚本目标、
+    //   触发动作的对象参数 —— 表现为任务力成员表恒空、AI 队伍永远招不到人。
+    if (UnitTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < UnitTypeClass::Array->Count; ++i)
+        {
+            UnitTypeClass* item = UnitTypeClass::Array->GetItem(i);
+            if (item != nullptr && !_strcmpi(item->ID, pID))
+                return item;
+        }
+    }
+    if (InfantryTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < InfantryTypeClass::Array->Count; ++i)
+        {
+            InfantryTypeClass* item = InfantryTypeClass::Array->GetItem(i);
+            if (item != nullptr && !_strcmpi(item->ID, pID))
+                return item;
+        }
+    }
+    if (AircraftTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < AircraftTypeClass::Array->Count; ++i)
+        {
+            AircraftTypeClass* item = AircraftTypeClass::Array->GetItem(i);
+            if (item != nullptr && !_strcmpi(item->ID, pID))
+                return item;
+        }
+    }
+    if (BuildingTypeClass::Array != nullptr)
+    {
+        for (int32 i = 0; i < BuildingTypeClass::Array->Count; ++i)
+        {
+            BuildingTypeClass* item = BuildingTypeClass::Array->GetItem(i);
+            if (item != nullptr && !_strcmpi(item->ID, pID))
+                return item;
+        }
+    }
+
     return nullptr;
 }
 
@@ -177,6 +224,23 @@ TechnoTypeClass::TechnoTypeClass() noexcept
     IsAutoFire            = false;
     IsGuardRange          = false;
     IsAggressive          = false;
+
+    // 这五项在 LoadFromINI 里都是 `ReadBool(section, key, 字段自身)` —— 即
+    // "ini 没写就用字段当前值"。字段此前没有构造初值（本类走 noinit 通道，
+    // 基类不清内存），于是缺 ini 时的取值取决于分配到的堆内容：同一份
+    // 规则表在不同进程里可能得到不同的"能否还击 / 能否追击"。
+    //
+    //   初值取自汇编 TechnoTypeClass_CTOR（asm 0x6A0C8x 段，本文件对应的
+    //   反汇编清单里是 `mov byte ptr [esi+CanPassiveAquire], 1` 一类）：
+    //     CanPassiveAquire / CanRetaliate / CanApproachTarget /
+    //     CanRecalcApproachTarget = 1，OpportunityFire = 0。
+    //   这四条直接决定 FootClass::CanFightBack 与 Mission_Guard 的追击，
+    //   此前兜底规则下全为 0，导致 Guard 单位永远不还击、不追击。
+    CanPassiveAquire        = true;
+    CanRetaliate            = true;
+    CanApproachTarget       = true;
+    CanRecalcApproachTarget = true;
+    OpportunityFire         = false;
     IsSelectable_         = true;
     IsInsignificant_      = false;
     IsLegalTarget_        = true;
@@ -238,6 +302,14 @@ TechnoTypeClass::TechnoTypeClass() noexcept
     IsMissileSpawn        = false;
     ThreatPosedValue      = 0.0f;
     DeathWeaponIndex      = -1;
+    // 归属限制三个位图的缺省值。原版 rules(md).ini 里绝大多数类型根本不写
+    //   这三个键，字段初值必须是 -1（"无限制"）。若留 0，GetOwners 的
+    //   fallback 就是 0，于是 RequiredHouses != -1 成立、与任何国家位相与
+    //   都是 0 —— GenerateAIBuildList 会把**所有**建筑判成"本方位无权建造"，
+    //   Base.Nodes 恒空，AI 永远不建房。
+    RequiredHouses        = -1;
+    SecretHouses          = 0;
+    ForbiddenHouses       = -1;
     WeaponCharge          = 0;
     IsFake                = false;
     IsDisableable         = false;
@@ -373,9 +445,31 @@ int32 TechnoTypeClass::GetWeaponCount() const
 
 WeaponStruct* TechnoTypeClass::GetWeapon(int32 index) const
 {
-    if (index < 0 || index >= WeaponCount || index >= 18)
+    if (index < 0 || index >= 18)
         return nullptr;
-    return const_cast<WeaponStruct*>(&Weapons[index]);
+
+    WeaponStruct* pSlot = const_cast<WeaponStruct*>(&Weapons[index]);
+
+    // 原版里 Primary/Secondary 就是武器表 0/1 号槽的别名，读 INI 时直接
+    //   落进数组。本树把两者拆成了独立成员，个别读取路径（子类曾各自
+    //   声明了一份同名数组）只填了别名没回写数组，于是 GetWeapon(0) 为空、
+    //   单位永远打不出子弹。这里按别名补齐，取用与数组完全等价。
+    if (pSlot->WeaponType == nullptr)
+    {
+        WeaponTypeClass* pAlias = (index == 0) ? Primary
+                                : (index == 1) ? Secondary : nullptr;
+        if (pAlias != nullptr)
+            pSlot->WeaponType = pAlias;
+    }
+
+    if (pSlot->WeaponType == nullptr)
+        return nullptr;
+
+    // 别名补齐后可能超出 INI 声明的槽数：以实际有武器的最大槽为准。
+    if (index >= WeaponCount)
+        const_cast<TechnoTypeClass*>(this)->WeaponCount = index + 1;
+
+    return pSlot;
 }
 
 // ============================================================================
@@ -691,8 +785,13 @@ int32 TechnoTypeClass::GetPipMax() const
             return this->InitialAmmo;
 
         case 1:  // PipScale::Tiberium
-            // A resource gatherer shows five pips, everything else three.
-            return this->IsResourceGatherer ? 5 : 3;
+            // asm 0x7162BD：`call WhatAmI; sub eax,10h; neg; sbb eax,eax;
+            // and eax,2; add eax,3` → WhatAmI() == 0x10 (InfantryType) 时 3，
+            // 其余（UnitType 矿车等）一律 5。
+            // ★ 原实现写成 `IsResourceGatherer ? 5 : 3`，把判据从“类型种类”
+            //   换成了“是否采矿车”：矿车恰好也是 UnitType，两者对矿车一致，
+            //   但任何非采矿的 UnitType 会被错判成 3 个 pip。
+            return (this->WhatAmI() == AbstractType::InfantryType) ? 3 : 5;
 
         case 2:  // PipScale::Passengers
             return this->Passengers;
@@ -1117,6 +1216,37 @@ bool TechnoTypeClass::LoadFromINI(CCINIClass* pINI)
     { char _buf[0x40]; if (pINI->ReadString(section, "Secondary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) Secondary = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "ElitePrimary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) ElitePrimary = _p; } }
     { char _buf[0x40]; if (pINI->ReadString(section, "EliteSecondary", "", _buf, sizeof(_buf)) > 0) { WeaponTypeClass* _p = WeaponTypeClass::FindOrAllocate(_buf); if (_p) EliteSecondary = _p; } }
+
+    // ------------------------------------------------------------------
+    // Primary/Secondary → Weapons[] 槽位同步
+    //
+    //   原版 TechnoTypeClass 只有一份武器数组（WeaponStruct Weapons[18]），
+    //   `Primary`/`Secondary` 就是它的 0/1 号槽的别名，GetWeapon(n) 直接读
+    //   数组。本树把两者拆成了独立成员，解析时只写了 Primary/Secondary，
+    //   Weapons[] 始终是空的 —— 于是 GetWeapon(0) 恒为 nullptr，
+    //   TechnoClass::Update_Combat 的"武器槽为空 → 丢弃目标"分支每帧触发，
+    //   **任何单位都无法开火**。
+    // ------------------------------------------------------------------
+    if (Primary != nullptr)
+        Weapons[0].WeaponType = Primary;
+    if (Secondary != nullptr)
+        Weapons[1].WeaponType = Secondary;
+    if (ElitePrimary != nullptr)
+        EliteWeapons[0].WeaponType = ElitePrimary;
+    if (EliteSecondary != nullptr)
+        EliteWeapons[1].WeaponType = EliteSecondary;
+
+    // WeaponCount 以实际有槽的武器数为准（INI 里通常不写这个键）。
+    {
+        int32 slots = 0;
+        for (int32 i = 0; i < 18; ++i)
+        {
+            if (Weapons[i].WeaponType != nullptr)
+                slots = i + 1;
+        }
+        if (slots > WeaponCount)
+            WeaponCount = slots;
+    }
     pINI->ReadString(section, "VoiceMove", VoiceMove, VoiceMove, sizeof(VoiceMove));
     pINI->ReadString(section, "VoiceSelect", VoiceSelect, VoiceSelect, sizeof(VoiceSelect));
     pINI->ReadString(section, "VoiceSelectEnslaved", VoiceSelectEnslaved, VoiceSelectEnslaved, sizeof(VoiceSelectEnslaved));

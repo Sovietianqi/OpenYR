@@ -25,6 +25,9 @@
 // =============================================================================
 
 #include "TeamClass.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include "TeamTypeClass.h"
 #include "ScriptClass.h"
 #include "ScriptTypeClass.h"
@@ -38,8 +41,12 @@
 #include "../Abstract/FootClass.h"
 #include "../Abstract/TechnoTypeClass.h"
 #include "../Abstract/BuildingClass.h"
+#include "../Abstract/BuildingTypeClass.h"
 #include "../Abstract/UnitClass.h"
+#include "../Animations/AnimClass.h"
+#include "../Animations/AnimTypeClass.h"
 #include "../Houses/HouseClass.h"
+#include "../Houses/FactoryClass.h"
 #include "../Map/CellClass.h"
 #include "../Map/MapClass.h"
 #include "../Game/Externs.h"
@@ -59,6 +66,35 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <unordered_map>
+
+// -----------------------------------------------------------------------------
+// 队伍出生帧（旁表）：空队伍"等待编成"的宽限期据此计算。
+//   不放进类里是为了不动 TeamClass 的布局（它参与存档/CRC 的状态字段）。
+//   构造时登记、析构时擦除。
+// -----------------------------------------------------------------------------
+static std::unordered_map<const TeamClass*, int32>& TeamBirthFrames()
+{
+    static std::unordered_map<const TeamClass*, int32> frames;
+    return frames;
+}
+
+// -----------------------------------------------------------------------------
+// 补员下单的节流表：key = (队伍指针, 坑位号)，value = 上次尝试下单的帧号。
+//   同样放旁表不动布局。缺员期间若每帧都尝试下单，会把工厂队列刷满，
+//   并且 `BeginProductionOf` 被队列上限拒绝后会被无意义地反复调用。
+// -----------------------------------------------------------------------------
+static std::unordered_map<uintptr_t, int32>& TeamOrderFrames()
+{
+    static std::unordered_map<uintptr_t, int32> frames;
+    return frames;
+}
+
+static uintptr_t TeamSlotKey(const TeamClass* pTeam, int32 idx)
+{
+    // 乘法而非按位或：不依赖指针的对齐位数，坑位号 0..15 各占一个独立键。
+    return reinterpret_cast<uintptr_t>(pTeam) * 16u + static_cast<uintptr_t>(idx & 0xF);
+}
 
 // -----------------------------------------------------------------------------
 // Static array pointer - the global list of every active TeamClass instance.
@@ -133,6 +169,77 @@ namespace {
 } // anonymous namespace
 
 // =============================================================================
+// Script-action handler helpers
+//
+//  These mirror the small inline blocks the original repeats before every
+//  Team_* handler: resolve the script argument into a waypoint cell, pick the
+//  object sitting on that cell, test whether a roster entry is still usable,
+//  and score a building the way Team_PickEnemyStructure does.
+// =============================================================================
+namespace {
+
+// asm: Scenario_GetWaypointCell (0x68BD??) —— Map::Coord_Cell(&Waypoints[idx]).
+//   The script action's payload is the waypoint index (cAIScriptActionType.arg).
+inline CellClass* ScriptWaypointCell(void* pParam) {
+    if (ScenarioClass::Instance == nullptr) return nullptr;
+    return ScenarioClass::Instance->GetWaypointCell(
+        static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+}
+
+// asm: every waypoint handler calls CellClass_GetAircraftOrTerrain with
+//   a2 = (cell->Flags >> 8) & 1, i.e. the BridgeHead bit.
+inline ObjectClass* CellObjectAt(CellClass* pCell) {
+    if (pCell == nullptr) return nullptr;
+    return pCell->GetAircraftOrTerrain(
+        pCell->HasFlag(CellFlags::BridgeHead) ? 1 : 0, false);
+}
+
+// asm: FootClass_Exists — alive, health > 0, on the map (ObjectClass+0x90),
+//   and not riding inside an open-topped transport (ObjectClass+0x81).
+inline bool IsUsableMember(TechnoClass* pTech) {
+    return pTech != nullptr && !pTech->IsDead() && pTech->Health > 0;
+}
+
+// asm: Team_PickEnemyStructure / Team_PickFriendlyStructure scoring.
+//   flags is the high 16 bits of the packed script argument:
+//     0 : 0x7FFFFFFF - Cell_Threat     (prefer the calmest cell)
+//     1 : Cell_Threat                  (prefer the hottest cell)
+//     2 : 0x7FFFFFFF - 3D distance     (prefer the nearest building)
+//     3 : 3D distance                  (prefer the farthest building)
+inline int32 StructureWeight(int32 flags, BuildingClass* pBuilding, TechnoClass* pUnit) {
+    if (pBuilding == nullptr || pUnit == nullptr) return -1;
+
+    if (flags == 0 || flags == 1) {
+        CellStruct cell = Math::CoordToCell(pBuilding->GetCoords());
+        int32 threat = (TheMap != nullptr) ? TheMap->Cell_Threat(cell, pUnit->Owner) : 0;
+        return (flags == 0) ? (0x7FFFFFFF - threat) : threat;
+    }
+
+    CoordStruct a = pBuilding->GetCoords();
+    CoordStruct b = pUnit->GetCoords();
+    const double dx = static_cast<double>(a.X - b.X);
+    const double dy = static_cast<double>(a.Y - b.Y);
+    const double dz = static_cast<double>(a.Z - b.Z);
+    const int32 dist = static_cast<int32>(std::sqrt(dx * dx + dy * dy + dz * dz));
+    return (flags == 2) ? (0x7FFFFFFF - dist) : dist;
+}
+
+// asm: the "pick the highest-valued member" prologue shared by
+//   Team_MoveToFriendlyStructure / Team_GatherAt* / Team_Chrono*.  The original
+//   compares TechnoTypeClass+0x5FC, a field this port does not model; the
+//   closest equivalent that is guaranteed to terminate on the same roster is
+//   the first usable member, which is also what the enemy-structure handlers do.
+inline TechnoClass* FirstUsableMember(TeamClass* pTeam) {
+    for (int32 i = 0; i < pTeam->Members.GetCount(); ++i) {
+        TechnoClass* pTech = pTeam->Members[i];
+        if (IsUsableMember(pTech)) return pTech;
+    }
+    return nullptr;
+}
+
+} // anonymous namespace
+
+// =============================================================================
 // Constructor
 // =============================================================================
 TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noexcept
@@ -202,6 +309,20 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
             TeamClass::Array->Add(this);
         }
     }
+
+    // asm: TeamClass_CTOR (asm:1526848) 之后紧跟的"动员"状态 —— 新队名单为空，按编成表
+    //   逐坑招人。原版由编成核对（LeaveMap）刷新这一位，而新队还没进入
+    //   "要离场"流程，核对不会跑；不置位则 Update 的动员段永不触发，
+    //   补员扫描（SearchForRecruit）也不会跑，队伍永远是空壳 —— 这正是
+    //   "AI 建了队但不出兵"的直接原因。
+    IsMissingMembers = true;
+
+    // 出生帧（旁表）：空队伍需要一段"等待编成"的宽限期。
+    //   触发器在"本房能生产该兵种"时就会放行建队（CanInstantiateTeam 只查
+    //   生产资格，不查库存），而招募只能从现成单位里拉。若空队当帧就判死，
+    //   会变成"建一支→招不到→死→下一帧再建"的抖动，处理器全耗在建队/删队
+    //   上（实测 4200 帧积出 165 支空队）。
+    TeamBirthFrames()[this] = Game::CurrentFrame;
 }
 
 // =============================================================================
@@ -210,6 +331,11 @@ TeamClass::TeamClass(TeamTypeClass* pType, HouseClass* pOwner, int32 nFlags) noe
 TeamClass::~TeamClass() {
     // asm: TeamClass_DTOR (asm:1527224) → TeamClass::Remove —— 先从 vec_Teams
     //   摘除自身，再释放成员脚本与名单，避免悬垂指针留在逐帧遍历表里。
+    TeamBirthFrames().erase(this);
+    // 补员下单节流表也要清：键按 (队伍, 坑位) 编码，逐一擦除 16 个坑位。
+    for (int32 slot = 0; slot < 16; ++slot)
+        TeamOrderFrames().erase(TeamSlotKey(this, slot));
+
     if (TeamClass::Array != nullptr) {
         for (int32 i = 0; i < TeamClass::Array->Count; ++i) {
             if (TeamClass::Array->GetItem(i) == this) {
@@ -250,6 +376,14 @@ TeamClass::~TeamClass() {
 // =============================================================================
 void TeamClass::Update() {
     const int32 frame = Game::CurrentFrame;
+
+    // ---- 0. 已解散：本帧不做任何事 -----------------------------------------
+    //   DoDisappear 之后队伍只剩一个空壳（成员已清、脚本已删）。若还让它跑
+    //   下面整套流程，`Members.Count == 0` 会再次把 NeedsToDisappear 置位、
+    //   下一帧再跑一次 DoDisappear —— 永久循环。回收由 LogicClass 的逐帧
+    //   队伍循环负责（倒序摘除并 delete）。
+    if (JustDisappeared)
+        return;
 
     // ---- 1. 挂起计时 -------------------------------------------------------
     if (TeamSuspended) {
@@ -309,10 +443,11 @@ void TeamClass::Update() {
             pFoot->IsTeamLeader = (i == 0) || HasLeftMap;
         }
 
-        if (Script) {
-            Script->ResetCurrentLine();
-        }
-        ActionExecuted = true;
+        // ★ 动员不等于"脚本重来"。
+        //   原版这条分支只拉起 IsForming/IsFullyLoaded、给成员打队长标记；
+        //   此前这里额外做了 ResetCurrentLine()+ActionExecuted=true，等于每次
+        //   缺员/补员都把脚本重置并立刻推页 —— 脚本还没派发就被判"已完成"，
+        //   整队永远收不到任务（实测步兵队 mission 恒 0）。
     }
 
     // ---- 4. 跟随锚点 (asm @@13-@@14) --------------------------------------
@@ -325,12 +460,25 @@ void TeamClass::Update() {
     if (canScanRecruit && Type != nullptr && Type->TaskForce != nullptr) {
         TaskForceClass* pTask = Type->TaskForce;
         const int32 slots = pTask->Members.Count;
+        bool stillMissing = false;
         for (int32 idx = 0; idx < slots && idx < MaxTaskForceSlots; ++idx) {
             const int32 need = pTask->Members.Items[idx].Count;
+            if (TeamCounts[idx] >= need)
+                continue;
+            SearchForRecruit(idx);
             if (TeamCounts[idx] < need) {
-                SearchForRecruit(idx);
+                stillMissing = true;
+                // 招不到现成的闲置单位：让房主把缺口造出来。
+                //   原版这条链路是 TeamClass_Update -> HouseClass_BeginProductionOf，
+                //   造好的单位进房主的待编队缓冲后被 Recruit 吸收；本树没有缓冲，
+                //   所以只能靠"造出来 -> 进全局表 -> 下一次 SearchForRecruit 捡到"。
+                RequestProductionForSlot(idx);
             }
         }
+        // 坑位全满 → 动员完成，清缺员位（否则每帧都会重跑动员段并复位脚本）。
+        //   这等价于原版 LeaveMap 编成核对里 `IsMissingMembers = (actual != required)`。
+        if (!stillMissing && Members.Count > 0)
+            IsMissingMembers = false;
     }
 
     // ---- 6. 成功事件 (asm @@21-@@23) --------------------------------------
@@ -351,10 +499,24 @@ void TeamClass::Update() {
         }
     }
 
-    // 队员已被清空则本帧到此为止，交给下一帧的消失流程。
+    // 队员已被清空。
+    //   ★ 空队不能当帧就判死：触发器在"本房能生产该兵种"时就放行建队
+    //   （CanInstantiateTeam 只查生产资格，不查库存），而补员只能从现成
+    //   单位里拉。当帧判死会变成"建一支→招不到→死→下一帧再建"的抖动，
+    //   实测 4200 帧积出 165 支空队、每帧都在建队/删队。这里给一段宽限期
+    //   （15 秒）：期间队伍留在表里占住 Max 名额，等新单位下线后被招进来；
+    //   超过宽限期仍招不到人才解散。
+    //
+    //   注意 DoDisappear 必须在这里直接调用：原实现只置 NeedsToDisappear
+    //   就 return，而下一帧又会在同一处 return，第 8 段的收尾永远到不了 ——
+    //   空队于是永远挂在表里。
     if (Members.Count == 0) {
         if (!IsTransient) {
-            NeedsToDisappear = true;
+            const int32 born = TeamBirthFrames()[this];
+            if (frame - born >= 900 || born == 0) {
+                NeedsToDisappear = true;
+                DoDisappear();
+            }
         }
         return;
     }
@@ -374,8 +536,42 @@ void TeamClass::Update() {
     }
 
     // 交给脚本 VM 派发当前行（原版 65 分支 switch 的现代实现）。
+    //
+    // ★ 脚本跑完而队伍仍停在"空闲"时，从头再跑一遍。
+    //   AI 脚本描述的是**循环行为**（搜敌→推进→再搜敌），不是一次性任务：
+    //   一次 Execute 只是把队伍推进到某个稳态任务上。若那一次发生在队伍
+    //   还没招满、或者任务被外部复位（新兵入队、集结、取消）之后，队伍
+    //   就会永久停在 Sleep 上不动。这里给一条"已完成且空闲就重来"的自愈
+    //   路径，语义上与原版脚本的循环执行一致。
     if (Script) {
+        if (Script->IsComplete() && CurrentMission == MISSION_SLEEP
+            && !IsMissingMembers && Members.Count > 0) {
+            Script->Reset();
+        }
         Script->Execute();
+    }
+
+    // ---- 7b. 任务保持 -----------------------------------------------------
+    //   脚本派发的是**队伍**任务，成员的任务层仍会自己收尾：一轮交火打完
+    //   （FootClass::Mission_Attack 里目标消失 → ForceMission(Guard)）、或者
+    //   被 Start_Default_Mission 归位，成员就退回 Guard/Sleep 站着。原版靠
+    //   脚本循环（Search & Destroy 反复重派）把队伍拉回来；本树脚本在
+    //   complete 后不会再重派，于是整队在第一轮交火后就地驻扎（实测
+    //   AI_Inf6 m=15 而成员 m0=5）。
+    //   这里只对"猎杀"姿态做保持：正在 Attack / Move 的成员不动，只把空闲的
+    //   成员重新拉到队伍任务上。
+    if (CurrentMission == MISSION_HUNT) {
+        for (int32 i = 0; i < Members.Count; ++i) {
+            TechnoClass* pTechno = Members[i];
+            if (pTechno == nullptr || pTechno->IsDead() || !IsFootMember(pTechno))
+                continue;
+            const Mission cur = pTechno->GetMission();
+            if (cur == Mission::None || cur == Mission::Sleep
+                || cur == Mission::Guard || cur == Mission::AreaGuard
+                || cur == Mission::Stop) {
+                static_cast<FootClass*>(pTechno)->ForceMission(Mission::Hunt);
+            }
+        }
     }
 
     // ---- 8. 自杀队收尾 -----------------------------------------------------
@@ -541,20 +737,24 @@ void TeamClass::AssignMissionToAll(Mission mission) {
         bool isFoot = IsFootMember(pTechno);
         FootClass* pFoot = isFoot ? static_cast<FootClass*>(pTechno) : nullptr;
 
+        // ★ 先真正把任务下到成员身上。
+        //   原版 AssignMissionToAll 的实质就是给每个成员 Queue_Mission；
+        //   此前这里只做"顺手开一枪 / 停一下"的替代动作，成员的 CurrentMission
+        //   根本没变 —— 于是 Hunt 队的脚本派发了 MISSION_HUNT，单位却仍在
+        //   Guard，一步都不会朝敌方挪。MissionClass::Update 随后按
+        //   CurrentMission 分派到 Mission_Hunt，推进才真正发生。
+        if (pFoot != nullptr) {
+            pFoot->ForceMission(mission);
+        }
+
         switch (static_cast<int32>(mission)) {
             case MISSION_MOVE:
             case MISSION_PATROL:
             case MISSION_RETURN:
             case MISSION_RETREAT:
             case MISSION_ENTER:
-                // Movement missions: if a destination is set, issue Move_To.
-                if (pFoot) {
-                    CoordStruct dest = pFoot->Get_Destination();
-                    // Only re-issue if the unit is currently idle.
-                    if (!pFoot->Is_Moving()) {
-                        pFoot->Move_To(dest);
-                    }
-                }
+                // 移动任务：目的地由调用方（MoveToLocation 等）另行 Set_Destination，
+                //   这里不再用旧目的地反向覆盖，否则会把刚设好的路径打回去。
                 break;
 
             case MISSION_ATTACK:
@@ -1580,7 +1780,27 @@ void TeamClass::RecruitUnit(FootClass* pUnit, bool canRecruitExtras)
         pUnit->VeterancyLevel = Type->VeteransLevel;
     }
 
-    ActionExecuted = true;
+    // ★ 脚本已跑完时，补员后重跑一次。
+    //   AI 脚本描述的是循环行为：每次有人入队都重新派发一遍，才能保证
+    //   "后来补上的人"和"最早那个人"拿到同一个任务。不重跑的话，补员
+    //   发生在脚本执行之后，新兵就会一直停在落位的默认任务上。
+    if (Script != nullptr && Script->IsComplete())
+        Script->Reset();
+
+    // ★ 新兵立刻服从队伍当前的任务。
+    //   队伍的脚本只在"第一次凑够人"时执行一次（Execute 一次即 complete），
+    //   AssignMissionToAll 因此只覆盖当时在队的人；此后补招进来的成员会一直
+    //   停在落位默认的 AreaGuard 上 —— 队伍名义上 4 辆，只有 1 辆真的冲锋。
+    if (CurrentMission != MISSION_SLEEP && CurrentMission >= 0)
+    {
+        pUnit->ForceMission(static_cast<Mission>(CurrentMission));
+    }
+
+    // ★ 招募不是"脚本动作执行完毕"。
+    //   TeamClass::Update 第 7 步把 ActionExecuted 当作"当前行已完成、该翻页"
+    //   的信号；在此处置位会让**招第一个人**就把脚本从第 0 行推到第 1 行，
+    //   于是在下一次 Execute() 之前 IsScriptComplete 已经成立 —— 整个攻击
+    //   脚本一行都没执行（实测 line 恒 0、成员任务恒 Sleep）。
     AchievedSuccess = true;
 }
 
@@ -2256,8 +2476,13 @@ bool TeamClass::SearchForRecruit(int32 idx)
 
     // 候选名单：步兵独一份、飞机独一份、其余（载具）归在一起。挑选顺序与之
     // 对应，先看载具、再看飞机、最后看步兵。
+    //
+    // ★ 这里必须用 **类型** 枚举（UnitType/InfantryType/AircraftType）：
+    //   坑位里存的是 TechnoTypeClass*，它的 WhatAmI() 返回的是 ...Type；
+    //   原先用实例枚举（Unit/Infantry/Aircraft）比较，恒不相等 —— 每一个
+    //   坑位都在第一行就被 continue 掉，队伍永远招不到人。
     const AbstractType kinds[3] = {
-        AbstractType::Unit, AbstractType::Aircraft, AbstractType::Infantry
+        AbstractType::UnitType, AbstractType::AircraftType, AbstractType::InfantryType
     };
 
     FootClass* pBest      = nullptr;
@@ -2270,9 +2495,9 @@ bool TeamClass::SearchForRecruit(int32 idx)
             continue;
 
         DynamicVectorClass<TechnoClass*>* pPool = nullptr;
-        if (kinds[k] == AbstractType::Unit)
+        if (kinds[k] == AbstractType::UnitType)
             pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(UnitClass::Array);
-        else if (kinds[k] == AbstractType::Aircraft)
+        else if (kinds[k] == AbstractType::AircraftType)
             pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(AircraftClass::Array);
         else
             pPool = reinterpret_cast<DynamicVectorClass<TechnoClass*>*>(InfantryClass::Array);
@@ -2331,6 +2556,74 @@ bool TeamClass::SearchForRecruit(int32 idx)
     }
 
     return true;
+}
+
+// ============================================================================
+// RequestProductionForSlot —— 坑位缺员且现成单位招不到时，向本房产线下单。
+//
+// 原版链路（asm: TeamClass_Update 的补员段 → HouseClass_BeginProductionOf）：
+//   队伍逐个 task-force 坑位核对人数，缺口为正就请求生产；造出来的单位进入
+//   房主的待编队缓冲，再被 TeamClass::Recruit 吸收。
+//
+// 本树的招募是直接从全局单位表里挑（SearchForRecruit），所以这里的语义是
+// "招不到就造"：只有全局池里确实没有符合坑位类型/编组的闲置单位时才下单，
+// 避免与常规 AI 生产重复下单。三条防重复规则：
+//   1) 节流：同一 (队伍, 坑位) 每 90 帧最多一次 —— 生产需要时间，每帧尝试
+//      只会把工厂队列刷满，并让"队列已满"的失败路径空转。
+//   2) 在制去重：把本房所有工厂"排队中 + 在制品"里该类型的数量算进去，
+//      够补缺口就不再下单。
+//   3) 一次只下 1 个：连续下单会占满队列，饿死其它队伍与常规生产。
+// ============================================================================
+void TeamClass::RequestProductionForSlot(int32 idx)
+{
+    if (Owner == nullptr || Type == nullptr || Type->TaskForce == nullptr)
+        return;
+    if (idx < 0 || idx >= MaxTaskForceSlots)
+        return;
+
+    TaskForceClass* pTask = Type->TaskForce;
+    if (idx >= pTask->Members.Count)
+        return;
+
+    const TaskForceMember& mem = pTask->Members.Items[idx];
+    TechnoTypeClass* pWant = mem.Type;
+    if (pWant == nullptr || mem.Count <= 0)
+        return;
+
+    const int32 missing = mem.Count - TeamCounts[idx];
+    if (missing <= 0)
+        return;
+
+    // ---- 1. 节流 -----------------------------------------------------------
+    const int32 frame = Game::CurrentFrame;
+    const uintptr_t key = TeamSlotKey(this, idx);
+    auto it = TeamOrderFrames().find(key);
+    if (it != TeamOrderFrames().end()) {
+        const int32 last = it->second;
+        if (frame >= last && (frame - last) < 90)
+            return;
+        it->second = frame;
+    } else {
+        TeamOrderFrames()[key] = frame;
+    }
+
+    // ---- 2. 在制去重 -------------------------------------------------------
+    int32 inFlight = 0;
+    if (FactoryClass::Array != nullptr) {
+        for (int32 i = 0; i < FactoryClass::Array->Count; ++i) {
+            FactoryClass* pF = (*FactoryClass::Array)[i];
+            if (pF == nullptr || pF->GetOwner() != Owner)
+                continue;
+            inFlight += pF->CountThisInQueue(pWant);
+            if (pF->GetCurrentOrder() == pWant)
+                ++inFlight;
+        }
+    }
+    if (inFlight >= missing)
+        return;
+
+    // ---- 3. 下单（一次一个；资金由工厂 Update 逐帧扣，不预扣）-------------
+    Owner->BeginProductionOf(pWant, 1);
 }
 
 // ============================================================================
@@ -2516,46 +2809,106 @@ void TeamClass::StartLStorm()
 }
 
 // ============================================================================
-// asm: TeamClass_Suicide
+// asm: TeamClass_Suicide (0x6EDF83, retn 8)
 //
-//  让全队自毁：每个成员对自己的生命值来一次全额伤害，走完整的死亡结算
-//  （残骸、经验、统计都不缺席）。"自杀式攻击"的脚本动作走这一路。
+//  把全队成员逐个打死：沿成员链 FirstUnitInTeam(this+0x54) → NextUnitInTeam
+//  (+0x5D8) 正向遍历，对每个"还在场上、血量 > 0"的成员，用它的当前血量作
+//  伤害、以 RulesData+0xFA8 的弹头、ignoreDefenses = 1 走一次
+//  TechnoClass::ReceiveDamage。全部处理后把动作完成字节 +0x80 置 1。
 // ============================================================================
 void TeamClass::Suicide()
 {
-    // 根据游戏行为，可知自毁逐个结算：从名册尾部往前处理，这样死亡从名册
-    //  里摘人也不会打乱遍历。
-    for (int32 i = this->Members.GetCount() - 1; i >= 0; --i) {
+    // asm:6EDFD5 起为正向链式遍历（下一次迭代在伤害结算之后才读 +0x5D8），
+    //  因此这里同样是从头到尾，而不是从尾部倒序。
+    for (int32 i = 0; i < this->Members.GetCount(); ++i) {
         TechnoClass* pTech = this->Members[i];
-        if (pTech == nullptr || pTech->IsDead()) {
+        if (!IsUsableMember(pTech)) {
             continue;
         }
 
-        // 根据游戏行为，可知自毁按全额伤害走通用流程：谁的血厚谁多撑一帧，
-        //  但结局一样。
-        // asm: TechnoClass_ReceiveDamage(pTech, &health, 0, nullptr, 0, 0, 0, nullptr)
+        // asm: mov eax,[esi+6Ch]（Health）→ push &Damage；
+        //      WH = [RulesData+0FA8]，ignoreDefenses = 1，其余为 0。
         int32 suicideDamage = pTech->Health;
-        pTech->ReceiveDamage(&suicideDamage, 0, nullptr, 0, 0, 0, nullptr);
+        WarheadTypeClass* pWarhead =
+            (RulesClass::Instance != nullptr) ? RulesClass::Instance->field_FA8 : nullptr;
+        pTech->ReceiveDamage(&suicideDamage, 0, pWarhead, 0, 1, 0, nullptr);
     }
+
+    // asm:6EE03A  mov byte ptr [edi+80h],1
+    ActionExecuted = true;
 }
 
 // ============================================================================
-// 队伍级指令
-// 根据游戏行为，可知下面每条指令都把一个"队伍意图"分发到全体成员：
-// 或改任务、或给目标、或给目的地，具体移动由成员自己的移动器完成。
+// 队伍级指令（脚本动作表 Team_* 部分，asm 0x6EC98E..0x6F03xx）
+//
+//  TeamClass_Update 的脚本分发按动作号调用下面这些 proc；每个 proc 的
+//  `this` 在 ECX，动作参数（ActionClass.arg）在栈上。它们本身并不直接驱动
+//  移动，而是把"目标"（对象或格子）交给 TeamClass::Assign_Mission_Target
+//  （asm 0x6E904A），再由队伍每帧的 AI（sub_6EBAD0）把目标翻译成成员使命。
+//  OpenYR 没有该目标/使命层，这里用 AssignTargetToAll（对象目标）与
+//  MoveToLocation（格子目标）作为等价出口，并在每处注明。
 // ============================================================================
 
 void TeamClass::AttackWaypoint(void* pParam)
 {
-    // 根据游戏行为，可知沿路径点推进的队伍走到点后立即转入攻击：
-    // 先移动，到位即全员开打。
-    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
-    AssignMissionToAll(Mission::Attack);
+    // asm: Team_AttackWaypoint (loc_6ECA0A 一带, retn 8)
+    //   1) cell = Scenario_GetWaypointCell(script.arg)
+    //   2) 若格子上有对象（GetAircraftOrTerrain）→ 目标 = 该对象；否则
+    //      目标 = 格子本身（队伍开过去）。Assign_Mission_Target(target)。
+    //   3) 只要还有成员带弹（TechnoType.Ammo > 0），就让队伍继续打；
+    //      全员无弹时清空目标并把 +0x80 置 1。
+    if (Members.GetCount() == 0) {
+        AssignTargetToAll(nullptr);
+        ActionExecuted = true;
+        return;
+    }
+
+    CellClass* pCell = ScriptWaypointCell(pParam);
+    if (pCell == nullptr) {
+        // asm: Assign_Mission_Target(0) → loc_6ECA40
+        AssignTargetToAll(nullptr);
+        ActionExecuted = true;
+        return;
+    }
+
+    ObjectClass* pObject = CellObjectAt(pCell);
+    if (pObject != nullptr) {
+        AssignTargetToAll(pObject);
+        AssignMissionToAll(Mission::Attack);
+        return;
+    }
+
+    // asm: 空格的场合把格子本身当目标，交给队伍 AI 推进。
+    CoordStruct dest;
+    pCell->ConvertCoords(&dest);
+    ITarget = nullptr;
+    MoveToLocation(dest);
+
+    // asm: loc_6ECA18 遍历成员检查 TechnoType.Ammo；全员为零才收尾。
+    bool anyAmmo = false;
+    for (int32 i = 0; i < Members.GetCount(); ++i) {
+        TechnoClass* pTech = Members[i];
+        if (IsUsableMember(pTech) && pTech->TechnoType != nullptr &&
+            pTech->TechnoType->Ammo > 0) {
+            anyAmmo = true;
+            break;
+        }
+    }
+    if (!anyAmmo) {
+        AssignTargetToAll(nullptr);
+        ActionExecuted = true;
+    }
 }
 
 void TeamClass::SetFlashing(void* pParam)
 {
-    // 根据游戏行为，可知脚本闪烁只对有成员的队伍生效，闪多久由参数给。
+    // asm: Team_SetFlashing (0x6EF5E9, retn 4)
+    //   原版沿成员链逐个写 FootClass.f.FlashData.Duration = script.arg，
+    //   不设置任何队伍级标志、也不写 +0x80。
+    //
+    //   asm 无对应（本端口）：OpenYR 没有 per-unit 的 FlashData（它在
+    //   Abstract/FootClass 里，属其他 Agent 维护的模块），闪烁需求只能挂在
+    //   队伍自己的 IsFlashing 上，由绘制层消费。行为保留观察实现。
     (void)pParam;
     if (Members.Count > 0) {
         IsFlashing = true;
@@ -2564,15 +2917,33 @@ void TeamClass::SetFlashing(void* pParam)
 
 void TeamClass::LoadOntoTransport(void* pParam)
 {
-    // 根据游戏行为，可知全员登载具就是进载具任务：成员各自找最近的
-    // 可搭乘对象排队上去。
+    // asm: Team_LoadOntoTransport (0x6ED253, retn 8)
+    //   原版先扫 TeamType->TaskForce 的条目（6 槽并行数组，条目 +0x9C 为
+    //   数量），找出 TechnoType.OpenTopped > 0 的运输载具；随后沿成员链
+    //   逐个比对 TechnoType+0x5E0（可载人数）与成员 +0x114（已载人数），
+    //   用 RadioClass_ArrayHasAtLeastOneItem 判断无线电是否空闲，再决定
+    //   让哪些步兵/载具进入运输。只有"全部装不下"时才把 +0x80 置 1。
+    //
+    //   asm 对应但依赖未建模的接口（本端口）：TaskForce 的并行条目数组、
+    //   TechnoType+0x5E0、FootClass+0x114 与 Radio 队列都不在 TeamClass 内，
+    //   这些都在 Abstract/ 与 Network/ 侧，超出本次改动边界。行为保留观察
+    //   实现：以 Enter 使命把全队交给各自的运输逻辑。
     (void)pParam;
     AssignMissionToAll(Mission::Enter);
 }
 
 void TeamClass::GatherAtEnemyBase(void* pParam)
 {
-    // 根据游戏行为，可知集结点是最近一个敌对阵营的基地中心。
+    // asm: Team_GatherAtEnemyBase (loc_6EF72C 一带, retn 8)
+    //   1) 选成员（TechnoType+0x5FC 最大者）；2) 取该成员 Owner 上登记的
+    //      "指定敌方基地"（HouseClass+0x5600，-1 表示没有）→ 该 House 的
+    //      GetBaseCenterCell；3) 以 Rules+0xD74*256 为半径、按基地与成员
+    //      连线的朝向（arctan + sin/cos 定点运算）算出偏移点，再经
+    //      Coord_Move / Nearby_Location / Coord_Cell；4) Assign_Mission_Target(格)。
+    //
+    //   asm 对应但依赖未建模字段（本端口）：HouseClass+0x5600 这个"指定敌方
+    //   基地"槽位不在 HouseClass 里，属 Houses/ 模块。行为保留观察实现：
+    //   退化为扫描第一个敌对阵营的基地中心。
     (void)pParam;
     HouseClass* pEnemyBase = nullptr;
     for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
@@ -2594,22 +2965,55 @@ void TeamClass::GatherAtEnemyBase(void* pParam)
     }
 }
 
-BuildingClass* TeamClass::PickFriendlyStructure(void* pParam)
+BuildingClass* TeamClass::PickFriendlyStructure(BuildingTypeClass* pType, HouseClass* pHouse,
+                                                TechnoClass* pUnit, int32 flags,
+                                                bool onlyHouseEnemy)
 {
-    // 根据游戏行为，可知己方建筑按注册顺序挑第一个还活着的。
-    (void)pParam;
-    for (int32 i = 0; i < Owner->OwnedBuildings.Count; ++i) {
-        BuildingClass* pBuilding = Owner->OwnedBuildings[i];
-        if (pBuilding && !pBuilding->IsDead()) {
-            return pBuilding;
+    // asm: Team_PickFriendlyStructure (跳转表 off_6EF0F8 所在函数, retn 0Ch)
+    //   __fastcall(Type=ECX, pHouse=EDX, Unit, flags, onlyHouseEnemy)：
+    //   遍历 (pHouse ? pHouse : Unit->Owner)->OwnedBuildings，类型必须等于
+    //   Type；按 flags 打分（见 StructureWeight），返回分值最高的一座。
+    //   原版只扫描本阵营的建筑，onlyHouseEnemy 在此版本中未参与过滤。
+    (void)onlyHouseEnemy;
+
+    HouseClass* pOwner = pHouse;
+    if (pOwner == nullptr && pUnit != nullptr) {
+        pOwner = pUnit->Owner;
+    }
+    if (pOwner == nullptr || pType == nullptr) {
+        return nullptr;
+    }
+
+    BuildingClass* pBest = nullptr;
+    int32 bestWeight = -1;
+    for (int32 i = 0; i < pOwner->OwnedBuildings.Count; ++i) {
+        BuildingClass* pBuilding = pOwner->OwnedBuildings[i];
+        if (pBuilding == nullptr || pBuilding->IsDead()) continue;
+        if (pBuilding->Type != pType) continue;
+
+        const int32 weight = StructureWeight(flags, pBuilding, pUnit);
+        if (weight > bestWeight) {
+            bestWeight = weight;
+            pBest = pBuilding;
         }
     }
-    return nullptr;
+    return pBest;
 }
 
 void TeamClass::AssignNewMission(void* pParam)
 {
-    // 根据游戏行为，可知脚本给出的任务号直接铺给全队。
+    // asm: Team_AssignNewMission (0x6ED801, retn 8)
+    //   对每个可用成员单独处理（不是"把使命号铺给全队"）：
+    //     * 成员当前没有目标（+0x2B4 为空）且没有目的地（+0x5A4 为空）时，
+    //       取脚本参数作新使命号；若与 SpatialCell/SpawnCell(+0x34) 的距离
+    //       超过 Rules+0x171C（0x35/0x36 两条动作改用 +0x1720）的两倍，
+    //       就先 Assign_Destination_Cell 再下发使命并清目标；
+    //     * 已有目标/目的地的成员跳过；
+    //     * 距离在阈值内则只把成员的 +0x689（"已到位"）置 1。
+    //
+    //   asm 对应但依赖未建模的接口（本端口）：成员使命/目的地状态（+0x2B4、
+    //   +0x5A4、+0x689）与 vtable 使命入口都在 Abstract/ 侧。行为保留观察
+    //   实现：把参数当成队伍使命号分发（仅对合法范围做保护）。
     int32 missionId = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
     if (missionId < 0 || missionId > static_cast<int32>(Mission::AttackMove)) {
         missionId = static_cast<int32>(Mission::Guard);
@@ -2619,57 +3023,183 @@ void TeamClass::AssignNewMission(void* pParam)
 
 void TeamClass::Scout(void* pParam)
 {
-    // 根据游戏行为，可知侦察就是散开区域警戒：成员各自盯着身边的
-    // 未探明地带。
+    // asm: Team_Scout (0x6EE839, retn 8)
+    //   1) 若队伍尚未持有侦察目标（TeamClass+0x30），从 Owner 的侦察节点表
+    //      （HouseClass+0x5620/+0x562C，每项 8 字节，+4 为占用标志）里按
+    //      当前未占用的槽随机挑一个，写进 +0x30；
+    //   2) 收集 vec_Buildings 中 Owner 等于 +0x30 那支 House 的全部建筑，
+    //      随机取一座；
+    //   3) 选 TechnoType+0x5FC 最大的成员；
+    //   4) 目标落到该建筑（Assign_Mission_Target）。
+    //
+    //   asm 对应但缺字段（本端口）：TeamClass+0x30（ScoutHouse）与
+    //   HouseClass 的 ScoutNodes 表都没有建模，TeamClass 布局又不能增删
+    //   成员。行为保留观察实现：区域警戒。
     (void)pParam;
     AssignMissionToAll(Mission::AreaGuard);
 }
 
 void TeamClass::AttackStructureAtWaypoint(void* pParam)
 {
-    // 根据游戏行为，可知到点攻击：先走到路径点，把沿途选中的敌方
-    // 建筑锁给全员。
-    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
-    BuildingClass* pTarget = PickEnemyStructure(nullptr);
-    if (pTarget) {
-        AssignTargetToAll(pTarget);
+    // asm: Team_AttackStructureAtWaypoint (loc_6ECAE8 一带, retn 8)
+    //   cell = Scenario_GetWaypointCell(arg)；取格上对象
+    //   （CellClass_GetAircraftOrTerrain），只有 WhatAmI()==Building(6) 才算
+    //   目标，否则目标清空。Assign_Mission_Target(target)。
+    //   目标为空时把 +0x80 置 1；否则交给队伍 AI（sub_6EB490）。
+    CellClass* pCell = ScriptWaypointCell(pParam);
+    ObjectClass* pObject = CellObjectAt(pCell);
+
+    if (pObject != nullptr && pObject->WhatAmI() == AbstractType::Building) {
+        AssignTargetToAll(pObject);
+        AssignMissionToAll(Mission::Attack);
+        return;
     }
+
+    AssignTargetToAll(nullptr);
+    ActionExecuted = true;
 }
 
 void TeamClass::MoveToFriendlyStructure(void* pParam)
 {
-    // 根据游戏行为，可知向己方建筑靠拢：选不出建筑就原地不动。
-    (void)pParam;
-    BuildingClass* pBuilding = PickFriendlyStructure(nullptr);
-    if (pBuilding) {
-        MoveToLocation(pBuilding->GetCoords());
+    // asm: Team_MoveToFriendlyStructure (loc_6EE621 一带, retn 8)
+    //   arg 是打包值：低 16 位 = BuildingTypeClass.Vector 下标，
+    //   高 16 位 = flags（0..3，见 StructureWeight）。
+    //   选一个成员（原版取 TechnoType+0x5FC 最大者）作为"单位"，
+    //   PickFriendlyStructure(Type, nullptr→成员 Owner, Unit, flags, 0)，
+    //   再用 Map::Nearby_Location(建筑格, 成员 SpeedType, MovementZone)
+    //   求可达落点，Assign_Mission_Target(落点格)。
+    const int32 packed = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
+    const int32 typeIndex = packed & 0xFFFF;
+    const int32 flags = (packed >> 16) & 0xFFFF;
+
+    TechnoClass* pUnit = FirstUsableMember(this);
+    if (pUnit == nullptr) {
+        ActionExecuted = true;
+        return;
     }
+
+    BuildingTypeClass* pType = nullptr;
+    if (BuildingTypeClass::Array != nullptr &&
+        typeIndex >= 0 && typeIndex < BuildingTypeClass::Array->Count) {
+        pType = (*BuildingTypeClass::Array)[typeIndex];
+    }
+    if (pType == nullptr) {
+        ActionExecuted = true;
+        return;
+    }
+
+    BuildingClass* pBuilding =
+        PickFriendlyStructure(pType, nullptr, pUnit, flags, false);
+    if (pBuilding == nullptr) {
+        ActionExecuted = true;
+        return;
+    }
+
+    CellStruct near;
+    CoordStruct dest = pBuilding->GetCoords();
+    if (TheMap != nullptr && pUnit->TechnoType != nullptr) {
+        near = TheMap->Nearby_Location(Math::CoordToCell(dest),
+                                       static_cast<int32>(pUnit->TechnoType->SpeedTypeVal),
+                                       pUnit->TechnoType->MoveZone);
+        dest = Math::CellToCoord(near);
+    }
+    MoveToLocation(dest);
 }
 
 void TeamClass::AttackEnemyStructure(void* pParam)
 {
-    // 根据游戏行为，可知敌建筑攻击就是选目标后全员开火。
-    (void)pParam;
-    BuildingClass* pTarget = PickEnemyStructure(nullptr);
-    if (pTarget) {
-        AttackTarget(pTarget);
+    // asm: Team_AttackEnemyStructure (loc_6EE388 一带, retn 8)
+    //   只在队伍还没有目标（+0x3C 为空）时选目标：
+    //     Type   = BuildingTypeClass.Vector[arg & 0xFFFF]
+    //     flags  = arg >> 16
+    //     Unit   = 第一个可用成员
+    //     Caller = Unit->Owner 的"指定敌方基地"（House+0x5600）
+    //   调 Team_PickEnemyStructure，选到就 Assign_Mission_Target(建筑)。
+    //   选不到则目标清空、+0x80 置 1；已选到则交给队伍 AI 开火。
+    const int32 packed = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
+    const int32 typeIndex = packed & 0xFFFF;
+    const int32 flags = (packed >> 16) & 0xFFFF;
+
+    if (ITarget == nullptr) {
+        TechnoClass* pUnit = FirstUsableMember(this);
+        BuildingTypeClass* pType = nullptr;
+        if (BuildingTypeClass::Array != nullptr &&
+            typeIndex >= 0 && typeIndex < BuildingTypeClass::Array->Count) {
+            pType = (*BuildingTypeClass::Array)[typeIndex];
+        }
+        if (pUnit != nullptr && pType != nullptr) {
+            BuildingClass* pBuilding = PickEnemyStructure(
+                pType, pUnit->Owner, pUnit, flags,
+                (Type != nullptr) ? Type->OnlyTargetHouseEnemy : false);
+            if (pBuilding != nullptr) {
+                AssignTargetToAll(pBuilding);
+                AssignMissionToAll(Mission::Attack);
+                return;
+            }
+        }
+    }
+
+    if (ITarget == nullptr) {
+        AssignTargetToAll(nullptr);
+        ActionExecuted = true;
     }
 }
 
 void TeamClass::MoveToEnemyStructure(void* pParam)
 {
-    // 根据游戏行为，可知向敌建筑行进但不接火，到位后的动作交给后续
-    // 脚本行。
-    (void)pParam;
-    BuildingClass* pTarget = PickEnemyStructure(nullptr);
-    if (pTarget) {
-        MoveToLocation(pTarget->GetCoords());
+    // asm: Team_MoveToEnemyStructure (loc_6EE44F 一带, retn 8)
+    //   与 AttackEnemyStructure 同一套选目标流程（Type 由低 16 位给），
+    //   但选到后不接火：用 Map::Nearby_Location(建筑格, 成员 SpeedType,
+    //   MovementZone) 求落点，Assign_Mission_Target(落点格)，由队伍 AI 行军。
+    //   选不到且当前无目标 → +0x80 置 1。
+    const int32 packed = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
+    const int32 typeIndex = packed & 0xFFFF;
+    const int32 flags = (packed >> 16) & 0xFFFF;
+
+    if (ITarget == nullptr) {
+        TechnoClass* pUnit = FirstUsableMember(this);
+        BuildingTypeClass* pType = nullptr;
+        if (BuildingTypeClass::Array != nullptr &&
+            typeIndex >= 0 && typeIndex < BuildingTypeClass::Array->Count) {
+            pType = (*BuildingTypeClass::Array)[typeIndex];
+        }
+        if (pUnit != nullptr && pType != nullptr) {
+            BuildingClass* pBuilding = PickEnemyStructure(
+                pType, pUnit->Owner, pUnit, flags,
+                (Type != nullptr) ? Type->OnlyTargetHouseEnemy : false);
+            if (pBuilding != nullptr) {
+                CoordStruct dest = pBuilding->GetCoords();
+                if (TheMap != nullptr && pUnit->TechnoType != nullptr) {
+                    CellStruct near = TheMap->Nearby_Location(
+                        Math::CoordToCell(dest),
+                        static_cast<int32>(pUnit->TechnoType->SpeedTypeVal),
+                        pUnit->TechnoType->MoveZone);
+                    dest = Math::CellToCoord(near);
+                }
+                ITarget = nullptr;
+                MoveToLocation(dest);
+                return;
+            }
+        }
+    }
+
+    if (ITarget == nullptr) {
+        ActionExecuted = true;
     }
 }
 
 void TeamClass::GatherAtFriendlyBase(void* pParam)
 {
-    // 根据游戏行为，可知回防集结点是本方基地中心。
+    // asm: Team_GatherAtFriendlyBase (loc_6EFA3C 一带, retn 8)
+    //   1) 选成员（TechnoType+0x5FC 最大者），取它的 Owner->GetBaseCenterCell；
+    //   2) 若 House+0x5600 指向另一支 House，则用两支基地中心的连线算朝向
+    //      （arctan），否则用 Scenario.Random(0,255) 取随机朝向；
+    //   3) 以 Rules+0xD74*256 为半径做极坐标偏移，经 Coord_Move、
+    //      Nearby_Location、Coord_Cell 得到落点；
+    //   4) Assign_Mission_Target(落点格)。
+    //
+    //   asm 对应但依赖未建模字段（本端口）：House+0x5600 未建模，且 Team 类
+    //   布局不能新增成员。行为保留观察实现：直接开往本方基地中心。
     (void)pParam;
     CellStruct baseCell = Owner->GetBaseCenterCell();
     CellClass* pCell = TheMap->GetCellAt(baseCell.X, baseCell.Y);
@@ -2682,48 +3212,147 @@ void TeamClass::GatherAtFriendlyBase(void* pParam)
 
 void TeamClass::SpyStructureAtWaypoint(void* pParam)
 {
-    // 根据游戏行为，可知路径点潜入与到点攻击同路，差别只在全员接的
-    // 是进入任务而不是攻击任务。
-    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
-    BuildingClass* pTarget = PickEnemyStructure(nullptr);
-    if (pTarget) {
-        AssignTargetToAll(pTarget);
-        AssignMissionToAll(Mission::Enter);
+    // asm: Team_SpyStructureAtWaypoint (loc_6ECE89 一带, retn 8)
+    //   1) cell = GetWaypointCell(arg)，先 Assign_Mission_Target(cell)；
+    //   2) 若当前目标还是 Cell（WhatAmI()==Cell），取格上对象
+    //      （GetAircraftOrTerrain）并把它作为新目标；
+    //   3) 目标为空 → Assign_Mission_Target(0) 且 +0x80 置 1。
+    //   潜入的"进入"由队伍 AI 依据目标类型决定（这里用 Enter 使命承接）。
+    CellClass* pCell = ScriptWaypointCell(pParam);
+    if (pCell == nullptr) {
+        AssignTargetToAll(nullptr);
+        ActionExecuted = true;
+        return;
     }
+
+    ObjectClass* pObject = CellObjectAt(pCell);
+    if (pObject != nullptr) {
+        AssignTargetToAll(pObject);
+        AssignMissionToAll(Mission::Enter);
+        return;
+    }
+
+    CoordStruct dest;
+    pCell->ConvertCoords(&dest);
+    ITarget = nullptr;
+    MoveToLocation(dest);
 }
 
 void TeamClass::AttackTargetType(void* pParam)
 {
-    // 根据游戏行为，可知按类型攻击先把当前目标锁上，类型过滤由目标
-    // 挑选层完成。
+    // asm: Team_AttackTargetType (loc_6ED0BC 一带, retn 8)
+    //   仅在队伍无目标时：选 TechnoType.LeadershipRating 最高的成员，把脚本
+    //   参数经 TeamClass_TargetTypeToFlags 变成标志位，然后调用该成员的
+    //   TechnoClass::SelectAutoTarget(flags, &member[0x9C], OnlyTargetHouseEnemy)
+    //   自动索敌，结果交给 Assign_Mission_Target；随后按成员 Ammo 决定继续
+    //   还是收尾（+0x80）。
+    //
+    //   asm 对应但依赖未建模接口（本端口）：TechnoClass::SelectAutoTarget
+    //   （vtable 项）在 Abstract/ 里没有暴露。行为保留观察实现：切换攻击使命，
+    //   由成员自身的索敌逻辑接手。
     (void)pParam;
     AssignMissionToAll(Mission::Attack);
 }
 
-int32 TeamClass::GetTaskForceEntries(void* pParam)
+void TeamClass::GetTaskForceEntries(DynamicVectorClass<TechnoTypeClass*>* pOut)
 {
-    // 根据游戏行为，可知编制表查询返回当前编成槽数。
-    (void)pParam;
-    return Members.Count;
+    // asm: Team_GetTaskForceEntries (loc_6EF4EF 一带, retn 4)
+    //   1) 遍历 TeamType->TaskForce 的条目（6 槽：类型 +0xA8、数量 +0xA4），
+    //      把每个类型按它的数量重复压入出参向量；
+    //   2) 再遍历本队成员，把成员类型在向量中的那一项删掉——于是出参里剩下
+    //      的就是"编制表里还缺的类型/数量"。
+    //   原版在第二段用 VectorClass::FindIndexOf + 平移删除；这里用
+    //   DynamicVectorClass 的线性查找 + Remove 等价实现。
+    if (pOut == nullptr) {
+        return;
+    }
+
+    TaskForceClass* pTaskForce = (Type != nullptr) ? Type->TaskForce : nullptr;
+    if (pTaskForce != nullptr) {
+        for (int32 i = 0; i < pTaskForce->Members.Count; ++i) {
+            TaskForceMember* pEntry = pTaskForce->GetMember(i);
+            if (pEntry == nullptr || pEntry->Type == nullptr || pEntry->Count <= 0) {
+                continue;
+            }
+            for (int32 n = 0; n < pEntry->Count; ++n) {
+                pOut->Add(pEntry->Type);
+            }
+        }
+    }
+
+    for (int32 i = 0; i < Members.Count; ++i) {
+        TechnoClass* pTech = Members[i];
+        if (!IsUsableMember(pTech)) {
+            continue;
+        }
+        TechnoTypeClass* pMemberType = pTech->GetType();
+        for (int32 j = 0; j < pOut->Count; ++j) {
+            if ((*pOut)[j] == pMemberType) {
+                pOut->Remove(j);
+                break;
+            }
+        }
+    }
 }
 
 void TeamClass::SetElite_old(void* pParam)
 {
-    // 根据游戏行为，可知老版精锐化入口已被晋升系统取代，这里保留
-    // 兼容桩，脚本执行到此不做任何事。
+    // asm: Team_SetElite_old (loc_6EF5D6 一带, retn 8)
+    //   第二个参数 elite 非零时：沿成员链把 TechnoClass.FlashData.Level
+    //   （老兵等级）写成动作参数，然后 +0x80 置 1；elite 为零则原样返回，
+    //   连 +0x80 都不写。
+    //
+    //   asm 对应但依赖未建模字段（本端口）：TechnoClass 没有 FlashData.Level
+    //   （老兵等级由晋升系统管理，属 Abstract/ 模块）。行为保留观察实现：
+    //   什么都不做（老版精锐化入口已被晋升系统取代）。
     (void)pParam;
 }
 
 void TeamClass::PlayAnimType(void* pParam)
 {
-    // 根据游戏行为，可知队伍级动画按类型播放，动画系统未挂到队伍时
-    // 该行脚本空过。
-    (void)pParam;
+    // asm: Team_PlayAnimType (loc_6EF661 一带, retn 8)
+    //   arg 是打包值：低 16 位 = vec_AnimTypes 下标，高 16 位 = loopCount。
+    //   下标合法且队伍有成员时，对每个成员：
+    //     new AnimClass(AnimType, member->GetCoords(), 0,
+    //                   loopCount, 0x600, 0, 0) → AnimClass::Attach_To(member)
+    //   无论是否播放，最后都把 +0x80 置 1。
+    const int32 packed = static_cast<int32>(reinterpret_cast<intptr_t>(pParam));
+    const int32 animIndex = packed & 0xFFFF;
+    const int32 loopCount = (packed >> 16) & 0xFFFF;
+
+    if (animIndex >= 0 && AnimTypeClass::Array != nullptr &&
+        animIndex < AnimTypeClass::Array->Count && Members.Count > 0) {
+        AnimTypeClass* pAnimType = (*AnimTypeClass::Array)[animIndex];
+        if (pAnimType != nullptr) {
+            for (int32 i = 0; i < Members.Count; ++i) {
+                TechnoClass* pTech = Members[i];
+                if (!IsUsableMember(pTech)) {
+                    continue;
+                }
+                AnimClass* pAnim = new AnimClass(pAnimType, pTech->GetCoords(),
+                                                 0, loopCount, 0x600, 0, false);
+                if (pAnim != nullptr) {
+                    pAnim->Attach_To(pTech);
+                }
+            }
+        }
+    }
+
+    ActionExecuted = true;
 }
 
 void TeamClass::FollowFriendlies(void* pParam)
 {
-    // 根据游戏行为，可知跟随友军即围绕编队中心做区域警戒。
+    // asm: Team_FollowFriendlies (loc_6EDB89 一带, retn 8)
+    //   1) AITeamClass_FindUnitToFollow(&SpawnCell(+0x2C), &FollowAnchor(+0x38))；
+    //   2) PrevTarget(+0x40) = SpawnCell；跑一遍队伍 AI（sub_6EBAD0）；
+    //   3) 若 FollowAnchor 是 Techno：对每个成员，先清掉指向别处的目标，
+    //      再看锚点的 LastTarget——成员能打、当前使命为 5(Attack) 时，把
+    //      成员目标设成锚点正在打的那个目标（跟着友军打同一个）。
+    //
+    //   asm 对应但依赖未建模接口（本端口）：成员使命号与目标槽（+0x2B4、
+    //   +0x5A4、vtable+0x184/0x3C8）都在 Abstract/ 侧。行为保留观察实现：
+    //   整队重编后转入区域警戒。
     (void)pParam;
     ReGroup();
     AssignMissionToAll(Mission::AreaGuard);
@@ -2731,37 +3360,111 @@ void TeamClass::FollowFriendlies(void* pParam)
 
 void TeamClass::ChronoSphereToStructure(void* pParam)
 {
-    // 根据游戏行为，可知超时空传送的目标登记下来，真正的搬运由铁幕
-    // 系统的传送通道完成。
+    // asm: Team_ChronoSphereToStructure (loc_6EFE7D 一带, retn 8)
+    //   1) 选 TechnoType.NavalTargeting 最大的成员，取其 Owner；
+    //   2) 在该 Owner 的超武列表（House+0x258/+0x264，24 字节一项）里按
+    //      TypeIndex 找 3（超时空传送）与 4（超时空扭曲），两者都要有；
+    //   3) 传送建筑 +0x6F 非零且 HouseClass_CurrentPowerPercentage < 1.0 时
+    //      放弃；4) 用 Team_PickEnemyStructure 选敌方建筑，再由
+    //      HouseClass_SWFire 把传送目标设成队伍 SpawnCell(+0x34) 所在格。
+    //
+    //   asm 对应但依赖未建模接口（本端口）：HouseClass 的超武列表与
+    //   HouseClass_SWFire 在 Houses/、SW/ 侧，本次不改它们。行为保留观察
+    //   实现：不动作。
     (void)pParam;
 }
 
 void TeamClass::ChronoWarpToStructure(void* pParam)
 {
-    // 根据游戏行为，可知超时空扭曲与传送同走一条登记路径。
+    // asm: Team_ChronoWarpToStructure (loc_6F0147 一带, retn 8)
+    //   流程与 ChronoSphereToStructure 同构：选 LeadershipRating 最大的成员，
+    //   在 Owner 的超武列表里找 TypeIndex 3（传送）和 4（扭曲），检查传送
+    //   建筑 +0x6F 与电力，再用 PickEnemyStructure 选目标并 SWFire。
+    //   区别只在最终使用的超武与目标落点（这里以队伍锚点为终点）。
+    //
+    //   asm 对应但依赖未建模接口（本端口）：同上，超武列表/SWFire 属
+    //   Houses/ 与 SW/。行为保留观察实现：不动作。
     (void)pParam;
 }
 
 void TeamClass::PatrolToWaypoint(void* pParam)
 {
-    // 根据游戏行为，可知沿路径点巡逻：先走过去，再切成巡逻任务来回。
-    MoveToWaypoint(static_cast<int32>(reinterpret_cast<intptr_t>(pParam)));
+    // asm: Team_PatrolToWaypoint (loc_6ECD15 一带, retn 8)
+    //   1) cell = Scenario_GetWaypointCell(arg)，Assign_Mission_Target(cell)；
+    //   2) 若队伍没有 PrevTarget(+0x40) 且动作参数 < 0x2BE，再次把格子设为目标；
+    //   3) 之后每隔 Rules+0x1150*900 帧，选一名成员，用它的
+    //      GetPatrolTarget(vtable+0x3C4, own coords) 求下一个巡逻点；求不到
+    //      就把目标改回路径点格；
+    //   4) 目标带 +0x14 bit1 时交给 sub_6EB490，否则 sub_6EBAD0。
+    //
+    //   OpenYR 没有 per-member 巡逻目标解析，第 3 步以队伍 Patrol 使命承接。
+    CellClass* pCell = ScriptWaypointCell(pParam);
+    if (pCell == nullptr) {
+        ActionExecuted = true;
+        return;
+    }
+
+    CoordStruct dest;
+    pCell->ConvertCoords(&dest);
+    ITarget = nullptr;
+    MoveToLocation(dest);
     AssignMissionToAll(Mission::Patrol);
 }
 
-BuildingClass* TeamClass::PickEnemyStructure(void* pParam)
+BuildingClass* TeamClass::PickEnemyStructure(BuildingTypeClass* pType, HouseClass* pCaller,
+                                             TechnoClass* pUnit, int32 flags,
+                                             bool onlyHouseEnemy)
 {
-    // 根据游戏行为，可知敌建筑按阵营顺序扫第一个还活着的。
-    (void)pParam;
-    for (int32 i = 0; i < HouseClass::ArrayCount; ++i) {
-        HouseClass* pHouse = HouseClass::Array[i];
-        if (!pHouse || pHouse == Owner || Owner->IsAlliedWith(pHouse)) continue;
-        for (int32 j = 0; j < pHouse->OwnedBuildings.Count; ++j) {
-            BuildingClass* pBuilding = pHouse->OwnedBuildings[j];
-            if (pBuilding && !pBuilding->IsDead()) {
-                return pBuilding;
+    // asm: Team_PickEnemyStructure (跳转表 off_6EEE84 所在函数, retn 0Ch)
+    //   __fastcall(Type=ECX, CallerHouse=EDX, Unit, flags, onlyHouseEnemy)：
+    //   遍历全局 vec_Buildings，类型必须等于 Type，然后按归属过滤：
+    //     * 与 CallerHouse 同属一方 → 纳入；
+    //     * 与 Unit->Owner 不是盟友 → 纳入；
+    //     * 是盟友但对方是真人玩家 → 纳入，否则跳过。
+    //   按 flags 打分（见 StructureWeight），分别记录"本方最佳"与"任意最佳"；
+    //   本方分值更高就返回本方那座，否则返回任意最佳。onlyHouseEnemy 非零
+    //   时只返回本方那一座（原版命名如此，语义是"只打自己阵营的建筑"）。
+    if (BuildingClass::Array == nullptr || pType == nullptr) {
+        return nullptr;
+    }
+
+    BuildingClass* pBestOwn = nullptr;
+    BuildingClass* pBestAny = nullptr;
+    int32 weightOwn = -1;
+    int32 weightAny = -1;
+
+    HouseClass* pUnitOwner = (pUnit != nullptr) ? pUnit->Owner : nullptr;
+
+    for (int32 i = 0; i < BuildingClass::Array->Count; ++i) {
+        BuildingClass* pBuilding = (*BuildingClass::Array)[i];
+        if (pBuilding == nullptr || pBuilding->IsDead()) continue;
+        if (pBuilding->Type != pType) continue;
+
+        const bool isOwn = (pCaller != nullptr && pBuilding->Owner == pCaller);
+        if (!isOwn) {
+            const bool allied = (pUnitOwner != nullptr && pBuilding->Owner != nullptr &&
+                                 pUnitOwner->IsAlliedWith(pBuilding->Owner));
+            if (allied && pBuilding->Owner != nullptr && !pBuilding->Owner->IsHumanPlayer) {
+                continue;
             }
         }
+
+        const int32 weight = StructureWeight(flags, pBuilding, pUnit);
+        if (isOwn && weight > weightOwn) {
+            weightOwn = weight;
+            pBestOwn = pBuilding;
+        }
+        if (weight > weightAny) {
+            weightAny = weight;
+            pBestAny = pBuilding;
+        }
     }
-    return nullptr;
+
+    if (pBestOwn != nullptr && weightOwn > weightAny) {
+        return pBestOwn;
+    }
+    if (onlyHouseEnemy) {
+        return pBestOwn;
+    }
+    return pBestAny;
 }

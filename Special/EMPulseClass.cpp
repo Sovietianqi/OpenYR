@@ -173,9 +173,14 @@ void EMPulseClass::ApplyEMPToCell(const CellStruct& cell, int32 distance) {
         pTechno->TakeDamage(actualDamage, nullptr, nullptr);
     }
 
-    // EMP disable is handled by setting a flag on the cell
+    // asm: EMPulseClass_Initialize 对命中的 techno 写
+    //   `mov [techno+EMPDurationRemaining], [pulse+30h]`
+    // 之后 TechnoClass_Update 每帧递减，归零那帧恢复动力/雷达；
+    // vt+0x37C（IsUnderEMP）据此返回真。
     int32 disableDuration = static_cast<int32>(DisableDuration * rangeFactor);
     if (disableDuration > 0) {
+        if (disableDuration > pTechno->EMPDurationRemaining)
+            pTechno->EMPDurationRemaining = disableDuration;
         pCell->SetFlag(CellFlags::EMPPresent, true);
     }
 }

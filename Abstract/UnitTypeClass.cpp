@@ -122,7 +122,8 @@ void UnitTypeClass::Delete_All()
 // ============================================================================
 
 UnitTypeClass::UnitTypeClass() noexcept
-    : TechnoTypeClass(noinit)
+    : TechnoTypeClass()   // 走完整默认值（noinit 版会跳过 TechnoTypeClass 的
+                          //   全部字段初始化，Ammo / ROT / WeaponCount 等停在 0）
 {
     Harvester             = false;
     Weeder                = false;
@@ -902,7 +903,13 @@ UnitTypeClass* UnitTypeClass::FindOrAllocate(const char* pID)
         strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
         newItem->ID[sizeof(newItem->ID) - 1] = '\0';
     }
-    if (newItem && Array) Array->Add(newItem);
+    if (newItem && Array)
+    {
+        Array->Add(newItem);
+        // asm: 类型构造末尾把"我在类型表里的下标"写进 +0x98（ArrayIndex）。
+        //   缺这一步时 GetArrayIndex() 恒 0/-1，AI 选型、工厂索引全部错位。
+        newItem->Set_ArrayIndex(Array->Count - 1);
+    }
     return newItem;
 }
 

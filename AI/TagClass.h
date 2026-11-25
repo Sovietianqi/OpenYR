@@ -87,6 +87,14 @@ public:
     //   retn 14h —— 5 参，返回"是否有触发器真正执行了动作"。
     bool RaiseEvent(int32 eventKind, AbstractClass* pTagObject, CellStruct loc, bool isRepeating, AbstractClass* pSource);
 
+    // ------------------------------------------------------------------------
+    // asm: FootClass_UpdatePosition 的 [CellTags] 判定段。
+    //   单位每进入一个新格（含飞行器越过），若该格挂有 AttachedTag，就向
+    //   该标签上抛事件 1（EnteredBy）。这是"单位踩点触发剧情"的唯一入口。
+    //   TriggerEventType 与 EventKind 同值，故直接传 1。
+    // ------------------------------------------------------------------------
+    static void SpringCellTag(CellStruct cell, AbstractClass* pObject);
+
     // asm: TagClass_GetCRC / _GetSize / _GetAbstractDerivationID
     int32 GetCRC() const;
     int32 GetSize() const;

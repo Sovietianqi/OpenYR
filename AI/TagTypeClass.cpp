@@ -1,5 +1,6 @@
 #include "TagTypeClass.h"
 #include "TriggerTypeClass.h"
+#include "TriggerClass.h"
 #include "TagClass.h"
 #include "../Abstract/AbstractTypeClass.h"
 #include "../Abstract/AbstractClass.h"
@@ -134,7 +135,9 @@ void TagTypeClass::CreateFromINIList(CCINIClass* pINI)
             continue;
         }
 
-        char value[0x18];
+        // [Tags] 行是 "PERSISTENCE,NAME,TRIGGER_ID"，名字段可能较长；
+        //   原来用 0x18 缓冲，稍长的标签名会把第三段截断 → 触发器丢失。
+        char value[0x100];
         value[0] = '\0';
         if (pINI->GetString("Tags", pKeyName, value, sizeof(value)) <= 0) {
             continue;
@@ -156,6 +159,30 @@ void TagTypeClass::CreateFromINIList(CCINIClass* pINI)
 
         if (pTag != nullptr) {
             pTag->LoadFromINI(pINI);
+
+            // ── 运行期实例化 ────────────────────────────────────────────
+            // asm: TagTypeClass_CreateInstance 造 TagClass，随后按
+            //   TagType->Trigger 链为每个触发器类型造一条 TriggerClass
+            //   并 AttachTrigger。缺这一步则 [Tags] 只有"类型"，没有
+            //   可服务的实例，ProcessTagEvents 遍历的是空表。
+            TagClass* pRuntime = CreateInstance(pTag);
+            if (pRuntime != nullptr) {
+                pRuntime->TagType = pTag;
+                for (TriggerTypeClass* pTypeChain = pTag->Trigger;
+                     pTypeChain != nullptr; pTypeChain = pTypeChain->NextTrigger) {
+                    const char* pTrigId = pTypeChain->get_ID();
+                    if (pTrigId == nullptr || pTrigId[0] == '\0') continue;
+
+                    TriggerClass* pTrig = TriggerClass::FindOrAllocate(pTrigId);
+                    if (pTrig == nullptr) continue;
+                    pTrig->Type = pTypeChain;
+                    pTrig->Repeatable = (pTag->Repeating == 2);
+                    pTrig->Easy   = pTypeChain->Easy;
+                    pTrig->Normal = pTypeChain->Normal;
+                    pTrig->Hard   = pTypeChain->Hard;
+                    pRuntime->AttachTrigger(pTrig);
+                }
+            }
         }
     }
 }
@@ -317,18 +344,23 @@ bool TagTypeClass::LoadFromINI(CCINIClass* pINI)
         return false;
     }
 
-    // 第一段：重复标志（十进制）。
+    // 第一段：PERSISTENCE —— 0 = 一次性（任一对象命中即移除）、
+    //   1 = 全灭后一次（全部挂载对象都命中才触发）、2 = 可重复。
     char* token = std::strtok(buffer, ",");
-    if (token != nullptr) {
-        Repeating = std::atoi(token);
-    }
+    Repeating = (token != nullptr) ? std::atoi(token) : 0;
+    if (Repeating < 0) Repeating = 0;
+    if (Repeating > 2) Repeating = 2;
 
-    // 第二段：标签 ID 后缀，仅作保留（asm 拷入 nameINI 字段）。
+    // 第二段：标签显示名（仅地图编辑器使用）。
     std::strtok(nullptr, ",");
 
-    // 第三段：触发器类型名。
+    // 第三段：触发器 ID。<none> / 缺段时清空。
     token = std::strtok(nullptr, ",");
-    Trigger = TriggerTypeClass::FindOrAllocate(token);
+    if (token != nullptr && _strcmpi(token, "<none>") != 0 && _strcmpi(token, "none") != 0) {
+        Trigger = TriggerTypeClass::FindOrAllocate(token);
+    } else {
+        Trigger = nullptr;
+    }
 
     return true;
 }

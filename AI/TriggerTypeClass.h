@@ -69,7 +69,8 @@ public:
     // ------------------------------------------------------------------------
     // [Triggers] section bulk IO (asm: CreateFromINIList / SaveToINIList).
     // ------------------------------------------------------------------------
-    void CreateFromINIList(CCINIClass* pINI);
+    // asm 里是 __fastcall 自由函数，与实例无关。
+    static void CreateFromINIList(CCINIClass* pINI);
     void SaveToINIList(CCINIClass* pINI);
 
     // ------------------------------------------------------------------------

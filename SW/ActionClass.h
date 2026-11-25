@@ -425,10 +425,11 @@ public:
     // ========================================================================
     // 静电场/粒子遗留接口（历史空壳，本任务按 asm 语义归位）
     // ========================================================================
-    // asm: _ActionClass_SpawnParticleSysAt_unused
-    static void LightningStrikeAt_unused(const CoordStruct& pos);
-    // asm: _ActionClass_RemoveParticleSysAt_unused
-    static void RemoveParticleSystemsAt_unused(const CoordStruct& pos);
+    // asm: ActionClass_LightningStrikeAt_unused (0x6E0040) —— __thiscall，
+    // 路点号取自 this+0x44，不是静态函数。
+    void LightningStrikeAt_unused(const CoordStruct& pos);
+    // asm: ActionClass_RemoveParticleSystemsAt_unused (0x6E00D0) —— 同上。
+    void RemoveParticleSystemsAt_unused(const CoordStruct& pos);
 
     // ========================================================================
     // 内嵌字段（原版 ActionClass 布局）

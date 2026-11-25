@@ -66,6 +66,19 @@ public:
     void Unregister_Logic();
     bool Is_Logic_Registered() const;
 
+    // ========================================================================
+    // FinalizeUnlimbo —— 各子类覆写版 Unlimbo 的公共收尾
+    //
+    //   原版只有 ObjectClass::Unlimbo 一条落位路径，收尾做三件事：
+    //     ① `Alive = 1`（+0x88）—— MissionClass_Update 的第一道门；
+    //     ② 登记 vec_Logics（Register_Logic）；
+    //     ③ 交给显示层（DisplayClass::Submit）。
+    //   本树为各子类写了自包含的覆写版（ Infantry 占格 + 播 Ready、
+    //   Unit 占位、Aircraft 起飞、Building Mark），这些覆写都绕过了基类，
+    //   于是公共收尾必须单独提供，否则对象"在世界里但永不逐帧/永不绘制"。
+    // ========================================================================
+    void FinalizeUnlimbo();
+
     ObjectClass() noexcept
         : LogicClass()
         , Location()
@@ -78,7 +91,7 @@ public:
         , PassengerBlocked(false)
         , Tag(nullptr)
         , NextObject(nullptr)
-        , field_14(0)
+        , field_14(0xFF)
         , field_6C(0)
         , field_74(1)
         , Selected(0)
@@ -90,10 +103,16 @@ public:
     virtual AbstractType WhatAmI() const override { return AbstractType::Object; }
     virtual int32 Size() const override { return sizeof(ObjectClass); }
 
-    // 根据游戏行为，可知建造资格查询在对象面上只对建筑本体开放；
-    // 电力链接绘制把两端对象各标记一次。
+    // 根据游戏行为，可知建造资格查询在对象面上只对建筑本体开放。
     bool Who_Can_Build_Me(TechnoTypeClass* pType, bool buildLimit, const HouseClass* pHouse) const;
-    void DrawALinkTo(const ObjectClass* pTarget) const;
+
+    // asm: ObjectClass_DrawALinkTo (retn 1Ch) —— 把一条"垂链"画到合成面：
+    //   起点/终点各给一个世界坐标 + 基色，两端各落一个 3x3 端点块，中间 32 段
+    //   插值成向下垂的链。原版签名是 (srcX,srcY,srcZ, dstX,dstY,dstZ, RGBb)，
+    //   并非"传一个目标对象"。
+    void DrawALinkTo(int32 srcX, int32 srcY, int32 srcZ,
+                     int32 dstX, int32 dstY, int32 dstZ,
+                     const ColorStruct& colour) const;
 
     virtual HRESULT GetClassID(CLSID* pClassID) override { return E_FAIL; }
     virtual HRESULT Load(IStream* pStm) override { return S_OK; }
@@ -492,7 +511,16 @@ public:
     //   +0x88  Alive 存活标志
     // 注：原版 Health(+0x64)/BackupHealth(+0x68) 在本项目中由
     // TechnoClass 同名字段承载（见 TechnoClass.h），此处不重复声明以免遮蔽。
-    uint8           field_14;              // +0x14  震屏相关标志位
+    // ★ 初值 0xFF，不是 0。
+    //   asm: AbstractClass_CTOR 里 `mov dword ptr [eax+AbstractClass.
+    //   derivationFlags], 0FFFFFFFFh` —— 这个字节在对象出生时就是全 1
+    //   （各具体类的构造函数同样写 0FFFFFFFFh）。本树把它当字节用，故取 0xFF。
+    //   调用方都是按位测的：
+    //     bit0 —— Damage_At_Cell 的"可受震屏影响"门；
+    //     bit2 —— FootClass_CanFightBack 的 A 段、TechnoClass_ShouldRetaliate
+    //             的"自杀队/已是当前目标"两道门、ReceiveDamage 的散射段。
+    //   写成 0 会让这些门全部退化成"永假"，看起来像"原版就没有这段逻辑"。
+    uint8           field_14;              // +0x14  派生/震屏标志字节（初值 0xFF）
     uint8           field_6C;              // +0x6C  扫描/绘制标志字节
     uint8           field_74;              // +0x74  战术层注册标记
     uint8           Selected;              // +0x81  选中标志

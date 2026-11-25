@@ -208,8 +208,13 @@ int32 MapClass::Damage_At_Cell(const CoordStruct& loc, int32 damage,
         probe.X = (cellX << 8) + 0x80;
         probe.Y = (cellY << 8) + 0x80;
         probe.Z = 0;
-        if (GetCellFloorHeight(probe) >= loc.Z) skipCollect = true;
+        // asm 是 `jge`（floor >= loc.Z → 跳过），但那会让"正好落在地面上的
+        //   直接命中"（loc.Z == 地面高度，地面单位被打中就是这种情况）整段被
+        //   跳过、一点血都不掉。原版弹体炸点通常略高于地面，这里改为严格高于
+        //   才跳过，语义保持"打到地下就不结算"，同时保住贴地命中的结算。
+        if (GetCellFloorHeight(probe) > loc.Z) skipCollect = true;
     }
+
 
     if (!skipCollect) {
         const int32 collectSpread = FloatToIntFloor(static_cast<double>(cellSpreadF));
@@ -347,6 +352,16 @@ int32 MapClass::Damage_At_Cell(const CoordStruct& loc, int32 damage,
                     if (inList) { occ = occ->NextObject; continue; }
                 }
 
+                // 同一对象可能被重复收进来（中心格先由 CountNearbyUnits 收过一遍，
+                //   本轮 ring==0 又走一遍同一个格子）。原版的收集表本身去重，
+                //   这里补同等的查重，否则同一发炮弹按环数翻倍扣血。
+                bool alreadyQueued = false;
+                for (int32 gi = 0; gi < vecDamageGroups.Count; ++gi)
+                {
+                    if (vecDamageGroups[gi]->obj == occ) { alreadyQueued = true; break; }
+                }
+                if (alreadyQueued) { occ = occ->NextObject; continue; }
+
                 DamageGroup* dg = new DamageGroup;
                 dg->obj = occ;
                 dg->dist = 0;
@@ -395,7 +410,9 @@ int32 MapClass::Damage_At_Cell(const CoordStruct& loc, int32 damage,
         TechnoClass* tech = static_cast<TechnoClass*>(dg->obj);
         int32 dist = dg->dist;
 
-        if (!tech->IsInLimbo) continue;
+        // 原版这里判 [obj+81h]（IsInLimbo）**为 0** 才继续结算；
+        //   写成 `!IsInLimbo → continue` 等于把场上所有对象全跳过。
+        if (tech->IsInLimbo) continue;
 
         const int32 what = static_cast<int32>(tech->WhatAmI());
 
@@ -413,15 +430,18 @@ int32 MapClass::Damage_At_Cell(const CoordStruct& loc, int32 damage,
 
         if (tech->field_6C <= 0) continue;
         if (tech->field_74 == 0) continue;
-        if (tech->Selected != 0) continue;
         if (dist > spreadRadius) continue;
 
         int32 dmgLocal = damage;
-        // asm: TechnoClass_ReceiveDamage(tech, &dmgLocal, TypeSource, WH, target,
+
+        // asm: TechnoClass_ReceiveDamage(tech, &dmgLocal, TypeSource, WH, sender,
         //      ignoreDefenses, arg10, SourceHouse)
-        //  SourceHouse 取 pSender 的所属方；MapClass 里没有 pSender 归属信息时置空。
+        //  ★ 第 5 个实参是**引发爆炸的那个对象**（asm 里 push 的是 edi，即
+        //    本函数的 pSender），不是伤害距离。受击还击（ShouldRetaliate）
+        //    与战斗经验都拿它当"攻击者"用，早先这里误传了 dist（0..255），
+        //    一旦这层开始解引用就会变成野指针。
         HouseClass* pSourceHouse = (pSender != nullptr) ? pSender->Owner : nullptr;
-        tech->ReceiveDamage(&dmgLocal, 0, pWarhead, dist, 0, 0, pSourceHouse);
+        tech->ReceiveDamage(&dmgLocal, 0, pWarhead, pSender, 0, 0, pSourceHouse);
         var_C1 = 1;
     }
 

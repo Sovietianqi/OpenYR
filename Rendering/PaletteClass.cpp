@@ -6,6 +6,7 @@
 // ============================================================================
 
 #include "PaletteClass.h"
+#include "IO/FileSystem.h"
 
 #include <cstring>
 #include <cstdio>
@@ -60,7 +61,7 @@ bool PaletteClass::Load_From_File(const char* pFilename)
         return false;
     }
 
-    FILE* pFile = std::fopen(pFilename, "rb");
+    FILE* pFile = File_Open_Archive_Stream(pFilename);
     if (!pFile) {
         return false;
     }

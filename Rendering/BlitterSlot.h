@@ -19,6 +19,9 @@ using uint32 = std::uint32_t;
 namespace BlitterSlot
 {
 
+// 下标 = ConvertClass::Blitters[] 的数组下标（该数组只有 50 个元素，见
+// ConvertClass.h:144）。原 asm 的槽 32/33/34 落在 Blitters[47..49]：
+// 47~49 是数组里仅剩的空位（0..46 已被占用），改成 50/51/52 会越界。
 constexpr int32 SlotToBlitter[50] =
 {
     /* 0  BlitPlainXlat              */ 16,
@@ -53,9 +56,9 @@ constexpr int32 SlotToBlitter[50] =
     /* 29 BlitTransLucent25Alpha     */  8,
     /* 30 BlitTransXlatWriteAlpha    */ 45,
     /* 31 BlitTransXlatMultWriteAlpha*/ 46,
-    /* 32 BlitTranslucentWriteAlpha  */ -1,
-    /* 33 BlitTranslucent50NonzeroAlpha */ -1,
-    /* 34 BlitTranslucent50ZeroAlpha */ -1,
+    /* 32 BlitTranslucentWriteAlpha  */ 47,
+    /* 33 BlitTranslucent50NonzeroAlpha */ 48,
+    /* 34 BlitTranslucent50ZeroAlpha */ 49,
     /* 35 BlitPlainXlatAlpha         */ 19,
     /* 36 BlitTransXlatAlphaZRead    */ 23,
     /* 37 BlitTransZRemapXlatAlphaZRead */ 28,

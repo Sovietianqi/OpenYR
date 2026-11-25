@@ -261,12 +261,17 @@ void MapClass::Init(int32 maxX, int32 maxY)
     CellCount = MapSize;
 
     // asm: [Map] Size also publishes the playfield extents, which the radar
-    //   diamond test (In_Radar) uses as R.  Leaving them at 0 makes every
-    //   query outside the diamond, so unit placement rejects the whole map.
+    //   diamond test (In_Radar) uses as R:
+    //       x + y <= R,  x - y < R,  y - x < R,  x + y <= R + 2*B
+    //   本树的地图是矩形格阵（原点左上、x/y 各 0..W-1/H-1），x+y 的最大值是
+    //   (W-1)+(H-1)，所以 R 必须取这个值，B 取 0 —— 这样菱形判定正好覆盖
+    //   整张矩形地图。以前 R 取 maxX，x+y > W 的格子（也就是大半个地图）会
+    //   被判成"在地图外"，凡是过 In_Radar 的逻辑全废：矿石生长
+    //   （CellClass::CanAddTiberium 的第一道门）、随机木箱、空投点。
     VisibleRectX      = 0;
     VisibleRectY      = 0;
-    VisibleRectWidth  = maxX;
-    VisibleRectHeight = maxY;
+    VisibleRectWidth  = (maxX > 0 && maxY > 0) ? (maxX - 1) + (maxY - 1) : 0;
+    VisibleRectHeight = 0;
 
     Init_Cells();
     Init_Waypoints();
@@ -357,6 +362,8 @@ bool MapClass::Allocate_Cells(int32 maxX, int32 maxY)
     if (maxX <= 0 || maxY <= 0) return false;
 
     int32 totalCells = maxX * maxY;
+    // 旧的占用旁表以 CellClass* 为键，重新分配后全部失效，先清空。
+    CellClass::Clear_Occupancy_Cache();
     CellArray = new CellClass[totalCells];
     if (!CellArray) return false;
 
@@ -370,6 +377,7 @@ void MapClass::Free_Cells()
         delete[] CellArray;
         CellArray = nullptr;
     }
+    CellClass::Clear_Occupancy_Cache();
     CellCount = 0;
 }
 
@@ -627,39 +635,76 @@ void MapClass::Remove_Wall(int32 x, int32 y)
 // Tiberium
 // ============================================================================
 
+// ============================================================================
+// 矿石生长 / 蔓延总驱动
+//
+//   原版没有"每帧全图扫矿"的过程：每一格矿由自己的 CellClass 更新节拍调用
+//   sub_483710(Grow_Tiberium) 与 CellClass::Spread_Tiberium。本树没有逐格
+//   计时器，这里按 30 帧一次的全局节拍近似（一帧内扫完全图，成本 4096~16900
+//   次判断，可接受），并且：
+//     * 随机源一律走 ScenarioClass::Random —— 原来这里用 rand()，同样的种子
+//       跑两遍结果都不一样，直接破坏定步长可复现性；
+//     * 蔓延只在"这一格已经长满"时才发生，且还要过 TiberiumClass 的
+//       Should_Spread 掷骰，避免一帧把全图铺满矿。
+// ============================================================================
 void MapClass::Update_Tiberium_Spread()
 {
-    // Tiberium growth logic
-    // In the original game, this spreads tiberium to adjacent cells
-    // based on the current tiberium concentration and growth rate
+    if (ScenarioClass::Instance == nullptr)
+        return;
+    if (!ScenarioClass::Instance->TiberiumGrowthEnabled)
+        return;
 
-    if (!ScenarioClass::Instance) return;
-    if (!ScenarioClass::Instance->TiberiumGrowthEnabled) return;
+    // 节拍：30 帧一次。
+    if ((ScenarioClass::Instance->FrameCount % 30) != 0)
+        return;
 
-    // Simple growth: scan for tiberium cells and spread
-    for (int32 i = 0; i < CellCount; ++i) {
-        if (CellArray[i].TiberiumValue > 0) {
-            // Check adjacent cells for spreading
-            int32 x = GetCellX(i);
-            int32 y = GetCellY(i);
+    // 诊断（OPENYR_HARV_PROBE=1）：生长链每一环的计数，定位"矿不再长"的原因。
+    const bool probe = (std::getenv("OPENYR_HARV_PROBE") != nullptr);
+    int32 nOre = 0, nOverlayFail = 0, nTibNull = 0, nNoGrowth = 0, nGrew = 0;
+    int32 nSpreadTry = 0, nSpreadOk = 0;
 
-            for (int32 dy = -1; dy <= 1; ++dy) {
-                for (int32 dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    int32 nx = x + dx;
-                    int32 ny = y + dy;
-                    if (IsValidCell(nx, ny)) {
-                        CellClass* pAdj = GetCellAt(nx, ny);
-                        if (pAdj && pAdj->TiberiumValue == 0) {
-                            // Small chance to spread
-                            if ((rand() % 100) < 5) {
-                                pAdj->TiberiumValue = 1;
-                            }
-                        }
-                    }
-                }
+    for (int32 i = 0; i < CellCount; ++i)
+    {
+        CellClass& cell = CellArray[i];
+        if (!cell.IsTiberium())
+            continue;
+        if (probe)
+        {
+            ++nOre;
+            if (cell.Get_Contained_Tiberium_Index() < 0) ++nOverlayFail;
+            else if (TiberiumClass::FindByIndex(cell.Get_Contained_Tiberium_Index()) == nullptr) ++nTibNull;
+        }
+
+        // 先长自己：密度 +1（是否长由 GrowthPercentage 掷骰决定）。
+        const bool grew = cell.Grow_Tiberium();
+        if (probe) { if (grew) ++nGrew; else ++nNoGrowth; }
+
+        // 长满了才有资格往邻格铺。Is_Overlay_Idx_Tiberium 拿不到矿类型的格子
+        //   Spread_Tiberium 自己会返回 false，这里不用重复判。
+        int32 unitVal = 25;
+        {
+            TiberiumClass* pT = TiberiumClass::FindByIndex(cell.Get_Contained_Tiberium_Index());
+            if (pT != nullptr && pT->Value > 0) unitVal = pT->Value;
+        }
+        if (cell.Get_Tiberium_Value() >= unitVal * 12)
+        {
+            const int32 oreIdx = cell.Get_Contained_Tiberium_Index();
+            TiberiumClass* pTib = TiberiumClass::FindByIndex(oreIdx);
+            if (pTib != nullptr && pTib->Should_Spread(cell.Get_Tiberium_Value()))
+            {
+                ++nSpreadTry;
+                if (cell.Spread_Tiberium(true)) ++nSpreadOk;
             }
         }
+    }
+
+    if (probe)
+    {
+        std::fprintf(stderr,
+                     "[TIBS] ore=%d overlayFail=%d tibNull=%d grew=%d noGrow=%d"
+                     " spreadTry=%d spreadOk=%d\n",
+                     nOre, nOverlayFail, nTibNull, nGrew, nNoGrowth,
+                     nSpreadTry, nSpreadOk);
     }
 }
 
@@ -959,6 +1004,15 @@ void MapClass::Logic()
     if (ScenarioClass::Instance == nullptr) {
         return;
     }
+
+    // asm L751891 的 MapClass::Logic：地图自身的逐帧逻辑。
+    //   除了随机木箱，还有"矿脉生长"这一支 —— 原版由 CellClass 自己的节拍
+    //   驱动（sub_483710 Grow_Tiberium / Spread_Tiberium），本树没有逐格
+    //   计时器，改为每 30 帧扫一遍全图：长满的格子往邻格铺一格（概率由
+    //   TiberiumClass::Should_Spread 决定），没长满的格子按 GrowthPercentage
+    //   提升一级密度。这样采空的格子会自己长回来，AI 的经济才不会一次性枯竭。
+    Update_Tiberium_Spread();
+
     if (!ScenarioClass::Instance->IsCrates) {
         return;
     }

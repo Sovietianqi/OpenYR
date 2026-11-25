@@ -151,7 +151,8 @@ void InfantryTypeClass::Delete_All()
 // ============================================================================
 
 InfantryTypeClass::InfantryTypeClass() noexcept
-    : TechnoTypeClass(noinit)
+    : TechnoTypeClass()   // 走完整默认值（noinit 版会跳过 TechnoTypeClass 的
+                          //   全部字段初始化，Ammo / ROT / WeaponCount 等停在 0）
 {
     Engineer          = false;
     Thief             = false;
@@ -1032,7 +1033,13 @@ InfantryTypeClass* InfantryTypeClass::FindOrAllocate(const char* pID)
         strncpy(newItem->ID, pID, sizeof(newItem->ID) - 1);
         newItem->ID[sizeof(newItem->ID) - 1] = '\0';
     }
-    if (newItem && Array) Array->Add(newItem);
+    if (newItem && Array)
+    {
+        Array->Add(newItem);
+        // asm: 类型构造末尾把"我在类型表里的下标"写进 +0x98（ArrayIndex）。
+        //   缺这一步时 GetArrayIndex() 恒 0/-1，AI 选型、工厂索引全部错位。
+        newItem->Set_ArrayIndex(Array->Count - 1);
+    }
     return newItem;
 }
 
@@ -1243,6 +1250,16 @@ InfantryClass* InfantryTypeClass::CreateInfantry(HouseClass* pOwner) const
     InfantryClass* pInf = new InfantryClass(pOwner);
     if (pInf) {
         pInf->Type = const_cast<InfantryTypeClass*>(this);
+
+        // ★ 基类那份类型指针也必须回填。
+        //   本树的 InfantryClass 把类型放在自己的 `Type` 上，而 TechnoClass
+        //   的 `TechnoType`（vt+0x84 GetTechnoType 的返回值）是另一份存储。
+        //   只写 Type 会让**所有**走工厂/地图 INI 生成的步兵在基类视角里
+        //   "没有类型"：ShouldRetaliate / Combat_Damage / SelectWeapon /
+        //   CanPassiveAquire / 视野半径 / 移动音效 全部读 TechnoType，于是
+        //   步兵不会还击、不会主动索敌、视野按 0 算。
+        //   载具侧（UnitClass_CreateFromINIList）一直是两份都写，这里对齐。
+        pInf->TechnoType = const_cast<InfantryTypeClass*>(this);
     }
     return pInf;
 }

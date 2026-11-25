@@ -176,6 +176,11 @@ public:
 
     // Dirty area management
     void RegisterDirtyArea(Rectangle Area, bool bUnk);
+    // 消费脏区：逐块与视口 ViewRect 求交，交非空则把 z 缓冲对应矩形填回
+    // 0xFFFF；随后清空容器。脏区为空时**什么都不做**（不清整屏）。
+    // asm: sub_6D2B60 的 vec_DirtyAreas 循环 + TacticalClass_Draw 尾部的
+    //   "把 length 一路减到 0" 的清理块。
+    void Flush_Dirty_Areas();
     void RegisterCellAsVisible(CellClass* pCell);
 
     // Selection
@@ -218,6 +223,12 @@ public:
     bool field_D7C;
     bool Redrawing;
     BYTE gap_D7E[2];
+    // asm: vec_DirtyAreas —— 本次绘制周期内被标脏的屏幕矩形（DirtyAreaStruct
+    //   = {x, y, w, h, flag}，0x14 字节）。绘制代码调用 RegisterDirtyArea
+    //   入表，下一帧第一趟 Render 时由 Flush_Dirty_Areas 消费（逐块与视口
+    //   求交后清 z），消费完立即清空。
+    DynamicVectorClass<Rectangle> DirtyAreas;
+
     Rectangle ContainingMapCoords;
     LTRBStruct Band;
     DWORD MouseFrameIndex;

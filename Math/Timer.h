@@ -67,19 +67,40 @@ public:
 };
 
 // ============================================================================
-// TimerStruct - simple countdown timer
+// TimerStruct - asm 的绝对时刻计时器（12 字节）
+//
+//   +0 TimeStart  —— 起跑时刻（毫秒，Get_System_Tick_Count）
+//   +4 LastCheck  —— 最近一次查询时刻
+//   +8 TimeLeft   —— 总时长（毫秒）
+//
+//   sub_4F1B20(TimerStruct*) 的算法：
+//       if (TimeStart == -1)      return TimeLeft;   // 未起跑
+//       elapsed = now - TimeStart;
+//       if (elapsed >= TimeLeft)  return 0;
+//       return TimeLeft - elapsed;
+//
+//   与 CDTimerClass 的区别：本结构比较**墙钟毫秒**，不依赖逻辑帧推进，
+//   可以在任意渲染帧查询（话泡计时就是这种用法）。
 // ============================================================================
 
-class TimerStruct {
-public:
-    int32 Value;
+struct TimerStruct {
+    int32 TimeStart;
+    int32 LastCheck;
+    int32 TimeLeft;
 
     TimerStruct();
     explicit TimerStruct(int32 v);
 
+    // 以当前墙钟时刻起跑 / 停止。
     void Start(int32 duration);
+    void Start(int32 duration, int32 now);
     void Stop();
+    void Stop(int32 now);
+
+    // 剩余毫秒（<=0 表示已到期）。
+    int32 GetTimeLeft() const;
+    int32 GetTimeLeft(int32 now) const;
+
     bool HasTimeLeft() const;
     bool Expired() const;
-    void Update();
 };

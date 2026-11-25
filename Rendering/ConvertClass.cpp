@@ -260,6 +260,18 @@ void ConvertClass::BuildBlitters(DSurface* pSurface, bool skipBlitters)
     Blitters[45] = new BlitTransXlatWriteAlpha<uint16>(pal);
     Blitters[46] = new BlitTransXlatMultWriteAlpha<uint16>(pal);
 
+    // 读 alpha 混合的三个（asm 槽 32/33/34）。数组只有 50 个元素，故落在
+    // 仅剩的 47~49；映射见 Rendering/BlitterSlot.h 的 SlotToBlitter。
+    //   47 BlitTranslucentWriteAlpha     —— 只有 palette，逐像素按 abuf 混合
+    //   48 BlitTranslucent50NonzeroAlpha —— palette + 50% 掩码
+    //   49 BlitTranslucent50ZeroAlpha    —— palette + alpha remap 表
+    // 原版构造：47 只传 ConvertClass*，48 传 (ConvertClass*, WORD mask)，
+    // 49 传 (ConvertClass*, AlphaLightingRemapClass*)。AlphaLightRemap_Global
+    // 在本工程尚未建模，与其它 Alpha 族一样传 nullptr（退化为普通查表）。
+    Blitters[47] = new BlitTranslucentWriteAlpha<uint16>(pal);
+    Blitters[48] = new BlitTranslucent50NonzeroAlpha<uint16>(pal, HalfTranslucencyMask);
+    Blitters[49] = new BlitTranslucent50ZeroAlpha<uint16>(pal, nullptr);
+
     // Build RLE blitters
     RLEBlitters[0]  = new RLEBlitTransLucent25<uint16>(pal, QuatTranslucencyMask);
     RLEBlitters[1]  = new RLEBlitTransLucent50<uint16>(pal, HalfTranslucencyMask);

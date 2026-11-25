@@ -21,6 +21,7 @@
 
 #include "IO/CCFileClass.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -32,6 +33,7 @@ void*  StringTable::Array      = nullptr;
 int32  StringTable::ArrayLen   = 0;
 void*  StringTable::ListB1CF88 = nullptr;
 bool   StringTable::Loaded     = false;
+const char* StringTable::MainCSF = nullptr;
 int32  StringTable::MaxLabelLen = 0;
 char   StringTable::LabelBuffer[0x1000] = {};
 wchar_t StringTable::ValueBuffer[0x2002] = {};
@@ -139,8 +141,40 @@ void StringTable::Unload_All(){
 //     goto loop
 // ============================================================================
 
+// asm: StringTable_LoadFile（asm.txt:1674603）
+bool StringTable::Load_File(const char* pName)
+{
+    // asm: bool_StringTable_Loaded 为真时直接返回 1（重复调用是空操作）。
+    if (Loaded)
+        return true;
+
+    if (pName == nullptr || pName[0] == '\0')
+        return false;
+
+    // asm: 拷进 Main_CSF_Filename -> strchr('.') -> 截断 -> 追加 ".csf"。
+    static char s_MainCSF[MAX_PATH_LEN];
+    std::snprintf(s_MainCSF, sizeof(s_MainCSF), "%s", pName);
+
+    char* pDot = std::strrchr(s_MainCSF, '.');
+    if (pDot != nullptr)
+        *pDot = '\0';
+
+    const size_t used = std::strlen(s_MainCSF);
+    if (used + 4 < sizeof(s_MainCSF))
+        std::strncat(s_MainCSF, ".csf", sizeof(s_MainCSF) - used - 1);
+
+    MainCSF = s_MainCSF;
+    return Parse_File(s_MainCSF);
+}
+
 bool StringTable::Parse_File(const char* pFname)
 {
+    // asm: StringTable_LoadFile 在空指针检查之后、真正解析之前就
+    //   `mov MainCSF, ecx` —— 记下"最近一次要加载的文件名"。Game_EnableJabber
+    //   在 Jabber 开关变化后靠它按同一份 CSF 重建字符串表。
+    if (pFname != nullptr && pFname[0] != '\0')
+        MainCSF = pFname;
+
     CCFileClass file(pFname);                          // asm: lea ecx,[esp+2Ch] ; CCFileClass_CTOR
 
     if (!file.Is_Available(0))                         // asm: CCFileClass::Is_Available(0)
@@ -283,5 +317,8 @@ bool StringTable::Parse_File(const char* pFname)
 
 success:                                               // asm: loc_734CAD
     file.Close();                                      // asm: Buffer / CDFileClass 析构链
+    // asm: bool_StringTable_Loaded 在 StringTable_LoadFile 入口就置 1；
+    // 这里在真正解析成功后落位，保证 Load_File 的幂等门与「表已可用」一致。
+    Loaded = true;
     return true;
 }

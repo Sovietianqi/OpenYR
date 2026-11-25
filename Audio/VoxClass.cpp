@@ -1,4 +1,5 @@
 #include "VoxClass.h"
+#include "VocClass.h"
 #include "../INI/INIClass.h"
 
 #include <cstring>
@@ -369,8 +370,15 @@ namespace
         }
     }
 
-    // asm: AudioStream_Play_WAV —— 后端未建模，回调优先，否则仅记录
-    bool PlayVoiceFile(const char* pFileName)
+    // asm: AudioStream_Play_WAV —— 把 "名字.WAV" 交给音频后端。
+    //
+    // 原版这里是把样本塞进一个固定的语音通道；本工程的等价路径是：
+    //   1) 若宿主注册了后端回调（录像/测试用），交给它；
+    //   2) 否则从 audio.idx + audio.bag 取样本、解码，再走混音器播放。
+    // 取不到样本时返回 false —— 不谎报成功，调用方的失败分支会保持状态。
+    VocClass* g_CurrentSample = nullptr;      // 正在播的 EVA 样本
+
+    bool PlayVoiceFile(const char* pFileName, float volume)
     {
         int32 len = static_cast<int32>(std::strlen(pFileName));
         if (len > static_cast<int32>(sizeof(g_LastSample)) - 1)
@@ -380,7 +388,42 @@ namespace
 
         if (g_VoiceBackend != nullptr)
             return g_VoiceBackend(pFileName);
+
+        VocClass* pVoc = VocClass::FindOrLoadShared(pFileName);
+        if (pVoc == nullptr)
+        {
+            static bool s_Warned = false;
+            if (!s_Warned)
+            {
+                s_Warned = true;
+                std::fprintf(stderr,
+                             "[AUDIO] audio.idx 里找不到 \"%s\"（或未挂载音频库）；"
+                             "EVA 语音将保持静音。\n", pFileName);
+            }
+            return false;
+        }
+
+        if (g_CurrentSample != nullptr && g_CurrentSample != pVoc)
+            g_CurrentSample->Stop();
+
+        int32 vol = static_cast<int32>(volume * 255.0f);
+        if (vol < 0)   vol = 0;
+        if (vol > 255) vol = 255;
+        pVoc->SetVolume(vol);
+        pVoc->Play();
+
+        g_CurrentSample = pVoc;
         return true;
+    }
+
+    // 打断/清空语音时同步停掉真正在播的那一路样本。
+    void StopCurrentSample()
+    {
+        if (g_CurrentSample != nullptr)
+        {
+            g_CurrentSample->Stop();
+            g_CurrentSample = nullptr;
+        }
     }
 }
 
@@ -469,6 +512,7 @@ void VoxClass::PlayFromIndex(int32 index, int32 typeFlags, int32 priorityFlags)
             g_CurrentVox = nullptr;                 // asm: [+20h] = 0
         }
         // asm: Stop_Sample(channel) 只是停掉当前样本，+28h 通道本身仍然有效
+        StopCurrentSample();
         for (int32 i = 0; i < 3; ++i)
             ClearQueue(&g_SideQueues[i]);           // asm: call sub_752370
         g_PlaybackStart  = 0;                       // asm: [+2Ch] = 0
@@ -497,6 +541,12 @@ void VoxClass::PlayFromName(const char* pName, int32 typeFlags, int32 priorityFl
     const int32 found = FindIndex(pName);
     if (found >= 0)
         index = found;
+
+    // OPENYR_AUDIODBG：把"谁想播、有没有查到这个 ID"打出来。EVA 静音时
+    // 第一步要区分"压根没触发"和"触发了但查不到/没样本"。
+    static const bool s_AudioDbg = (std::getenv("OPENYR_AUDIODBG") != nullptr);
+    if (s_AudioDbg)
+        std::fprintf(stderr, "[VOX] PlayFromName %s idx=%d\n", pName, index);
 
     PlayFromIndex(index, typeFlags, priorityFlags); // asm: call VoxClass_PlayFromIndex
 }
@@ -568,7 +618,9 @@ void VoxClass::PlayEVASideSpecific()
     sampleName[sizeof(sampleName) - 5] = '\0';
     std::strcat(sampleName, ".WAV");                 // asm: 追加 ".WAV"
 
-    if (!PlayVoiceFile(sampleName))                  // asm: AudioStream_Play_WAV
+    // 音量来自 [DialogList] 该条的 Volume（0..1）；原版在把样本塞进通道时
+    // 用它折算通道音量。
+    if (!PlayVoiceFile(sampleName, pEntry->Volume))  // asm: AudioStream_Play_WAV
         return;
 
     g_PlaybackStart  = 500;                          // asm: mov [+2Ch],500
@@ -641,6 +693,7 @@ void VoxClass::DeleteAll()
         ClearQueue(&g_SideQueues[i]);
 
     // asm: Stop_Sample(channel) —— 通道保留，仅停当前样本
+    StopCurrentSample();
     g_PlaybackStart  = 0;
     g_PlaybackLength = 0;
 

@@ -6,6 +6,7 @@
 #include <Core/Macros.h>
 #include <Map/MapClass.h>
 #include <Map/CellClass.h>
+#include <Map/WaypointPathClass.h>
 #include <Abstract/UnitClass.h>
 #include <Abstract/InfantryClass.h>
 #include <Abstract/BuildingClass.h>
@@ -43,6 +44,7 @@
 // ============================================================================
 // HouseClass.cpp - House class implementation
 // ============================================================================
+
 // Standalone engine reconstruction of the HouseClass.
 // In the original game, methods are at these addresses:
 //   HouseClass::HouseClass: 0x4F4780
@@ -62,6 +64,16 @@
 // ============================================================================
 // Static member definitions
 // ============================================================================
+
+// asm: gSWAllowed —— 当前会话是否允许超级武器。
+//
+//   原版是 .data 段的一个全局字节，会话初始化时由 Rules->SuperWeaponsAllowed
+//   写入（见 Networking/ModemClass.cpp 的会话同步），单机默认 1。
+//   AI 建造列表的过滤与 FirstBuildable 都读它：为 0 时"带超武且禁止从外壳
+//   禁用"的建筑不给 AI 造。
+// ============================================================================
+bool gSWAllowed = true;
+
 HouseClass* HouseClass::Array[32] = {};
 int32 HouseClass::ArrayCount = 0;
 HouseClass* HouseClass::pCurrentPlayer = nullptr;
@@ -123,7 +135,11 @@ HouseClass::HouseClass(HouseTypeClass* pType)
     , AvailableSuperWeapons(0)
     , UsedSuperWeapons(0)
     , UIName{}
-    , RatioAITriggerTeam(0)
+    // asm: 三个 AI 比例位的默认值是"全速"（100），不是 0。
+    //   0 表示"本房永不评估 AI 触发器"——HouseClass_TryFindEligibleAITriggers
+    //   第一道门 roll(1..100) > RatioAITriggerTeam 会恒真，AI 直接不成军。
+    //   内置场景（代码建房，不走 LoadFromINIList）此前就停在这个 0 上。
+    , RatioAITriggerTeam(100)
     , RatioTeamAircraft(0)
     , RatioTeamInfantry(0)
     , RatioTeamUnits(0)
@@ -408,6 +424,13 @@ HouseClass::HouseClass(HouseTypeClass* pType)
         SuperWeaponTimers[i].Stop();
     }
 
+    // asm: HouseClass_CTOR —— +210h 起的 12 条规划路线槽位构造时全部清空，
+    //   +20Ch（当前编辑槽位）清零。
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        PlanningWaypoints[i] = nullptr;
+    }
+    NextPlanningWaypointSlot = 0;
+
     // Set ally to self
     if (ArrayIndex >= 0 && ArrayIndex < 32) {
         AllyBitfield |= (1u << ArrayIndex);
@@ -420,6 +443,13 @@ HouseClass::HouseClass(HouseTypeClass* pType)
 
 HouseClass::~HouseClass()
 {
+    // 12 条规划路线由本阵营持有，连同节点表一起释放（析构里会把自己从
+    // vec_WaypointPaths 摘除）。
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        delete PlanningWaypoints[i];
+        PlanningWaypoints[i] = nullptr;
+    }
+
     // Tracking lists are cleaned up by their destructors automatically
     // Type pointed to by Type member is not owned by this class
 }
@@ -1173,6 +1203,29 @@ void HouseClass::Update()
         SpySat_Update();
     }
 
+    // asm: HouseClass_Update_Unit_Counts —— 周期重算"现存"分档计数。
+    //   增量维护（RegisterTechnoGain / RegisterLoss）已经覆盖常规路径，
+    //   这一步负责自愈：单位被吞、建筑被碾、存档读回等旁路都会让增量漂移，
+    //   而 AI 的 CountOwnedNow 判定（触发器条件、前置建筑检查）全依赖它。
+    if ((Game::CurrentFrame & 63) == 0) {
+        Update_Unit_Counts();
+    }
+
+    // ── 逐帧产线校验（原版 HouseClass_Update_Factories 的逐帧部分）─────────
+    //   原版每帧对五类主工厂各跑一遍 FactoryClass::Validate_Production：
+    //   清掉造不出来的队列条目、复查在制品、**线空时从队列顶下一件开工**。
+    //   本树此前只在建筑落位/被拆时才调，于是"队列有货、线是空的"这种状态
+    //   没有任何东西去推进 —— 实测兵营/战车工厂的队列堆到上限 100，
+    //   progress 永远是 0，AI 一台单位都造不出来。
+    if (FactoryClass::Array != nullptr) {
+        for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+            BuildingClass* pB = OwnedBuildings[i];
+            if (pB == nullptr || pB->IsDead() || pB->Factory == nullptr)
+                continue;
+            pB->Factory->Validate_Production();
+        }
+    }
+
     // asm: loc_4F8A00..loc_4F8B08 —— ★ 建队段（L552843 TeamTypeClass_CreateTeam）。
     //   位置在 AI() 之前：asm 里 CreateTeam(552841) 早于 Update_AI(553401)
     //   与 AI_Building(553465)。此前这一整段缺失，导致 AI 触发器挑出的
@@ -1428,20 +1481,24 @@ int32 HouseClass::AI()
 // MakeAlly - Make this house allied with another
 // ============================================================================
 
+// asm: HouseClass::Make_Ally (asm:554941) 用 [house2+30h] —— ActLikeIndex ——
+//   作盟友位图下标（不是 ArrayIndex）。同一个 ActLikeIndex 下可以有多个
+//   国家，它们共享同一位；这里必须与 Is_Ally 用同一套编号。
 void HouseClass::MakeAlly(HouseClass* pHouse)
 {
     if (!pHouse) return;
     if (pHouse == this) return;
 
-    int32 idx = pHouse->ArrayIndex;
-    if (idx < 0 || idx >= 32) return;
+    const int32 idx = pHouse->ActLikeIndex;
+    const int32 own = ActLikeIndex;
+    if (idx < 0 || idx >= 32 || own < 0 || own >= 32) return;
 
     AllyBitfield |= (1u << idx);
     EnemyBitfield &= ~(1u << idx);
 
     // Reciprocate
-    pHouse->AllyBitfield |= (1u << ArrayIndex);
-    pHouse->EnemyBitfield &= ~(1u << ArrayIndex);
+    pHouse->AllyBitfield |= (1u << own);
+    pHouse->EnemyBitfield &= ~(1u << own);
 
     AlliesCounter++;
     pHouse->AlliesCounter++;
@@ -1451,20 +1508,22 @@ void HouseClass::MakeAlly(HouseClass* pHouse)
 // MakeEnemy - Declare this house as enemy of another
 // ============================================================================
 
+// 与 MakeAlly 对称：敌友位图一律以 ActLikeIndex 编号（asm 用 [h+30h]）。
 void HouseClass::MakeEnemy(HouseClass* pHouse)
 {
     if (!pHouse) return;
     if (pHouse == this) return;
 
-    int32 idx = pHouse->ArrayIndex;
-    if (idx < 0 || idx >= 32) return;
+    const int32 idx = pHouse->ActLikeIndex;
+    const int32 own = ActLikeIndex;
+    if (idx < 0 || idx >= 32 || own < 0 || own >= 32) return;
 
     EnemyBitfield |= (1u << idx);
     AllyBitfield &= ~(1u << idx);
 
     // Reciprocate
-    pHouse->EnemyBitfield |= (1u << ArrayIndex);
-    pHouse->AllyBitfield &= ~(1u << ArrayIndex);
+    pHouse->EnemyBitfield |= (1u << own);
+    pHouse->AllyBitfield &= ~(1u << own);
 
     EnemiesCounter++;
     pHouse->EnemiesCounter++;
@@ -1476,13 +1535,53 @@ void HouseClass::MakeEnemy(HouseClass* pHouse)
 
 bool HouseClass::IsAlliedWith(HouseClass* pHouse) const
 {
-    if (!pHouse) return false;
-    if (pHouse == this) return true;
+    return Is_Ally(pHouse);
+}
 
-    int32 idx = pHouse->ArrayIndex;
-    if (idx < 0 || idx >= 32) return false;
+// asm: char __thiscall HouseClass::Is_Ally(HouseClass_old *this, HouseClass_old *h2)
+//      (asm:554728)
+//
+//   test ecx,ecx / jz false          ; h2 == null
+//   cmp ecx,eax / jz true            ; h2 == this
+//   mov ecx,[ecx+30h] / cmp [eax+30h] ; ActLikeIndex 相同 → 盟友
+//   cmp ecx,-1 / jz false            ; 无 ActLike 的国家不与任何人结盟
+//   bt [eax+5788h], ecx              ; 否则查盟友位图
+bool HouseClass::Is_Ally(HouseClass* pHouse) const
+{
+    if (pHouse == nullptr)
+        return false;
+
+    if (pHouse == this)
+        return true;
+
+    const int32 idx = pHouse->ActLikeIndex;
+    if (idx == this->ActLikeIndex)
+        return true;
+
+    if (idx == -1)
+        return false;
+
+    if (idx < 0 || idx >= 32)
+        return false;
 
     return (AllyBitfield & (1u << idx)) != 0;
+}
+
+// asm: char __thiscall HouseClass::Is_Ally(HouseClass_old *this, _TechnoClass *a2)
+//      (asm:554781)
+//
+//   mov eax,[ecx] / call [eax+3Ch]   ; a2->Get_Owning_House()
+//   之后与上面的指针版逐条一致。
+bool HouseClass::Is_Ally(TechnoClass* pTechno) const
+{
+    if (pTechno == nullptr)
+        return false;
+
+    HouseClass* pOwner = pTechno->GetOwningHouse();
+    if (pOwner == nullptr)
+        return false;
+
+    return Is_Ally(pOwner);
 }
 
 // ============================================================================
@@ -1494,7 +1593,8 @@ bool HouseClass::IsHostileTo(HouseClass* pHouse) const
     if (!pHouse) return false;
     if (pHouse == this) return false;
 
-    int32 idx = pHouse->ArrayIndex;
+    // 与 MakeEnemy / Is_Ally 同一套编号：敌友位图按 ActLikeIndex 索引。
+    const int32 idx = pHouse->ActLikeIndex;
     if (idx < 0 || idx >= 32) return false;
 
     return (EnemyBitfield & (1u << idx)) != 0;
@@ -1944,10 +2044,13 @@ bool HouseClass::IsAllied(int32 house1, int32 house2)
     if (house1 < 0 || house1 >= 32 || house2 < 0 || house2 >= 32) return false;
     if (house1 == house2) return true;
 
-    HouseClass* pHouse = Array[house1];
-    if (!pHouse) return false;
+    // 位图按 ActLikeIndex 编号（见 MakeAlly / Is_Ally），这里不能拿
+    // Array 下标直接当位号，必须经双方阵营对象换算。
+    HouseClass* pHouse1 = GetHouseByIndex(house1);
+    HouseClass* pHouse2 = GetHouseByIndex(house2);
+    if (pHouse1 == nullptr || pHouse2 == nullptr) return false;
 
-    return (pHouse->AllyBitfield & (1u << house2)) != 0;
+    return pHouse1->Is_Ally(pHouse2);
 }
 
 // ============================================================================
@@ -2386,38 +2489,43 @@ void HouseClass::Recalc_Threats()
 // ============================================================================
 // BeginProductionOf — 开始生产指定类型单位
 // 原版: HouseClass_BeginProductionOf（708 行）
-// 语义: 校验资金/科技树/数量上限后入生产队列；资金不足返回 false。
+// 语义: 校验科技树/产线后把类型排进**对应的**工厂；资金由工厂逐帧扣。
+//
+// ★ 本轮修正两处（均为实测暴露）：
+//   1) 旧实现先 `SpendMoney(totalCost)` 预扣全款，而 FactoryClass::Update
+//      又会按 `span = Balance / (0x36 - Progress)` 逐帧 `SpendMoney(span)`
+//      直到付清 Balance —— 同一笔钱被扣了两次。实测 AI 房 `money` 恒为 0，
+//      建造厂虽然在出货，但房主的账面现金被预扣榨干，任何新订单（含 AI
+//      队伍的补员订单）都因“付不起”被拒。原版并不预扣：订单只入队，
+//      钱随进度付（asm: FactoryClass_Update 的 span/HouseClass_Spend_Money 段）。
+//   2) “取第一个本房工厂”不看产线类别：步兵订单会被塞进战车工厂。
+//      改用现成的 Fetch_Factory(按 Type->Factory 归类 + Naval 分档)。
+//   3) 找不到产线时旧实现 `return true` —— 假成功，调用方以为下单成功。
 // ============================================================================
 bool HouseClass::BeginProductionOf(TechnoTypeClass* pType, int32 quantity)
 {
-    if (pType == nullptr)
+    if (pType == nullptr || quantity <= 0)
         return false;
 
     if (!CanBuild(pType))
         return false;
 
-    int32 totalCost = pType->Cost * quantity;
-    if (GetAvailableMoney() < totalCost)
+    // 产线匹配：步兵 -> 兵营，载具 -> 战车工厂（陆/海分档），飞机 -> 机场，
+    //   建筑 -> 建造厂。没有对应产线就不能下单（而不是随便塞一个工厂）。
+    FactoryClass* pFactory = Fetch_Factory(
+        static_cast<int32>(pType->WhatAmI()), pType->Naval, 0);
+    if (pFactory == nullptr)
         return false;
 
-    SpendMoney(totalCost);
-
-    // Route the order into the first available factory for this type.
-    if (FactoryClass::Array != nullptr)
+    bool anyAccepted = false;
+    for (int32 q = 0; q < quantity; ++q)
     {
-        for (int32 i = 0; i < FactoryClass::Array->Count; ++i)
-        {
-            FactoryClass* pFactory = (*FactoryClass::Array)[i];
-            if (pFactory != nullptr && pFactory->GetOwner() == this)
-            {
-                for (int32 q = 0; q < quantity; ++q)
-                    pFactory->QueueProduction(pType);
-                return true;
-            }
-        }
+        if (!pFactory->QueueProduction(pType))
+            break;                 // 队列满/被禁用：剩下的这个批次不再排
+        anyAccepted = true;
     }
 
-    return true;
+    return anyAccepted;
 }
 
 // ============================================================================
@@ -2462,13 +2570,362 @@ bool HouseClass::Can_Afford(int32 cost) const
 
 // ============================================================================
 // GenerateAIBuildList — 生成 AI 建造清单
-// 原版: HouseClass_GenerateAIBuildList（1307 行）
-// 语义: 按 AI 建造权重遍历可建造类型，生成有序队列。
+//
+// asm: void __thiscall HouseClass_GenerateAIBuildList(HouseClass *House)
+//      (asm:578188；唯一调用点 HouseClass_AcquiredConyard，asm:577755)
+//
+// 七段：
+//   ① 过滤 BuildingTypeClass::Array -> canBuild[] + built[]（同下标 bool 表）
+//   ② BuildConst / BuildPower 的首个可建项直接进 willBuild
+//   ③ BuildBarracks 命中项与 canBuild[0] 互换，BuildWeapons 与 canBuild[1] 互换
+//      （注意：bools 不是交换，新落位标 0，旧标志移到命中下标）
+//   ④ 逐轮把 canBuild 里前置满足的项补进 willBuild；GAPLUG 作闸门：某一轮
+//      一项都没补上时，强制放入 GAPLUG
+//   ⑤ 精炼厂按 AISlaveMinerNumber / AIExtraRefineries 复制若干份，插入位置
+//      用 Scenario->Random(min,max) 抽
+//   ⑥ 先抄 willBuild 前 3 项、再按序追加其余 -> finalList；随后按
+//      HouseType->Side × DifficultyLevel 查出轮数，在 [3, n-1] 随机位置插入 -1
+//   ⑦ 逐项写进 Base.Nodes（原版 +0x56D8 就是 BaseClass 的节点向量），
+//      每项 16 字节：{ pType, Cell{0,0}, 0, 0 }
 // ============================================================================
 void HouseClass::GenerateAIBuildList()
 {
-    // Build-list generation is driven by the RulesClass AI section once the
-    // factory queue is wired.  The hook is kept for the AI loop.
+    // asm: lea ecx,[ebx+56D8h]; call [edx+vt_Vector.Clear]
+    Base.Clear();
+
+    RulesClass* const pRules = RulesClass::Instance;
+    if (Type == nullptr || pRules == nullptr || BuildingTypeClass::Array == nullptr)
+        return;
+
+    // asm: mov [HouseSideIndex], [Type+0BCh]
+    const int32 houseSideIndex = Type->Side;
+
+    // asm: HouseTypeClass::From_Name(Type->ParentCountry) -> 1 << idx
+    //
+    //   ★ 位图的基准是 **HouseTypeClass 的注册下标**（INIClass::GetOwners
+    //     解析 Owner= 时就是 `mask |= 1 << HouseTypeClass::FindIndex(token)`），
+    //     所以这里必须用同一个查找函数。踩过的两个坑：
+    //       · ParentCountry 在本树内置规则集里是空串 → From_Name 返回 -1 →
+    //         `1 << 31` = INT_MIN，与任何 Owner= 都不重合；
+    //       · Type->GetArrayIndex() 对本树创建的房屋返回 5（房索引），而
+    //         FindIndex("Russians") 是 1 —— 拿房索引当国家位同样对不上。
+    //     后果都一样：canBuild 一条都进不来，Base.Nodes 恒空，AI 永不建房。
+    int32 ownCountryIndex = HouseTypeClass::FindIndex(Type->ID);
+    if (ownCountryIndex < 0)
+        ownCountryIndex = HouseTypeClass::FindIndexOfName(Type->Name);
+    if (ownCountryIndex < 0)
+        ownCountryIndex = HouseTypeClass::FindIndexOfName(Type->ParentCountry);
+    const int32 ownerBit = (ownCountryIndex >= 0)
+        ? (1 << (ownCountryIndex & 0x1F)) : 0;
+
+    // asm: [Type+HouseTypeClass.indexInArray] -> 1 << idx
+    int32 houseTypeIndex = Type->GetArrayIndex();
+    if (houseTypeIndex < 0)
+        houseTypeIndex = 0;
+    const int32 houseTypeBit = 1 << (houseTypeIndex & 0x1F);
+
+    DynamicVectorClass<BuildingTypeClass*> canBuild;
+    DynamicVectorClass<uint8>             built;
+
+    // ── ① 过滤 ───────────────────────────────────────────────────────────
+    for (int32 i = 0; i < BuildingTypeClass::Array->Count; ++i)
+    {
+        BuildingTypeClass* pType = (*BuildingTypeClass::Array)[i];
+        if (pType == nullptr)
+            continue;
+
+        // asm: test [Type+Owners], ebp / jz lct_DontBuild
+        if ((pType->GetOwners() & ownerBit) == 0)
+            continue;
+
+        // asm: [Type+AIBasePlanningSide] == House.Type->Side 或 == -1
+        if (pType->AIBasePlanningSide != Type->Side && pType->AIBasePlanningSide != -1)
+            continue;
+
+        // asm: mov al,[Type+AIBuildThis] / test / jz
+        if (!pType->AIBuildThis)
+            continue;
+
+        // asm: [Type+TechLevel] > House.TechLevel -> 跳过
+        if (pType->TechLevel > TechLevel)
+            continue;
+
+        // asm: RequiredHouses != -1 且本方位未置 -> 跳过
+        if (pType->RequiredHouses != -1 && (pType->RequiredHouses & houseTypeBit) == 0)
+            continue;
+
+        // asm: ForbiddenHouses != -1 且本方位已置 -> 跳过
+        if (pType->ForbiddenHouses != -1 && (pType->ForbiddenHouses & houseTypeBit) != 0)
+            continue;
+
+        // asm: gSWAllowed == 0 且带超武时：
+        //   在 Rules.BuildTech（asm field_918）里 -> 仍可造；
+        //   否则看该超武类型 DisableableFromShell，为真则跳过。
+        if (!gSWAllowed && pType->SuperWeapon != -1)
+        {
+            bool whitelisted = false;
+            for (int32 k = 0; k < pRules->BuildTech.Count; ++k)
+            {
+                if (pRules->BuildTech[k] == pType)
+                {
+                    whitelisted = true;
+                    break;
+                }
+            }
+
+            if (!whitelisted)
+            {
+                SuperClass* pSW = nullptr;
+                if (SuperWeapons != nullptr && pType->SuperWeapon >= 0
+                    && pType->SuperWeapon < SuperWeapons->Count)
+                {
+                    pSW = (*SuperWeapons)[pType->SuperWeapon];
+                }
+                if (pSW != nullptr && pSW->Type != nullptr
+                    && pSW->Type->DisableableFromShell)
+                {
+                    continue;
+                }
+            }
+        }
+
+        canBuild.Add(pType);
+        built.Add(static_cast<uint8>(0));
+    }
+
+    const int32 totalCanBuild = canBuild.Count;
+
+    // ── ② BuildConst / BuildPower ────────────────────────────────────────
+    DynamicVectorClass<BuildingTypeClass*> willBuild;
+
+    BuildingTypeClass* pFirst = FirstBuildableBuilding_FromVector(&pRules->BuildConst);
+    if (pFirst != nullptr)
+    {
+        for (int32 i = 0; i < totalCanBuild; ++i)
+        {
+            if (canBuild[i] == pFirst)
+            {
+                built[i] = 1;
+                willBuild.Add(pFirst);
+                break;
+            }
+        }
+    }
+
+    pFirst = FirstBuildableBuilding_FromVector(&pRules->BuildPower);
+    if (pFirst != nullptr)
+    {
+        willBuild.Add(pFirst);
+    }
+
+    // ── ③ BuildBarracks -> canBuild[0]，BuildWeapons -> canBuild[1] ──────
+    pFirst = FirstBuildableBuilding_FromVector(&pRules->BuildBarracks);
+    if (pFirst != nullptr && totalCanBuild > 0)
+    {
+        for (int32 i = 0; i < totalCanBuild; ++i)
+        {
+            if (canBuild[i] == pFirst)
+            {
+                // asm loc_50580D：canBuild[0] 换出，built[0] 挪到 i，built[0] 清 0
+                BuildingTypeClass* old = canBuild[0];
+                canBuild[0] = pFirst;
+                built[i] = built[0];
+                built[0] = 0;
+                canBuild[i] = old;
+                break;
+            }
+        }
+    }
+
+    pFirst = FirstBuildableBuilding_FromVector(&pRules->BuildWeapons);
+    if (pFirst != nullptr && totalCanBuild > 1)
+    {
+        for (int32 i = 0; i < totalCanBuild; ++i)
+        {
+            if (canBuild[i] == pFirst)
+            {
+                // asm loc_50585A：同上，但位置是 [1]
+                BuildingTypeClass* old = canBuild[1];
+                canBuild[1] = pFirst;
+                built[i] = built[1];
+                built[1] = 0;
+                canBuild[i] = old;
+                break;
+            }
+        }
+    }
+
+    // ── ④ 逐轮补全 ───────────────────────────────────────────────────────
+    // asm: cnt_Buildings_0 = totalCanBuild - 1
+    int32 remaining = totalCanBuild - 1;
+
+    while (remaining > 0)
+    {
+        // asm: vectorLength = willBuild.ActiveCount（本轮固定）
+        const int32 vectorLength = willBuild.Count;
+        bool addedThisRound = false;
+        int32 plugIndex = -1;
+
+        for (int32 i = 0; i < totalCanBuild; ++i)
+        {
+            if (built[i] != 0)
+                continue;
+
+            BuildingTypeClass* pType = canBuild[i];
+
+            // asm: __strcmpi(Type->ID, "GAPLUG") -> 记下，稍后作为闸门
+            if (strcasecmp(pType->get_ID(), "GAPLUG") == 0)
+            {
+                plugIndex = i;
+                continue;
+            }
+
+            if (!PrerequisiteIsAvailable(pType, &willBuild, vectorLength))
+                continue;
+
+            built[i] = 1;
+            willBuild.Add(pType);
+            addedThisRound = true;
+            --remaining;
+        }
+
+        if (!addedThisRound)
+        {
+            if (plugIndex == -1)
+                break;
+
+            built[plugIndex] = 1;
+            willBuild.Add(canBuild[plugIndex]);
+            --remaining;
+        }
+    }
+
+    // ── ⑤ 精炼厂 ─────────────────────────────────────────────────────────
+    BuildingTypeClass* pRefinery = FirstBuildableBuilding_FromVector(&pRules->BuildRefinery);
+    if (pRefinery != nullptr)
+    {
+        // asm: 本阵营是否有可造的采集车（Rules.HarvesterUnit 的 Owners 位）
+        bool hasHarvester = false;
+        for (int32 i = 0; i < pRules->HarvesterUnit.Count; ++i)
+        {
+            UnitTypeClass* pHarvester = pRules->HarvesterUnit[i];
+            if (pHarvester != nullptr && (pHarvester->GetOwners() & ownerBit) != 0)
+            {
+                hasHarvester = true;
+                break;
+            }
+        }
+
+        // asm: AISlaveMinerNumber[diff] - 1（有采集车）/ AIExtraRefineries[diff]
+        int32 copies = 0;
+        const int32 diff = (DifficultyLevel >= 0) ? DifficultyLevel : 0;
+        if (hasHarvester)
+        {
+            if (diff < pRules->AISlaveMinerNumber.Count)
+                copies = pRules->AISlaveMinerNumber[diff] - 1;
+        }
+        else
+        {
+            if (diff < pRules->AIExtraRefineries.Count)
+                copies = pRules->AIExtraRefineries[diff];
+        }
+
+        // asm: 在 willBuild[0 .. ActiveCount-2] 里找精炼厂位置
+        int32 pos = -1;
+        for (int32 i = 0; i + 1 < willBuild.Count; ++i)
+        {
+            if (willBuild[i] == pRefinery)
+            {
+                pos = i;
+                break;
+            }
+        }
+
+        while (pos != -1 && copies > 0 && TheScenario != nullptr)
+        {
+            // asm: Random2(edi, ActiveCount-1)
+            const int32 at = TheScenario->Random(willBuild.Count > 0 ? pos : 0,
+                                                 willBuild.Count - 1);
+            if (at < 0)
+                break;
+
+            // 插到 at+1（asm: mov [edx+esi*4+4], ebp）
+            willBuild.Add(nullptr);
+            for (int32 k = willBuild.Count - 1; k > at + 1; --k)
+                willBuild[k] = willBuild[k - 1];
+            willBuild[at + 1] = pRefinery;
+
+            --copies;
+        }
+    }
+
+    // ── ⑥ finalList：前 3 项 + 其余；再插 -1 哨兵 ───────────────────────
+    DynamicVectorClass<BuildingTypeClass*> finalList;
+
+    for (int32 i = 0; i < 3 && i < willBuild.Count; ++i)
+        finalList.Add(willBuild[i]);
+
+    for (int32 i = 3; i < willBuild.Count; ++i)
+        finalList.Add(willBuild[i]);
+
+    // asm: Side 0/1/2 -> Rules+0D80h/0D9Ch/0DB8h 的三张按难度索引的 int 表
+    const DynamicVectorClass<int32>* pRounds = nullptr;
+    if (houseSideIndex == 0)
+        pRounds = &pRules->AlliedBaseDefenseCounts;
+    else if (houseSideIndex == 1)
+        pRounds = &pRules->SovietBaseDefenseCounts;
+    else if (houseSideIndex == 2)
+        pRounds = &pRules->ThirdBaseDefenseCounts;
+
+    int32 rounds = 0;
+    if (pRounds != nullptr && DifficultyLevel >= 0 && DifficultyLevel < pRounds->Count)
+        rounds = (*pRounds)[DifficultyLevel];
+
+    while (rounds > 0 && finalList.Count > 3 && TheScenario != nullptr)
+    {
+        // asm: Random2(3, ActiveCount-1)
+        const int32 at = TheScenario->Random(3, finalList.Count - 1);
+        if (at < 0)
+            break;
+
+        finalList.Add(nullptr);
+        for (int32 k = finalList.Count - 1; k > at; --k)
+            finalList[k] = finalList[k - 1];
+        finalList[at] = reinterpret_cast<BuildingTypeClass*>(-1);
+
+        --rounds;
+    }
+
+    // ── ⑦ 写入 Base.Nodes ───────────────────────────────────────────────
+    // asm 的元素是 16 字节：{ NumberInArray 或哨兵, 0, 0, 0 }。
+    // 工程 BaseNodeClass::pType 是指针，故普通项直接存 BuildingTypeClass*，
+    // 哨兵仍以 -1..-4 的伪指针存放（BaseClass 各消费点按 intptr 比较）。
+    for (int32 i = 0; i < finalList.Count; ++i)
+    {
+        BuildingTypeClass* pType = finalList[i];
+        const intptr_t raw = reinterpret_cast<intptr_t>(pType);
+
+        if (raw < 0)
+        {
+            // asm: -4 <= value < 0 时原样写入（哨兵）
+            if (raw < -4)
+                continue;            // 原版会解引用该负值；本树跳过以保证安全
+            Base.Add_Node(pType, CellStruct(0, 0));
+        }
+        else if (pType != nullptr)
+        {
+            Base.Add_Node(pType, CellStruct(0, 0));
+        }
+    }
+
+#if defined(PLATFORM_LINUX)
+    if (g_bDebugMode)
+    {
+        fprintf(stderr, "[GAME] AI build list for house %d: %d nodes\n",
+                ArrayIndex, Base.NodeCount);
+        fflush(stderr);
+    }
+#endif
 }
 
 // ============================================================================
@@ -2497,6 +2954,28 @@ int32 HouseClass::Get_Total_Value() const
 //   original compares with a case-insensitive strcmpi; the index returned is
 //   the *player number*, i.e. the house's own ArrayIndex slot.
 // ============================================================================
+int32 HouseClass::FindIndexByNameOrType(const char* pName)
+{
+    if (pName == nullptr || pName[0] == '\0')
+        return -1;
+
+    const int32 byName = FindIndexByName(pName);
+    if (byName >= 0)
+        return byName;
+
+    // 房型兜底：地图写国家名（"Russians"），本树房名是 "Enemy"。
+    for (int32 i = 0; i < ArrayCount; ++i)
+    {
+        HouseClass* pHouse = Array[i];
+        if (pHouse == nullptr || pHouse->Type == nullptr)
+            continue;
+        if (_strcmpi(pHouse->Type->ID, pName) == 0)
+            return i;
+    }
+
+    return -1;
+}
+
 int32 HouseClass::FindIndexByName(const char* pName)
 {
     if (pName == nullptr)
@@ -2539,6 +3018,12 @@ bool HouseClass::InitFromINI(CCINIClass* pINI)
 {
     if (pINI == nullptr)
         return false;
+
+    // asm: HouseClass 的 ActLike（+0x30）默认就是自己的房号；结盟位图
+    //   （+0x5788）按这个编号索引。本项目的构造函数把它置 -1，只有显式
+    //   Set_ActLike 才会改，若在这里不补齐，盟友位图永远对不上号。
+    if (ActLikeIndex < 0)
+        ActLikeIndex = ArrayIndex;
 
     char section[0x20];
     std::strncpy(section, InitialName, sizeof(section) - 1);
@@ -2592,7 +3077,16 @@ bool HouseClass::InitFromINI(CCINIClass* pINI)
     // ---------------------------------------------------------------
     // AI ratios
     // ---------------------------------------------------------------
-    RatioAITriggerTeam = pINI->ReadInteger(section, "RatioAITriggerTeam", RatioAITriggerTeam);
+    // asm: 缺省值不是 0。0 的含义是"本房永不评估 AI 触发器"，
+    //   会让 HouseClass::TryFindEligibleAITriggers 的第一道随机门
+    //   （roll(1..100) > RatioAITriggerTeam）恒为真、直接 return false。
+    //   原版每个国别段都显式写 100；这里在缺键时按 100 补，显式写 0 的
+    //   场景仍保留 0（尊重"禁用触发器"的意图）。
+    if (pINI->KeyExists(section, "RatioAITriggerTeam")) {
+        RatioAITriggerTeam = pINI->ReadInteger(section, "RatioAITriggerTeam", 100);
+    } else if (RatioAITriggerTeam <= 0) {
+        RatioAITriggerTeam = 100;
+    }
     RatioTeamAircraft  = pINI->ReadInteger(section, "RatioTeamAircraft",  75);
     RatioTeamInfantry  = pINI->ReadInteger(section, "RatioTeamInfantry",  75);
     RatioTeamUnits     = pINI->ReadInteger(section, "RatioTeamUnits",     75);
@@ -2666,7 +3160,7 @@ bool HouseClass::InitFromINI(CCINIClass* pINI)
 //   house's InitialName.  InitFromINI then fills in each house's block.
 //   When the list is empty every house type gets a default house instead.
 // ============================================================================
-bool HouseClass::LoadFromINIList(CCINIClass* pINI)
+bool HouseClass::LoadFromINIList(CCINIClass* pINI, int32 nInitialMoney)
 {
     if (pINI == nullptr)
         return false;
@@ -2688,6 +3182,11 @@ bool HouseClass::LoadFromINIList(CCINIClass* pINI)
         countryBuf[0] = '\0';
         pINI->ReadString(name, "Country", "", countryBuf, sizeof(countryBuf));
 
+        // 没有 Country= 的条目（遭遇战地图的 [Houses] 常态）用条目本身当国别：
+        //   `0=Americans` 等价于 `[Americans] Country=Americans` 的简写。
+        if (countryBuf[0] == '\0')
+            std::snprintf(countryBuf, sizeof(countryBuf), "%s", name);
+
         HouseTypeClass* pType = HouseTypeClass::FindOrAllocate(countryBuf);
         if (pType == nullptr)
             pType = HouseTypeClass::Array[0];
@@ -2697,16 +3196,104 @@ bool HouseClass::LoadFromINIList(CCINIClass* pINI)
         std::strncpy(pHouse->InitialName, name, sizeof(pHouse->InitialName) - 1);
         pHouse->InitialName[sizeof(pHouse->InitialName) - 1] = '\0';
 
+        // asm: 多人被动阵营 —— 地图里的 Neutral / Special 两个固定名。
+        //   Neutral 是"全民公敌但只还手"，Special 与所有玩家同盟；两者
+        //   都不参与 AI 出兵，也不在默认敌对循环里被拉进战争。
+        if (_strcmpi(name, "Neutral") == 0 || _strcmpi(name, "Special") == 0)
+        {
+            pHouse->IsMultiplayerPassive = true;
+            if (_strcmpi(name, "Neutral") == 0)
+                pHouse->IsCivilians = true;
+        }
+
+        // asm: HouseClass_CTOR 尾段 —— 房价 / 序号 / 自身盟友位 / 全局 Houses[]。
+        //   缺这一步时 TheHouseCount 与 Houses[] 都是空，AI 遍历不到新阵营，
+        //   观战 / 胜负判定也无从谈起。
+        if (ArrayCount >= MaxHouses)
+            break;
+
         Array[ArrayCount] = pHouse;
         pHouse->ArrayIndex = ArrayCount;
         pHouse->AllHousesIndex = ArrayCount;
+        if (ArrayCount < MAX_HOUSES)
+            Houses[ArrayCount] = pHouse;
+        if (pHouse->ActLikeIndex < 0)
+            pHouse->ActLikeIndex = ArrayCount;
+        if (ArrayCount < 32)
+            pHouse->AllyBitfield |= (1u << ArrayCount);
+        // asm: BaseClass 的 OwnerHouseIndex（+74h）在房建成时写成自己的房号。
+        //   BaseClass::Placed 拿它跟建筑的 GetOwningHouseIndex() 比，相等才
+        //   进"按类型 + 格子"精确匹配那一支；留 -1 则永远走不到，AI 的基地
+        //   节点打不上"已建"标记。
+        pHouse->Base.OwnerHouseIndex = ArrayCount;
+        // 启动资金播种：InitFromINI 的缺省值是"当前 Credits / 100"，房对象
+        //   刚构造时为 0，若不预置就会把场景金额改成 0。
+        pHouse->Credits = (nInitialMoney > 0) ? nInitialMoney : pHouse->Credits;
         ++ArrayCount;
     }
+
+    TheHouseCount = ArrayCount;
 
     for (int32 i = 0; i < ArrayCount; ++i)
     {
         if (Array[i] != nullptr)
             Array[i]->InitFromINI(pINI);
+    }
+
+    // ── 默认敌对关系 ─────────────────────────────────────────────────────
+    //   原版在场景装入后按 Allies= 建好盟友位图，其余两两互为敌人；
+    //   不写 EnemyBitfield 时 IsHostileTo 恒为假，索敌 / 攻击判定会把
+    //   所有外阵营当成"既非友也非敌"，AI 永远不会主动开火。
+    //   多人被动阵营（Neutral / Special）不参战，按原版保持中立。
+    for (int32 i = 0; i < ArrayCount; ++i)
+    {
+        HouseClass* pA = Array[i];
+        if (pA == nullptr || pA->IsMultiplayerPassive)
+            continue;
+
+        for (int32 j = i + 1; j < ArrayCount; ++j)
+        {
+            HouseClass* pB = Array[j];
+            if (pB == nullptr || pB->IsMultiplayerPassive)
+                continue;
+            if (pA->Is_Ally(pB))
+                continue;
+
+            pA->MakeEnemy(pB);
+            pB->MakeEnemy(pA);
+        }
+    }
+
+    // ── 玩家位 ────────────────────────────────────────────────────────────
+    //   原版在会话建立时把 PlayerControl=yes 的那套房标成人类玩家；没有
+    //   任何一套声明时（遭遇战地图的常态）退回第 0 套，保证 ThePlayerIndex
+    //   始终有效 —— 否则玩家视角 / 侧边栏 / 输入过滤全部没有宿主。
+    if (ArrayCount > 0)
+    {
+        HouseClass* pPlayer = nullptr;
+        for (int32 i = 0; i < ArrayCount; ++i)
+        {
+            if (Array[i] != nullptr && Array[i]->PlayerControl)
+            {
+                pPlayer = Array[i];
+                break;
+            }
+        }
+        if (pPlayer == nullptr)
+        {
+            pPlayer = Array[0];
+            if (pPlayer != nullptr)
+                pPlayer->PlayerControl = true;
+        }
+
+        if (pPlayer != nullptr)
+        {
+            pPlayer->IsHumanPlayer = true;
+            pPlayer->CurrentPlayer = true;
+            Player          = pPlayer;
+            pCurrentPlayer  = pPlayer;
+            ThePlayerIndex  = pPlayer->ArrayIndex;
+        }
     }
 
     return true;
@@ -4610,6 +5197,10 @@ int32 HouseClass::CountInstancesOfTeam(TeamTypeClass* pTeamType) const
         // 只算本阵营、且编成相符的队伍。
         if (pTeam->Owner != this)
             continue;
+        // 已解散的空壳不再占用编队名额（它们会被 LogicClass 的回收段删掉，
+        //   但删除发生在下一帧，这一帧不能被它们挡住新队伍的组建）。
+        if (pTeam->JustDisappeared || pTeam->NeedsToDisappear)
+            continue;
         if (pTeam->Type != pTeamType)
             continue;
 
@@ -4622,18 +5213,43 @@ int32 HouseClass::CountInstancesOfTeam(TeamTypeClass* pTeamType) const
 // ============================================================================
 // asm: char __fastcall HouseClass_CanAddPlanningWaypoint(HouseClass_old *this)   (asm:584940)
 //
-//  判断本阵营能否再画一条行军路线：路线槽位上限十二个，且当前选中的槽位
-//  必须还是空的、没有被任何已存在的路线占用。能画则返回真。
+//   5090F0  mov eax, [ecx+20Ch]              ; NextPlanningWaypointSlot
+//   5090F6  test eax, eax   ; jl  -> 0       ; 槽位号 < 0
+//   5090FA  cmp eax, 0Ch    ; jge -> 0       ; 槽位号 >= 12
+//   5090FE  mov eax, [ecx+eax*4+210h]        ; 当前路线
+//   509105  mov edx, RulesData
+//   509107  mov ecx, [eax+38h]               ; 已有节点数
+//   50910B  mov esi, [edx+90h]               ; Rules->MaxWaypointPathLength
+//   509111  cmp ecx, esi    ; jge -> 0       ; 已满
+//   509113  cmp dword ptr [eax+24h], 0FFFFFFFFh ; jnz -> 0
+//   50911A  mov eax, 1 ; retn
+//
+//   asm 在这里直接解引用 +210h[slot]，不做空指针检查 —— 调用方（
+//   DisplayClass::Waypoint_Mode_Control）会先 CreateWaypointPath2 把槽位建好。
+//   本工程加一层空判断：槽位没建时返回 false，而不是崩溃。
 // ============================================================================
 bool HouseClass::CanAddPlanningWaypoint() const
 {
-    // 槽位号越界（或还没开始用）就不能再画。
-    if (NextPlanningWaypointSlot < 0 || NextPlanningWaypointSlot >= MaxPlanningPaths)
+    const int32 slot = NextPlanningWaypointSlot;
+    if (slot < 0 || slot >= MaxPlanningPaths) {
         return false;
+    }
 
-    // 槽位已被占用也不能再画。
-    if (PlanningWaypoints[NextPlanningWaypointSlot] != nullptr)
+    const WaypointPathClass* pPath = PlanningWaypoints[slot];
+    if (pPath == nullptr) {
         return false;
+    }
+
+    // asm: cmp [eax+38h], [RulesData+90h] ; jge -> 0
+    const RulesClass* pRules = RulesClass::Instance;
+    if (pRules != nullptr && pPath->GetWaypointCount() >= pRules->MaxWaypointPathLength) {
+        return false;
+    }
+
+    // asm: cmp dword ptr [eax+24h], 0FFFFFFFFh ; jnz -> 0
+    if (pPath->RefId != -1) {
+        return false;
+    }
 
     return true;
 }
@@ -4755,6 +5371,57 @@ void HouseClass::Update_Factories_Timing()
         }
         // asm: 重算并（变化时）写回 +0x38。
         pFactory->Recalc_Build_Estimate();
+    }
+}
+
+// ============================================================================
+// asm: HouseClass::Update_Factories (0x509129, retn 0Ch)
+//
+//   void __thiscall HouseClass::Update_Factories(HouseClass *this,
+//        eFactory FactoryOf, BuildingTypeClass *bldType, int buildCat)
+//
+//   原版先从 IHouse::PrimaryFactory 的五个槽（Aircraft/Infantry/Vehicles/
+//   Ships/Structures）里按 FactoryOf 取一个工厂指针，再对它做三件事：
+//     ① 摘掉队列里已经造不出来的条目；
+//     ② 在制品造不出来 -> Abandon + StartProduction，超建造上限 -> Suspend，
+//        恢复可造且未手动暂停 -> Unsuspend；
+//     ③ 在制品与队列都空 -> 销毁这个工厂对象。
+//   本树的工厂挂在建筑上（BuildingClass::Factory），没有 PrimaryFactory 槽，
+//   所以按"扫本房所有同类工厂"处理：语义等价，且不会漏掉分基地的工厂。
+//   ③ 的销毁不做（工厂随建筑生命周期走），原因写在 FactoryClass 里。
+// ============================================================================
+void HouseClass::Update_Factories(int32 factoryOf, BuildingTypeClass* bldType,
+                                  int32 buildCat)
+{
+    (void)bldType;   // asm 里只在"玩家房 + 侧边栏红点"分支用到，本树无侧边栏
+
+    // eFactory -> 本树的工厂类别（BuildingTypeClass::Factory 用的 AbstractType）。
+    AbstractType want;
+    if (factoryOf == 0) {
+        want = AbstractType::AircraftType;           // eFactory::Aircraft
+    } else if (factoryOf == 13) {
+        want = AbstractType::InfantryType;           // eFactory::Infantry
+    } else if (factoryOf == 37) {                    // 0x25 Vehicles / Ships
+        if (buildCat != 0) {
+            return;                                  // 舰船：本树没有船厂类别
+        }
+        want = AbstractType::UnitType;
+    } else if (factoryOf >= 1 && factoryOf <= 38) {   // 建筑 / 防御
+        want = AbstractType::BuildingType;
+    } else {
+        return;                                      // asm: default
+    }
+
+    for (int32 i = 0; i < OwnedBuildings.Count; ++i)
+    {
+        BuildingClass* pB = OwnedBuildings[i];
+        if (pB == nullptr || pB->IsDead() || pB->Type == nullptr
+            || pB->Factory == nullptr)
+            continue;
+        if (pB->Type->Factory != want)
+            continue;
+
+        pB->Factory->Validate_Production();
     }
 }
 
@@ -4891,7 +5558,101 @@ bool HouseClass::PrerequisiteIsAvailable(TechnoTypeClass* pType) const
 }
 
 // ============================================================================
-// asm: char __thiscall HouseClass_ShouldDisableCameo(HouseClass_old *this, _TechnoTypeClass *a2)   (asm:589214)
+// asm: byte __thiscall HouseClass_PrerequisiteIsAvailable
+//        (HouseClass *this, TechnoTypeClass *Techno,
+//         VectorPtrBuildingTypeClass *vectorBuildings, int vectorLength)
+//        (asm:577982, retn 0Ch)
+//
+//  只看传入的 vectorBuildings（待建/在建清单），不查本房已拥有统计：
+//    * 正数前置 -> BuildingTypeClass::Array[idx] 必须出现在清单里；
+//    * 负数前置 -> idx+6 落到 0..5（PROC/TECH/RADAR/BARRACKS/FACTORY/POWER），
+//      该类别向量里只要有任意一项出现在清单里即算满足。
+//  任一条不满足即返回 false；清单为空则直接 true。
+// ============================================================================
+bool HouseClass::PrerequisiteIsAvailable(TechnoTypeClass* pType,
+                                         DynamicVectorClass<BuildingTypeClass*>* pVectorBuildings,
+                                         int32 vectorLength) const
+{
+    if (pType == nullptr)
+        return true;
+
+    const int32 count = pType->Prerequisite.GetCount();
+    if (count <= 0)
+        return true;
+
+    RulesClass* const pRules = RulesClass::Instance;
+    if (pRules == nullptr)
+        return false;
+
+    // asm: 线性比对 [ebp+4]（清单 Vector）共 vectorLength 项
+    const int32 listCount = (pVectorBuildings == nullptr)
+        ? 0
+        : ((vectorLength < pVectorBuildings->Count) ? vectorLength : pVectorBuildings->Count);
+
+    auto InList = [&](BuildingTypeClass* pCandidate) -> bool
+    {
+        if (pCandidate == nullptr || pVectorBuildings == nullptr)
+            return false;
+        for (int32 i = 0; i < listCount; ++i)
+        {
+            if ((*pVectorBuildings)[i] == pCandidate)
+                return true;
+        }
+        return false;
+    };
+
+    for (int32 i = 0; i < count; ++i)
+    {
+        const int32 idx = pType->Prerequisite[i];
+
+        if (idx >= 0)
+        {
+            BuildingTypeClass* pBld = nullptr;
+            if (BuildingTypeClass::Array != nullptr && idx < BuildingTypeClass::Array->Count)
+                pBld = (*BuildingTypeClass::Array)[idx];
+
+            if (!InList(pBld))
+                return false;
+        }
+        else
+        {
+            // asm: add eax,6 / cmp eax,5 / ja default -> 跳转表
+            DynamicVectorClass<BuildingTypeClass*>* pClassList = nullptr;
+            switch (idx + 6)
+            {
+            case 0: pClassList = &pRules->BuildRefinery; break;   // PROC
+            case 1: pClassList = &pRules->BuildTech;     break;   // TECH
+            case 2: pClassList = &pRules->BuildRadar;    break;   // RADAR
+            case 3: pClassList = &pRules->BuildBarracks; break;   // BARRACKS
+            case 4: pClassList = &pRules->BuildWeapons;  break;   // FACTORY
+            case 5: pClassList = &pRules->BuildPower;    break;   // POWER
+            default: break;
+            }
+
+            if (pClassList == nullptr || pClassList->Count <= 0)
+                return false;
+
+            bool found = false;
+            for (int32 k = 0; k < pClassList->Count; ++k)
+            {
+                if (InList((*pClassList)[k]))
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// asm: char __thiscall HouseClass_ShouldDisableCameo(HouseClass *this, TechnoTypeClass *a2)
+//      (asm:589214)
 //
 //  判断侧边栏上某个建造图标是否该被置灰：只要本阵营当前不满足该项目的
 //  前置条件（缺少前置建筑、科技等级不够、已达数量上限）就该置灰。返回真
@@ -4903,18 +5664,18 @@ bool HouseClass::ShouldDisableCameo(TechnoTypeClass* pType) const
         return true;
     }
 
-    // asm: char __thiscall HouseClass_DoInfantrySelfHeal(HouseClass *this)   (asm:594067)
+    // asm: call HouseClass_PrerequisiteIsAvailable
     //  不了还没解锁的东西。
     if (!this->PrerequisiteIsAvailable(pType)) {
         return true;
     }
 
-    // asm: char __thiscall HouseClass_DoInfantrySelfHeal(HouseClass *this)   (asm:594067)
+    // asm: mov eax,[a2+TechLevel]; cmp eax,[this+TechLevel]; jg -> 1
     if (pType->TechLevel > this->TechLevel) {
         return true;
     }
 
-    // asm: char __thiscall HouseClass_DoInfantrySelfHeal(HouseClass *this)   (asm:594067)
+    // asm: [a2+BuildLimit] > 0 且 CountOwnedNow >= BuildLimit -> 1
     if (pType->BuildLimit > 0 && this->CountOwnedNow(pType) >= pType->BuildLimit) {
         return true;
     }
@@ -5013,8 +5774,11 @@ bool HouseClass::SendSpyPlane(const CellStruct& target)
 
 bool HouseClass::CreateAirstrike(const CellStruct& target)
 {
-    // asm: void __thiscall HouseClass_UpdateFlagCoords(HouseClass_old *this, _ObjectClass *unit, int x)   (asm:559477)
-    //  冷却未过不能重复呼叫。
+    // 项目侧简化：只保留"雷达在线 + 冷却"两道门。
+    // 原版 asm HouseClass_CreateAirstrike (asm:1253589) 是 9 参函数
+    //   (House, idxAircraftType, a3, a4, sourceCell, a6, idxPassenger,
+    //    cntPassenger, Airstrike*)：要建 AirstrikeClass、挑机场、扣弹药，
+    //   本树尚未建模这些原语，故不冒充原版语义。
     if (!this->RadarVisible) {
         return false;
     }
@@ -5033,27 +5797,91 @@ bool HouseClass::CreateAirstrike(const CellStruct& target)
 }
 
 // ============================================================================
-// asm: void __thiscall HouseClass_UpdateFlagCoords(HouseClass_old *this, _ObjectClass *unit, int x)   (asm:559477)
+// asm: char __thiscall HouseClass_UpdateFlagCoords(HouseClass_old *this,
+//                                                  _ObjectClass *unit, int x)
+//      (asm:559477)
 //
-//  刷新本阵营"旗帜/指挥中心"在地图上的位置：当基地中心发生变化（新造了
-//  建筑、原有建筑被拆）时，把旗子重新挂到新的基地中心格上，让玩家一眼看到
-//  自己的基地在哪。基地不存在时把旗子收起来。
+//   unit 为空 → 返回 0。
+//   unit->WhatAmI()==1（载具）：
+//       bl = unit->DropFlag();   // UnitClass_DropFlag (asm:1696504)
+//   unit 不是载具：
+//       coords = unit->GetCoords(); X >>= 8; Y >>= 8;
+//       if (!Map.In_Radar(coords)) → 返回 0
+//       bl = cell->FlagPickedUp();  // CellClass_FlagPickedUp (asm:300382)
+//   若 bl 为真且 this->ObjectWithOurFlag == unit → ObjectWithOurFlag = 0。
+//   最后 x（第三参）非零时：若 FlagCoords 不是默认离子炮坐标，就把旧格子的
+//   旗主槽（asm [cell+44h]）置 -1，并把 FlagCoords 复位为默认值。
+// ============================================================================
+bool HouseClass::UpdateFlagCoords(TechnoClass* pUnit, int32 what)
+{
+    if (pUnit == nullptr)
+        return false;
+
+    bool dropped = false;
+
+    if (pUnit->WhatAmI() == AbstractType::Unit)
+    {
+        dropped = static_cast<UnitClass*>(pUnit)->DropFlag();
+        if (dropped && this->ObjectWithOurFlag == pUnit)
+            this->ObjectWithOurFlag = nullptr;
+    }
+    else
+    {
+        CoordStruct coords;
+        pUnit->GetCoords(&coords);
+
+        CellStruct cell;
+        cell.X = static_cast<int16>(coords.X >> 8);
+        cell.Y = static_cast<int16>(coords.Y >> 8);
+
+        if (TheMap != nullptr && TheMap->In_Radar(cell, false))
+        {
+            CellClass* pCell = TheMap->GetCellAt(cell);
+            if (pCell != nullptr)
+            {
+                dropped = pCell->Flag_Picked_Up();
+                if (dropped && this->ObjectWithOurFlag == pUnit)
+                    this->ObjectWithOurFlag = nullptr;
+            }
+        }
+    }
+
+    // asm: test byte ptr [esp+..x], 1 / jz 结束
+    if (what != 0)
+    {
+        const bool atDefault =
+            (this->FlagCoords.X == DefaultIonCannon_Coords.X &&
+             this->FlagCoords.Y == DefaultIonCannon_Coords.Y);
+
+        if (!atDefault)
+        {
+            if (TheMap != nullptr)
+            {
+                CellClass* pOld = TheMap->GetCellAt(this->FlagCoords);
+                if (pOld != nullptr)
+                    pOld->WallOwner = -1;      // asm: mov dword ptr [eax+44h], -1
+            }
+            this->FlagCoords = DefaultIonCannon_Coords;
+        }
+    }
+
+    return dropped;
+}
+
+// ============================================================================
+// 项目侧辅助：基地中心格变化时同步 BaseSpawnCell（无 asm 对应）
 // ============================================================================
 void HouseClass::UpdateFlagCoords()
 {
-    // asm: HouseClass_RegisterTechnoGain_PrereqCounters
     if (this->OwnedConyards.GetCount() <= 0) {
         return;
     }
 
-    // asm: HouseClass_RegisterTechnoGain_PrereqCounters
     const CellStruct centre = this->GetBaseCenterCell();
     if (!TheMap->IsValidCell(centre.X, centre.Y)) {
         return;
     }
 
-    // asm: HouseClass_RegisterTechnoGain_PrereqCounters
-    //  重新推算。
     this->BaseSpawnCell = centre;
 }
 
@@ -5061,8 +5889,9 @@ void HouseClass::UpdateFlagCoords()
 // asm: char __thiscall HouseClass::Flag_Attach(HouseClass_old *this,
 //                                              _ObjectClass *a2, int what)
 //   a2 为空或仍在 limbo（尚未落位）时直接返回假。否则：
-//     1. UpdateFlagCoords(this, ObjectWithOurFlag, what) —— 旧旗主收旗；
-//     2. a2->PickUpFlag(this->Type->idxCountry)          —— 新旗主举旗；
+//     1. HouseClass_UpdateFlagCoords(this, ObjectWithOurFlag, what)
+//        —— 让旧旗主把旗子放下（asm:559477）；
+//     2. a2->PickUpFlag(this->Country->idxCountry) —— 新旗主举旗；
 //     3. ObjectWithOurFlag = a2；返回真。
 // ============================================================================
 bool HouseClass::Flag_Attach(TechnoClass* pObject, int32 what)
@@ -5072,8 +5901,9 @@ bool HouseClass::Flag_Attach(TechnoClass* pObject, int32 what)
     if (pObject->IsInLimbo)
         return false;
 
-    (void)what;
-    this->UpdateFlagCoords();
+    // asm: push x / push [this+ObjectWithOurFlag] / call UpdateFlagCoords
+    //   —— 让旧旗主先放旗；what 非零时顺带清掉旧旗格的旗标。
+    this->UpdateFlagCoords(this->ObjectWithOurFlag, what);
 
     const int32 houseIndex = (this->Type != nullptr)
         ? this->Type->GetArrayIndex() : -1;
@@ -5143,28 +5973,170 @@ void HouseClass::RegisterObjectGain_FromFactory(TechnoClass* pTechno)
     //  各类追踪列表，这样后续的资产统计、重建与 AI 决策才能看到它。
     this->RegisterTechnoGain_PrereqCounters(pTechno);
 
+    // ★ 幂等登记。
+    //   工厂产品的落位走 Unlimbo，Unlimbo 尾部已经调过 RegisterTechnoGain
+    //   把这些对象挂进 Owned* 表；这里再无条件 Add 一次就会让**同一个对象
+    //   在表里出现两次**（实测一座兵营/电厂各占两格，blds 虚高一半）。
+    //   后果不只是统计失真：AI 的"已有该类型就不再建"判断、精炼厂计数、
+    //   电厂计数全部被翻倍，建造清单也就跟着错。
+    //   Ever 计数不受影响（那是"历史累计造过多少"，本就每次 +1）。
+    auto alreadyIn = [pTechno](auto& vec) -> bool
+    {
+        for (int32 i = 0; i < vec.GetCount(); ++i)
+        {
+            if (static_cast<TechnoClass*>(vec[i]) == pTechno)
+                return true;
+        }
+        return false;
+    };
+
     switch (pTechno->WhatAmI()) {
         case AbstractType::Building:
-            this->OwnedBuildings.Add(reinterpret_cast<BuildingClass*>(pTechno));
+            if (!alreadyIn(this->OwnedBuildings))
+                this->OwnedBuildings.Add(reinterpret_cast<BuildingClass*>(pTechno));
             break;
         case AbstractType::Infantry:
-            this->OwnedInfantry.Add(reinterpret_cast<InfantryClass*>(pTechno));
+            if (!alreadyIn(this->OwnedInfantry))
+                this->OwnedInfantry.Add(reinterpret_cast<InfantryClass*>(pTechno));
             break;
         case AbstractType::Aircraft:
-            this->OwnedAircraft.Add(reinterpret_cast<AircraftClass*>(pTechno));
+            if (!alreadyIn(this->OwnedAircraft))
+                this->OwnedAircraft.Add(reinterpret_cast<AircraftClass*>(pTechno));
             break;
         case AbstractType::Unit:
-            this->OwnedUnits.Add(reinterpret_cast<UnitClass*>(pTechno));
+            if (!alreadyIn(this->OwnedUnits))
+                this->OwnedUnits.Add(reinterpret_cast<UnitClass*>(pTechno));
             break;
         default:
             break;
     }
 
-    this->AllOwnedObjects.Add(pTechno);
+    if (!alreadyIn(this->AllOwnedObjects))
+        this->AllOwnedObjects.Add(pTechno);
 }
 
 // ============================================================================
-// asm: void __thiscall HouseClass_UnitFromFactory(HouseClass_old *this, int abstractID, int idx, char arg8, int a5)   (asm:557778)
+// RegisterTechnoGain —— 对象落位时把它挂进本阵营的 Owned* 向量。
+//
+//   asm: TechnoClass_Unlimbo 尾部（HouseClass::RegisterTechnoGain 语义）
+//
+//   与 RegisterObjectGain_FromFactory 的区别：那个是**工厂出货**出口，会
+//   额外累加 "Ever" 计数；本函数只做"把对象挂进追踪表"，由 Unlimbo 调用，
+//   覆盖所有落位路径（起始单位、MCV 展开、地图预置、工厂出货）。
+//
+//   幂等：同一对象已在表里时不重复 Add —— 工厂产品既走 Unlimbo 又走
+//   FromFactory，两处都会碰到这些向量。
+// ============================================================================
+void HouseClass::RegisterTechnoGain(TechnoClass* pTechno)
+{
+    if (pTechno == nullptr)
+        return;
+
+    auto alreadyIn = [pTechno](auto& vec) -> bool
+    {
+        for (int32 i = 0; i < vec.GetCount(); ++i)
+            if (vec[i] == pTechno) return true;
+        return false;
+    };
+
+    switch (pTechno->WhatAmI()) {
+        case AbstractType::Building:
+        {
+            BuildingClass* pBuilding = reinterpret_cast<BuildingClass*>(pTechno);
+            // ★ 入表的同时维护"现存/逐类型"计数。
+            //   asm 的 RegisterObjectGain 会同时改 vec + 计数；只挂列表不记数，
+            //   则 HouseClass::CountOwnedNow 恒 0 —— AITriggerTypeClass 的
+            //   HouseOwns 条件因此永远判 false，整张触发器表单废。
+            if (!alreadyIn(OwnedBuildings)) {
+                OwnedBuildings.Add(pBuilding);
+                if (pBuilding->Type != nullptr) {
+                    const int32 tidx = pBuilding->Type->GetArrayIndex();
+                    if (tidx >= 0 && tidx < MaxTypeCounts)
+                        ++OwnedBuildingTypeCounts[tidx];
+                }
+                ++OwnedBuildingCount;
+                ++BuildingCount;
+            }
+
+            // ── 建造场登记 ────────────────────────────────────────────────
+            //   asm: BuildingClass_Captured / Unlimbo 里按 Rules->BuildConst
+            //   命中后 `vec_Conyards.Add(this)`。这是 AcquiredConyard 的前置：
+            //   AI_Building 的第一道门就是 OwnedConyards.Count > 0。
+            if (pBuilding->Type != nullptr)
+            {
+                bool isConYard = pBuilding->Type->IsConstructionYard;
+                if (!isConYard && RulesClass::Instance != nullptr)
+                {
+                    for (int32 i = 0; i < RulesClass::Instance->BuildConst.Count; ++i)
+                    {
+                        if (RulesClass::Instance->BuildConst[i] == pBuilding->Type) {
+                            isConYard = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isConYard)
+                {
+                    bool listed = false;
+                    for (int32 i = 0; i < OwnedConyards.GetCount(); ++i)
+                        if (OwnedConyards[i] == pBuilding) { listed = true; break; }
+                    if (!listed)
+                    {
+                        OwnedConyards.Add(pBuilding);
+                        AcquiredConyard(pBuilding);
+                    }
+                }
+            }
+            break;
+        }
+        case AbstractType::Infantry:
+            if (!alreadyIn(OwnedInfantry)) {
+                OwnedInfantry.Add(reinterpret_cast<InfantryClass*>(pTechno));
+                if (pTechno->TechnoType != nullptr) {
+                    const int32 tidx = pTechno->TechnoType->GetArrayIndex();
+                    if (tidx >= 0 && tidx < MaxTypeCounts)
+                        ++OwnedInfantryTypeCounts[tidx];
+                }
+                ++OwnedInfantryCount;
+                ++InfantryCount;
+            }
+            break;
+        case AbstractType::Aircraft:
+            if (!alreadyIn(OwnedAircraft)) {
+                OwnedAircraft.Add(reinterpret_cast<AircraftClass*>(pTechno));
+                if (pTechno->TechnoType != nullptr) {
+                    const int32 tidx = pTechno->TechnoType->GetArrayIndex();
+                    if (tidx >= 0 && tidx < MaxTypeCounts)
+                        ++OwnedAircraftTypeCounts[tidx];
+                }
+                ++OwnedAircraftCount;
+                ++AircraftCount;
+            }
+            break;
+        case AbstractType::Unit:
+            if (!alreadyIn(OwnedUnits)) {
+                OwnedUnits.Add(reinterpret_cast<UnitClass*>(pTechno));
+                if (pTechno->TechnoType != nullptr) {
+                    const int32 tidx = pTechno->TechnoType->GetArrayIndex();
+                    if (tidx >= 0 && tidx < MaxTypeCounts)
+                        ++OwnedUnitTypeCounts[tidx];
+                }
+                ++OwnedUnitCount;
+                ++UnitCount;
+            }
+            break;
+        default:
+            break;
+    }
+
+    bool allListed = false;
+    for (int32 i = 0; i < AllOwnedObjects.GetCount(); ++i)
+        if (AllOwnedObjects[i] == pTechno) { allListed = true; break; }
+    if (!allListed)
+        AllOwnedObjects.Add(pTechno);
+}
+
 //
 //  工厂完成一件产品时的统一出口：先给对象指定归属、把它送到工厂的集结点，
 //  再把这一"已获得"的事实登记进阵营的各种计数。返回真表示交接成功。
@@ -5685,6 +6657,84 @@ TechnoTypeClass* HouseClass::FirstBuildableTechno_FromVector(DynamicVectorClass<
 }
 
 // ----------------------------------------------------------------------------
+// asm HouseClass_FirstBuildableTechno_FromVector (0x505180, retn 4)
+//   同一函数在 BuildingTypeClass* 向量上的入口。过滤顺序与原版一致：
+//     Owners 位 -> RequiredHouses -> ForbiddenHouses -> AIBasePlanningSide
+//     -> gSWAllowed 超武白名单（Rules.BuildTech）/ DisableableFromShell
+// ----------------------------------------------------------------------------
+BuildingTypeClass* HouseClass::FirstBuildableBuilding_FromVector(DynamicVectorClass<BuildingTypeClass*>* pList)
+{
+    if (pList == nullptr || Type == nullptr)
+        return nullptr;
+
+    RulesClass* const pRules = RulesClass::Instance;
+
+    // asm: mov ecx,[ebp+34h]; add ecx,98h; call HouseTypeClass::From_Name
+    const int32 ownerBit = 1 << (HouseTypeClass::From_Name(Type->ParentCountry) & 0x1F);
+
+    // asm: [Type+HouseTypeClass.indexInArray] -> 1 << idx
+    int32 houseTypeIndex = Type->GetArrayIndex();
+    if (houseTypeIndex < 0)
+        houseTypeIndex = 0;
+    const int32 houseTypeBit = 1 << (houseTypeIndex & 0x1F);
+
+    for (int32 i = 0; i < pList->Count; ++i)
+    {
+        BuildingTypeClass* pType = (*pList)[i];
+        if (pType == nullptr)
+            continue;
+
+        if ((pType->GetOwners() & ownerBit) == 0)
+            continue;
+
+        if (pType->RequiredHouses != -1 && (pType->RequiredHouses & houseTypeBit) == 0)
+            continue;
+
+        if (pType->ForbiddenHouses != -1 && (pType->ForbiddenHouses & houseTypeBit) != 0)
+            continue;
+
+        if (pType->AIBasePlanningSide != -1 && pType->AIBasePlanningSide != Type->Side)
+            continue;
+
+        // asm loc_505288..loc_5052C1：超武禁用检查
+        if (!gSWAllowed && pType->SuperWeapon != -1)
+        {
+            bool whitelisted = false;
+            if (pRules != nullptr)
+            {
+                for (int32 k = 0; k < pRules->BuildTech.Count; ++k)
+                {
+                    if (pRules->BuildTech[k] == pType)
+                    {
+                        whitelisted = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!whitelisted)
+            {
+                SuperClass* pSW = nullptr;
+                if (SuperWeapons != nullptr && pType->SuperWeapon >= 0
+                    && pType->SuperWeapon < SuperWeapons->Count)
+                {
+                    pSW = (*SuperWeapons)[pType->SuperWeapon];
+                }
+                if (pSW != nullptr && pSW->Type != nullptr
+                    && pSW->Type->DisableableFromShell)
+                {
+                    continue;
+                }
+            }
+        }
+
+        return pType;
+    }
+
+    return nullptr;
+}
+
+// ----------------------------------------------------------------------------
 // asm HouseClass_FindFirstAccessibleTechnoTypeFromArray (0x505320, retn 4):
 //   遍历向量，返回第一个 Owners 位含本阵营（按 Type->ParentCountry 注册号）
 //   的类型。
@@ -5837,18 +6887,54 @@ bool HouseClass::CanSeePsiWarning()
 
 void HouseClass::ActivateBaseBuilding(BuildingClass* pBuilding)
 {
-    // asm: HouseClass_AcquiredConyard
+    // asm: HouseClass_ActivateBaseBuilding (0x591081)
+    //   把刚激活的基地建筑派进驻守使命。
     if (pBuilding) {
         pBuilding->QueueMission(Mission::Guard);
     }
 }
 
+// ============================================================================
+// asm: void __thiscall HouseClass_AcquiredConyard(HouseClass *this)
+//      (asm:577700, retn 0)
+//
+//  首次拿到建造厂时生成 AI 建造清单：
+//    * Is_Human() 为假且处于会话中 -> Computer_Paranoid()（多人 AI 互斗初始化）
+//    * 本房基地节点表为空 -> 临时把 ScenarioInit 清零，跑 GenerateAIBuildList，
+//      再恢复
+// ============================================================================
 void HouseClass::AcquiredConyard(BuildingClass* pConyard)
 {
-    // asm: HouseClass_IonCannonFire
-    if (pConyard) {
-        pConyard->Captured(this);
+    (void)pConyard;
+
+    const bool isHuman = Is_Human();
+    if (!isHuman && SessionClass::GetInstance() != nullptr)
+    {
+        // asm: call HouseClass::Computer_Paranoid
+        //   本树未实现该函数：它需要 GlobalMPGameModeClass 的虚函数槽与
+        //   Scenario->TeamsPresent，用来在多人局开局把非人类 AI 房两两设为
+        //   敌对/结盟。缺失它不影响单人局与 AI 建造清单，故此处如实留空。
     }
+
+    // asm: mov eax,[this+Base.vec_Nodes.length] / test / jnz ret
+    if (Base.NodeCount != 0)
+        return;
+
+#if defined(PLATFORM_LINUX)
+    if (g_bDebugMode)
+    {
+        fprintf(stderr, "[GAME] AcquiredConyard: house %d, first base -> AI build list\n",
+                ArrayIndex);
+        fflush(stderr);
+    }
+#endif
+
+    // asm: edi = ScenarioInit; ScenarioInit = 0; call GenerateAIBuildList;
+    //      ScenarioInit = edi
+    const int32 savedInit = ScenarioInit;
+    ScenarioInit = 0;
+    GenerateAIBuildList();
+    ScenarioInit = savedInit;
 }
 
 void HouseClass::IonCannonFire(const CellStruct& target)
@@ -5960,20 +7046,92 @@ void HouseClass::CreateParadrop(const CellStruct& target)
     Fire_Paradrop();
 }
 
-CellStruct HouseClass::GetPlanningWaypointAt(int32 index)
+// ============================================================================
+// asm: WaypointClass *__thiscall HouseClass_GetPlanningWaypointAt(HouseClass_old *this, wXY *a2)   (asm:571977)
+//
+//   5023A5  mov ebp, [a2]              ; a2 = 目标节点（WaypointClass*，单位 lepton）
+//   5023B3  lea ebx, [ecx+210h]        ; 第 0 条路线的槽位
+//   5023C5  cmp dword ptr [ebx], 0
+//           为 0 就 new 一条 WaypointPathClass(idx) 填进槽位
+//   5023E6  mov ecx, [ebx]
+//   5023E9  mov eax, [ecx+38h]         ; 节点数
+//   5023F1  push edi ; call WaypointPathClass_GetWaypoint
+//           eax = waypoint->X ; /256（算术右移 8 位，负数向零取整）
+//           eax = waypoint->Y ; /256
+//           cmp cx, [ebp] ; cmp ax, [ebp+2]   ; 与目标格比较
+//           命中 -> 直接返回该节点指针
+//   502430  槽位 +4，i++，直到 12 条全部走完；都不命中返回 0
+//
+//   注意：asm 在扫描前会先 new 出一条空路线，等价于本工程的
+//   CreateWaypointPath(i)，副作用（新建空路线）与原版一致。
+// ============================================================================
+const CellStruct* HouseClass::GetPlanningWaypointAt(const CellStruct& cell)
 {
-    // asm: char __thiscall HouseClass_GetPlanningWaypointProperties(HouseClass_old *this, WaypointClass *a2, int *idxPath, byte *idxWP)   (asm:572099)
-    if (index < 0 || index >= PlanningWaypointCoordCount) {
-        return CellStruct(0, 0);
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        if (PlanningWaypoints[i] == nullptr) {
+            CreateWaypointPath(i);
+        }
+
+        WaypointPathClass* pPath = PlanningWaypoints[i];
+        if (pPath == nullptr) {
+            continue;
+        }
+
+        const int32 count = pPath->GetWaypointCount();
+        for (int32 j = 0; j < count; ++j) {
+            const CellStruct* pNode = pPath->GetWaypoint(j);
+            if (pNode != nullptr && pNode->X == cell.X && pNode->Y == cell.Y) {
+                return pNode;
+            }
+        }
     }
-    return PlanningWaypointCoords[index];
+
+    return nullptr;
 }
 
-int32 HouseClass::GetPlanningWaypointProperties(int32 index)
+// ============================================================================
+// asm: char __thiscall HouseClass_GetPlanningWaypointProperties(HouseClass_old *this, WaypointClass *a2, int *idxPath, byte *idxWP)   (asm:572100)
+//
+//   与 GetPlanningWaypointAt 同一套 12 路 × 逐节点扫描，只是把命中的位置
+//   输出到两个出参里：
+//     命中 : *idxPath = 路线号（dword），*idxWP = 节点号（byte），返回 1
+//     未命中: *idxPath = -1，*idxWP = 0，返回 0
+//   asm 的出口是 loc_5024D1（命中）/ loc_5024AE（未命中扫完）。
+// ============================================================================
+bool HouseClass::GetPlanningWaypointProperties(const CellStruct& cell, int32* idxPath, uint8* idxWP)
 {
-    // asm: void __thiscall HouseClass_AcquiredThreatNode(HouseClass_old *this)   (asm:584985)
-    (void)index;
-    return 0;
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        if (PlanningWaypoints[i] == nullptr) {
+            CreateWaypointPath(i);
+        }
+
+        WaypointPathClass* pPath = PlanningWaypoints[i];
+        if (pPath == nullptr) {
+            continue;
+        }
+
+        const int32 count = pPath->GetWaypointCount();
+        for (int32 j = 0; j < count; ++j) {
+            const CellStruct* pNode = pPath->GetWaypoint(j);
+            if (pNode != nullptr && pNode->X == cell.X && pNode->Y == cell.Y) {
+                if (idxPath != nullptr) {
+                    *idxPath = i;
+                }
+                if (idxWP != nullptr) {
+                    *idxWP = static_cast<uint8>(j);
+                }
+                return true;
+            }
+        }
+    }
+
+    if (idxPath != nullptr) {
+        *idxPath = -1;
+    }
+    if (idxWP != nullptr) {
+        *idxWP = 0;
+    }
+    return false;
 }
 
 void HouseClass::AcquiredThreatNode(const CellStruct& cell)
@@ -6571,31 +7729,69 @@ TechnoTypeClass* HouseClass::GetTechnoToProduce(AbstractType technoKind)
 
 void HouseClass::DroppedFlag()
 {
-    // asm: void __thiscall HouseClass_CreateWaypointPath(HouseClass_old *this, int idxPath)   (asm:576504)
+    // 项目侧简化：原版 asm HouseClass_DroppedFlag (asm:559619) 是
+    //   (wXY* coords, UnitClass* object)：In_Radar 通过后先让旧旗主放旗，
+    //   再在落点格调 CellClass_FlagPlaced；失败时用 MapClass::Nearby_Location
+    //   重试一次，成功后把 +0x53DC 直接写成 **格子指针**（不是单位指针）。
+    //
+    //   本项目的 ObjectWithOurFlag 声明为 TechnoClass*，装不下格子指针；
+    //   在把该槽改成"可同时承载单位/格子的通用指针"之前，这里不做半截实现，
+    //   只保留基地中心重算。
     UpdateFlagCoords();
 }
 
-void HouseClass::CreateWaypointPath(const CellStruct& from, const CellStruct& to)
+// ============================================================================
+// asm: void __thiscall HouseClass_CreateWaypointPath(HouseClass_old *this, int idxPath)   (asm:576504)
+//
+//   50475C  mov esi, [a2]                 ; idxPath
+//   504763  mov eax, [edi+esi*4+210h]
+//   50476A  test eax, eax ; jnz 返回        ; 槽位已有对象就什么都不做
+//           否则 new WaypointPathClass(idxPath) 后写回槽位（new 失败写 0）
+//
+//   注意：这里是"保证存在"，既不建节点也不动 +20Ch 游标。
+// ============================================================================
+void HouseClass::CreateWaypointPath(int32 idxPath)
 {
-    // asm: signed int __fastcall HouseClass_CreateWaypointPath2(HouseClass_old *this)   (asm:584877)
-    (void)from;
-    if (PlanningWaypointCoordCount < 8) {
-        PlanningWaypointCoords[PlanningWaypointCoordCount++] = to;
+    if (idxPath < 0 || idxPath >= MaxPlanningPaths) {
+        return;
     }
+
+    if (PlanningWaypoints[idxPath] != nullptr) {
+        return;
+    }
+
+    // asm: WaypointPathClass_CTOR(this, idxPath)
+    PlanningWaypoints[idxPath] = new WaypointPathClass(idxPath);
 }
 
-void HouseClass::CreateWaypointPath2(const CellStruct& from, const CellStruct& to, int32 hop)
+// ============================================================================
+// asm: signed int __fastcall HouseClass_CreateWaypointPath2(HouseClass_old *this)   (asm:584877)
+//
+//   5090A5  xor esi, esi ; lea edi, [ecx+210h]
+//   5090AA  mov eax, [edi]
+//           为 0 就 new 一条 —— 注意这里走的是 WaypointPathClass_DCTOR
+//           （无参那条构造：一律登记进 vec_WaypointPaths，不看槽位号是否合法）
+//   5090C9  mov ecx, [eax+38h] ; test ecx, ecx
+//           节点数为 0 -> 这就是要的空槽位，返回 esi
+//           否则 inc esi / add edi,4 / cmp esi,0Ch / jl 继续
+//   抛完 12 条仍没空位 -> 返回 -1
+// ============================================================================
+int32 HouseClass::CreateWaypointPath2()
 {
-    // asm: int __thiscall HouseClass_Update_AI_Production(HouseClass_old *this, int)   (asm:585803)
-    if (hop <= 0) hop = 1;
-    int32 dx = (to.X > from.X ? 1 : (to.X < from.X ? -1 : 0));
-    int32 dy = (to.Y > from.Y ? 1 : (to.Y < from.Y ? -1 : 0));
-    CellStruct cur = from;
-    while ((cur.X != to.X || cur.Y != to.Y) && PlanningWaypointCoordCount < 8) {
-        cur.X += dx * hop;
-        cur.Y += dy * hop;
-        PlanningWaypointCoords[PlanningWaypointCoordCount++] = cur;
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        if (PlanningWaypoints[i] == nullptr) {
+            // asm 先建再判空：新建出来的节点数必然是 0，于是直接命中该槽位。
+            // 原版走的是无参构造（无条件登记），故这里传 -1 表示"不校验槽位号"。
+            PlanningWaypoints[i] = new WaypointPathClass(-1);
+        }
+
+        WaypointPathClass* pPath = PlanningWaypoints[i];
+        if (pPath != nullptr && pPath->GetWaypointCount() == 0) {
+            return i;
+        }
     }
+
+    return -1;
 }
 
 // ============================================================================
@@ -6741,8 +7937,22 @@ void HouseClass::Fire_GenMutator(int32 a3)
 }
 
 // ------------------------------------------------------------------------
-// asm: HouseClass_ClickWaypoint_unused
-// 追加节点；链尾命中既有节点时报告成功。
+// asm: void __thiscall HouseClass_ClickWaypoint_unused(HouseClass_old *this, WaypointClass *wpt)   (asm:571653)
+//
+//   50217B  先把 wpt 的两个 lepton 坐标 /256 变成格坐标
+//   502196  lea ebp, [ecx+210h]            ; 槽位基址
+//   50219F  cmp [ebp], 0 -> 为 0 先 new 出这条路线
+//   （内层）逐节点比格坐标：
+//           命中且 命中路线号 == [this+20Ch]  -> 继续扫（loc_502211）
+//           命中且 命中路线号 != [this+20Ch]  -> 直接返回（loc_50227C）
+//   外层走完 12 条后：
+//   502233  eax = [edi+20Ch]               ; 当前槽位
+//           槽位为空则 new 出一条（无参构造）
+//   502265  WaypointPathClass_AddWaypoint(当前路线, wpt)
+//
+//   返回值：asm 的两条出口都没有显式写 al，调用方也不看返回值。本工程按控制流
+//   给出语义：真正把节点追加进去了返回 true；因为"该格已属于别的路线"而提前
+//   放弃返回 false。这一点是**推断**，不是 asm 的直接证据。
 // ------------------------------------------------------------------------
 bool HouseClass::ClickWaypoint_unused(const CoordStruct* pPos)
 {
@@ -6750,10 +7960,47 @@ bool HouseClass::ClickWaypoint_unused(const CoordStruct* pPos)
         return false;
     }
 
-    CellStruct cell;
-    cell.X = static_cast<int16>((pPos->X + (pPos->X < 0 ? 255 : 0)) >> 8);
-    cell.Y = static_cast<int16>((pPos->Y + (pPos->Y < 0 ? 255 : 0)) >> 8);
-    return cell.X >= 0 && cell.Y >= 0;
+    // asm: (v + (v >> 31 & 0xFF)) >> 8，即算术右移 8 位 —— 与 Coord2Cell 等价。
+    const CellStruct cell = CellClass::Coord2Cell(*pPos);
+
+    for (int32 i = 0; i < MaxPlanningPaths; ++i) {
+        if (PlanningWaypoints[i] == nullptr) {
+            CreateWaypointPath(i);
+        }
+
+        WaypointPathClass* pPath = PlanningWaypoints[i];
+        if (pPath == nullptr) {
+            continue;
+        }
+
+        const int32 count = pPath->GetWaypointCount();
+        for (int32 j = 0; j < count; ++j) {
+            const CellStruct* pNode = pPath->GetWaypoint(j);
+            if (pNode != nullptr && pNode->X == cell.X && pNode->Y == cell.Y) {
+                // asm: cmp 路线号, [this+20Ch] ; jnz -> 返回
+                if (i != NextPlanningWaypointSlot) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // asm: 当前槽位没建就先建一条，然后追加节点。
+    const int32 slot = NextPlanningWaypointSlot;
+    if (slot < 0 || slot >= MaxPlanningPaths) {
+        return false;
+    }
+
+    if (PlanningWaypoints[slot] == nullptr) {
+        PlanningWaypoints[slot] = new WaypointPathClass(-1);
+    }
+
+    if (PlanningWaypoints[slot] == nullptr) {
+        return false;
+    }
+
+    PlanningWaypoints[slot]->AddWaypoint(cell);
+    return true;
 }
 
 // ------------------------------------------------------------------------
@@ -6863,8 +8110,11 @@ bool HouseClass::Can_Produce_Type(TechnoTypeClass* pType) const
     }
 
     // asm: test [eax+_TechnoTypeClass.t.Owners], houseBit
+    //   houseBit 取自房类型自己的注册序号（原版 [Type+idxInArray]），
+    //   不是按 ParentCountry 名字回查 —— 兜底规则集里 ParentCountry 常为空，
+    //   From_Name 会返回 -1，`1 << -1` 是 UB，Owner 掩码比对随之失效。
     if (Type != nullptr) {
-        const int32 ownerBit = 1 << HouseTypeClass::From_Name(Type->ParentCountry);
+        const int32 ownerBit = 1 << (Type->GetArrayIndex() & 0x1F);
         if ((pType->GetOwners() & ownerBit) == 0) {
             return false;
         }
@@ -6910,6 +8160,12 @@ void HouseClass::AI_Building()
     }
 
     // asm: node->pType 索引 -> BuildingTypeClass::Vector[.]。
+    //
+    //   ★ 原版节点里存的是**数组下标**；本工程的 BaseNodeClass::pType 是
+    //     BuildingTypeClass*（GenerateAIBuildList ⑦ 段写的是指针）。若照
+    //     原版当索引用，`typeIndex >= Array->Count` 永远成立 —— AI_Building
+    //     每次都在这里静默返回，AI 有清单却永不下单。指针分支优先，小整数
+    //     再按旧式下标解释，两种编码都能吃。
     const intptr_t raw = reinterpret_cast<intptr_t>(pNode->pType);
 
     // asm buildingtype_idx_neg / cmp eax,-3:
@@ -6927,15 +8183,48 @@ void HouseClass::AI_Building()
     if (raw < 0) {
         return;
     }
-    const int32 typeIndex = static_cast<int32>(raw);
 
-    if (BuildingTypeClass::Array == nullptr
-        || typeIndex >= BuildingTypeClass::Array->Count) {
-        return;
+    BuildingTypeClass* pType = nullptr;
+    if (raw > 0x10000) {
+        // 指针编码（本工程实际写入的形态）。
+        pType = pNode->pType;
     }
-    BuildingTypeClass* pType = BuildingTypeClass::Array->GetItem(typeIndex);
+    else {
+        // 旧式下标编码。
+        const int32 typeIndex = static_cast<int32>(raw);
+        if (BuildingTypeClass::Array != nullptr
+            && typeIndex < BuildingTypeClass::Array->Count) {
+            pType = BuildingTypeClass::Array->GetItem(typeIndex);
+        }
+    }
     if (pType == nullptr) {
         return;
+    }
+
+    // ---- 建造场唯一性 ---------------------------------------------------
+    //   Base 清单里通常写着多座 GACNST（GenerateAIBuildList 按 BuildConst 的
+    //   需求预算铺节点），但"开分基地"在原版走的是 BaseClass::CreateBase +
+    //   AI 的分基地决策，本树还没有那条链。若不拦，AI 会在主基地里再造一座
+    //   建造场（实测 cy=2），既吃地盘也吃钱，还把基地节点挤乱。
+    //   这里按"本房已有建造场就不再下单"处理：该节点从 Base 里摘掉，下一帧
+    //   自然轮到后面的节点。
+    if (pType->ConstructionYard) {
+        bool hasConyard = false;
+        for (int32 i = 0; i < OwnedBuildings.Count; ++i) {
+            BuildingClass* pB = OwnedBuildings[i];
+            if (pB != nullptr && !pB->IsDead() && pB->Type != nullptr
+                && pB->Type->ConstructionYard) {
+                hasConyard = true;
+                break;
+            }
+        }
+        if (hasConyard) {
+            const int32 nodeIdx = Base.Find_Node(pNode->pType, pNode->Cell);
+            if (nodeIdx >= 0) {
+                Base.Remove_Node(nodeIdx);
+            }
+            return;
+        }
     }
 
     // asm: 海军建筑在无海军场时跳过。

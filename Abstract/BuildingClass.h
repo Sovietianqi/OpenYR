@@ -291,6 +291,18 @@ public:
     virtual void MissionAttack();
     virtual void MissionGuard();
     virtual void MissionSleep();
+    // ★ 任务分派槽（MissionClass::ExecuteMission 的 32 路函数指针表以
+    //   `(this->*handler)()` 做虚分派，落点就是基类这四个槽）。
+    //
+    //   原先本类只写了 MissionConstruction() / MissionRepair()（无下划线、void），
+    //   它们不在 MissionClass 的虚表里，于是 ExecuteMission 只能落到基类空实现：
+    //     · MCV 展开（UnitClass 下 Construction）之后建筑永远建不成；
+    //     · 选中建筑点修理没有任何反应。
+    //   这两个覆写接上了分派；下面两个同名旧槽**必须保留**——它们是本类
+    //   自己的虚表槽位，删掉会让其后所有虚函数槽号整体前移，任何按固定
+    //   偏移调用 vtable 的代码都会错位（实测画面直接全黑）。
+    virtual int32 Mission_Construction() override;
+    virtual int32 Mission_Repair() override;
     virtual void MissionConstruction();
     virtual void MissionSelling();
     virtual void MissionRepair();
@@ -432,11 +444,13 @@ public:
     //
     //  The mirror of SaveToMapINIList: reads [Structures] back out of a scenario
     //  INI and rebuilds every placed structure.  Each record is
-    //  "owner,type,health,facing(x[,y]),mission,flags...,upgrades..." (the field
-    //  layout switches on NewINIFormat).  Returns the number of structures
-    //  successfully created.
+    //  "owner,type,health,x,y,facing,tag,..." (the field layout switches on
+    //  NewINIFormat).  Returns the number of structures successfully created.
+    //
+    //  ★ static：asm 里它不读 this（全程只访问 INI 与全局类型/阵营表），
+    //    场景装载时也没有"某座建筑"可以挂号调用。带 this 的声明是移植残留。
     // ------------------------------------------------------------------------
-    int32 CreateFromINIList(INIClass* pINI);
+    static int32 CreateFromINIList(INIClass* pINI);
 
  // BuildingClass_SaveToMapINI.  Serializes one structure's
     // placement record into the map INI under [Structures].
@@ -492,6 +506,17 @@ public:
     // 根据游戏行为，可知 Update_Factory 是工厂生产线的一帧推进入口。
     // ========================================================================
     void Update_Factory();
+
+    // ========================================================================
+    // Rollout_Product —— 把一件已完成的产品真正放到战场上
+    //
+    //  asm: BuildingClass_Update_Factory 的 discharge 段通过虚槽
+    //    vt_BuildingClass.vt.r.m.o.KickOutUnit(product, &coords) 完成落地，
+    //    返回值 0=没放成 / 1=单位类（走 900 帧出厂节流）/ 2=建筑类（立即）。
+    //    gamemd 里该槽的实体没有符号名（被 IDA 当成 sub_4x 段），本树按
+    //    语义重建为这个成员函数，返回值与调用点的分派完全对齐。
+    // ========================================================================
+    int32 Rollout_Product(TechnoClass* pProduct);
 
     // ========================================================================
     // asm: void __thiscall BuildingClass_Update_Repair(BuildingClass *this)
@@ -785,7 +810,7 @@ public:
     // House that owned this structure before it was mind-controlled away.
     // Set by HouseClass::MindControl_Base_Of and cleared by
     // HouseClass::Return_Control_Base_Of.
-    HouseClass*         OriginallyOwnedBy;             // +0x2E0
+    HouseClass*         OriginallyOwnedBy;             // +0x2E0（TechnoClass 结构名 0x2DC + vtable 4）
     bool                IsPrimaryFactory;              // primary factory for its type
     int32               BunkerState;                   // garrison state machine value
     int32               PrismStage;                    // prism charge state

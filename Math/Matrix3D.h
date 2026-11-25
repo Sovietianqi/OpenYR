@@ -32,9 +32,15 @@ public:
     // Construction
     //========================================================================
 
+    // asm: Matrix3D::Matrix3D (0x5AF000, ID 903395)
+    //     mov edx, 1.0 / xor eax,eax
+    //     [ecx]=edx [ecx+4]=0 [ecx+8]=0 [ecx+0Ch]=0
+    //     [ecx+10h]=0 [ecx+14h]=edx [ecx+18h]=0 [ecx+1Ch]=0
+    //     [ecx+20h]=0 [ecx+24h]=0 [ecx+28h]=edx [ecx+2Ch]=0
+    //   -> 默认构造是 **单位矩阵**（0/5/10 号槽 = 1.0），不是零矩阵。
     Matrix3D() noexcept
     {
-        std::memset(Data, 0, sizeof(Data));
+        MakeIdentity();
     }
 
     // Plain float constructor (row-major order)

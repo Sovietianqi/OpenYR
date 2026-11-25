@@ -124,7 +124,10 @@ public:
     // 一环或 Team 槽所指，则修正对应指针。
     virtual void PointerGotInvalid(AbstractClass* pInvalid, bool removed) override;
 
-    // asm: TEventClass_LoadFromINI / TEventClass_SaveToINI
+    // asm: TEventClass_LoadFromINI(EventClass *this) —— 从 [Events] 串解析本元素。
+    // 注意 asm 的 TEventClass_SaveToINI 接的是**字符串缓冲**（见 FormatSaveString），
+    // 不是这里的 INI 虚槽；EventClass 在 asm 里没有覆写 INI 虚槽，故 SaveToINI
+    // 直接委托基类 AbstractTypeClass::SaveToINI。
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual bool SaveToINI(CCINIClass* pINI) override;
 
@@ -147,7 +150,9 @@ public:
 
     void GetEventName(char* buffer, int32 bufferSize) const;
 
-    // asm TEventClass_SaveToINI 的串写出目标（TriggerTypeClass 侧调用）。
+    // asm TEventClass_SaveToINI(this, char* a2) 的串写出目标（TriggerTypeClass
+    // 侧调用）：Team 非空 → "%d,%d,%s"；EventKind 为 60/61 → "%d,%d,%d,%s"；
+    // 其余 → "%d,%d,%d"。
     void FormatSaveString(char* buffer, int32 bufferSize) const;
     // asm TEventClass_LoadFromINI 的串解析（field0=kind,field1=tag,field2=value[,name]）。
     bool ParseSaveString(const char* pString);

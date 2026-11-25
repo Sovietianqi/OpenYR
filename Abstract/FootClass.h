@@ -19,7 +19,14 @@ public:
         CurrentTarget(nullptr), Transporter(nullptr),
         IsVisibleNowFlag(false), PlanningToken(-1), PlanningTokenIdx(-1), IsUnselectable(false),
         WalkFrameCounter(0), BalloonHoverTainted(false), MoveSoundPlaying(false),
-        MoveSoundCooldown(0), IsHunting(false) {}
+        MoveSoundCooldown(0), IsHunting(false)
+    {
+        // +0x578 SpeedPercentage：原版构造为 1.0（"正常速度"）。
+        //   本树此前没有初始化，值域里是 0，于是 Walk/Drive 的
+        //   `if (Owner->SpeedPercentage <= 0) return;` 门恒真 ——
+        //   所有单位"在移动"却一步都走不动。
+        SpeedPercentage = 1.0;
+    }
     virtual ~FootClass() {}
 
     virtual AbstractType WhatAmI() const override { return AbstractType::Foot; }
@@ -155,8 +162,26 @@ public:
     // ========================================================================
     // Movement helpers
     // ========================================================================
+    // 设定行进目的地。
+    //   目标格不可进入（被敌方单位/建筑占据、站满 3 人、水面）时，不再直接
+    //   失败，而是在目标格周围 1..4 环内取"最贴目标、其次最贴自身"的可站
+    //   格作为落点 —— 这就是原版"追击时停在对手身边"的行为。飞机不做降级
+    //   （机位/停机坪必须是那一格本身），仍按不可入即失败处理。
     bool Set_Destination(const CoordStruct& dest);
     bool Can_Enter_Cell(const CellStruct& cell) const;
+
+    // 目标格不可入时的替代落点搜索：以 centre 为中心按环半径 1..4 外扩，
+    //   环内先比"到 centre 的欧氏平方距离"，再比"到自身的平方距离"。
+    //   返回 false 表示 4 环内没有可站格。
+    bool Find_Fallback_Cell(const CellStruct& centre, CellStruct& out) const;
+
+    // 逐格 A* 路径（通行判据 = Can_Enter_Cell，含地形与占用）。
+    //   outPath[0] 是起点格，末项是终点格；返回 false 表示不可达。
+    //   终点格若被占满（例如敌方单位所在的格子已经站了 3 个人），会先在
+    //   终点周围找一格可进入的落点再寻路 —— 这样步兵不会强行挤进同一格。
+    bool Build_Path(const CellStruct& destCell,
+                    DynamicVectorClass<CellStruct>& outPath) const;
+
     void Scatter(const CoordStruct& from, bool ignoreMission = true);
 
     // ========================================================================
@@ -168,6 +193,11 @@ public:
     //  (a value <= the pass threshold means "keep going").
     // ========================================================================
     virtual int32 Mission_Move();
+    virtual int32 Mission_Attack();
+    // 猎杀：TechnoClass_Mi_Hunt 在 FootClass 层的实体。原版由
+    //   MissionClass_Mi_Hunt 槽位（跳表 15）分派；基类只 `mov eax,1C2h`
+    //   （not-done），真正"往敌方推进 + 沿途索敌"落在这里。
+    virtual int32 Mission_Hunt();
     virtual int32 Mission_Guard();
     virtual int32 Mission_AreaGuard();
     virtual int32 Mission_Patrol();
@@ -260,7 +290,7 @@ public:
     virtual void ComputeCRC(CRCEngine& crc) const override;
     // FootClass_ReceiveDamage: the foot-layer damage entry point.
     virtual int32 ReceiveDamage(int32* pDamage, int32 typeSource,
-                                WarheadTypeClass* pWarhead, int32 target,
+                                WarheadTypeClass* pWarhead, TechnoClass* pAttacker,
                                 int32 ignoreDefenses, int32 arg10,
                                 HouseClass* pSourceHouse);
     // FootClass_ClickedMission: handles a left-click selecting this unit for a
@@ -359,7 +389,10 @@ public:
     // ========================================================================
     // Motion / status probes
     // ========================================================================
-    bool  IsParalysed() const;
+    // asm vt+0x380 —— FootClass_IsParalysed：ParalysisTimer 未走完即为真。
+    //   覆写 TechnoClass 的恒假基类实现，供 CanSetWaypoint / Can_Be_Commanded
+    //   这类基类虚调用正确落到脚类实体上。
+    bool  IsParalysed() const override;
     void  SetSpeedPercentage(double pct);
     int32 GetDistance(const CoordStruct& other) const;
     CoordStruct GetCoords_unknown1() const;
@@ -393,6 +426,20 @@ public:
     void  RemoveThreatFromCell(class CellClass* pCell);
     void  AbandonHunt();
     bool  UpdateTargetingTimer();
+
+    // ------------------------------------------------------------------------
+    // asm: TechnoClass::Target_Something_Nearby(this, arg0, arg4)   (asm:1590090)
+    //
+    //   空闲单位的"目标重评"入口：
+    //     1. 重设定目标计时器：StartTime=Frame，TimeLeft = Rules 的重评延迟
+    //        （AreaGuard 用 GuardAreaTargetingDelay，其余用 NormalTargetingDelay）
+    //        + Random(0,2)；
+    //     2. 已有目标、但开火状态是 5/6/8（无武器 / 超出射程 / 目标不能打）→
+    //        丢目标；
+    //     3. 没有目标 → 在警戒半径内重新索敌并设为目标。
+    //   返回"评估后是否持有目标"。
+    // ------------------------------------------------------------------------
+    bool  Target_Something_Nearby(int32 arg0, int32 arg4);
 
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 FindNearestOfBuildingsOfTypes 负责在给定的建筑类型
@@ -432,6 +479,19 @@ public:
     //  原目标的关联，再记下新目标并复位任务步进。
     // ------------------------------------------------------------------------
     void SetNewTarget(AbstractClass* pTarget);
+
+    // ------------------------------------------------------------------------
+    // 目标字段的唯一写入口：覆写 TechnoClass 的空实现，只负责写 FootClass
+    //  层这一份 CurrentTarget。
+    //
+    //  必须由派生类的 SetTarget 显式调用（UnitClass / InfantryClass /
+    //  AircraftClass 各自还存着一份目标指针）。否则 UpdateTargeting 读
+    //  CurrentTarget、派生类读自己的字段，两边看到的是不同目标 ——
+    //  表现为"永远不索敌、Mission_Enter 永远不真的进建筑"。
+    //
+    //  这里覆写的是 TechnoClass 已有的虚表槽位，不新增槽位、不改布局。
+    // ------------------------------------------------------------------------
+    virtual void SetTarget(AbstractClass* pTarget) override;
 
     // ------------------------------------------------------------------------
     // 根据游戏行为，可知 EnterAsPassenger 负责让本单位以乘客身份进入某个

@@ -182,6 +182,18 @@ void ObjectTypeClass::One_Time()
     ObjectTypeClass_One_Time_Load("TALKBUBL.SHP", g_OneTime_TalkBubbleSHP, g_OneTime_TalkBubbleValid);
 }
 
+// asm: CCFile_TALKBUBL_SHP（byte_AC148B）—— 绘制侧的话泡素材句柄。
+SHPStruct* ObjectTypeClass::Get_TalkBubble_Shape()
+{
+    return g_OneTime_TalkBubbleSHP;
+}
+
+// asm: CCFile_PIPS_SHP（byte_AC1489）—— 军衔 / 弹药等 pips 的素材句柄。
+SHPStruct* ObjectTypeClass::Get_Pips_Shape()
+{
+    return g_OneTime_PipsSHP;
+}
+
 // ============================================================================
 // Construction / destruction
 // ============================================================================
@@ -240,12 +252,36 @@ ObjectTypeClass::ObjectTypeClass(const char* pID) noexcept
     ImageSHP       = nullptr;
 }
 
+// asm: ObjectTypeClass_CTOR (asm:1054192)
+//
+//  B 类：汇编里的 ObjectTypeClass_CTOR 是"带 ID 的正常构造"——先
+//  AbstractTypeClass_CTOR(name)，然后把 +0x98 起的标志字节、+0x1E8 起的
+//  计数/索引、+0x211 起的布尔量逐条铺默认值。本项目的
+//  ObjectTypeClass(const char*) / ObjectTypeClass() 正是这份实现。
+//  这里的 noinit 变体是工程自有的"派生类已经铺过底，不要重复初始化"通道，
+//  原版没有对应出口，故只做基类构造，不碰任何字段。
 ObjectTypeClass::ObjectTypeClass(noinit_t) noexcept
     : AbstractTypeClass(noinit)
 {
     // Subclasses own initialisation; leave fields untouched.
 }
 
+// asm: ObjectTypeClass_DTOR (asm:1054467)
+//
+//  B 类（工程对象模型差异）：汇编的析构函数体确实有活——
+//    1. 重刷 4 个 vftable 指针；
+//    2. 通过 GetArrayIndex 把自己从 v_ObjectType 里摘除并左移后续元素；
+//    3. delete [+0A4h]（当 [+0A8h] 标志置位）；
+//    4. TechnoTypeClass_UnloadTurretArt()；
+//    5. 逐块 delete +0x280 / +0x26C / +0x258 / +0x244 … 的容器缓冲。
+//  本工程不照搬的两点原因：
+//    * 第 5 步的容器在本项目里是具名成员（DynamicVectorClass / std::string），
+//      由成员自己的析构函数释放，再手工 delete 会二次释放；
+//    * 第 2 步的摘表在本项目由外部驱动：ObjectTypeClass::Delete_All 先
+//      GameDelete(item) 再 Array->Remove(i)。若析构里再自摘一次，索引会
+//      整体左移，Delete_All 随后的 Remove(i) 就会删掉错误的元素并留下悬垂
+//      指针。
+//  因此析构保持为空，实际释放交由成员析构与 Delete_All 完成。
 ObjectTypeClass::~ObjectTypeClass()
 {
     // No heap resources to release at this level.
@@ -952,46 +988,45 @@ SHPStruct* ObjectTypeClass::GetImage() const
     return ImageSHP;
 }
 
-// ObjectTypeClass_GetPipMax (asm: xor eax, eax ; retn).
+// asm: ObjectTypeClass_GetPipMax (asm:1054619) — xor eax, eax / retn
 //
-//  At the base level a type renders no pips; the types that do (buildings
-//  showing a production queue, harvesters showing a fill) override this.
+//  A 类：基类不画任何 pip，汇编即常量 0；会画 pip 的类型（显示生产队列的
+//  建筑、显示装填量的矿车）各自覆写该槽。
 int32 ObjectTypeClass::GetPipMax() const
 {
     return 0;
 }
 
-// ObjectTypeClass_GetActualCost (asm: xor eax, eax ; retn 4).
+// asm: ObjectTypeClass_GetActualCost (asm:1054687) — xor eax, eax / retn 4
 //
-//  The cost after every owning-house modifier.  The type layer has no owner
-//  to consult, so it reports nothing.
+//  A 类：类型层没有阵营可询问，汇编直接返回 0；阵营折扣由 TechnoTypeClass
+//  的覆写实现施加。
 int32 ObjectTypeClass::GetActualCost(HouseClass* /*pOwner*/) const
 {
     return 0;
 }
 
-// ObjectTypeClass_GetBuildSpeed (asm: xor eax, eax ; retn).
+// asm: ObjectTypeClass_GetBuildSpeed (asm:1054700) — xor eax, eax / retn
 //
-//  Build-speed factor used by the factory timing code; the concrete type
-//  classes supply their real value.
+//  A 类：建造速度系数，基类汇编返回 0，具体类型类给出真实值。
 int32 ObjectTypeClass::GetBuildSpeed() const
 {
     return 0;
 }
 
-// ObjectTypeClass_GetCameo (asm: xor eax, eax ; retn).
+// asm: ObjectTypeClass_GetCameo (asm:1054713) — xor eax, eax / retn
 //
-//  Sidebar cameo SHP.  The base type has no cameo art of its own, so it
-//  returns null; TechnoTypeClass supplies the cached CameoShape.
+//  A 类：基类没有侧边栏图标，汇编返回空；TechnoTypeClass 覆写后给出
+//  缓存的 CameoShape。
 SHPStruct* ObjectTypeClass::GetCameo() const
 {
     return nullptr;
 }
 
-// ObjectTypeClass_GetOwners (asm: or eax, 0FFFFFFFFh ; retn).
+// asm: ObjectTypeClass_GetOwners (asm:128067) — or eax, 0FFFFFFFFh / retn
 //
-//  Owner bitmask.  The generic object type claims no owning house, so it
-//  reports all bits set; TechnoTypeClass supplies the real mask.
+//  A 类：基类的所有者位掩码是全 1（"谁都不属于"），汇编即
+//  `or eax, -1`；TechnoTypeClass 覆写为解析出的 Owners 位。
 int32 ObjectTypeClass::GetOwners() const
 {
     return -1;

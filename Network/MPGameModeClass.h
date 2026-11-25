@@ -138,7 +138,16 @@ public:
     virtual void    CreateMPTeams();
     virtual void    CreateStartingUnits();
     virtual void    DrawTeamSelector();
-    virtual void    SmthStartingHouses2(int32 idxHouse, DynamicVectorClass<CoordStruct>* pCoords, bool positionsTaken);
+    // asm: MPGameMode_SmthStartingHouses2 (vftable +0xC4, 0x5D6820)
+    //   wXY *__thiscall(this, int32 *outCell, int32 idxHouse, VecWXY *cells,
+    //                   uint8 *positionsTaken)
+    //   为 idxHouse 从候选格表里挑一格：全部未占用时随机取第一格；否则取
+    //   "到所有已占用格的距离和最大"的一格。结果写回 outCell，并把
+    //   Scenario->HouseIndices[slot] 记成 idxHouse、positionsTaken[slot] 置 1。
+    //   返回 outCell（原版返回 wXY*）。
+    virtual CellStruct* SmthStartingHouses2(CellStruct* pOutCell, int32 idxHouse,
+                                            DynamicVectorClass<CellStruct>* pCells,
+                                            uint8* positionsTaken);
     virtual bool    func10();
     virtual bool    func40();
     virtual int32   func54(void* memory, int32 a2, int32 a3, int32 a4, int32 a5, int32 a6, int32 a7);

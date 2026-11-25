@@ -116,7 +116,8 @@ BulletClass* GlobalFiring::Fire(WeaponTypeClass* pWeapon, CoordStruct source,
     // Initialize the bullet with all combat parameters.
     pBullet->Init(pBulletType, fireCoords, target, pOwner,
                   pWeapon->Damage, pWeapon->Warhead, pWeapon);
-    pBullet->SetRange(pWeapon->Range * 256);
+    // asm: pWeapon->Range 本身就是 lepton（CCINIClass::Get_Lepton），直接透传。
+    pBullet->SetRange(pWeapon->Range);
     pBullet->SetWeaponType(pWeapon);
 
     // Instant-hit weapons travel at effectively infinite speed.

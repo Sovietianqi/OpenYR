@@ -54,6 +54,7 @@ int32       s_DumpEvery   = 30;      // 每 N 帧导一张
 int32       s_DumpLimit   = 60;      // 最多导 N 张
 int32       s_DumpedFiles = 0;       // 已落盘张数
 int32       s_Frames      = 0;       // 已 Present 帧数
+bool        s_CrcTrace    = false;   // OPENYR_CRC_TRACE=1：逐帧打印像素指纹
 
 // ----------------------------------------------------------------------------
 // 小工具
@@ -162,7 +163,8 @@ inline uint32 Crc32Update(uint32 crc, BYTE value)
     return crc;
 }
 
-void TraceFirstFrame(const Surface* pSource, int32 bpp, int32 pitch)
+void TraceFrame(const Surface* pSource, int32 bpp, int32 pitch,
+                int32 frameNo, bool everyFrame)
 {
     const BYTE* base = static_cast<const BYTE*>(pSource->Buffer);
     if (base == nullptr) return;
@@ -197,10 +199,22 @@ void TraceFirstFrame(const Surface* pSource, int32 bpp, int32 pitch)
     }
 
     crc ^= 0xFFFFFFFFu;
-    std::fprintf(stderr,
-                 "[PRESENT] crc=%08lX nonblack=%d size=%dx%d bpp=%d\n",
-                 static_cast<unsigned long>(crc), nonBlack,
-                 pSource->Width, pSource->Height, bpp);
+
+    if (everyFrame)
+    {
+        // 逐帧差分用：同一 seed 的两次运行按行 diff，第一处不同即分歧帧。
+        std::fprintf(stderr,
+                     "[CRC] frame=%d crc=%08lX nonblack=%d size=%dx%d bpp=%d\n",
+                     frameNo, static_cast<unsigned long>(crc), nonBlack,
+                     pSource->Width, pSource->Height, bpp);
+    }
+    else
+    {
+        std::fprintf(stderr,
+                     "[PRESENT] crc=%08lX nonblack=%d size=%dx%d bpp=%d\n",
+                     static_cast<unsigned long>(crc), nonBlack,
+                     pSource->Width, pSource->Height, bpp);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -447,6 +461,8 @@ void InitBackends()
     s_Initialized = true;
     s_Shutdown = false;
 
+    s_CrcTrace = (ReadEnvInt("OPENYR_CRC_TRACE", 0) != 0);
+
     const char* dumpDir = std::getenv("OPENYR_DUMP");
     if (dumpDir != nullptr && *dumpDir != '\0')
     {
@@ -500,9 +516,10 @@ void Present(Surface* pSource)
     const int32 bpp = SurfaceBytesPerPixel(pSource);
     const int32 pitch = (pSource->Pitch > 0) ? pSource->Pitch : pSource->Width * bpp;
 
-    // 帧 1 打一次像素指纹，证明读到的不是空缓冲。
-    if (s_Frames == 1)
-        TraceFirstFrame(pSource, bpp, pitch);
+    // 帧 1 打一次像素指纹，证明读到的不是空缓冲；
+    // OPENYR_CRC_TRACE=1 时逐帧打印（定步长回归的差分依据）。
+    if (s_Frames == 1 || s_CrcTrace)
+        TraceFrame(pSource, bpp, pitch, s_Frames, s_CrcTrace);
 
     // 宿主窗口（宏未开时为空实现）。
     PresentSDL(pSource);

@@ -204,6 +204,13 @@ BulletClass::BulletClass(BulletTypeClass* pType) noexcept
                                  : BulletMotion::Straight;
     }
 
+    // asm: ObjectClass_CTOR 把 +81h（IsInLimbo）置 1 —— 新对象以"未落位"
+    //   状态交出，随后 BulletClass_SetMovement → ObjectClass::Unlimbo 才允许
+    //   落位。本树 ObjectClass 默认 0，若不在这里补，Unlimbo 的第一道门
+    //   （`!IsInLimbo -> false`）直接把弹体挡回去：速度没写、不进战术层，
+    //   Update 里 |v|==0 判成"已停滞"，弹体在炮口原地起爆、伤害打空。
+    IsInLimbo = true;
+
     // asm: vec_Bullets.length++ / data[len] = this
     if (BulletClass::Array != nullptr) {
         BulletClass::Array->Add(this);
@@ -450,10 +457,18 @@ bool BulletClass::SetMovement(CoordStruct xyz, CoordStruct velocity, int32 speed
     // vector; an all-zero vector becomes the (0, 100, 0) sentinel.
     const double len = Bullet_Length(Velocity);
     if (len <= BULLET_DIRECTION_EPSILON) {
-        Velocity[0] = 0.0; Velocity[1] = 100.0; Velocity[2] = 0.0;
+        Velocity[0] = 0.0; Velocity[1] = 1.0; Velocity[2] = 0.0;
     } else {
         Velocity[0] /= len; Velocity[1] /= len; Velocity[2] /= len;
     }
+
+    // asm loc_468A1x: 单位方向向量再乘速度 —— Velocity 的**长度**就是每帧
+    //   前进的 lepton 数（WeaponTypeClass::Speed）。此前只归一到单位长度，
+    //   于是 Update 里 `|v| < 8 → 已停滞` 第一帧就成立，弹体在炮口原地起爆。
+    const double shotMagnitude = (Speed > 0) ? static_cast<double>(Speed) : 1.0;
+    Velocity[0] *= shotMagnitude;
+    Velocity[1] *= shotMagnitude;
+    Velocity[2] *= shotMagnitude;
 
     // asm loc_468A3F: arm = (Target is an Aircraft) ? 0 : type->Arm(+0x2F0),
     // fed into BulletSubClass_SetData(&this+0xB8, Location, Fuse, arm, INT_MAX).
@@ -752,17 +767,31 @@ int32 BulletClass::Simulate_Ballistic(bool& preciseHit, bool& mustDetonate) {
 //   `exactHit` is raised for a precise (floor / occupant / wall) collision.
 // =============================================================================
 int32 BulletClass::Resolve_Ballistic_Hit(const CoordStruct& prev,
-                                         const CoordStruct& next,
+                                         CoordStruct& next,
                                          bool& exactHit) {
     if (MapClass::Instance == nullptr || Class == nullptr) return 0;
 
     // asm loc_46706A / loc_467371: the floor test adds the cell-height bias
     // dword_89DE64 and fires on a Z crossing in either direction.
+    // 目标还在前方（距离大于本帧步长）时，弹体要从炮口高度降到目标高度，
+    //   途中必然穿过"地面高度 + bias"这条线。此时若按地面命中处理，炮弹会
+    //   在离目标还有大半格的地方开花、伤害落在空地上。原版弹道贴近水平、
+    //   bias 也小，踩不到这条；本树炮口高度与步长都更粗，需显式跳过——
+    //   真打到地面时下面的桥/建筑/占用者分支仍会命中。
+    bool targetAhead = false;
+    if (Target != nullptr)
+    {
+        int32 step = static_cast<int32>(Bullet_Length(Velocity));
+        if (step < 0x20) step = 0x20;
+        const CoordStruct tcAhead = Target->GetCoords();
+        targetAhead = (Bullet_Distance3D(next, tcAhead) > step);
+    }
+
     const int32 bias = (MapClass::Instance->HalfCellHeight != 0)
                      ? (MapClass::Instance->HalfCellHeight / 16) : 2;
     const int32 floorZ = MapClass::Instance->GetCellFloorHeight(next) + bias;
-    if ((prev.Z >= floorZ && next.Z < floorZ) ||
-        (prev.Z <= floorZ && next.Z > floorZ)) {            // loc_4674F6/loc_467510
+    if (!targetAhead && ((prev.Z >= floorZ && next.Z < floorZ) ||
+                         (prev.Z <= floorZ && next.Z > floorZ))) {   // loc_4674F6/loc_467510
         exactHit = true;
         return 1;
     }
@@ -771,6 +800,94 @@ int32 BulletClass::Resolve_Ballistic_Hit(const CoordStruct& prev,
     if (Cell_Is_Bridged(next) || Cell_Is_Bridged(prev)) {
         if (next.Z < floorZ && prev.Z >= floorZ) { exactHit = true; return 1; }
         if (prev.Z < floorZ) { exactHit = true; return 1; }
+    }
+
+    // ── 主线目标：线段到目标点的最近距离 ────────────────────────────────
+    //   占用判定是"按格"做的，而对象坐标可能正好落在四格交界的角上
+    //   （Cell2Coord 返回格角而非格心），斜向弹道会从角点掠过、两个格子
+    //   都不含目标，于是"瞄准了却打不到"。这里先对**当前锁定的目标**做一次
+    //   点—线段距离判定：弹道真的从目标身上穿过就算命中。
+    if (Target != nullptr && CanHit(Target))
+    {
+        const CoordStruct tc = Target->GetCoords();
+
+        const double ax = static_cast<double>(tc.X - prev.X);
+        const double ay = static_cast<double>(tc.Y - prev.Y);
+        const double az = static_cast<double>(tc.Z - prev.Z);
+        const double bx = static_cast<double>(next.X - prev.X);
+        const double by = static_cast<double>(next.Y - prev.Y);
+        const double bz = static_cast<double>(next.Z - prev.Z);
+
+        const double bb = bx * bx + by * by + bz * bz;
+        double t = (bb > 0.0)
+                 ? ((ax * bx + ay * by + az * bz) / bb) : 0.0;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+
+        const double cx = ax - bx * t;
+        const double cy = ay - by * t;
+        const double cz = az - bz * t;
+        const double d2 = cx * cx + cy * cy + cz * cz;
+
+        if (d2 < 128.0 * 128.0)
+        {
+            // 命中点落在弹体与目标之间：把这一帧的落点推到目标身上。
+            //   否则弹体停在半空，CellSpread=0 的弹头（坦克炮、步枪）
+            //   Damage_At_Cell 里 dist>0 会被直接丢掉，表现为"打中了却不掉血"。
+            next = tc;
+            exactHit = true;
+            return 1;
+        }
+    }
+
+    // ── 逐段采样做占用判定 ──────────────────────────────────────────────
+    //   一帧位移可达 100+ lepton，而占用判定只看"落点所在格"。斜向飞行时
+    //   落点会从两个格子的夹缝里跳过去（例如从 (28,37) 直接跳到 (27,38)），
+    //   炮弹就擦着站在 (28,38) 的目标飞走，最后落在空地上爆炸、伤害打空。
+    //   这里把本帧位移按 ≤64 lepton 切成若干采样点，逐点走一遍占用链。
+    {
+        const double segLen = Bullet_Distance3D(prev, next);
+        const int32 samples = (segLen > 64.0)
+                            ? static_cast<int32>(segLen / 64.0) : 1;
+
+        for (int32 si = 1; si <= samples; ++si)
+        {
+            CoordStruct sp;
+            sp.X = prev.X + (next.X - prev.X) * si / samples;
+            sp.Y = prev.Y + (next.Y - prev.Y) * si / samples;
+            sp.Z = prev.Z + (next.Z - prev.Z) * si / samples;
+
+            const CellStruct sc = Math::CoordToCell(sp);
+            CellClass* pc = MapClass::Instance->GetCellAt(sc);
+            if (pc == nullptr)
+                continue;
+
+            for (ObjectClass* pOcc = pc->FirstObject; pOcc != nullptr;
+                 pOcc = pOcc->NextObject)
+            {
+                const AbstractType occWhat = pOcc->WhatAmI();
+                if (occWhat != AbstractType::Unit && occWhat != AbstractType::Infantry
+                 && occWhat != AbstractType::Aircraft)
+                    continue;
+
+                TechnoClass* pTech = static_cast<TechnoClass*>(pOcc);
+                if (pTech == Owner)
+                    continue;
+                if (Owner != nullptr && Owner->Is_Ally(pTech))
+                    continue;
+
+                const CoordStruct tc = pTech->GetCoords();
+                if (Bullet_Distance3D(sp, tc) < 0x80 && CanHit(pTech))
+                {
+                    // 挡在弹道上的单位就是真正的命中对象：落点贴到它身上，
+                    //   而不是停在采样点。CellSpread=0 的弹头只在 dist==0 时
+                    //   结算（见 MapClass::Damage_At_Cell），停在中途等于打空。
+                    next = tc;
+                    exactHit = true;
+                    return 1;
+                }
+            }
+        }
     }
 
     // asm loc_4678F8: building occupant on the destination cell.
@@ -788,21 +905,34 @@ int32 BulletClass::Resolve_Ballistic_Hit(const CoordStruct& prev,
             }
         }
 
-        // asm loc_467943: nearest techno occupant of the destination cell.
-        CellStruct probe = cell;
-        ObjectClass* pOcc = pCell->Cell_Techno(&probe, false, Owner);
-        if (pOcc != nullptr && pOcc->WhatAmI() != AbstractType::Building) {
+        // asm loc_467943: 目标格里"离弹体最近"的技术对象命中即视为命中。
+        //
+        //   原版调 CellClass::Cell_Techno 取最近者，随后统一做
+        //   `0x80 内 + 敌对 + CanHit` 判定。这里直接遍历该格的占用链做同
+        //   一套判定：同格可能叠着多个对象（步兵挤在一格是常态），只看
+        //   "最近的那一个"会因为 Cell_Techno 的近似排序而漏判真正的目标，
+        //   表现为炮弹从目标身上穿过去。
+        for (ObjectClass* pOcc = pCell->FirstObject; pOcc != nullptr;
+             pOcc = pOcc->NextObject)
+        {
+            const AbstractType occWhat = pOcc->WhatAmI();
+            if (occWhat != AbstractType::Unit && occWhat != AbstractType::Infantry
+             && occWhat != AbstractType::Aircraft)
+                continue;
+
             TechnoClass* pTech = static_cast<TechnoClass*>(pOcc);
-            const bool isOwn = (pTech == Owner);
-            const bool isAlly = (Owner != nullptr && Owner->Is_Ally(pTech));
+            if (pTech == Owner)
+                continue;                                   // asm: 不打自己
+            if (Owner != nullptr && Owner->Is_Ally(pTech))
+                continue;                                   // asm: 不打友军
+
             // asm loc_467965: only a hostile techno within 0x80 of the
             // projectile counts as an impact.
-            if (!isOwn && !isAlly) {
-                const CoordStruct tc = pTech->GetCoords();
-                if (Bullet_Distance3D(next, tc) < 0x80 && CanHit(pTech)) {
-                    exactHit = true;
-                    return 1;
-                }
+            const CoordStruct tc = pTech->GetCoords();
+            if (Bullet_Distance3D(next, tc) < 0x80 && CanHit(pTech)) {
+                next = tc;                       // 落点贴到被命中的对象身上
+                exactHit = true;
+                return 1;
             }
         }
     }
@@ -849,6 +979,15 @@ void BulletClass::Commit_Position(const CoordStruct& next) {
 //   [ebp+8Dh] (IsIncoming) gates the Dropping self-detonate.
 // =============================================================================
 void BulletClass::Update() {
+    static int s_DbgCount = 0;
+    static const bool dbg = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+    if (dbg && s_DbgCount < 60) {
+        ++s_DbgCount;
+        std::fprintf(stderr, "[BUPDATE] #%d loc=(%d,%d,%d) v=(%.1f,%.1f,%.1f) active=%d limbo=%d\n",
+                     s_DbgCount, (int)Location.X, (int)Location.Y, (int)Location.Z,
+                     Velocity[0], Velocity[1], Velocity[2],
+                     (int)IsBulletActive, (int)IsInLimbo);
+    }
     ObjectClass::Update();                                   // asm: call ObjectClass_Update
     if (!IsBulletActive) return;                             // asm: [ebp+90h]
 
@@ -879,6 +1018,19 @@ void BulletClass::Update() {
     const int32 hitFlag = (Class->ROT > 0)
                         ? Simulate_Homing(preciseHit, mustDetonate)
                         : Simulate_Ballistic(preciseHit, mustDetonate);
+
+    // asm: Update 尾段 —— 撞地 / 撞崖 / 撞墙强制起爆（sub_468BB0）。
+    //   此前这条判定只有实现、没有任何调用方：弹丸会笔直穿过悬崖与围墙，
+    //   落到后面才炸。命中目标那条路径（hitFlag==1）不重复处理。
+    if (!mustDetonate && hitFlag == 0)
+    {
+        CoordStruct impact{};
+        if (Check_Terrain_Impact(impact))
+        {
+            Location = impact;
+            mustDetonate = true;
+        }
+    }
 
     Resolve_Step_End(hitFlag, preciseHit, mustDetonate);     // asm loc_467B7A
     Commit_Position(Location);                               // asm loc_467FBA
@@ -917,7 +1069,10 @@ void BulletClass::Resolve_Step_End(int32 hitFlag, bool& preciseHit,
     if (Target != nullptr && (hitFlag == 1 || preciseHit)
         && !Class->Airburst && !Class->Inaccurate) {
         const CoordStruct tc = Target->GetCoords();
-        if (Bullet_Distance3D(Location, tc) < 0x80) {        // asm cmp eax,0Ch/80h
+        int32 snap = 0x80;                                   // asm cmp eax,0Ch/80h
+        const int32 step = static_cast<int32>(Bullet_Length(Velocity));
+        if (step > snap) snap = step;                        // 见 Resolve_Impact_Point
+        if (Bullet_Distance3D(Location, tc) < snap) {
             Location = tc;
         }
     }
@@ -1013,6 +1168,13 @@ bool BulletClass::Check_Terrain_Impact(CoordStruct& pos) {
 // =============================================================================
 bool BulletClass::CanHit(TechnoClass* pTarget) const {
     if (pTarget == nullptr) return false;
+
+    // 已经打死的目标不能再吃弹。尸体在格子占用链里还要留几帧（死亡动画、
+    //   残骸），不排除它的话，弹体每帧都撞在同一条尸体上：弹道被永久遮断，
+    //   后面的活目标一个也打不到 —— 实测 3 个并排步兵，打死最前面那个之后
+    //   剩余两个满血站到 1500 帧。
+    if (pTarget->Health <= 0 || pTarget->IsDead()) return false;
+
     if (Owner == nullptr) return false;
     if (pTarget->GetOwningHouse() == Owner->GetOwningHouse()) return false;
     if (Owner->Is_Ally(pTarget)) return false;
@@ -1062,8 +1224,14 @@ CoordStruct BulletClass::Resolve_Impact_Point(bool a2) const {
             loc = tc;
         } else {
             const int32 d = DistanceFrom2(Target, 0, 0);
-            const int32 limit = (Target->WhatAmI() == AbstractType::Aircraft)
-                              ? 0x80 : 0x2A;                     // loc_468F23/60
+            int32 limit = (Target->WhatAmI() == AbstractType::Aircraft)
+                        ? 0x80 : 0x2A;                           // loc_468F23/60
+            // 本帧的位移量也应算进"够近"：弹体一帧能走 |v| lepton，
+            //   目标只要落在这步的射程内就算打中。原版速度较低时 0x2A 足够，
+            //   本树按武器 Speed 直接推进（~100/帧），不放宽会一跳越过目标，
+            //   弹体落在目标旁的格子里爆开、伤害打空。
+            const int32 step = static_cast<int32>(Bullet_Length(Velocity));
+            if (step > limit) limit = step;
             if (d < limit) loc = tc;
         }
     }
@@ -1102,6 +1270,17 @@ void BulletClass::Detonate(bool a2) {
 
     // asm loc_468FF4: `for (i = 0; i < type->Cluster; ++i) Fire(loc); scatter`.
     const int32 count = (Class != nullptr && Class->Cluster > 0) ? Class->Cluster : 1;
+    static const bool s_bFireDbg = (std::getenv("OPENYR_FIRE_DBG") != nullptr);
+    if (s_bFireDbg)
+    {
+        CoordStruct tp(0, 0, 0);
+        if (Target != nullptr) tp = Target->GetCoords();
+        std::fprintf(stderr, "[DETONATE] type=%s loc=(%d,%d,%d) tgt=(%d,%d,%d) dmg=%d wh=%p\n",
+                     (Class != nullptr) ? Class->ID : "?",
+                     (int)loc.X, (int)loc.Y, (int)loc.Z,
+                     (int)tp.X, (int)tp.Y, (int)tp.Z, (int)Damage,
+                     static_cast<void*>(Warhead));
+    }
     Explode(loc);                                       // asm loc_46902C iteration 0
     if (count > 1) {
         Spawn_Cluster_munitions(loc);                   // iterations 1..count-1
@@ -1339,6 +1518,7 @@ void BulletClass::Explode(const CoordStruct& loc) {
 
     // ---- splash / impact animation ----------------------------------------
     Spawn_Splash_Anim(loc);
+
 
     // ---- area damage ------------------------------------------------------
     if (Warhead == nullptr) return;

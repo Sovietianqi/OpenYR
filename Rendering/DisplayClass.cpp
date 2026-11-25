@@ -11,6 +11,9 @@
 #include "../Rendering/RadarClass.h"
 #include "../Rendering/SidebarClass.h"
 #include "../Rendering/GScreenClass.h"
+#include "../Rendering/MouseClass.h"
+#include "../Abstract/FootClass.h"
+#include "../Abstract/TechnoClass.h"
 #include "../Game/Game.h"
 #include "../Game/Externs.h"
 
@@ -690,10 +693,154 @@ void DisplayClass::LeftMouseButtonDown(const Point2D& point) {
     CursorPosition = point;
 }
 
+// ============================================================================
+// 选择集动作派发
+//
+// 原版把左键/右键统一折算成 Action，再交给选择集里每个对象执行。这里做
+// 同样的折算：选择类动作改选中态，其余动作落成 Mission（移动/攻击/进入/
+// 占领/区域警戒）。目标坐标与目标对象都由调用方给定。
+// ============================================================================
+namespace {
+
+void ClearSelectionSet()
+{
+    DynamicVectorClass<ObjectClass*>& sel = TacticalClass::SelectedObjects;
+    while (sel.Count > 0)
+    {
+        ObjectClass* pObj = sel[sel.Count - 1];
+        if (pObj != nullptr)
+            pObj->Deselect();      // Deselect 自身会从表里摘除
+        else
+            sel.Remove(sel.Count - 1);
+    }
+}
+
+// 把一条动作落到当前选择集。返回是否有对象受理。
+bool IssueActionToSelection(Action action, const CoordStruct& coords,
+                            ObjectClass* pTarget)
+{
+    DynamicVectorClass<ObjectClass*>& sel = TacticalClass::SelectedObjects;
+    bool any = false;
+
+    for (int32 i = 0; i < sel.Count; ++i)
+    {
+        ObjectClass* pObj = sel[i];
+        if (pObj == nullptr)
+            continue;
+
+        const AbstractType kind = pObj->WhatAmI();
+        if (kind != AbstractType::Unit &&
+            kind != AbstractType::Infantry &&
+            kind != AbstractType::Aircraft &&
+            kind != AbstractType::Building)
+            continue;
+
+        TechnoClass* pTechno = static_cast<TechnoClass*>(pObj);
+        if (pTechno->IsDead())
+            continue;
+
+        switch (action)
+        {
+        case Action::Move:
+        case Action::GuardArea:
+        case Action::NoMove:
+        {
+            if (kind == AbstractType::Building)
+                break;                     // 建筑不移动
+            FootClass* pFoot = static_cast<FootClass*>(pTechno);
+            if (pFoot->Set_Destination(coords))
+                any |= pTechno->DispatchMission(
+                    action == Action::GuardArea ? Mission::AreaGuard : Mission::Move);
+            break;
+        }
+        case Action::Attack:
+        {
+            if (pTarget == nullptr)
+                break;
+            pTechno->Assign_Target(pTarget);
+            any |= pTechno->DispatchMission(Mission::Attack);
+            break;
+        }
+        case Action::Enter:
+            any |= pTechno->DispatchMission(Mission::Enter);
+            break;
+        case Action::Capture:
+            if (pTarget != nullptr)
+                pTechno->Assign_Target(pTarget);
+            any |= pTechno->DispatchMission(Mission::Capture);
+            break;
+        case Action::Sabotage:
+            if (pTarget != nullptr)
+                pTechno->Assign_Target(pTarget);
+            any |= pTechno->DispatchMission(Mission::Sabotage);
+            break;
+        case Action::Repair:
+            if (pTarget != nullptr)
+                pTechno->Assign_Target(pTarget);
+            any |= pTechno->DispatchMission(Mission::Repair);
+            break;
+        case Action::Sell:
+        case Action::SellUnit:
+            any |= pTechno->DispatchMission(Mission::Selling);
+            break;
+        case Action::Harvest:
+            any |= pTechno->DispatchMission(Mission::Harvest);
+            break;
+        default:
+            break;
+        }
+    }
+    return any;
+}
+
+} // namespace
+
+// ============================================================================
+// LeftMouseButtonUp —— 左键抬起。
+//
+// 选择类动作（Select / ToggleSelect）改选中态；其余动作是"命令模式"下的
+// 执行请求，直接落到选择集。
+// ============================================================================
 void DisplayClass::LeftMouseButtonUp(
     const CoordStruct& coords, const CellStruct& cell,
     ObjectClass* pObject, Action action, DWORD dwUnk2)
 {
+    (void)dwUnk2;
+
+    // 格子被迷雾遮住时，除移动/区域警戒外一律不给指令。
+    if (!ConvertAction(cell, false, pObject, action, false))
+        return;
+
+    if (action == Action::Select)
+    {
+        if (pObject != nullptr && pObject->Is_Selectable())
+        {
+            ClearSelectionSet();
+            pObject->Select();
+        }
+        else if (pObject == nullptr)
+        {
+            ClearSelectionSet();
+        }
+        MarkToRedraw();
+        return;
+    }
+
+    if (action == Action::ToggleSelect)
+    {
+        if (pObject != nullptr)
+        {
+            if (pObject->Is_Selected())
+                pObject->Deselect();
+            else if (pObject->Is_Selectable())
+                pObject->Select();
+            MarkToRedraw();
+        }
+        return;
+    }
+
+    if (IssueActionToSelection(action, coords, pObject))
+        MarkToRedraw();
 }
 
 void DisplayClass::RightMouseButtonUp(DWORD dwUnk) {
@@ -728,7 +875,35 @@ void DisplayClass::RightMouseButtonUp(DWORD dwUnk) {
 
     if (changed) {
         MarkToRedraw();
+        return;                 // 有模式被取消时，右键只做"撤退"，不再下命令
     }
+
+    // ------------------------------------------------------------------
+    // 没有任何模式可取消：右键即"执行默认动作" —— 对光标下的目标下达
+    // 移动或攻击。原版由 ConvertAction 依据目标归属折算，这里取其默认
+    // 结果：敌方目标 -> Attack，友方/空地 -> Move。
+    // ------------------------------------------------------------------
+    if (MouseClass::Instance == nullptr)
+        return;
+
+    const Point2D pt = MouseClass::Instance->CursorPosition;
+    CoordStruct world;
+    ScreenToTactical(pt, &world);
+
+    ObjectClass* pTarget = MouseClass::Instance->HoveredObject;
+    if (pTarget != nullptr && pTarget->Is_Selected())
+        pTarget = nullptr;      // 点自己人身上不当作目标
+
+    Action action = Action::Move;
+    if (pTarget != nullptr)
+    {
+        const AbstractType kind = pTarget->WhatAmI();
+        if (kind != AbstractType::Terrain && kind != AbstractType::Smudge)
+            action = ConvertAttack(Action::Attack);
+    }
+
+    if (IssueActionToSelection(action, world, pTarget))
+        MarkToRedraw();
 }
 
 // ============================================================================
@@ -2602,8 +2777,11 @@ void DisplayClass::Refresh()
 
 void DisplayClass::Restore()
 {
-    // asm: DisplayClass::Restore —— 把备份面贴回主面（合成后端未建模，
-    // 语义等价为标记整屏重绘）。
+    // ⚠ 名称借用，**不是**原版 asm 的 DisplayClass_Restore（asm:396321）。
+    //   那一段的签名是 (HWND, UINT Msg, WPARAM, LPARAM)，函数体只有一句
+    //   `DefWindowProcA(...)`，实际是窗口过程（WndProc），与"把备份面贴回
+    //   主面"毫无关系。本项目的窗口过程在 Game/WinMain.cpp 的 WindowProc，
+    //   这里保留的是 AbstractClass 虚槽的占位：标记整屏重绘。
     MarkToRedraw();
 }
 

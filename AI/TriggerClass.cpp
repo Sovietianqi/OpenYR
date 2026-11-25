@@ -108,6 +108,13 @@ TriggerClass::TriggerClass(const char* pID) noexcept
             for (int32 i = 0; i < len; ++i) ID[i] = pID[i];
         }
     }
+    // asm: TriggerClass_CTOR 尾部把实例登记进 vec_Triggers。不登记则
+    //   ProcessTriggerEvents / GlobalUpdated / FireAllTriggersForEvent
+    //   全部遍历不到它 —— 触发器会"存在但永不服务"。
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<TriggerClass*>();
+    }
+    Array->AddItem(this);
 }
 
 // -----------------------------------------------------------------------------
@@ -141,17 +148,39 @@ TriggerClass::TriggerClass(TriggerTypeClass* pType) noexcept
         }
     }
     Reset();
+    if (Array == nullptr) {
+        Array = new DynamicVectorClass<TriggerClass*>();
+    }
+    Array->AddItem(this);
 }
 
 // =============================================================================
-// Destructor - release owned strings and event/action objects.
+// Destructor - release owned strings and detach from the global table.
+//
+// 注意：Event / TriggerAction 在 Type 驱动的实例里指向 TriggerTypeClass 的
+//   EventList/ActionList 元素，所有权在类型对象上；这里**不能** GameDelete，
+//   否则同一条触发链被释放两次（原实现无条件 GameDelete，接上 Type 后会崩）。
+//   只有 Type == nullptr 的独立实例才拥有自己的 Event/TriggerAction。
 // =============================================================================
 TriggerClass::~TriggerClass() {
+    if (Type == nullptr) {
+        if (TriggerAction) { GameDelete(TriggerAction); TriggerAction = nullptr; }
+        if (Event) { GameDelete(Event); Event = nullptr; }
+    }
+    TriggerAction = nullptr;
+    Event = nullptr;
+    CurrentAction = nullptr;
     if (ID) { delete[] ID; ID = nullptr; }
     if (Name) { delete[] Name; Name = nullptr; }
-    if (TriggerAction) { GameDelete(TriggerAction); TriggerAction = nullptr; }
-    if (Event) { GameDelete(Event); Event = nullptr; }
-    if (CurrentAction) { GameDelete(CurrentAction); CurrentAction = nullptr; }
+
+    if (Array != nullptr) {
+        for (int32 i = 0; i < Array->Count; ++i) {
+            if (Array->GetItem(i) == this) {
+                Array->Remove(i);
+                break;
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -174,17 +203,21 @@ TriggerClass* TriggerClass::FindOrAllocate(const char* pID) {
     if (!pID || !_strcmpi(pID, "<none>") || !_strcmpi(pID, "none")) return nullptr;
     TriggerClass* found = Find(pID);
     if (found) return found;
-    TriggerClass* newItem = GameCreate<TriggerClass>(pID);
-    if (newItem && Array) Array->Add(newItem);
-    return newItem;
+    // 构造函数已把实例登记进 Array，这里不能再 Add 一次（会重复服务）。
+    return GameCreate<TriggerClass>(pID);
 }
 
 // =============================================================================
-// LoadFromINIList - parse the trigger's configuration from its INI section.
+// LoadFromINIList - 旧式 "一触发器一 section" 形态的解析器。
 //
-// The section name is the trigger's ID.  Recognised keys:
-//   Name, Repeatable, Easy, Normal, Medium, Hard, Event, Action, House,
-//   LinkedTrigger, Data, Timer, Owner, Disabled
+//   ⚠ 这个形态**不是** RA2/YR 的 [Triggers] 格式。RA2 的每一行固定是
+//     HOUSE,LINKED_TRIGGER,NAME,DISABLED,EASY,NORMAL,HARD,TRANSFERABLE，
+//     事件与动作另外放在 [Events]/[Actions] 里按同一 ID 索引 —— 那套解析
+//     在 TriggerTypeClass::LoadFromINI / CreateFromINIList（这是真正的
+//     加载入口，已在 Game/WinMain.cpp 的 2.8 段接线）。
+//
+//   保留本函数只为兼容早期内部格式与往返测试；**不要**在场景加载路径上
+//   调它，否则会把 "Name=" / "Event=" 之类的键当成触发器主体。
 // =============================================================================
 bool TriggerClass::LoadFromINIList(CCINIClass* pINI) {
     if (!pINI) return false;
@@ -766,6 +799,14 @@ bool TriggerClass::FireActions(AbstractClass* pObject, CellStruct pos)
 
     bool fired = false;
     IsBeingFired = true;
+
+    static const bool s_TrigDbg = (std::getenv("OPENYR_TRIGDBG") != nullptr);
+    if (s_TrigDbg) {
+        std::fprintf(stderr, "[TRIGFIRE] frame=%d this=%p id=%s type=%p actions=%d destroyed=%d\n",
+                     (int)Game::CurrentFrame, (void*)this,
+                     (ID != nullptr) ? ID : "?", (void*)Type,
+                     (int)Type->ActionList.Count, Destroyed ? 1 : 0);
+    }
 
     // OpenYR 把 asm 的单链表 +0xB0 存成动态数组 ActionList（顺序一致）。
     for (int32 i = 0; i < Type->ActionList.Count; ++i) {

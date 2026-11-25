@@ -4,6 +4,7 @@
 #include "Rules/RulesClass.h"
 #include "Scenario/CampaignClass.h"
 #include "IO/MixFileClass.h"
+#include "Core/Random2Class.h"
 
 CoordStruct InitHooks::LocoDefaultPos[11];
 
@@ -22,7 +23,15 @@ void InitHooks::Rules()
 
 void InitHooks::Randomizer()
 {
-    // 根据游戏行为，可知随机数引擎以固定种子起步，保证回放可复现。
+    // asm: Init_Randomizer (0x4128A0 区)
+    //   push 0                      ; seed
+    //   mov  ecx, offset NonCriticalRandomNumber
+    //   call Random_Init
+    //
+    // 非关键随机数引擎以种子 0 起步：这条路径只服务视觉/装饰性抽样，
+    // 与 ScenarioClass 里带同步种子的那一只相互独立，固定种子保证回放时
+    // 装饰序列可复现。
+    NonCriticalRandomNumber.Init(0);
 }
 
 void InitHooks::Campaigns()

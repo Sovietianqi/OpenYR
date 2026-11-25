@@ -1,5 +1,9 @@
 #include "WalkLocomotionClass.h"
+
+#include <cstdio>
+#include <cstdlib>
 #include "../Map/MapClass.h"
+#include "../AI/TagClass.h"
 #include "../Map/CellClass.h"
 #include "../Rules/RulesClass.h"
 #include "../Scenario/ScenarioClass.h"
@@ -66,6 +70,9 @@ WalkLocomotionClass::WalkLocomotionClass()
     , OnRamp(false)
     , JustLanded(false)
     , WasCrushed(false)
+    , AltBlockedCell(0, 0)
+    , AltResultCell(0, 0)
+    , AltCooldown(0)
 {
     Speed = 64;
 }
@@ -77,16 +84,12 @@ WalkLocomotionClass::~WalkLocomotionClass()
 
 HRESULT WalkLocomotionClass::GetClassID(CLSID* pClassID)
 {
-    if (pClassID) {
-        pClassID->Data1 = static_cast<uint32>(LocoID);
-        pClassID->Data2 = 0;
-        pClassID->Data3 = 0;
-        for (int32 i = 0; i < 8; ++i) {
-            pClassID->Data4[i] = 0;
-        }
-        return S_OK;
-    }
-    return E_FAIL;
+    // asm: 判空失败返回 80004003h (E_POINTER)，否则把 16 字节 GUID 原样拷出。
+    if (pClassID == nullptr)
+        return E_POINTER;
+
+    *pClassID = CLSIDs::Get(LocoID);
+    return S_OK;
 }
 
 int32 WalkLocomotionClass::Size()
@@ -113,6 +116,25 @@ void WalkLocomotionClass::Move_To(CoordStruct to)
         }
     }
 
+    // ★ 同一目标不重复寻路。
+    //   任务层是每帧重下 Set_Destination 的（Mission_Attack / Mission_Hunt
+    //   每个任务步都会调一次）。A* 的代价是几十到几千个节点，若每次 Move_To
+    //   都重算，几十个步兵就能把一帧拖到几十毫秒（实测 2400 帧跑了 6 分钟
+    //   还没结束）。目标未变且路径还在就什么都不做 —— 语义与"重复下达同一
+    //   移动命令"一致。
+    //   ★ 判据用"目标**格**"而不是"目标坐标"。
+    //   追击类任务（Mission_Attack / Mission_Hunt）每帧拿目标的实时坐标重下
+    //   命令，坐标每个像素都在变，逐字节比较永远不等 → 每帧重跑一次 A*。
+    //   而路径本身就是逐格的，同一格内的坐标漂移不改变寻路结果：按格比较
+    //   既保持语义，又把"每帧一次 A*"降成"每换一格一次"。
+    if (IsMoving && !IsDefaultPos(to) && PathLength > 0
+        && PathIndex < PathLength
+        && CoordMath::CoordToCell(Dest).X == CoordMath::CoordToCell(to).X
+        && CoordMath::CoordToCell(Dest).Y == CoordMath::CoordToCell(to).Y) {
+        Dest = to;                 // 同步最新坐标，供到达判定用
+        return;
+    }
+
     Dest = to;
 
     if (IsDefaultPos(to)) {
@@ -131,7 +153,36 @@ void WalkLocomotionClass::Move_To(CoordStruct to)
 
     HeadTo = to;
 
-    // 生成逐格路径（原版由寻路系统写入路径表；此处按直线补全）。
+    // ★ 目标格不可入、且单位已经贴着它：不再重复寻路，直接进收脚/让位分支。
+    //
+    //   任务层每帧都会重下 Set_Destination。收脚后 IsMoving 为 false，上面
+    //   那条"同一目标不重复寻路"的短路不再命中，于是每帧重跑一次
+    //   FootClass::Build_Path —— 终点不可达时那是 8000 节点的 A*（实测
+    //   900 帧从 31 秒涨到 59 秒）。这里把"贴着不可入的目标格"当作等价的
+    //   到达状态：只登记朝往点、清空路径，让 Process 走收脚 / 让位分支。
+    //   目标格一旦空出来，Can_Enter_Cell 变真，本短路自动失效。
+    if (Owner != nullptr) {
+        const CellStruct hereCell = CoordMath::CoordToCell(CurrentCoord);
+        const CellStruct destCell = CoordMath::CoordToCell(to);
+        if ((destCell.X != hereCell.X || destCell.Y != hereCell.Y)
+            && CoordMath::CellDistance(hereCell, destCell) <= 1
+            && !Owner->Can_Enter_Cell(destCell))
+        {
+            IsMoving = false;
+            IsReallyMovingNow = false;
+            Path.Clear();
+            PathIndex = 0;
+            PathLength = 0;
+            return;
+        }
+    }
+
+    // 生成逐格路径。
+    //   ★ 优先用占用感知的 A*（FootClass::Build_Path）：它会绕开水面/建筑/
+    //   已站满的格子，走到"终点周围最近的可站格"。此前这里是"起点到终点的
+    //   直线补全"，完全不查通行性 —— 6 名步兵会一路走进敌方单位所在的格子
+    //   叠成同一个坐标点，同时能开火的只有最前面一个。A* 失败（不可达）时
+    //   再退回直线补全，保证不会因为寻路失败而完全不移动。
     Path.Clear();
     PathIndex = 0;
     PathLength = 0;
@@ -142,24 +193,46 @@ void WalkLocomotionClass::Move_To(CoordStruct to)
     CurrentCell = startCell;
     NextCell = destCell;
 
-    int32 dx = static_cast<int32>(destCell.X) - static_cast<int32>(startCell.X);
-    int32 dy = static_cast<int32>(destCell.Y) - static_cast<int32>(startCell.Y);
-    const int32 adx = std::abs(dx);
-    const int32 ady = std::abs(dy);
-    const int32 steps = (adx > ady) ? adx : ady;
-
-    if (steps > 0) {
-        for (int32 i = 1; i <= steps; ++i) {
-            CellStruct cs;
-            cs.X = static_cast<int16>(static_cast<int32>(startCell.X)
-                + (dx * i) / steps);
-            cs.Y = static_cast<int16>(static_cast<int32>(startCell.Y)
-                + (dy * i) / steps);
-            Path.Add(cs);
+    bool routed = false;
+    if (Owner != nullptr)
+    {
+        DynamicVectorClass<CellStruct> cells;
+        const bool ok = Owner->Build_Path(destCell, cells);
+        if (ok && cells.GetCount() > 0)
+        {
+            // 跳过起点格（步兵已经在那一格上）。
+            for (int32 i = 1; i < cells.GetCount(); ++i)
+                Path.Add(cells[i]);
+            PathLength = Path.GetCount();
+            if (PathLength > 0)
+            {
+                NextCell = Path[0];
+                routed = true;
+            }
         }
-        PathLength = Path.GetCount();
-        if (PathLength > 0) {
-            NextCell = Path[0];
+    }
+
+    if (!routed)
+    {
+        int32 dx = static_cast<int32>(destCell.X) - static_cast<int32>(startCell.X);
+        int32 dy = static_cast<int32>(destCell.Y) - static_cast<int32>(startCell.Y);
+        const int32 adx = std::abs(dx);
+        const int32 ady = std::abs(dy);
+        const int32 steps = (adx > ady) ? adx : ady;
+
+        if (steps > 0) {
+            for (int32 i = 1; i <= steps; ++i) {
+                CellStruct cs;
+                cs.X = static_cast<int16>(static_cast<int32>(startCell.X)
+                    + (dx * i) / steps);
+                cs.Y = static_cast<int16>(static_cast<int32>(startCell.Y)
+                    + (dy * i) / steps);
+                Path.Add(cs);
+            }
+            PathLength = Path.GetCount();
+            if (PathLength > 0) {
+                NextCell = Path[0];
+            }
         }
     }
 
@@ -347,6 +420,23 @@ void WalkLocomotionClass::Stop_Movement_Animation()
 
 bool WalkLocomotionClass::Process()
 {
+    if (std::getenv("OPENYR_CHAIN_DEBUG") != nullptr)
+    {
+        static int s_dumped = 0;
+        if (s_dumped < 2)
+        {
+            ++s_dumped;
+            const CoordStruct oc = (Owner != nullptr) ? Owner->GetCoords() : CoordStruct(0,0,0);
+            std::fprintf(stderr,
+                "[CHAIN] walk#%d moving=%d pathIdx=%d pathLen=%d cur=(%d,%d,%d) own=(%d,%d,%d) dest=(%d,%d) fall=%d jump=%d spdPct=%.3f\n",
+                s_dumped, (int)IsMoving, (int)PathIndex, (int)PathLength,
+                CurrentCoord.X, CurrentCoord.Y, CurrentCoord.Z,
+                oc.X, oc.Y, oc.Z, Dest.X, Dest.Y,
+                (int)IsFalling, (int)IsJumping,
+                (Owner != nullptr) ? Owner->SpeedPercentage : -1.0);
+        }
+    }
+
     // asm: sub_75AEC0 开头 —— HeadTo 与 Destination 同时归零则直接返回。
     if (!IsMoving && IsDefaultPos(HeadTo) && IsDefaultPos(Dest)) {
         IsReallyMovingNow = false;
@@ -356,6 +446,11 @@ bool WalkLocomotionClass::Process()
     if (!Owner) {
         IsReallyMovingNow = false;
         return false;
+    }
+
+    // 替代格缓存的退避窗口按帧递减（每个载体每帧一次）。
+    if (AltCooldown > 0) {
+        --AltCooldown;
     }
 
     // 先跑空格落逻辑（下坠 / 跳跃期间不走地面步进）。
@@ -379,20 +474,91 @@ bool WalkLocomotionClass::Process()
         return false;
     }
 
-    // ---- 到达判定（asm: RulesClass CloseEnough 比较） ----
-    if (IsAtDestination()) {
-        // 收脚：贴合目标点，停止移动。
-        CurrentCoord = target;
-        Owner->SetCoords(CurrentCoord);
+    // ---- 目标格站满：就地落位收脚 ----------------------------------------
+    //   目标格已被 3 名步兵站满（或被建筑 / 载具占住）时，逐格步进永远走不
+    //   进去：MoveOneStep 每帧找替代格 → 又回到本格，表现就是原地抖动、
+    //   动画一直播走路。这里在"已经贴到目标格（切比雪夫距离 <= 1）"时就
+    //   结束这次移动：先把 Owner 让到 BFS 找到的最近可站格并登记占用，再
+    //   走正常收尾（IsMoving = false 等）。
+    //
+    //   与"已经在目标格内"不冲突：这里要求 targetCell != hereCell，已站在
+    //   目标格里的情况仍由下面的 IsAtDestination 分支处理。
+    const CellStruct hereCell   = CoordMath::CoordToCell(CurrentCoord);
+    const CellStruct targetCell = CoordMath::CoordToCell(target);
+
+    if ((targetCell.X != hereCell.X || targetCell.Y != hereCell.Y)
+        && CoordMath::CellDistance(hereCell, targetCell) <= 1
+        && !Owner->Can_Enter_Cell(targetCell))
+    {
+        const CellStruct altCell = FindAlternativeCell(targetCell);
+        if ((altCell.X != 0 || altCell.Y != 0)
+            && (altCell.X != hereCell.X || altCell.Y != hereCell.Y))
+        {
+            CoordStruct loc = CoordMath::CellToCoord(altCell);
+            loc.Z = MapClass::Instance->GetGroundHeight(loc);
+
+            CellClass* pOldCell = MapClass::Instance->GetCellAt(hereCell);
+            CellClass* pNewCell = MapClass::Instance->GetCellAt(altCell);
+            if (pOldCell != nullptr && pOldCell != pNewCell)
+                pOldCell->Remove_Occupier(Owner);
+            if (pNewCell != nullptr)
+                pNewCell->Add_Occupier(Owner);
+
+            CurrentCoord = loc;
+            CurrentCell  = altCell;
+            NextCell     = altCell;
+            Owner->SetCoords(CurrentCoord);
+        }
+
         IsMoving = false;
         IsReallyMovingNow = false;
         HeadTo = CoordStruct(0, 0, 0);
-        Dest = CoordStruct(0, 0, 0);
+        Dest   = CoordStruct(0, 0, 0);
         Path.Clear();
         PathIndex = 0;
         PathLength = 0;
         Owner->SetSequence(Sequence::Ready);
         return false;
+    }
+
+    // ---- 到达判定（asm: RulesClass CloseEnough 比较） ----
+    //   ★ 吸附到目标点之前必须先确认"那一格还能站"。
+    //   IsAtDestination 的判据是距离 <= CloseEnough，可能落在下一格的中心；
+    //   此前这里直接 `CurrentCoord = target` 跳过逐格步进，于是①绕过了
+    //   CanMoveToCell 的占用检查（5 名步兵照样压进同一格）②换格了却不更新
+    //   占用链（后来者看到的仍是空格）。目标格站满时改为继续走逐格步进，
+    //   由 MoveOneStep 选择替代格。
+    if (IsAtDestination()) {
+        if ((targetCell.X != hereCell.X || targetCell.Y != hereCell.Y)
+            && !Owner->Can_Enter_Cell(targetCell))
+        {
+            // 目标格已满/不可入：不吸附，落到下面的逐格步进。
+        }
+        else
+        {
+            if (targetCell.X != hereCell.X || targetCell.Y != hereCell.Y)
+            {
+                CellClass* pOldCell = MapClass::Instance->GetCellAt(hereCell);
+                CellClass* pNewCell = MapClass::Instance->GetCellAt(targetCell);
+                if (pOldCell != nullptr && pOldCell != pNewCell)
+                    pOldCell->Remove_Occupier(Owner);
+                if (pNewCell != nullptr)
+                    pNewCell->Add_Occupier(Owner);
+            }
+
+            // 收脚：贴合目标点，停止移动。
+            CurrentCoord = target;
+            Owner->SetCoords(CurrentCoord);
+            IsMoving = false;
+            IsReallyMovingNow = false;
+            HeadTo = CoordStruct(0, 0, 0);
+            Dest = CoordStruct(0, 0, 0);
+            Path.Clear();
+            PathIndex = 0;
+            PathLength = 0;
+            Owner->SetSequence(Sequence::Ready);
+            return false;
+        }
     }
 
     // ---- 朝向朝往点（步兵转身不设限速） ----
@@ -481,7 +647,14 @@ void WalkLocomotionClass::UpdatePosition()
     }
 
     Owner->SetCoords(CurrentCoord);
+
+    // 进入新格 → [CellTags]（asm: FootClass_UpdatePosition 的格判定段）。
+    const bool enteredNewCell =
+        (curCell.X != CurrentCell.X || curCell.Y != CurrentCell.Y);
     CurrentCell = curCell;
+    if (enteredNewCell) {
+        TagClass::SpringCellTag(curCell, Owner);
+    }
 }
 
 // ============================================================================
@@ -535,17 +708,67 @@ bool WalkLocomotionClass::IsAtDestination() const
 bool WalkLocomotionClass::MoveOneStep()
 {
     if (PathIndex >= PathLength) {
-        return false;
+        // 没有寻路结果（步兵的 Set_Destination 走的是"直线 Move_To"，
+        // 不会填 Path）。这里退化成"朝目标格推进一格"，让 UpdatePosition
+        // 每帧能插值过去；否则 MoveOneStep 恒 false，IsMoving 每帧被清，
+        // 步兵接到移动/攻击命令后原地踏步。
+        const CoordStruct target = !IsDefaultPos(HeadTo) ? HeadTo : Dest;
+        if (IsDefaultPos(target)) {
+            return false;
+        }
+        NextCell = CoordMath::CoordToCell(target);
+        if (CurrentCell.X == NextCell.X && CurrentCell.Y == NextCell.Y) {
+            // 已经在目标格里、但坐标没贴合落点：这里返回 true 会让
+            // Process 每帧都把 IsMoving 置回真、循环播走路动画而坐标不动
+            // （实测 5 名 E1 这样空转）。逐格移动的粒度本来就是"格"，
+            // 进了目标格就算走到头 —— 返回 false 让 Process 收脚。
+            return false;
+        }
+        // 退化步进也要过占用检查：目标格站满时找替代格，别硬挤进去。
+        if (!CanMoveToCell(NextCell)) {
+            const CellStruct altCell = FindAlternativeCell(NextCell);
+            if (altCell.X == 0 && altCell.Y == 0) {
+                return false;               // 半径 4 内没有能站的格子
+            }
+            if (altCell.X == CurrentCell.X && altCell.Y == CurrentCell.Y) {
+                // 最近的可站格就是脚下这一格：再走也是原地，直接收脚。
+                return false;
+            }
+            NextCell = altCell;
+        }
+        // 与寻路分支保持一致：换格时同步占用登记。
+        if (Owner) {
+            CellClass* pOldCell = MapClass::Instance->GetCellAt(CurrentCell);
+            CellClass* pNewCell = MapClass::Instance->GetCellAt(NextCell);
+            if (pOldCell != nullptr && pOldCell != pNewCell)
+                pOldCell->Remove_Occupier(Owner);
+            if (pNewCell != nullptr)
+                pNewCell->Add_Occupier(Owner);
+        }
+        CurrentCell = NextCell;
+        return true;
     }
 
     CellStruct nextCell = Path[PathIndex];
     if (!CanMoveToCell(nextCell)) {
-        CellStruct altCell = FindAlternativeCell(nextCell);
+        const CellStruct altCell = FindAlternativeCell(nextCell);
         if (altCell.X == 0 && altCell.Y == 0) {
+            return false;
+        }
+        if (altCell.X == CurrentCell.X && altCell.Y == CurrentCell.Y) {
+            // 最近的可站格就是脚下这一格：堵死在本格，不再空转。
             return false;
         }
         nextCell = altCell;
     }
+
+    // ★ 换格时同步登记占用位。
+    //   此前步兵走路只改坐标，从不更新格子的占用链；于是"格子上站着人"
+    //   这件事在 CellClass 里根本不存在 —— Can_Enter_Cell / IsCellOccupied
+    //   一律看到空格，整队步兵会走进同一格叠成同一个坐标点（实测 6 名 E1
+    //   压在同一格，同时开火的只有最前面一个）。原版由
+    //   ObjectClass::Mark_All_Occupation_Bits 在每格步进时完成这件事。
+    CellClass* pOldCell = MapClass::Instance->GetCellAt(CurrentCell);
 
     CurrentCell = nextCell;
     NextCell = nextCell;
@@ -558,6 +781,12 @@ bool WalkLocomotionClass::MoveOneStep()
 
     if (Owner) {
         Owner->SetCoords(CurrentCoord);
+
+        CellClass* pNewCell = MapClass::Instance->GetCellAt(nextCell);
+        if (pOldCell != nullptr && pOldCell != pNewCell)
+            pOldCell->Remove_Occupier(Owner);
+        if (pNewCell != nullptr)
+            pNewCell->Add_Occupier(Owner);
     }
 
     ++PathIndex;
@@ -585,31 +814,170 @@ bool WalkLocomotionClass::CanMoveToCell(CellStruct cell)
         return false;
     }
 
-    if (MapClass::Instance->IsCellOccupied(cell) && !IsCrawling) {
+    // ★ 占用判据必须"按步兵的规则"，不能用 IsCellOccupied。
+    //   IsCellOccupied 只要格子上有任何对象就返回 true —— 用它会让两名步兵
+    //   永远无法相邻集结/并肩推进；而真正该拦的是"建筑、载具、或已有 3 名
+    //   步兵"。这套规则就在 FootClass::Can_Enter_Cell 里。
+    //   匍匐前进（IsCrawling）按原版可以钻过被占的格子，故跳过该判定。
+    if (!IsCrawling && Owner != nullptr && !Owner->Can_Enter_Cell(cell)) {
         return false;
     }
 
     return true;
 }
 
+// ============================================================================
+// FindAlternativeCell - 目标格不可入时，去最近的可站格。
+//
+// asm 依据：asm 导出里 WalkLocomotionClass 没有独立的"替代格"函数（只有
+//   CTOR / Process / MoveTo / StopMoving 那一批），落点搜索是走
+//   MapClass::Nearby_Location（asm:0x56DC50 起）—— 从中心格逐圈由内向外
+//   扫，半径取 min(0x20, width+height)。这里按行为等价实现：以当前格为
+//   圆心逐圈外扩，取第一个"地形可走 + 还能站人"的格子。
+//
+// 边界与判据：
+//   * 半径上限 4 格（9x9 = 81 个候选）。徒步单位疏散一格就够用了，同时
+//     把最坏代价钉死在 81 个节点以内 —— 不引入全局 A*，也不做每帧搜索。
+//   * 扩展层只看地形（水 / 墙 / 越界不可穿过），斜走不切角（与
+//     FootClass::Build_Path 的规则一致）；候选层才用 CanMoveToCell 判占用
+//     （建筑 / 载具独占、步兵每格 3 人）。两者必须分开：站满 3 人的格子
+//     不能站，但绕行时不该把它当墙，否则队伍一密集搜索立刻"四周全黑"。
+//   * 起点自身不算候选（单位已经站在那儿）。
+//   * 同一圈里若有多个可站格，取离 blocked 最近的那个。否则疏散会随机
+//     落到"离目标更远"的一侧，下一帧再往回走，表现就是原地抖动。
+//   * 找不到返回 (0,0)，沿用原有返回值约定。
+// ============================================================================
 CellStruct WalkLocomotionClass::FindAlternativeCell(CellStruct blocked)
 {
-    for (int32 radius = 1; radius <= 4; ++radius) {
-        for (int32 dx = -radius; dx <= radius; ++dx) {
-            for (int32 dy = -radius; dy <= radius; ++dy) {
-                if (std::abs(dx) != radius && std::abs(dy) != radius) {
+    const CellStruct here = CoordMath::CoordToCell(CurrentCoord);
+
+    // ── 缓存命中：同一目标格，退避窗口未过 ────────────────────────────────
+    //   被围死时如果每帧都重跑一遍 81 格搜索，几十个步兵同帧搜索会把一帧
+    //   拖长；没找到的情况下重搜也没意义（格子的占用不会在 1 帧内变空）。
+    if (AltCooldown > 0
+        && AltBlockedCell.X == blocked.X && AltBlockedCell.Y == blocked.Y)
+    {
+        if (AltResultCell.X == 0 && AltResultCell.Y == 0)
+            return AltResultCell;               // 上次就没找到：窗口内不再重搜
+        if (CoordMath::CellDistance(here, AltResultCell) <= 4
+            && CanMoveToCell(AltResultCell))
+            return AltResultCell;               // 结果格仍能站：直接复用
+        // 结果格已被别人占满 / 单位已走远 → 往下重搜。
+    }
+
+    // 地形通行（不含占用）：用于 BFS 扩展。
+    const auto terrainOk = [](CellStruct cs) -> bool
+    {
+        if (cs.X < 0 || cs.Y < 0 || cs.X >= 512 || cs.Y >= 512)
+            return false;
+        const LandType land = MapClass::Instance->GetLandType(cs);
+        return land != LandType::Water && land != LandType::Wall;
+    };
+
+    // 能否落脚（含占用）：用于候选判定。
+    //   自己脚下永远算能站 —— Can_Enter_Cell 在"本人已登记于该格、且该格
+    //   正好满 3 人（含本人）"时会返回 false，不能拿它否掉自己的格子。
+    const auto standable = [&](CellStruct cs) -> bool
+    {
+        if (cs.X == here.X && cs.Y == here.Y)
+            return true;
+        return CanMoveToCell(cs);
+    };
+
+    constexpr int32 kRadius = 4;
+    constexpr int32 kSpan   = kRadius * 2 + 1;          // 9
+
+    static const int8 kDX[8] = {  0,  1,  1,  1,  0, -1, -1, -1 };
+    static const int8 kDY[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    bool  visited[kSpan * kSpan] = {};
+    int8  curX[kSpan * kSpan];
+    int8  curY[kSpan * kSpan];
+    int8  nxtX[kSpan * kSpan];
+    int8  nxtY[kSpan * kSpan];
+
+    visited[kRadius * kSpan + kRadius] = true;          // 起点
+    curX[0] = 0;
+    curY[0] = 0;
+    int32 curCount = 1;
+
+    CellStruct result(0, 0);
+
+    for (int32 ring = 1; ring <= kRadius; ++ring)
+    {
+        int32 nxtCount = 0;
+        int32 bestDist = 0x7FFFFFFF;
+
+        for (int32 i = 0; i < curCount; ++i)
+        {
+            for (int32 d = 0; d < 8; ++d)
+            {
+                const int32 ox = static_cast<int32>(curX[i]) + kDX[d];
+                const int32 oy = static_cast<int32>(curY[i]) + kDY[d];
+                if (ox < -kRadius || ox > kRadius || oy < -kRadius || oy > kRadius)
+                    continue;
+
+                const int32 vi = (oy + kRadius) * kSpan + (ox + kRadius);
+                if (visited[vi])
+                    continue;
+
+                const CellStruct cs(static_cast<int16>(here.X + ox),
+                                    static_cast<int16>(here.Y + oy));
+                if (!terrainOk(cs))
+                {
+                    visited[vi] = true;             // 墙 / 水 / 越界：不可穿过
                     continue;
                 }
-                CellStruct cs;
-                cs.X = static_cast<int16>(static_cast<int32>(blocked.X) + dx);
-                cs.Y = static_cast<int16>(static_cast<int32>(blocked.Y) + dy);
-                if (CanMoveToCell(cs)) {
-                    return cs;
+
+                // 斜走不切角：两条正交边也必须能过。
+                if (kDX[d] != 0 && kDY[d] != 0)
+                {
+                    const CellStruct sideX(static_cast<int16>(here.X + ox), here.Y);
+                    const CellStruct sideY(here.X, static_cast<int16>(here.Y + oy));
+                    if (!terrainOk(sideX) || !terrainOk(sideY))
+                        continue;                   // 不置 visited：正交方向仍可到达
+                }
+
+                visited[vi] = true;
+                nxtX[nxtCount] = static_cast<int8>(ox);
+                nxtY[nxtCount] = static_cast<int8>(oy);
+                ++nxtCount;
+
+                // (0,0) 是"没找到"的哨兵值，不能当作合法候选返回。
+                if (cs.X == 0 && cs.Y == 0)
+                    continue;
+
+                if (standable(cs))
+                {
+                    const int32 dist = CoordMath::CellDistance(cs, blocked);
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        result = cs;
+                    }
                 }
             }
         }
+
+        if (result.X != 0 || result.Y != 0)
+            break;                                  // 本圈已命中：最近的一圈
+
+        for (int32 i = 0; i < nxtCount; ++i)
+        {
+            curX[i] = nxtX[i];
+            curY[i] = nxtY[i];
+        }
+        curCount = nxtCount;
+        if (curCount == 0)
+            break;                                  // 四周全是墙/水：无路可疏散
     }
-    return CellStruct(0, 0);
+
+    // 写回缓存：找到时 15 帧内复用，没找到时退避 60 帧（被围死期间不再重搜）。
+    AltBlockedCell = blocked;
+    AltResultCell  = result;
+    AltCooldown    = (result.X == 0 && result.Y == 0) ? 60 : 15;
+
+    return result;
 }
 
 // ============================================================================
@@ -751,6 +1119,14 @@ Move WalkLocomotionClass::Can_Enter_Cell(CellStruct cell)
     LandType land = MapClass::Instance->GetLandType(cell);
     if (land == LandType::Water || land == LandType::Wall) {
         return Move::No;
+    }
+
+    // ★ 占用判定交给载体（FootClass::Can_Enter_Cell）：建筑/载具独占一格、
+    //   步兵每格最多 3 人。这段此前完全缺失，于是整队步兵会一路走进敌方
+    //   单位所在的格子叠成一堆 —— 只查地形永远发现不了"这格站满了人"。
+    if (Owner != nullptr && !Owner->Can_Enter_Cell(cell)) {
+        // 岩石格允许"临时停留"（Move::Temp 会让上层继续找下一格）。
+        return (land == LandType::Rock) ? Move::Temp : Move::No;
     }
 
     if (land == LandType::Rock) {

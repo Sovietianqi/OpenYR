@@ -11,6 +11,9 @@
 #include <Rendering/GScreenClass.h>
 #include <Rendering/Surface.h>
 #include <Audio/VocClass.h>
+#include <Audio/AudioSampleBank.h>
+#include <Audio/Audio.h>
+#include <Audio/VoxClass.h>
 #include <INI/INIClass.h>
 #include <Game/Externs.h>
 #include <Game/LogicClass.h>
@@ -257,6 +260,7 @@ void Init_Game_Load()
             VocClass::CreateFromINIList(pSoundINI);
         }
     }
+
 }
 
 // ============================================================================
@@ -265,18 +269,22 @@ void Init_Game_Load()
 
 void Init_Random()
 {
-    // Use the current time as the seed for the standard C random generator
-    uint32 seed = static_cast<uint32>(time(nullptr));
+    // asm: Random_Init(Scenario+0x218, 0) —— 对局的同步随机流种子固定为 0；
+    //   会话级种子由 sub_52FC20 在开局时另行灌入。
+    //
+    //   原来的实现是 `time(nullptr) ^ (uintptr_t)&seed`：时间 + 栈地址。
+    //   栈地址在 PIE + ASLR 下每次进程都不同，于是同一份地图跑两次的随机流
+    //   从第一个数起就分叉 —— 这正是 crc 一直抖、没法做逐帧回归的根因之一。
+    //   现在种子完全由 OPENYR_SEED 决定（未设置则 0，与原版一致）。
+    int32 seed = 0;
+    if (const char* pEnv = std::getenv("OPENYR_SEED"))
+        seed = static_cast<int32>(std::strtol(pEnv, nullptr, 10));
 
-    // XOR with process-specific data for better entropy
-    seed ^= static_cast<uint32>(reinterpret_cast<uintptr_t>(&seed));
+    // C 库随机也钉死，避免任何残留的 rand() 引入非确定性。
+    srand(static_cast<unsigned int>(seed));
 
-    srand(seed);
-
-    // Also seed the ScenarioClass randomizer if it exists
-    if (ScenarioClass::Instance) {
-        ScenarioClass::Instance->Random.Seed = static_cast<int32>(seed);
-    }
+    if (ScenarioClass::Instance)
+        ScenarioClass::Instance->Random.Init(seed);
 }
 
 // ============================================================================
@@ -306,22 +314,17 @@ void Init_MixFiles()
 {
     if (g_MixFilesLoaded) return;
 
-    // In the original game, MIX files are loaded in a specific order
-    // to ensure proper asset priority. Files loaded later override earlier ones.
+    // 真正的挂载在 Game/WinMain.cpp 的 Init_MixFiles_Impl() 里（照
+    // Load_Bootstrap / WinMain / Init_SecondaryMixFiles 的汇编顺序：先
+    // EXPANDMD99..00，再 RA2MD/RA2/CACHEMD/CACHE/LOCALMD/LOCAL，
+    // 再 LANGMD/LANGUAGE，最后是内容档案）。这里只做状态封装。
     //
-    // Load order for Yuri's Revenge:
-    //   1. expandmd01.mix - Core game data
-    //   2. expandmd02.mix - Additional game data
-    //   3. expandmd03.mix - More game data
-    //   4. language.mix - Language-specific resources
-    //   5. multiplayer.mix - Multiplayer-specific resources
-    //   6. cache.mix - Cached resources
-    //   7. local.mix - Local modifications
-    //
-    // Each MIX file is a container that stores multiple files
-    // with optional encryption (RA2 uses a Blowfish-based scheme).
+    // 注意优先级方向：原版是**先注册的优先**（MixFileClass_FindFileByName
+    // 从注册表头往后遍历），所以 RA2MD 必须先于 RA2 注册才能覆盖基础版素材。
+    extern bool Init_MixFiles_Impl();
+    const bool ok = Init_MixFiles_Impl();
 
-    GameMixState = 1;
+    GameMixState = ok ? 1 : 2;
     g_MixFilesLoaded = true;
 }
 
@@ -385,16 +388,58 @@ void Init_Sound()
 {
     if (g_SoundInitialized) return;
 
-    // In the original game, this initializes:
-    // - Miles Sound System (MSS) or DirectSound
-    // - Audio channels (voc, theme, ambient)
-    // - Sound effect cache
-    // - Music playback system
-    // - Volume levels
-    // - EVA voice system
+    GameSoundOn  = true;
+    GameMusicOn  = true;
 
-    GameSoundOn = true;
-    GameMusicOn = true;
+    // 原版这一段的顺序是：声卡 → 采样索引(audio.idx) → [SoundList] 音效
+    // 定义 → EVA 语音表 → 各通道。本工程的可听链路依赖前三步全部到位，
+    // 少一步都会"看起来初始化了但一句也放不出来"：
+    //
+    //   * 没有索引表：SoundDefinition::AddSample 按原版语义"报成功但不入
+    //     表"，所有音效的 SampleIndex[] 都是空的；
+    //   * 没有 [SoundList]：Sound_Effect(index) 取不到定义；
+    //   * 没有 audio.bag：名字有了也拿不到 PCM。
+    //
+    // 这些文件都可能在 MIX 里，CCFileClass 会穿过去；缺失时只影响可听性，
+    // 不影响逻辑（回归 CRC 不受任何影响）。
+
+    // 1) 采样索引表（名字 → audio.idx 下标）
+    Audio_LoadSampleIndex("audio.idx", "");
+
+    // 2) [SoundList]：音效定义 + 每个定义用到的样本下标
+    if (g_SoundINIFile && g_SoundINIFile[0])
+    {
+        if (CCINIClass* pSoundINI = CCINIClass::LoadINIFile(g_SoundINIFile))
+        {
+            VocClass::CreateFromINIList(pSoundINI);
+            CCINIClass::UnloadINIFile(pSoundINI);
+        }
+    }
+
+    // 3) EVA 语音表（ra2md.ini 的 [DialogList]）
+    if (CCINIClass* pLangINI = CCINIClass::LoadINIFile("ra2md.ini"))
+    {
+        VoxClass::CreateFromINIList(pLangINI);
+        CCINIClass::UnloadINIFile(pLangINI);
+    }
+
+    // 4) 采样库（audio.idx + audio.bag），名字 → 原始字节
+    const bool bankOk = AudioSampleBank::Instance().Open("audio.idx");
+
+    // 5) 音频管理器（音量/通道池；真正的输出后端由 OPENYR_AUDIO 决定，
+    //    在第一次 Update_Audio 时惰性打开）
+    AudioManager::Instance()->Initialize();
+
+    if (std::getenv("OPENYR_AUDIO") != nullptr)
+    {
+        std::fprintf(stderr,
+                     "[AUDIO] 样本表=%d 音效定义=%d EVA条目=%d 采样库=%s\n",
+                     (g_pAudioIndexTable != nullptr) ? g_pAudioIndexTable->GetCount() : 0,
+                     VocClass::GetSoundDefinitionCount(),
+                     (VoxClass::Array != nullptr) ? VoxClass::Array->Count : 0,
+                     bankOk ? "已挂载" : "缺失（没有 audio.bag/audio.idx）");
+    }
+
     g_SoundInitialized = true;
 }
 

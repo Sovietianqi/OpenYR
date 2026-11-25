@@ -699,14 +699,30 @@ void ZBufferClass::Clear_Rect(int32 x, int32 y, int32 w, int32 h)
     for (int32 row = y0; row < y1; ++row)
     {
         uint16* line = Base + static_cast<size_t>(row) * rowWords + x0;
-        const int32 count = x1 - x0;
-        // asm 同样是"整 dword 铺 0xFFFFFFFF，奇尾补 word"
+        int32 count = x1 - x0;
         int32 i = 0;
+
+        // asm: `test dl, 2 / jz` —— 目标地址只按 2 字节对齐时先补一个 word，
+        //   后面才能安全地 rep stosd（一次 4 字节，两个 0FFFFh）。
+        if ((reinterpret_cast<uintptr_t>(line) & 2u) != 0u && count > 0)
+        {
+            line[0] = 0xFFFF;
+            i = 1;
+        }
+
+        // asm: `or eax, 0FFFFFFFFh / rep stosd`
         for (; i + 1 < count; i += 2)
             *reinterpret_cast<uint32*>(line + i) = 0xFFFFFFFFu;
+
+        // asm: `test byte ptr [..], 1 / mov word ptr [edi], 0FFFFh` —— 奇尾
         if (i < count)
             line[i] = 0xFFFF;
     }
+}
+
+void ZBufferClass::Clear_Rect(const Rectangle& rect)
+{
+    Clear_Rect(rect.X, rect.Y, rect.Width, rect.Height);
 }
 
 uint16* ZBufferClass::Lock(int32 x, int32 y)

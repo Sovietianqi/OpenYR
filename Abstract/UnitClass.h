@@ -609,10 +609,20 @@ public:
     bool Harvest();
 
     // ------------------------------------------------------------------------
+    // asm: int __thiscall UnitClass::Mission_Harvest(UnitClass *this)
+    //  采集任务本体（任务表槽位 10）。此前只声明了 Harvest() 单步函数，
+    //  任务槽仍走 MissionClass 的空实现 —— 矿车接到 Harvest 任务后原地不动，
+    //  舱里永远是 0，AI 花光开局资金后再也回不了血。
+    // ------------------------------------------------------------------------
+    virtual int32 Mission_Harvest() override;
+
+    // ------------------------------------------------------------------------
     // asm: char __thiscall UnitClass::Find_Ore(UnitClass *this, CellStruct *out)
     //  在当前位置周围螺旋搜索最近的含矿格，找到写回 out 并报告成功。
     // ------------------------------------------------------------------------
-    bool Find_Ore(CellStruct& outCell);
+    //   maxRadius 默认 12（原版采矿的局部搜索半径）；矿脉被采空、近处找不到
+    //   时由调用方放大半径再搜一次，否则矿车会永远停在"最近矿脉"这个死局里。
+    bool Find_Ore(CellStruct& outCell, int32 maxRadius = 12);
 
     // ------------------------------------------------------------------------
     // asm: int __thiscall UnitClass_GetOreValue(UnitClass *this, CellStruct *cell)

@@ -241,7 +241,7 @@ RulesClass::RulesClass()
     , DropPodAngle(0.0), ScrollMultiplier(0.0), CrewEscape(0.0)
     , ShakeScreen(0), HoverHeight(0)
     , HoverBob(0.0), HoverBoost(0.0), HoverAcceleration(0.0)
-    , HoverBrake(0.0), HoverDampen(0.0), PlacementDelay(0.0)
+    , HoverBrake(0.0), HoverDampen(0.0), PlacementDelay(0.02)
     , TireVoxelDebris(nullptr), ScrapVoxelDebris(nullptr), BridgeVoxelMax(0)
     , CloakingStages(0), RevealTriggerRadius(0)
     , ShipSinkingWeight(0.0), IceCrackingWeight(0.0), IceBreakingWeight(0.0)
@@ -346,7 +346,10 @@ RulesClass::RulesClass()
     , DropZoneAnim(nullptr)
     , MinMoney(0), Money(0), MaxMoney(0), MoneyIncrement(0)
     , MinUnitCount(0), UnitCount(0), MaxUnitCount(0)
-    , TechLevel(0), GameSpeed(0), AIDifficultyStruct(0), AIPlayers(0)
+    // asm: [General] TechLevel —— 缺省 10（原版 rulesmd.ini 即 10）。
+    //   兜底规则集没有这一键时若留在 0，所有 TechLevel>=1 的类型都会被
+    //   Can_Produce_Type 挡掉，AI 永远造不出任何东西。
+    , TechLevel(10), GameSpeed(0), AIDifficultyStruct(0), AIPlayers(0)
     , BridgeDestruction(false), ShadowGrow(false), Shroud(false), Bases(false)
     , TiberiumGrows(false), Crates(false), CaptureTheFlag(false)
     , HarvesterTruce(false), MultiEngineer(false), AlliesAllowed(false)
@@ -396,7 +399,7 @@ RulesClass::RulesClass()
     , ShroudGrow(false), NodAIBuildsWalls(false), AIBuildsWalls(false)
     , UseMinDefenseRule(false)
     , EMPulseSparkles(nullptr)
-    , EngineerCaptureLevel(0.0f), EngineerCaptureLevel_(0.0f), TalkBubbleTime(0.0f)
+    , EngineerCaptureLevel(0.0f), EngineerCaptureLevel_(0.0f), TalkBubbleTime(300)
     , RadDurationMultiple(0), RadApplicationDelay(0), RadLevelMax(0)
     , RadLevelDelay(0), RadLightDelay(0)
     , RadLevelFactor(0.0), RadLightFactor(0.0), RadTintFactor(0.0)
@@ -644,6 +647,8 @@ void RulesClass::Read_AudioVisual(CCINIClass* pINI)
     BuildingAbandonedSound      = ReadSoundName(pINI, section, "BuildingAbandonedSound", BuildingAbandonedSound);
     BuildingRepairedSound       = ReadSoundName(pINI, section, "BuildingRepairedSound", BuildingRepairedSound);
     CheerSound                  = ReadSoundName(pINI, section, "CheerSound", CheerSound);
+    VoiceStop                   = ReadSoundName(pINI, section, "VoiceStop", VoiceStop);
+    VoiceDeploy                 = ReadSoundName(pINI, section, "VoiceDeploy", VoiceDeploy);
     PlaceBeaconSound            = ReadSoundName(pINI, section, "PlaceBeaconSound", PlaceBeaconSound);
     DefaultChronoSound          = ReadSoundName(pINI, section, "DefaultChronoSound", DefaultChronoSound);
     StartPlanningModeSound      = ReadSoundName(pINI, section, "StartPlanningModeSound", StartPlanningModeSound);
@@ -1258,8 +1263,8 @@ void RulesClass::Read_General(CCINIClass* pINI)
     EngineerCaptureLevel           = static_cast<float>(pINI->ReadFixed(section, "EngineerCaptureLevel", EngineerCaptureLevel));
     EngineerCaptureLevel_          = static_cast<float>(pINI->ReadFixed(section, "EngineerCaptureLevel", EngineerCaptureLevel_));
     // asm: TalkBubbleTime = floor(GetFixed("TalkBubbleTime", old/60.0) * 60.0)
-    // —— INI 里是秒，字段里存的是 60fps 的帧数。
-    TalkBubbleTime                 = static_cast<float>(std::floor(
+    // —— INI 里的一单位 = 1/60 秒，字段里存的是毫秒（默认 0x12C = 300）。
+    TalkBubbleTime                 = static_cast<int32>(std::floor(
                                          pINI->ReadFixed(section, "TalkBubbleTime",
                                                          static_cast<double>(TalkBubbleTime) / 60.0) * 60.0));
 
@@ -2813,18 +2818,42 @@ void RulesClass::Addition(CCINIClass* pINI)
     Addition_AdvancedCommandBar(pINI, Game::IsMultiplayer);
 }
 
- // asm: RulesClass_CreateVectors (asm:21-652)
+// asm: RulesClass_CreateVectors (asm:1266708-1267425，718 行，0 分支)
 //
-//  逐句核对结论：这 632 行**只做一件事**——把本类持有的每一个 DynamicVector
-//  就地构造一遍。统计 asm 全文可见：
-//      54 次 `<Type>_CTOR` + 41 次 `TypeList<...>::vftable` 覆盖（每种容器
-//      一次），再加 2 次 `push offset ZeroOutColor`（向量元素析构回调）。
-//      全文 **0 次** SetCapacity / SetIncrement（`call dword ptr [eax+8]`
-//      与 `[edi+18h]` 写入的计数都是 0），也就是说原版**不预分配容量**，
-//      容器的 incrementAmount 保持构造缺省（10）。
+//  逐句核对结论：这 718 行**只做两件事**——
 //
-//  重建侧这些向量是成员对象，构造函数里已经全部建好（缺省 increment 同样是
-//  10），因此这里不需要任何语句——不是留白，而是这一步在 C++ 里由语言保证。
+//  A) 把本类持有的每个容器就地构造一遍。全文 109 次 `call`，按目标归类：
+//       dvc_int_CTOR                      44
+//       dvc_BuildingTypeClass_constP_CTOR 23
+//       vc_int_CTOR_0                     11
+//       vc_AnimType_CTOR                  10
+//       sub_512DC0 / sub_67AFF0 / sub_513190 /
+//       sub_67AC70 / sub_67B370 / sub_513560（各元素类型的 CTOR）
+//                                          6+5+3+2+1+1
+//     每次调用都是 `push 0 ; push 0 ; mov ecx,&member ; call CTOR`——两个 0
+//     就是 a2/a3（容量与增量），构造后紧跟一条 `mov [edi], offset <TypeList
+//     或 vt_Vector>::vftable` 覆盖虚表。
+//     全文 **0 次** SetCapacity / SetIncrement（没有任何对 [reg+8]/[reg+18h]
+//     的写入），即原版**不预分配容量**，incrementAmount 保持缺省（10）。
+//
+//  B) 收尾清零两处颜色：
+//       ZeroOutColor(&LocalRadarColor)                      ; 单个 RGB
+//       Buffer_Clear(&<LocalRadarColor+0x14>, 0x10, 3,
+//                    ZeroOutColor)                          ; ColorAdd[16]
+//     asm 用的是 IDA 的 "符号+常数" 记法（`[esi+(RulesClass.DominatorFireAt
+//     Percentage+155Ch)]`），把各字段在结构里的相对偏移算进去后：
+//       DominatorFireAtPercentage + 0x155C          = LocalRadarColor
+//       DrainMoneyAmount（DominatorFireAtPercentage + 0x14）+ 0x155C
+//                                                   = LocalRadarColor + 0x14
+//     本头文件里 LocalRadarColor / LineTrailColorOverride / ChronoBeamColor /
+//     MagnaBeamColor 共 12 字节，加 OreTwinkleChance(4)、OreTwinkle(4) 正好
+//     0x14，其后就是 ColorAdd[0x10]——与 Buffer_Clear 的 count=0x10、step=3
+//     （ColorStruct 三字节 RGB）完全吻合。
+//
+//  重建侧这些容器都是成员对象，构造函数已按同样缺省（increment 10）建好；
+//  ColorAdd 的 16 项清零与 LocalRadarColor 的默认色在 RulesClass::RulesClass
+//  里已经做过（见 ctor 的 "Initialize ColorAdd" 段）。所以本函数在 C++ 里
+//  没有剩余语句要做——不是留白，而是 A/B 两步都由语言/构造器保证。
 //  保留函数体只为让 Read_File / Init 的调用序与原版逐句对应。
 void RulesClass::CreateVectors()
 {

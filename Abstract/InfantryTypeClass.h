@@ -25,6 +25,7 @@ public:
     virtual ~InfantryTypeClass();
     virtual HRESULT Load(IStream* pStm) override;
     virtual HRESULT Save(IStream* pStm, BOOL fClearDirty) override;
+    virtual AbstractType WhatAmI() const override { return AbstractType::InfantryType; }
     virtual bool LoadFromINI(CCINIClass* pINI) override;
     virtual bool SaveToINI(CCINIClass* pINI) const override;
     virtual AbstractType GetAbstractDerivationID() const override;
@@ -144,10 +145,11 @@ public:
     float       ThreatPosedValue;
     int32       DeathWeaponIndex;
     int32       WeaponCharge;
-    int32       WeaponCount;
-    WeaponStruct Weapons[2];
-    int32       EliteWeaponCount;
-    WeaponStruct EliteWeapons[2];
+    // 注意：Weapons / EliteWeapons / WeaponCount 全部继承自 TechnoTypeClass
+    //   （原版只有一份 18 槽武器表）。这里曾经重复声明过一份 2 槽的表，
+    //   结果 Read_INI 写基类那份、战斗代码读子类这份，两边永远对不上：
+    //   所有步兵/载具的 GetWeaponRange 返回 0、自动索敌半径为 1 格、
+    //   有武器的单位也永远打不出子弹。
     bool        HasTurret;
     bool        CanCloak;
     bool        IsVoxel;

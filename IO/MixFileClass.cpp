@@ -146,11 +146,48 @@ MixFileClass::~MixFileClass() noexcept
 //   start offset, and the archive is linked into the registry tail.
 //========================================================================
 
-// Forward declarations for the self-contained Blowfish/MD5 helpers that live
-// at the bottom of this translation unit.
+// Forward declarations for the self-contained crypto helpers that live at the
+// bottom of this translation unit.
 namespace MixCrypto {
-    static void DeriveBlowfishKey(const uint8* header, int32 headerSize, uint8 outKey[16]);
+    // Canonical Blowfish context (P-array + four S-boxes).  Declared here so the
+    // streaming reader below can own one by value; the pi-derived tables and
+    // the key schedule itself live further down.
+    struct BlowfishContext
+    {
+        uint32 P[18];
+        uint32 S[4][256];
+    };
+
+    // Recover the 56-byte Blowfish key from the 80-byte RSA block that follows
+    // the archive's 4-byte leading header.  See the header block "Blowfish key
+    // for RA2/YR MIX files" for the full asm chain.
+    static bool RecoverBlowfishKey(const uint8 inBlock[80], uint8 outKey[56]);
+
+    // ECB-decrypt a whole region (used by Cache(), which decodes the resident
+    // copy in place instead of streaming it).
     static void DecryptMixBody(uint8* body, int32 bodySize, const uint8* key, int32 keyLen);
+
+    // Streaming equivalent of BlowStraw_ReadNextBytes: decrypts whole 8-byte
+    // blocks and buffers the tail, so a request that does not end on a block
+    // boundary consumes exactly as many ciphertext bytes as the original.
+    class BlowStream
+    {
+    public:
+        BlowStream() = default;
+
+        void Attach(CCFileClass* pSrc, const uint8* key, int32 keyLen);
+
+        // Returns the number of plaintext bytes stored, which is less than
+        // count only when the underlying stream runs dry.
+        int32 Read(uint8* dst, int32 count);
+
+    private:
+        CCFileClass*    m_Src = nullptr;
+        uint8           m_Buf[8] = { 0 };
+        int32           m_Avail = 0;
+        bool            m_Active = false;
+        BlowfishContext m_Ctx{};
+    };
 }
 
 MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
@@ -161,10 +198,14 @@ MixFileClass::MixFileClass(const char* pFileName, const char* pKey)
     , CountFiles(0)
     , FileSize(0)
     , BodySize(0)
+    , IndexSorted(false)
+    , DataSize(0)
     , FileStartOffset(0)
     , Headers(nullptr)
     , field_24(0)
     , HeaderSize(0)
+    , BlowfishStreamOffset(0)
+    , BlowfishKey{}
     , stashedKey(nullptr)
     , FileHandle(nullptr)
     , CachedData(nullptr)
@@ -242,6 +283,8 @@ bool MixFileClass::ReadHeader()
     if (!FileHandle) return false;
 
     HeaderSize = 0;
+    BlowfishStreamOffset = 0;
+    memset(BlowfishKey, 0, sizeof(BlowfishKey));
 
     // Read the leading 4 bytes in one shot.
     uint32 hdr0 = 0;
@@ -255,19 +298,56 @@ bool MixFileClass::ReadHeader()
 
     if (lowWord == 0)
     {
-        // RA2 / YR flavour: the 4 bytes are an explicit flag word.
-        //   bit 0 = index checksum present
-        //   bit 1 = index encrypted (Blowfish)
-        uint32 flags = hdr0;
-        Encryption = (flags & 0x2u) != 0;
-        Blowfish   = Encryption;
+        // RA2 / YR flavour.
+        //   asm 0x5B3CE6:  mov eax, [Src+2]  -> the flag word lives at
+        //                  bytes 2..3, i.e. the HIGH half of the dword we
+        //                  just read.  The low half is the zero sentinel.
+        //   asm 0x5B3CF1:  cl = bit0 -> [esi+10h] Encryption (checksum flag)
+        //   asm 0x5B3CF5:  al = bit1 -> [esi+11h] Blowfish   (index encrypted)
+        uint32 flags = hdr0 >> 16;
+        Encryption = (flags & 0x1u) != 0;
+        Blowfish   = (flags & 0x2u) != 0;
 
-        if (FileHandle->Read(&count, 2) != 2)
-            return false;
-        if (FileHandle->Read(&bodySize, 4) != 4)
-            return false;
+        if (Blowfish)
+        {
+            // asm 0x5B3CF7..0x5B3D2B: PKStraw_SetKey(&Key_0) + attach, then
+            // ReadNextBytes(&Dst, 6) pulls {count, bodySize} through the
+            // cipher chain.  The very first request first consumes the 80-byte
+            // RSA key block (2 x 40 bytes, see RecoverBlowfishKey); everything
+            // after that is plain Blowfish-ECB ciphertext.
+            uint8 keyBlock[BlowfishKeyBlockSize];
+            if (FileHandle->Read(keyBlock, BlowfishKeyBlockSize) != BlowfishKeyBlockSize)
+                return false;
 
-        HeaderSize = 4 + 2 + 4;   // 10 bytes
+            if (!MixCrypto::RecoverBlowfishKey(keyBlock, BlowfishKey))
+                return false;
+
+            BlowfishStreamOffset = 4 + BlowfishKeyBlockSize;   // 84
+
+            MixCrypto::BlowStream stream;
+            stream.Attach(FileHandle, BlowfishKey, BlowfishKeySize);
+
+            uint8 hdr[6] = { 0, 0, 0, 0, 0, 0 };
+            if (stream.Read(hdr, 6) != 6)
+                return false;
+
+            count    = static_cast<uint16>(hdr[0] | (hdr[1] << 8));
+            bodySize = static_cast<uint32>(hdr[2]) |
+                       (static_cast<uint32>(hdr[3]) << 8) |
+                       (static_cast<uint32>(hdr[4]) << 16) |
+                       (static_cast<uint32>(hdr[5]) << 24);
+
+            HeaderSize = 4 + BlowfishKeyBlockSize + 6;         // 90
+        }
+        else
+        {
+            if (FileHandle->Read(&count, 2) != 2)
+                return false;
+            if (FileHandle->Read(&bodySize, 4) != 4)
+                return false;
+
+            HeaderSize = 4 + 2 + 4;   // 10 bytes
+        }
     }
     else
     {
@@ -289,7 +369,18 @@ bool MixFileClass::ReadHeader()
 
     CountFiles = static_cast<int32>(static_cast<int16>(count));
     BodySize   = static_cast<int32>(bodySize);
-    FileSize   = BodySize;    // asm stores the raw body size into [this+18h]
+
+    // asm stores the raw body-size dword into [this+18h] and keeps it as the
+    // archive's logical size.  Retail archives disagree on whether that dword
+    // covers the index table or only the file data, so the measured physical
+    // size is what the reader uses for the cache allocation and for the data
+    // window: getting this wrong either truncates the last file or makes the
+    // bounds check reject perfectly good archives.
+    const int64 physical = FileHandle->Size();
+    if (physical > 0 && physical <= 0x7FFFFFFF)
+        FileSize = static_cast<int32>(physical);
+    else
+        FileSize = BodySize;
 
     return true;
 }
@@ -301,36 +392,115 @@ bool MixFileClass::ReadIndex()
 
     const int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
 
-    Headers = static_cast<MixIndexEntry*>(YRMemory::Allocate(static_cast<size_t>(indexSize)));
+    // A corrupt or hostile count must not turn into a huge allocation, and a
+    // count that claims more index bytes than the archive physically holds can
+    // never be valid.
+    if (indexSize <= 0 || (FileSize > 0 && indexSize > FileSize))
+        return false;
+
+    // asm: the index is read through the PKStraw/BlowStraw chain when flag
+    // bit 1 is set.  The 6-byte {count, bodySize} pair and the index are one
+    // continuous ECB stream, so the ciphertext occupies
+    // ceil((6 + indexSize) / 8) * 8 bytes and only the tail of that belongs
+    // to the index table itself.
+    //
+    // A BlowStraw consumes whole 8-byte blocks, so an encrypted index whose
+    // 12-byte entries do not end on a block boundary is stored padded; the
+    // reader has to consume the padding as well or every following file
+    // offset is shifted by 4 bytes.
+    int32 readSize   = indexSize;
+    int32 encTotal   = 0;
+    if (Blowfish)
+    {
+        encTotal = (6 + indexSize + 7) & ~7;
+        readSize = encTotal - 6;
+    }
+
+    Headers = static_cast<MixIndexEntry*>(YRMemory::Allocate(static_cast<size_t>(readSize)));
     if (!Headers) return false;
 
-    memset(Headers, 0, static_cast<size_t>(indexSize));
+    memset(Headers, 0, static_cast<size_t>(readSize));
 
-    // asm: FileStraw/PKStraw ReadNextBytes(Headers, CountFiles * 12)
-    int32 bytesRead = FileHandle->Read(Headers, indexSize);
-    if (bytesRead != indexSize)
+    if (Blowfish)
     {
-        YRMemory::Deallocate(Headers);
-        Headers = nullptr;
+        // asm 0x5B3CF7 tests the Blowfish bit (bit 1) and, when set, calls
+        // PKStraw_SetKey(Key_0) + sub_6330C0 so the index is read through the
+        // BlowStraw layer.  ReadHeader() already consumed the RSA key block,
+        // so rewind to the start of the ciphertext and replay the 6-byte
+        // header in order to land on the same block boundary the original
+        // sees.
+        FileHandle->Seek(BlowfishStreamOffset, static_cast<int32>(FileSeekMode::Set));
+
+        MixCrypto::BlowStream stream;
+        stream.Attach(FileHandle, BlowfishKey, BlowfishKeySize);
+
+        uint8 skip[6] = { 0, 0, 0, 0, 0, 0 };
+        if (stream.Read(skip, 6) != 6)
+        {
+            YRMemory::Deallocate(Headers);
+            Headers = nullptr;
+            return false;
+        }
+
+        if (stream.Read(reinterpret_cast<uint8*>(Headers), readSize) != readSize)
+        {
+            YRMemory::Deallocate(Headers);
+            Headers = nullptr;
+            return false;
+        }
+
+        // asm: [this+1Ch] = physical position after the whole ciphertext run.
+        FileStartOffset = BlowfishStreamOffset + encTotal;
+    }
+    else
+    {
+        // asm: FileStraw/PKStraw ReadNextBytes(Headers, CountFiles * 12)
+        int32 bytesRead = FileHandle->Read(Headers, readSize);
+        if (bytesRead != readSize)
+        {
+            YRMemory::Deallocate(Headers);
+            Headers = nullptr;
+            return false;
+        }
+
+        // asm: the body starts at the physical position right after the index.
+        FileStartOffset = FileHandle->Seek(0, static_cast<int32>(FileSeekMode::Current));
+        if (FileStartOffset <= 0)
+            FileStartOffset = HeaderSize + readSize;
+    }
+
+    // Measured data window: everything after the index.  Every entry offset is
+    // relative to this point (asm MixFileClass_FindFileByName adds [this+1Ch]).
+    DataSize = (FileSize > 0) ? (FileSize - FileStartOffset) : (BodySize - readSize);
+    if (DataSize < 0)
+        DataSize = 0;
+
+    // ---- 索引自检 ------------------------------------------------------
+    // 原版对索引完全信任，但「读不出文件」最常见的两个原因就是
+    //   (a) 索引没解密（全 0 或乱码）  (b) 偏移/长度越界
+    // 这里在挂载阶段就判掉，日志里能直接看出是哪一种，而不是等某个素材
+    // 加载时才 return nullptr。
+    IndexSorted = true;
+    int32 badEntries = 0;
+    for (int32 i = 0; i < CountFiles; ++i)
+    {
+        const MixIndexEntry& e = Headers[i];
+        if (DataSize > 0 &&
+            (e.Offset > static_cast<uint32>(DataSize) ||
+             e.Size   > static_cast<uint32>(DataSize) - e.Offset))
+        {
+            ++badEntries;
+        }
+        // 原版的顺序判定是同一条有符号比较（asm: cmp esi, ebx / jle），
+        // 用无符号比会把 0x8xxxxxxx 这类 CRC 判成「倒序」。
+        if (i > 0 && static_cast<int32>(Headers[i - 1].FileID) > static_cast<int32>(e.FileID))
+            IndexSorted = false;
+    }
+
+    // 超过四分之一的条目不可能被服务，基本可以断定索引是坏的（多半是
+    // 加密档没解对）。整档拒绝挂载，避免把垃圾当数据用。
+    if (CountFiles >= 4 && badEntries > 0 && badEntries * 4 >= CountFiles)
         return false;
-    }
-
-    // asm: if the header flags requested it, the index straw is switched to
-    // the Blowfish path (PKStraw_SetKey + sub_6330C0).  The key material is
-    // the plain flag word; the digest seeds the Blowfish key schedule and the
-    // whole index region is decrypted 8 bytes at a time.
-    if (Encryption)
-    {
-        uint8 key[16];
-        uint8 headerBytes[4] = { 0, 0, 0, 0 };   // the plain flag word
-        MixCrypto::DeriveBlowfishKey(headerBytes, 4, key);
-        MixCrypto::DecryptMixBody(reinterpret_cast<uint8*>(Headers), indexSize, key, 16);
-    }
-
-    // asm: the body starts at the physical position right after the index.
-    FileStartOffset = FileHandle->Seek(0, static_cast<int32>(FileSeekMode::Current));
-    if (FileStartOffset <= 0)
-        FileStartOffset = HeaderSize + indexSize;
 
     return true;
 }
@@ -368,6 +538,8 @@ void MixFileClass::Close()
     CountFiles = 0;
     FileSize = 0;
     HeaderSize = 0;
+    BlowfishStreamOffset = 0;
+    memset(BlowfishKey, 0, sizeof(BlowfishKey));
 }
 
 bool MixFileClass::Cache()
@@ -376,9 +548,11 @@ bool MixFileClass::Cache()
 
     const int32 headerSize = (HeaderSize > 0) ? HeaderSize : static_cast<int32>(sizeof(MixHeader));
 
-    // Read the entire archive into memory for faster access.
-    const int32 totalSize = FileSize > 0 ? (headerSize + FileSize) : 0;
-    if (totalSize <= 0) return false;
+    // Read the whole physical archive into memory.  FileSize is measured at
+    // open time from the real stream length, so this works for nested MIXes
+    // and for archives whose body-size dword excludes the index.
+    const int32 totalSize = FileSize;
+    if (totalSize <= 0 || totalSize < headerSize) return false;
 
     CachedData = static_cast<uint8*>(YRMemory::Allocate(static_cast<size_t>(totalSize)));
     if (!CachedData) return false;
@@ -395,15 +569,35 @@ bool MixFileClass::Cache()
 
     CachedSize = totalSize;
 
-    // The index now lives in the resident copy; drop the heap copy and point
-    // at the cache.  The encrypted flavour decrypts the index in place here.
-    if (Encryption && CountFiles > 0)
+    const int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
+    int32 indexStart = headerSize;
+
+    if (Blowfish && indexSize > 0 && BlowfishStreamOffset > 0)
     {
-        const int32 indexSize = CountFiles * static_cast<int32>(sizeof(MixIndexEntry));
-        uint8 key[16];
-        uint8 headerBytes[4] = {0, 0, 0, 0};
-        MixCrypto::DeriveBlowfishKey(headerBytes, 4, key);
-        MixCrypto::DecryptMixBody(CachedData + headerSize, indexSize, key, 16);
+        // The cached copy is a raw read from disk, so the encrypted run has to
+        // be decoded again in place.  It starts at BlowfishStreamOffset (right
+        // after the plain 4-byte header and the 80-byte RSA block), spans the
+        // 6-byte count/bodySize pair plus the index, and is padded to a whole
+        // number of 8-byte ECB blocks.
+        const int32 encTotal = (6 + indexSize + 7) & ~7;
+        if (BlowfishStreamOffset + encTotal <= totalSize)
+        {
+            MixCrypto::DecryptMixBody(CachedData + BlowfishStreamOffset, encTotal,
+                                      BlowfishKey, BlowfishKeySize);
+            indexStart      = BlowfishStreamOffset + 6;
+            FileStartOffset = BlowfishStreamOffset + encTotal;
+        }
+        else
+        {
+            // Truncated archive: keep the plain layout and let the index
+            // self-check reject it instead of reading past the buffer.
+            indexStart      = headerSize;
+            FileStartOffset = headerSize + indexSize;
+        }
+    }
+    else
+    {
+        FileStartOffset = headerSize + indexSize;
     }
 
     if (Headers)
@@ -411,8 +605,9 @@ bool MixFileClass::Cache()
         YRMemory::Deallocate(Headers);
         Headers = nullptr;
     }
-    Headers = reinterpret_cast<MixIndexEntry*>(CachedData + headerSize);
-    FileStartOffset = headerSize;
+    Headers = reinterpret_cast<MixIndexEntry*>(CachedData + indexStart);
+    DataSize = totalSize - FileStartOffset;
+    if (DataSize < 0) DataSize = 0;
 
     return true;
 }
@@ -449,6 +644,19 @@ void* MixFileClass::GetFile(uint32 crc, int32* pOutSize) const
     if (!entry) return nullptr;
 
     if (entry->Size == 0) return nullptr;
+
+    // Bounds check against the measured data window (everything after the
+    // index).  A truncated or corrupt archive must not turn into an
+    // out-of-range read; the retail loader trusts the index, so this is a
+    // hardening layer that only rejects entries that could not possibly be
+    // served.
+    if (DataSize > 0)
+    {
+        if (entry->Offset > static_cast<uint32>(DataSize))
+            return nullptr;
+        if (entry->Size > static_cast<uint32>(DataSize) - entry->Offset)
+            return nullptr;
+    }
 
     // Allocate buffer for the file data
     void* data = YRMemory::Allocate(entry->Size);
@@ -681,15 +889,15 @@ void MixFileClass::Bootstrap()
 // Helper: Decrypt MIX body using Blowfish
 //========================================================================
 
-// The RA2/YR MIX encryption uses Blowfish in ECB mode. The cipher key is
-// derived from the (plain) 8-byte MIX header: MD5(header) yields a 16-byte
-// digest which is fed into the standard Blowfish key schedule. The index
-// table and the file body that follow the header are then decrypted one
-// 8-byte block at a time.
+// The RA2/YR MIX encryption uses Blowfish in ECB mode with a 56-byte key.
+// asm evidence: MixFileClass_CTOR (0x5B3D0A) passes &Key_0 to
+// PKStraw_SetKey; ZeroOut_EncodingKeys (0x40D9C0) zero-fills Key_0 with
+// XMP_Init(Key_0, 0, 0x40) and nothing else in the binary writes it;
+// PKStraw_ReadNextBytes (0x6331FE) feeds 0x38 bytes to BlowStraw.
 //
-// This section provides a self-contained, correct Blowfish implementation
+// This section provides a self-contained Blowfish implementation
 // (key schedule with the canonical pi-derived P-array / S-boxes plus the
-// 16-round Feistel network) and a minimal MD5 used for key derivation.
+// 16-round Feistel network).
 
 namespace MixCrypto
 {
@@ -845,12 +1053,7 @@ namespace MixCrypto
     };
 
     // ── Blowfish context ───────────────────────────────────────────────
-
-    struct BlowfishContext
-    {
-        uint32 P[18];
-        uint32 S[4][256];
-    };
+    // (declared near the top of this file so MixCrypto::BlowStream can own one)
 
     static inline uint32 F(const BlowfishContext& ctx, uint32 x)
     {
@@ -941,152 +1144,225 @@ namespace MixCrypto
         }
     }
 
-    // ── MD5 (used for MIX key derivation) ──────────────────────────────
+    //----------------------------------------------------------------------
+    // Key_0 - the RSA public key recovered from "[PublicKey]".
+    //
+    // asm chain (every step verified against the disassembly):
+    //   Init_Keys             (1435396) -> INIClass::Get_PKey(&Key_0, 1)
+    //   INIClass::Get_PKey    (654046)  -> exponent = DER(0x10001)
+    //                                      modulus  = "PublicKey" UUBlock
+    //   PKey::Decode_Modulus  (1165729) -> Key_Voodoo1 stores the DER body
+    //                                      reversed (little-endian) and
+    //                                      PKey stores Key_Voodoo3()-1 at
+    //                                      +0x200.
+    //
+    // Base64 "AihRvNoIbTn85FZRYNZRcT+i6KpU+maCsEqr3Q5q+LDB5tH7Tz2qQ38V"
+    // is exactly 42 bytes:
+    //   02 28 | 51 BC DA 08 6D 39 FC E4 56 51 60 D6 51 71 3F A2 E8 AA
+    //         | 54 FA 66 82 B0 4A AB DD 0E 6A F8 B0 C1 E6 D1 FB 4F 3D
+    //         | AA 43 7F 15
+    // tag 0x02 / length 0x28 = 40 bytes => 319 significant bits, so Key_0
+    // carries 318 at +0x200 - which is what PKStraw_ReadNextBytes divides by
+    // 8 to obtain the 40-byte RSA chunk.
+    //----------------------------------------------------------------------
+    static const int32 kKey0Limbs = 10;                      // 40 bytes / 4
 
-    struct MD5Context
-    {
-        uint32 state[4];
-        uint64 count;     // number of bytes processed
-        uint8  buffer[64];
+    // Little-endian limbs of the DER body above (Key_Voodoo1 reverses it).
+    static const uint32 kKey0Modulus[kKey0Limbs] = {
+        0xAA437F15u, 0xD1FB4F3Du, 0xF8B0C1E6u, 0xABDD0E6Au, 0x6682B04Au,
+        0xE8AA54FAu, 0x51713FA2u, 0x565160D6u, 0x6D39FCE4u, 0x51BCDA08u
     };
 
-    static const uint32 MD5_K[64] = {
-        0xd76aa478u,0xe8c7b756u,0x242070dbu,0xc1bdceeeu,0xf57c0fau,0x4787c62au,0xa8304613u,0xfd469501u,
-        0x698098d8u,0x8b44f7afu,0xffff5bb1u,0x895cd7beu,0x6b901122u,0xfd987193u,0xa679438eu,0x49b40821u,
-        0xf61e2562u,0xc040b340u,0x265e5a51u,0xe9b6c7aau,0xd62f105du,0x02441453u,0xd8a1e681u,0xe7d3fbc8u,
-        0x21e1cde6u,0xc33707d6u,0xf4d50d87u,0x455a14edu,0xa9e3e905u,0xfcefa3f8u,0x676f02d9u,0x8d2a4c8au,
-        0xfffa3942u,0x8771f681u,0x6d9d6122u,0xfde5380cu,0xa4beea44u,0x4bdecfa9u,0xf6bb4b60u,0xbebfbc70u,
-        0x289b7ec6u,0xeaa127fau,0xd4ef3085u,0x04881d05u,0xd9d4d239u,0xe6db99e5u,0x1fa27cf8u,0xc4ac5665u,
-        0xf4292244u,0x432aff97u,0xab9423a7u,0xfc93a039u,0x655b59c3u,0x8f0ccc92u,0xffeff47du,0x85845dd1u,
-        0x6fa87e4fu,0xfe2ce6e0u,0xa3014314u,0x4e0811a1u,0xf7537e82u,0xbd3af235u,0x2ad7d2bbu,0xeb86d391u
-    };
+    // Public exponent: Get_PKey DER-encodes the constant 0x10001.
+    static const uint32 kKey0Exponent = 65537u;
 
-    static const int32 MD5_S[64] = {
-        7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
-        5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
-        4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
-        6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
-    };
-
-    static inline uint32 MD5_Rotl(uint32 x, uint32 n)
+    // a >= b for n-limb little-endian magnitudes.
+    static int32 BN_Cmp(const uint32* a, const uint32* b, int32 n)
     {
-        return (x << n) | (x >> (32u - n));
-    }
-
-    static void MD5_Transform(uint32 state[4], const uint8 block[64])
-    {
-        uint32 M[16];
-        for (int32 i = 0; i < 16; ++i)
+        for (int32 i = n - 1; i >= 0; --i)
         {
-            M[i] = static_cast<uint32>(block[i * 4]) |
-                   (static_cast<uint32>(block[i * 4 + 1]) << 8) |
-                   (static_cast<uint32>(block[i * 4 + 2]) << 16) |
-                   (static_cast<uint32>(block[i * 4 + 3]) << 24);
+            if (a[i] != b[i]) return (a[i] > b[i]) ? 1 : -1;
         }
-
-        uint32 a = state[0], b = state[1], c = state[2], d = state[3];
-        for (int32 i = 0; i < 64; ++i)
-        {
-            uint32 f;
-            int32 g;
-            if (i < 16)      { f = (b & c) | (~b & d);            g = i; }
-            else if (i < 32) { f = (d & b) | (~d & c);            g = (5 * i + 1) & 15; }
-            else if (i < 48) { f = b ^ c ^ d;                     g = (3 * i + 5) & 15; }
-            else             { f = c ^ (b | ~d);                  g = (7 * i) & 15; }
-
-            uint32 temp = d;
-            d = c;
-            c = b;
-            b = b + MD5_Rotl(a + f + MD5_K[i] + M[g], static_cast<uint32>(MD5_S[i]));
-            a = temp;
-        }
-        state[0] += a;
-        state[1] += b;
-        state[2] += c;
-        state[3] += d;
+        return 0;
     }
 
-    static void MD5_Init(MD5Context& ctx)
+    // r = a * b, where r has 2n limbs.
+    static void BN_Mul(uint32* r, const uint32* a, const uint32* b, int32 n)
     {
-        ctx.state[0] = 0x67452301u;
-        ctx.state[1] = 0xefcdab89u;
-        ctx.state[2] = 0x98badcfeu;
-        ctx.state[3] = 0x10325476u;
-        ctx.count = 0;
-    }
-
-    static void MD5_Update(MD5Context& ctx, const uint8* data, int32 len)
-    {
-        uint32 bufferUsed = static_cast<uint32>(ctx.count & 63);
-        ctx.count += static_cast<uint64>(len);
-
-        if (bufferUsed > 0)
+        memset(r, 0, static_cast<size_t>(2 * n) * sizeof(uint32));
+        for (int32 i = 0; i < n; ++i)
         {
-            uint32 space = 64 - bufferUsed;
-            uint32 toCopy = (static_cast<uint32>(len) < space) ? static_cast<uint32>(len) : space;
-            memcpy(ctx.buffer + bufferUsed, data, toCopy);
-            data += toCopy;
-            len -= static_cast<int32>(toCopy);
-            if ((bufferUsed + toCopy) == 64)
+            uint64 carry = 0;
+            for (int32 j = 0; j < n; ++j)
             {
-                MD5_Transform(ctx.state, ctx.buffer);
+                uint64 t = static_cast<uint64>(a[i]) * b[j] + r[i + j] + carry;
+                r[i + j] = static_cast<uint32>(t);
+                carry = t >> 32;
+            }
+            r[i + n] = static_cast<uint32>(carry);
+        }
+    }
+
+    // r = x mod m, with x carrying 2n limbs and m exactly n.
+    //
+    // XMP would use the same schoolbook long division; a bit-at-a-time
+    // remainder is small enough here (n = 10, 640 shift steps per reduction)
+    // and avoids bringing in the full Knuth estimator.
+    static void BN_Mod(uint32* r, const uint32* x, const uint32* m, int32 n)
+    {
+        uint32 rem[11] = { 0 };              // n + 1 limbs, holds up to 2m-1
+        for (int32 bit = 2 * n * 32 - 1; bit >= 0; --bit)
+        {
+            uint32 carry = (x[bit >> 5] >> (bit & 31)) & 1u;
+            for (int32 j = 0; j <= n; ++j)
+            {
+                uint32 next = rem[j] >> 31;
+                rem[j] = (rem[j] << 1) | carry;
+                carry = next;
+            }
+            if (rem[n] != 0 || BN_Cmp(rem, m, n) >= 0)
+            {
+                uint32 borrow = 0;
+                for (int32 j = 0; j < n; ++j)
+                {
+                    uint64 t = static_cast<uint64>(rem[j]) - m[j] - borrow;
+                    rem[j] = static_cast<uint32>(t);
+                    borrow = static_cast<uint32>(t >> 32) & 1u;
+                }
+                rem[n] -= borrow;
+            }
+        }
+        memcpy(r, rem, static_cast<size_t>(n) * sizeof(uint32));
+    }
+
+    // out = base^exp mod m  (same operation as sub_5C8500, which drives
+    // XMP's modular exponentiation).
+    static void BN_ModExp(uint32* out, const uint32* base, uint32 exp,
+                          const uint32* m, int32 n)
+    {
+        uint32 acc[kKey0Limbs] = { 0 };
+        uint32 cur[kKey0Limbs];
+        uint32 tmp[2 * kKey0Limbs];
+
+        memcpy(cur, base, static_cast<size_t>(n) * sizeof(uint32));
+        acc[0] = 1;
+
+        while (exp != 0)
+        {
+            if (exp & 1u)
+            {
+                BN_Mul(tmp, acc, cur, n);
+                BN_Mod(acc, tmp, m, n);
+            }
+            exp >>= 1;
+            if (exp != 0)
+            {
+                BN_Mul(tmp, cur, cur, n);
+                BN_Mod(cur, tmp, m, n);
+            }
+        }
+        memcpy(out, acc, static_cast<size_t>(n) * sizeof(uint32));
+    }
+
+    //----------------------------------------------------------------------
+    // asm: PKStraw_ReadNextBytes, "raw key" branch (0x6331EA -> 0x632870).
+    //
+    // Two 40-byte chunks are read from the stream.  Each one is treated as a
+    // little-endian integer and raised to the public exponent modulo the
+    // Key_0 modulus; that is signature recovery, so no private exponent is
+    // involved.  The 80 recovered bytes are then truncated to the 56-byte
+    // Blowfish key (asm pushes 0x38 into the BlowStraw SetKey slot).
+    //----------------------------------------------------------------------
+    static bool RecoverBlowfishKey(const uint8 inBlock[80], uint8 outKey[56])
+    {
+        uint8 plain[80];
+
+        for (int32 c = 0; c < 2; ++c)
+        {
+            uint32 chunk[kKey0Limbs];
+            uint32 recovered[kKey0Limbs];
+            memcpy(chunk, inBlock + c * 40, 40);
+
+            BN_ModExp(recovered, chunk, kKey0Exponent, kKey0Modulus, kKey0Limbs);
+            memcpy(plain + c * 40, recovered, 40);
+        }
+
+        memcpy(outKey, plain, 56);
+        return true;
+    }
+
+    //----------------------------------------------------------------------
+    // asm: BlowStraw_ReadNextBytes (0x4381F0).
+    //
+    // Only whole 8-byte blocks are run through Blowfish; a short read at the
+    // tail is copied verbatim, and leftover plaintext is buffered at the high
+    // end of the 8-byte window (asm keeps `avail` and addresses the buffer as
+    // buf + 8 - avail).
+    //----------------------------------------------------------------------
+    void BlowStream::Attach(CCFileClass* pSrc, const uint8* key, int32 keyLen)
+    {
+        m_Src = pSrc;
+        m_Avail = 0;
+        m_Active = (pSrc != nullptr && key != nullptr && keyLen > 0);
+        if (m_Active)
+            Blowfish_KeySetup(m_Ctx, key, keyLen);
+    }
+
+    int32 BlowStream::Read(uint8* dst, int32 count)
+    {
+        if (!m_Active || !dst || count <= 0)
+            return 0;
+
+        int32 total = 0;
+        while (count > 0)
+        {
+            if (m_Avail > 0)
+            {
+                int32 n = (count < m_Avail) ? count : m_Avail;
+                memcpy(dst, m_Buf + (8 - m_Avail), static_cast<size_t>(n));
+                m_Avail -= n;
+                dst     += n;
+                count   -= n;
+                total   += n;
+                continue;
+            }
+
+            int32 got = m_Src->Read(m_Buf, 8);
+            if (got <= 0)
+                break;
+
+            if (got == 8)
+            {
+                uint32 L = (static_cast<uint32>(m_Buf[0]) << 24) |
+                           (static_cast<uint32>(m_Buf[1]) << 16) |
+                           (static_cast<uint32>(m_Buf[2]) << 8)  |
+                           (static_cast<uint32>(m_Buf[3]));
+                uint32 R = (static_cast<uint32>(m_Buf[4]) << 24) |
+                           (static_cast<uint32>(m_Buf[5]) << 16) |
+                           (static_cast<uint32>(m_Buf[6]) << 8)  |
+                           (static_cast<uint32>(m_Buf[7]));
+
+                Blowfish_DecryptBlock(m_Ctx, L, R);
+
+                m_Buf[0] = static_cast<uint8>(L >> 24);
+                m_Buf[1] = static_cast<uint8>(L >> 16);
+                m_Buf[2] = static_cast<uint8>(L >> 8);
+                m_Buf[3] = static_cast<uint8>(L);
+                m_Buf[4] = static_cast<uint8>(R >> 24);
+                m_Buf[5] = static_cast<uint8>(R >> 16);
+                m_Buf[6] = static_cast<uint8>(R >> 8);
+                m_Buf[7] = static_cast<uint8>(R);
+
+                m_Avail = 8;
+            }
+            else
+            {
+                memmove(m_Buf + (8 - got), m_Buf, static_cast<size_t>(got));
+                m_Avail = got;
             }
         }
 
-        while (len >= 64)
-        {
-            MD5_Transform(ctx.state, data);
-            data += 64;
-            len -= 64;
-        }
-
-        if (len > 0)
-        {
-            memcpy(ctx.buffer, data, static_cast<size_t>(len));
-        }
-    }
-
-    static void MD5_Final(MD5Context& ctx, uint8 digest[16])
-    {
-        uint64 bits = ctx.count * 8ull;
-        uint32 bufferUsed = static_cast<uint32>(ctx.count & 63);
-
-        // append the 0x80 byte
-        ctx.buffer[bufferUsed++] = 0x80;
-        if (bufferUsed > 56)
-        {
-            while (bufferUsed < 64) ctx.buffer[bufferUsed++] = 0;
-            MD5_Transform(ctx.state, ctx.buffer);
-            bufferUsed = 0;
-        }
-        while (bufferUsed < 56) ctx.buffer[bufferUsed++] = 0;
-
-        // append the length in bits (little-endian)
-        for (int32 i = 0; i < 8; ++i)
-        {
-            ctx.buffer[56 + i] = static_cast<uint8>(bits >> (8 * i));
-        }
-        MD5_Transform(ctx.state, ctx.buffer);
-
-        for (int32 i = 0; i < 4; ++i)
-        {
-            digest[i * 4]     = static_cast<uint8>(ctx.state[i]);
-            digest[i * 4 + 1] = static_cast<uint8>(ctx.state[i] >> 8);
-            digest[i * 4 + 2] = static_cast<uint8>(ctx.state[i] >> 16);
-            digest[i * 4 + 3] = static_cast<uint8>(ctx.state[i] >> 24);
-        }
-    }
-
-    // Derive the Blowfish key from the (plain) MIX header. The RA2/YR
-    // format feeds the 8-byte header through MD5 and uses the resulting
-    // 16-byte digest as the Blowfish key material.
-    static void DeriveBlowfishKey(const uint8* header, int32 headerSize,
-                                   uint8 outKey[16])
-    {
-        MD5Context md5;
-        MD5_Init(md5);
-        MD5_Update(md5, header, headerSize);
-        MD5_Final(md5, outKey);
+        return total;
     }
 
     // Decrypt a single 8-byte MIX block (ECB) using the supplied key.
@@ -1179,6 +1455,11 @@ void MixFileClass::Init_List()
 // ============================================================================
 void MixFileClass::UnInit_List()
 {
+    // asm: MixFileClass_SDDTOR detaches *this* node from list_MixFiles.  The
+    // old port wiped the whole registry here, which made it unsafe to delete a
+    // constructor that failed to parse (and therefore never registered): every
+    // already-mounted archive would silently disappear from the lookup.  Only
+    // the node being destroyed is removed now.
     DynamicVectorClass<MixFileClass*>& arr = GetMixArray();
     for (int32 i = 0; i < arr.Count; ) {
         if (arr[i] == this) {
@@ -1188,10 +1469,11 @@ void MixFileClass::UnInit_List()
         ++i;
     }
 
-    List<MixFileClass*>& list = GetMixList();
-    list.Head = nullptr;
-    list.Tail = nullptr;
-    list.Count = 0;
+    // list_MixFiles is represented by GetMixArray() in this port; the legacy
+    // List<> registry holds Node<MixFileClass*> which MixFileClass does not
+    // derive from, so it is kept only as a static-construction placeholder and
+    // is never walked.  Wiping it here (as the old code did) destroyed every
+    // other archive's registration, so it is left untouched.
 }
 
 // ============================================================================
@@ -1243,6 +1525,28 @@ MixFileClass* MixFileClass::FindFileByName(const char* pName,
         }
 
         // asm: signed binary search over Headers[0 .. CountFiles).
+        // Archives whose index is not CRC-sorted (badly repacked mods) fall
+        // back to a linear scan rather than silently missing entries.
+        if (!pMix->IndexSorted) {
+            for (int32 i = 0; i < pMix->CountFiles; ++i) {
+                const MixIndexEntry& e = pMix->Headers[i];
+                if (static_cast<int32>(e.FileID) != key)
+                    continue;
+
+                if (pOutLength != nullptr)
+                    *pOutLength = static_cast<int32>(e.Size);
+
+                if (pOutOffset != nullptr) {
+                    int32 off = static_cast<int32>(e.Offset);
+                    if (pMix->CachedData == nullptr)
+                        off += pMix->FileStartOffset;
+                    *pOutOffset = off;
+                }
+                return pMix;
+            }
+            continue;
+        }
+
         int32 hi = pMix->CountFiles;
         int32 lo = 0;
         while (lo < hi) {

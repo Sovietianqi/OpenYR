@@ -4,10 +4,19 @@
 #include "../Core/Macros.h"
 #include "../Core/Memory.h"
 
+#include <cstdio>
+
+// asm: CCFileClass_OpenFile (0x473CF0) branches on `test [mode], 2`:
+//   mode 1 -> MIX lookup  -> read
+//   mode 2 -> disk only   -> write (CDFileClass_OpenFile)
+//   mode 3 -> disk only   -> read/write
+//   mode 0 -> also read (used by the port's callers)
+// The retail enum is therefore Read=1 / Write=2 / ReadWrite=3, and getting
+// this wrong makes every `Open(1)` truncate the target file ("wb").
 enum class FileAccessMode {
-    Read = 0,
-    Write = 1,
-    ReadWrite = 2,
+    Read = 1,
+    Write = 2,
+    ReadWrite = 3,
 };
 
 enum class FileSeekMode {
@@ -336,3 +345,14 @@ void CD_SetRequiredCDIndex(int32 nVolume);
 //   `timeout` bounds how long the scan keeps retrying a busy drive (in
 //   GetTickCount units).  Returns the zero-based drive index, or -1.
 int32 Get_CD_Index(char startLetter, int32 timeout);
+// ============================================================================
+// Archive-aware stream open
+//
+//  Format loaders that parse with stdio (PCX / FNT / PAL) must also be able to
+//  reach files that only exist inside a retail .mix.  This helper returns a
+//  read-only FILE* backed by an anonymous in-memory file (memfd) so the rest
+//  of the loader can keep its fseek/fread/fclose code untouched.
+//
+//  Order matches SHP/VXL/HVA: MIX registry first, loose file second.
+// ============================================================================
+std::FILE* File_Open_Archive_Stream(const char* pName);

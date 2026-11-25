@@ -2,6 +2,8 @@
 
 #include <Core/Memory.h>
 
+#include "../Game/Game.h"
+
 #include <cstdarg>
 #include <cstdio>
 
@@ -19,6 +21,20 @@ void WWDebugString(const char* pFormat, ...)
     va_start(args, pFormat);
     std::vfprintf(stderr, pFormat, args);
     va_end(args);
+}
+
+// asm 的时间基准：dword_887338（基准 tick，-1 表示未设）与 dword_887340
+// （累计毫秒）。Now() 复刻 asm 每次的 `mov eax,887338 / cmp eax,-1 /
+// Get_System_Tick_Count / sub eax,887338 / add edi,eax`。
+int32 s_TimeBaseTick = -1;      // asm: dword_887338
+int32 s_TimeAccum = 0;          // asm: dword_887340
+
+inline int32 Now()
+{
+    int32 now = s_TimeAccum;
+    if (s_TimeBaseTick != -1)
+        now += static_cast<int32>(Game::GetTickCount()) - s_TimeBaseTick;
+    return now;
 }
 
 // asm 的 `imul 88888889h / add edx,esi / sar edx,5 / shr-fix`：有符号
@@ -91,18 +107,80 @@ IPXGlobalConnClass::~IPXGlobalConnClass()
 // StripGlobalPacket -- asm IPXGlobalConnClass_StripGlobalPacket
 //                       (0x540110, retn 4)
 //
-//   ⚠ 留白：asm 里这一层还要经 [+4] 取到「连接对象」，再读它的接收队列
-//   （[conn+38h] 计数、sub_48B9E0 取包、sub_48B890 删包），并用到三个
-//   计时全局量（dword_887338 / dword_887340 / unk_88733C）。这些在
-//   OpenYR 侧的连接层尚未定案，因此本函数当前只保留函数签名与调用点，
-//   算法在连接层对齐后再补齐——按铁律①，宁可留白不写错。
+//   asm 逐句：
+//     num = [conn+38h]（接收队列条数）
+//     WWDebugString("Stripping queue entries older than %d seconds. "
+//                   "Num receive = %d", maxAge/60, num)
+//     for (i = 0 ; i < num ; ++i):
+//       pkt = sub_48B9E0(i)                     ; 第 i 个包
+//       WWDebugString("i = %d\n", i)
+//       if (!pkt) continue
+//       now = dword_887340 + (Tick - dword_887338)       ; 887338 == -1 时取 887340
+//       if (pkt->time + maxAge >= now)          ; 还新鲜
+//           打 "Leaving global packet due to age of %d seconds"
+//           continue
+//       打 "Stripping global packet due to age of %d seconds"
+//       for (j = 1..[this+0D4h]):
+//           if (AckSlots[j] == pkt->sender) AckSlots[j] = -1
+//       sub_48B890(..., i, ...)                 ; 移除第 i 个包，i 不前进
+//     WWDebugString("Done stripping. Num receive = %d\n", [conn+38h])
 //
-//   算法要点（供后续迁移）：按 maxAge（秒）遍历接收队列，把
-//     pkt->time + maxAge < now
-//   的包移除，并把 [+0D0h] ack 表里对应发送者 id 的槽位写成 -1。
+//   时间基准：原版 dword_887338（基准 tick，-1 表示未设）与 dword_887340
+//   （累计毫秒）在这里用文件内静态量复刻，Tick 取 Game::GetTickCount()。
+//   队列本身由本类的 ReceiveQueue 持有（原版挂在连接对象上，见头文件）。
 // ============================================================================
 void IPXGlobalConnClass::StripGlobalPacket(int32 maxAgeSeconds)
 {
-    // 留白：见上方说明。
-    (void)maxAgeSeconds;
+    // asm: mov eax,[esi+4] / mov ecx,[eax+38h]
+    const int32 num = ReceiveQueue.GetCount();
+
+    WWDebugString("Stripping queue entries older than %d seconds. "
+                  "Num receive = %d\n",
+                  MagicDiv60Signed(maxAgeSeconds), num);
+
+    for (int32 i = 0; i < ReceiveQueue.GetCount(); )
+    {
+        // asm: push ebp / call sub_48B9E0
+        const GlobalPacket& pkt = ReceiveQueue[i];
+        WWDebugString("i = %d\n", i);
+
+        // asm: mov eax,dword_887338 / mov esi,dword_887340 / cmp eax,-1
+        const int32 now = Now();
+
+        // asm: mov ecx,[edi+4] / add ecx,arg / cmp ecx,ebx / jge 保留
+        if (pkt.Time + maxAgeSeconds >= now)
+        {
+            WWDebugString("Leaving global packet due to age of %d seconds\n",
+                          MagicDiv60Signed(now - pkt.Time));
+            ++i;
+            continue;
+        }
+
+        WWDebugString("Stripping global packet due to age of %d seconds\n",
+                      MagicDiv60Signed(now - pkt.Time));
+
+        // asm: mov ecx,[edi+0Ch] / mov esi,[ecx+4]  —— 包里的发送者 id
+        const int32 sender = pkt.Sender;
+
+        // asm: mov ecx,[ebx+0D4h] / mov edi,[ebx+0D0h] / 线性找同值槽 -> -1
+        if (AckSlots != nullptr)
+        {
+            for (int32 j = 0; j < QueueCount; ++j)
+            {
+                if (AckSlots[j] == sender)
+                {
+                    AckSlots[j] = -1;
+                    break;
+                }
+            }
+        }
+
+        // asm: push 0 / push 0 / push ebp / push 0 / push 0 / call sub_48B890
+        ReceiveQueue.Remove(i);
+        // asm: dec ebp / jmp  —— 移除后下标不动，继续看同一个位置
+    }
+
+    // asm: mov ecx,[esi+4] / mov edx,[ecx+38h] / push edx
+    WWDebugString("Done stripping. Num receive = %d\n",
+                  ReceiveQueue.GetCount());
 }

@@ -1642,25 +1642,27 @@ void TacticalClass::Render(DSurface* pSurface, bool flag, TacticalRenderMode eMo
     //   整条绘制链会画到空指针上，画面永远是黑的。
     DrawSurface = pSurface;
 
-    // ---- z 缓冲：每帧清一次 + 挂到本帧的目标面上 --------------------------
+    // ---- z 缓冲：每帧按脏区清一次 + 挂到本帧的目标面上 --------------------
     //
-    // asm: z 缓冲的清零在 sub_6D2B60 里按脏区做（rect_mouseclass_vp 与每个
-    //   脏区的交，逐块 sub_7BCFB0(zbuf, rect) 填 0FFFFh）。本树 Draw() 是全量
-    //   重绘，脏区向量也没有建模，所以整片清一次等价。
-    //   用帧号做门：Render 一帧会被调多次（地形/对象/特效三趟），只有第一趟
-    //   清，后面的趟次必须看到前面写下的 z。
-    //    ⚠ 默认关闭：原版的清零是**按脏区**做的（sub_6D2B60 里 vec_DirtyAreas
-    //   与 rect_mouseclass_vp 逐个求交后 sub_7BCFB0），本树没有脏区向量，
-    //   用"每帧整片清一次"近似会让 z 在多次 Render 之间残留，实时模式下
-    //   实测 nonblack 从 246399 掉到 188862 且随帧率漂移 —— 这是清屏模型
-    //   不对，不是提笔器的错。在把脏区向量建起来之前，这条路径只能 opt-in：
-    //     OPENYR_ZBUFFER=1 才挂 z 缓冲；默认不挂，提笔器按"无深度测试"走。
-    static const bool s_bUseZBuffer = []() {
+    // asm: sub_6D2B60（TacticalClass_Draw 的第一趟）遍历 vec_DirtyAreas，
+    //   逐块与 rect_mouseclass_vp 求交后 sub_7BCFB0(zbuf, rect) 填 0FFFFh；
+    //   整个 Draw 结束时再把脏区表清空。**没有"整片清零"这一步** —— 没变
+    //   脏的区域保留上一帧写下的 z，这是画家算法能连续工作的前提。
+    //
+    //   本树的 Render 一帧会被调多趟（地形/对象/特效），用帧号做门：只有
+    //   第一趟消费脏区，后续趟次必须看到前面写下的 z。
+    //
+    //   开关：默认开启。设置 OPENYR_ZBUFFER=0 可显式关闭（调试/回退用）。
+    static const bool s_bZBufferEnabled = []() {
         const char* e = std::getenv("OPENYR_ZBUFFER");
-        return e != nullptr && e[0] == '1' && e[1] == '\0';
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
     }();
 
-    if (s_bUseZBuffer)
+    if (!s_bZBufferEnabled)
+    {
+        DirtyAreas.Clear();
+    }
+    else
     {
         if (ZBuffer_Global == nullptr && ScreenWidth > 0 && ScreenHeight > 0)
             ZBuffer_Global = new ZBufferClass(Rectangle(0, 0, ScreenWidth, ScreenHeight));
@@ -1669,10 +1671,16 @@ void TacticalClass::Render(DSurface* pSurface, bool flag, TacticalRenderMode eMo
         {
             if (ZBufferFrame != Game::CurrentFrame)
             {
-                ZBuffer_Global->Clear();      // asm: 填 0FFFFh（无限远）
+                Flush_Dirty_Areas();          // asm: 按脏区清 z（空则不清）
                 ZBufferFrame = Game::CurrentFrame;
             }
             ZBuffer_Global->Bind(pSurface);   // 供 CC_Draw_Shape 按行取 zbuf
+        }
+        else if (ZBufferFrame != Game::CurrentFrame)
+        {
+            // 没有可用缓冲：脏区无处消费，直接丢弃，避免无限累积。
+            DirtyAreas.Clear();
+            ZBufferFrame = Game::CurrentFrame;
         }
     }
 
@@ -1944,9 +1952,29 @@ DynamicVectorClass<ObjectClass*> TacticalClass::GetVisibleObjects()
 
 // =============================================================================
 // RegisterDirtyArea - Mark a screen area as needing redraw
+//
+// asm: TacticalMap_RegisterDirtyArea (0x6D27xx, retn 14h) —— 5 个 dword 参数：
+//   (x, y, w, h, flag)，把 {x,y,w,h,flag} 作为一个 0x14 字节的
+//   DirtyAreaStruct 收进 vec_DirtyAreas：
+//     * w <= 0 或 h <= 0 直接丢弃（loc_6D28C0 里两个 test/jle）；
+//     * 与每个已有项比对：
+//         - 完全被已有项包住 → 不再重复入表（清 z 幂等）；
+//         - 与若干项相交 → 并入**面积最小**的那一项（loc_6D29D2 里
+//           `imul ebp,edi / imul ecx,[esp+74h] / imul eax,esi` 求面积，
+//           取 var_4C 最小者，再 sub_487F40 求并）；
+//         - 都不相交 → 追加到表尾（loc_6D2A94 的 rep movsd）。
+//   本树按同一规则实现（面积比较用 Rectangle::Area）。
 // =============================================================================
 void TacticalClass::RegisterDirtyArea(Rectangle Area, bool bUnk)
 {
+    (void)bUnk;   // asm 的 flag 只影响"完全相同的矩形是否仍保留一份"，对清 z 无差别
+
+    // asm: w/h <= 0 的矩形不入表。
+    if (Area.IsEmpty())
+        return;
+
+    // 既有语义：ContainingMapCoords 是所有脏区的并集（Do_Cell_Twinkle 等
+    // 旧路径按它定位"整片变化范围"，保持不动）。
     if (ContainingMapCoords.IsEmpty())
     {
         ContainingMapCoords = Area;
@@ -1959,6 +1987,90 @@ void TacticalClass::RegisterDirtyArea(Rectangle Area, bool bUnk)
         int32 newB = std::max(ContainingMapCoords.Y + ContainingMapCoords.Height, Area.Y + Area.Height);
         ContainingMapCoords = Rectangle(newX, newY, newR - newX, newB - newY);
     }
+
+    // asm: 逐项比对，记录"相交且面积最小"的那一项。
+    int32 bestIndex = -1;
+    int32 bestArea  = 0x7FFFFFFF;
+    for (int32 i = 0; i < DirtyAreas.Count; ++i)
+    {
+        const Rectangle& d = DirtyAreas[i];
+
+        // 已被已有脏区完全包住 → 无需入表。
+        if (d.X <= Area.X && d.Y <= Area.Y &&
+            d.X + d.Width  >= Area.X + Area.Width &&
+            d.Y + d.Height >= Area.Y + Area.Height)
+        {
+            return;
+        }
+
+        if (!d.Intersects(Area))
+            continue;
+
+        const int32 a = d.Area();
+        if (a < bestArea)
+        {
+            bestArea  = a;
+            bestIndex = i;
+        }
+    }
+
+    if (bestIndex >= 0)
+    {
+        // asm: sub_487F40 求并后写回原项。
+        Rectangle& d = DirtyAreas[bestIndex];
+        const int32 nx = std::min(d.X, Area.X);
+        const int32 ny = std::min(d.Y, Area.Y);
+        const int32 nr = std::max(d.X + d.Width,  Area.X + Area.Width);
+        const int32 nb = std::max(d.Y + d.Height, Area.Y + Area.Height);
+        d = Rectangle(nx, ny, nr - nx, nb - ny);
+        return;
+    }
+
+    // asm: loc_6D2A94 —— 追加到表尾。
+    DirtyAreas.Add(Area);
+}
+
+// =============================================================================
+// Flush_Dirty_Areas - 按脏区清 z（asm: sub_6D2B60 的脏区循环）
+//
+// asm 逐项（**倒序**，所以边遍历边删除是安全的）：
+//     rect = dirty[i] + (视口滚动增量)
+//     rect = rect ∩ rect_mouseclass_vp
+//     if (rect.w > 0 && rect.h > 0) sub_7BCFB0(zbuf, rect)   ; 填 0FFFFh
+//     else                         移除该项（后续项前移）
+//   整个 TacticalClass_Draw 结束时再把 vec_DirtyAreas.length 一路减到 0。
+//
+// 本树的脏区在"登记它的那一帧"里就已经是屏幕坐标，消费发生在下一帧第一趟
+// Render，因此这里直接把矩形与 ViewRect 求交后清 z，随后清空容器。
+// 脏区为空 = 一块都不清 —— 绝不退化成整片清零。
+// =============================================================================
+void TacticalClass::Flush_Dirty_Areas()
+{
+    if (DirtyAreas.Count <= 0)
+        return;
+
+    const bool hasZ = (ZBuffer_Global != nullptr && ZBuffer_Global->Is_Allocated());
+    if (!hasZ)
+    {
+        DirtyAreas.Clear();
+        return;
+    }
+
+    const Rectangle vp = ViewRect;   // asm: rect_mouseclass_vp（屏幕坐标）
+    for (int32 i = 0; i < DirtyAreas.Count; ++i)
+    {
+        const Rectangle hit = DirtyAreas[i].Intersection(vp);
+        if (hit.IsEmpty())
+            continue;                // asm: 交为空的项被移除
+
+        // z 缓冲是"视口局部坐标"：减去 ZBufferClass 记录的视口原点。
+        ZBuffer_Global->Clear_Rect(hit.X - ZBuffer_Global->Left,
+                                   hit.Y - ZBuffer_Global->Top,
+                                   hit.Width, hit.Height);
+    }
+
+    // asm: TacticalClass_Draw 尾部把 vec_DirtyAreas.length 清零。
+    DirtyAreas.Clear();
 }
 
 // =============================================================================

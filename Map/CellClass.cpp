@@ -3,6 +3,7 @@
 #include <vector>
 #include <queue>
 #include <utility>
+#include <unordered_map>
 #include "../Abstract/ObjectClass.h"
 #include "../Abstract/BuildingClass.h"
 #include "../Abstract/UnitClass.h"
@@ -593,22 +594,64 @@ int32 CellClass::Get_Tiberium_Type() const {
 }
 
 int32 CellClass::Get_Contained_Tiberium_Index() const {
-    return Is_Overlay_Idx_Tiberium(Overlay);
+    const int32 idx = Is_Overlay_Idx_Tiberium(Overlay);
+    if (idx >= 0)
+        return idx;
+
+    // 叠加物表里没有登记矿时（内置兜底规则集不含 [OverlayTypes]，真实地图的
+    //   IsoMapPack5 才带 overlay），退回 Set_Tiberium 记在 OverlayData 低字节
+    //   里的矿种号 —— 否则这种格子永远拿不到矿类型，Grow_Tiberium /
+    //   Spread_Tiberium 全部直接返回 false，矿只会被采空、永不生长。
+    if (TiberiumValue > 0 || Land == ::LandType::Tiberium)
+        return OverlayData & 0xFF;
+
+    return -1;
 }
 
 int32 CellClass::Get_Tiberium_Value() const {
     return TiberiumValue;
 }
 
-void CellClass::Set_Tiberium(int32 type, int32 value) {
-    if (value < 0) value = 0;
-    if (value > 12) value = 12;  // maximum growth level
-    TiberiumValue = value;
-    if (value > 0) {
+// ----------------------------------------------------------------------------
+// 一格矿的"单位价值"（每种矿不同：Riparius = 25、Cruentus 等各有取值）。
+//   asm: CellClass_TiberiumInCell = tib->Value(+0xB8) * (OverlayFrame + 1)，
+//   即**矿量 = 单位价值 × 生长阶段**。本树把 TiberiumValue 建模成"矿量"，
+//   阶段则由 OverlayFrame 表达，二者必须互相对得上。
+// ----------------------------------------------------------------------------
+static int32 Tiberium_Unit_Value(int32 oreIdx)
+{
+    TiberiumClass* pType = TiberiumClass::FindByIndex(oreIdx);
+    if (pType != nullptr && pType->Value > 0)
+        return pType->Value;
+    return 25;      // 兜底：Riparius 的原版单位价值
+}
+
+// ----------------------------------------------------------------------------
+// Set_Tiberium(type, amount) —— 设定这一格的矿量（不是生长阶段）。
+//   amount 上限 = 单位价值 × 12（12 是 overlay 的生长阶段上限）。
+//   OverlayFrame 由矿量反推：stage = ceil(amount / unit)，存 0..11。
+//   原实现把 amount 直接当阶段并 clamp 到 12，导致一格最多只有 12 "单位"的
+//   矿，而矿车容量是 360 —— 一辆车能吃掉 30 格，一片矿田几趟就没了。
+// ----------------------------------------------------------------------------
+void CellClass::Set_Tiberium(int32 type, int32 amount) {
+    const int32 unit = Tiberium_Unit_Value(type);
+    const int32 maxAmount = unit * 12;
+
+    if (amount < 0) amount = 0;
+    if (amount > maxAmount) amount = maxAmount;
+    TiberiumValue = amount;
+
+    if (amount > 0) {
+        int32 stage = (amount + unit - 1) / unit;   // 1..12
+        if (stage < 1) stage = 1;
+        if (stage > 12) stage = 12;
+        OverlayFrame = static_cast<uint8>(stage - 1);   // 0..11
+
         OverlayData = (OverlayData & ~0xFF) | (type & 0xFF);
         if (Overlay < 0) Overlay = 0;  // ensure overlay is set
         Land = ::LandType::Tiberium;
     } else {
+        OverlayFrame = 0;
         // When tiberium is depleted, restore the underlying land type
         if (Land == ::LandType::Tiberium) {
             Land = ::LandType::Clear;
@@ -901,6 +944,49 @@ int32 CellClass::Get_Occupier_Count() const {
     return Occupier ? 1 : 0;
 }
 
+// ============================================================================
+// 步兵占用计数（与 FirstObject 链解耦的权威计数）
+//
+//   为什么不能只靠链来数人：一条格子链共用对象里唯一的 NextObject 指针，
+//   一旦某个对象的登记格与它实际所在的格不一致（Scatter / ForceImmediate
+//   Destination / 卸载落位都会绕过行走逻辑直接改坐标），注销就找不到它，
+//   链上会留下"指向已换格对象"的残链。实测 6 名步兵站在同一格，链长只有
+//   2 —— 靠链数人永远数不准，3 人上限也就形同虚设。
+//
+//   这里用两张旁表维护"对象 → 所在格"和"每格步兵数"，Add/Remove 时双向
+//   更新，重复 Add 会先把旧格的计数扣掉。CellArray 重新分配时调用
+//   Clear_Occupancy_Cache() 清空（指针失效）。
+// ============================================================================
+namespace {
+
+struct OccupancyTables
+{
+    std::unordered_map<const CellClass*, int32>          InfantryPerCell;
+    std::unordered_map<const ObjectClass*, const CellClass*> CellOfObject;
+};
+
+OccupancyTables& Occupancy()
+{
+    static OccupancyTables tables;
+    return tables;
+}
+
+} // namespace
+
+int32 CellClass::Infantry_Count() const
+{
+    const OccupancyTables& t = Occupancy();
+    const auto it = t.InfantryPerCell.find(this);
+    return (it != t.InfantryPerCell.end()) ? it->second : 0;
+}
+
+void CellClass::Clear_Occupancy_Cache()
+{
+    OccupancyTables& t = Occupancy();
+    t.InfantryPerCell.clear();
+    t.CellOfObject.clear();
+}
+
 ObjectClass* CellClass::Get_Occupier() const {
     return Occupier;
 }
@@ -908,27 +994,97 @@ ObjectClass* CellClass::Get_Occupier() const {
 void CellClass::Add_Occupier(ObjectClass* pObj) {
     if (!pObj) return;
 
-    // Thread onto the ground occupancy chain unless it is already linked.
-    if (pObj->NextObject == nullptr && FirstObject != pObj) {
-        pObj->NextObject = FirstObject;
-        FirstObject = pObj;
-        ++ContentCount;
+    const bool isBuilding = (pObj->WhatAmI() == AbstractType::Building);
+    const bool isInfantry = (pObj->WhatAmI() == AbstractType::Infantry);
+    OccupancyTables& t = Occupancy();
+
+    // ── 1. 唯一归属：先把对象从"上一次登记的格子"上摘下来 ────────────────
+    //   一条链只有一个 NextObject 指针。同一个对象同时挂在两条链上时，第二次
+    //   挂接会覆盖第一次写的 NextObject，两条链互相指向对方 → 成环 → 任何
+    //   遍历（索敌扫描、绘制、Cell_Techno）都会死循环。实测索敌扫描在
+    //   cell(29,27) 上走了 513 个节点还没到链尾，一帧卡死几十秒。
+    //   旁表 CellOfObject 是权威登记，凡换格先摘旧链，从根上杜绝多链共存。
+    if (!isBuilding) {
+        const auto prev = t.CellOfObject.find(pObj);
+        if (prev != t.CellOfObject.end() && prev->second != nullptr) {
+            if (prev->second == this) {
+                // 已在本格：幂等返回，但补一次槽位与计数。
+                Occupier = pObj;
+                return;
+            }
+            CellClass* pOld = const_cast<CellClass*>(prev->second);
+            pOld->Remove_Occupier(pObj);
+        }
+    }
+
+    // ── 2. 步兵计数（权威）────────────────────────────────────────────────
+    //   同一对象对同一格重复 Add 不能把计数加两遍。
+    if (isInfantry) {
+        const auto prev = t.CellOfObject.find(pObj);
+        const bool alreadyHere = (prev != t.CellOfObject.end() && prev->second == this);
+        if (!alreadyHere) {
+            t.CellOfObject[pObj] = this;
+            ++t.InfantryPerCell[this];
+        }
+    }
+
+    // ── 3. 入链 ──────────────────────────────────────────────────────────
+    //   建筑的多格占用只登记 Occupier + ContainsBuilding，**不**挂 FirstObject
+    //   链：多格建筑若同时挂在 2~9 条链上，同样会把链连成环。原版也只在
+    //   一个"主格"上入链。
+    if (!isBuilding) {
+        // 有界去重：链可能被历史数据弄脏，最多走 512 个节点就放弃。
+        bool linked = false;
+        int32 guard = 0;
+        for (ObjectClass* p = FirstObject; p != nullptr && guard < 512;
+             p = p->NextObject, ++guard) {
+            if (p == pObj) { linked = true; break; }
+        }
+        if (!linked) {
+            pObj->NextObject = FirstObject;
+            FirstObject = pObj;
+            ++ContentCount;
+        }
+        t.CellOfObject[pObj] = this;
     }
 
     Occupier = pObj;
-    SetAltFlag(AltCellFlags::ContainsBuilding, true);
+
+    // ★ ContainsBuilding 只能由建筑置位。
+    //   此前不论对象类型都置 true，等于"站着一个兵"也宣称"这格有建筑"：
+    //   Cell_Has_Building / 建筑选址 / 驻扎判定都会据此误判（原版的
+    //   AltFlags bit1 只在建筑落位时置位）。
+    if (isBuilding)
+        SetAltFlag(AltCellFlags::ContainsBuilding, true);
 }
 
 void CellClass::Remove_Occupier(ObjectClass* pObj) {
     if (!pObj) return;
 
-    // Unlink from the ground occupancy chain.
+    OccupancyTables& t = Occupancy();
+
+    // 步兵计数：按"对象 → 登记格"的旁表扣减，不依赖调用方传入的格是否准确。
+    if (pObj->WhatAmI() == AbstractType::Infantry)
+    {
+        const auto it = t.CellOfObject.find(pObj);
+        if (it != t.CellOfObject.end())
+        {
+            const auto cnt = t.InfantryPerCell.find(it->second);
+            if (cnt != t.InfantryPerCell.end() && --(cnt->second) <= 0)
+                t.InfantryPerCell.erase(cnt);
+        }
+    }
+    t.CellOfObject.erase(pObj);
+
+    // Unlink from the ground occupancy chain（有界，防脏链死循环）。
     if (FirstObject == pObj) {
         FirstObject = pObj->NextObject;
         pObj->NextObject = nullptr;
         if (ContentCount > 0) --ContentCount;
     } else {
-        for (ObjectClass* pPrev = FirstObject; pPrev; pPrev = pPrev->NextObject) {
+        int32 guard = 0;
+        for (ObjectClass* pPrev = FirstObject; pPrev != nullptr && guard < 512;
+             pPrev = pPrev->NextObject, ++guard) {
             if (pPrev->NextObject == pObj) {
                 pPrev->NextObject = pObj->NextObject;
                 pObj->NextObject = nullptr;
@@ -940,7 +1096,16 @@ void CellClass::Remove_Occupier(ObjectClass* pObj) {
 
     if (Occupier == pObj) {
         Occupier = nullptr;
-        SetAltFlag(AltCellFlags::ContainsBuilding, false);
+        // 同上：只有建筑离场才清 ContainsBuilding，否则一名步兵走开就会把
+        //   真实建筑所在格的标志抹掉。
+        if (pObj->WhatAmI() == AbstractType::Building)
+            SetAltFlag(AltCellFlags::ContainsBuilding, false);
+
+        // 槽只是单指针的类型快速查询缓存，链才是权威：此刻链上若还有别的
+        //   对象（例如坦克开走、留下同格的步兵），把它让给链首，别因为
+        //   "最后一个登记的人离开"就把整格宣告成空的。
+        if (FirstObject != nullptr && FirstObject != pObj)
+            Occupier = FirstObject;
     }
 }
 
@@ -996,6 +1161,29 @@ void CellClass::Occupy_Down(ObjectClass* pContent, bool bridge)
         place.Z = GetFloorHeight(place);
         pContent->SetLocation(place);
     }
+}
+
+// ============================================================================
+// AddContent —— 把对象挂进本格的占用链（地面 / 桥面），并维护 ContentCount。
+//   已挂在链上时直接返回，避免同一对象被重复挂接（重复会形成自环）。
+// ============================================================================
+void CellClass::AddContent(ObjectClass* pObj, bool alt)
+{
+    if (pObj == nullptr)
+        return;
+
+    ObjectClass*& pHead = alt ? AltObject : FirstObject;
+
+    for (ObjectClass* p = pHead; p != nullptr; p = p->NextObject)
+    {
+        if (p == pObj)
+            return;                                   // 已在链上
+    }
+
+    pObj->NextObject = pHead;
+    pHead = pObj;
+    if (!alt)
+        ++ContentCount;
 }
 
 // ============================================================================
@@ -2290,6 +2478,11 @@ BuildingClass* CellClass::Cell_Building() const {
         if (pObj->WhatAmI() == AbstractType::Building)
             return static_cast<BuildingClass*>(pObj);
     }
+
+    // 多格建筑只在主格入链，其余占地格靠 Occupier 槽登记（见 Add_Occupier）。
+    if (Occupier != nullptr && Occupier->WhatAmI() == AbstractType::Building)
+        return static_cast<BuildingClass*>(Occupier);
+
     return nullptr;
 }
 
@@ -2789,6 +2982,48 @@ void CellClass::Relink_Vein_Overlay()
 }
 
 // ============================================================================
+// asm: sub_483710 —— CellClass::Grow_Tiberium
+//
+//   Scenario->TiberiumGrowth(=+0x34A6) 开着、这一格的叠加物是矿、矿还没长满
+//   这一类型的最大密度、格上没有对象、该类型的 GrowthPercentage > 1e-5 时，
+//   把这一格的矿密度 +1。矿石"采完还能长回来"就靠这一步：没有它，一张图的
+//   矿量是有限的（本树的 CellClass::Set_Tiberium 上限是 12 阶段），AI 采完
+//   之后永久零收入。
+// ============================================================================
+bool CellClass::Grow_Tiberium()
+{
+    if (ScenarioClass::Instance == nullptr)
+        return false;
+    if (!ScenarioClass::Instance->TiberiumGrowthEnabled)
+        return false;
+
+    const int32 oreIdx = Is_Overlay_Idx_Tiberium(Overlay);
+    if (oreIdx == -1)
+        return false;
+
+    TiberiumClass* pTib = TiberiumClass::FindByIndex(oreIdx);
+    if (pTib == nullptr)
+        return false;
+
+    // asm: 密度阶段已经到达该类型的上限 -> 不再长。
+    const int32 unit = Tiberium_Unit_Value(oreIdx);
+    if (TiberiumValue >= unit * 12)
+        return false;
+
+    // asm: [cell+11Ch] 非零 = 格上有对象压着，不长。
+    if (FirstObject != nullptr)
+        return false;
+
+    // asm: GrowthPercentage <= 1e-5 -> 该类型不长。
+    if (!pTib->Should_Grow(TiberiumValue))
+        return false;
+
+    // 长一级 = 矿量 + 单位价值。
+    Set_Tiberium(oreIdx, TiberiumValue + unit);
+    return true;
+}
+
+// ============================================================================
 // asm: char __thiscall CellClass::Spread_Tiberium(CellClass *this, char a2)
 //      (asm:6763, retn 4)
 //
@@ -2850,7 +3085,11 @@ bool CellClass::Spread_Tiberium(bool a2)
         if (!pAdj->CanAddTiberium())
             continue;
 
-        pAdj->Set_Tiberium(oreType, 3);
+        // asm: sub_487190(cell, oreIdx, 3) 是"叠加"语义，不是"赋值"。
+        //   这里必须写成 现值+3（并按 12 上限截断）：直接赋 3 会把邻格已有
+        //   的矿量抹掉 —— 一块满矿田互相蔓延时会把自己越铺越少。
+        int32 grown = pAdj->Get_Tiberium_Value() + Tiberium_Unit_Value(oreType) * 3;
+        pAdj->Set_Tiberium(oreType, grown);   // Set_Tiberium 自己按上限截断
         return true;
     }
 
@@ -3019,6 +3258,16 @@ void CellClass::RemoveContent(ObjectClass* pObj, bool alt)
     }
 
     pObj->NextObject = nullptr;
+
+    // Occupier 槽也要跟着摘：只摘链不摘槽时，对象析构后格子里会留一个
+    //   指向已释放内存的 Occupier，Has_Unit / GetCellOccupier / 碾压判定
+    //   下一次读它就是悬空访问（载具登记之后这条路径每帧都在走）。
+    if (Occupier == pObj)
+    {
+        Occupier = (FirstObject != pObj) ? FirstObject : nullptr;
+        if (pObj->WhatAmI() == AbstractType::Building)
+            SetAltFlag(AltCellFlags::ContainsBuilding, false);
+    }
 
     // asm: void __thiscall CellClass_SetWallOwner(CellClass *this)   (asm:289439)
     if (pObj->WhatAmI() == AbstractType::Infantry)
@@ -3383,55 +3632,187 @@ void CellClass::Clear_Icon_4814F0()
 // ============================================================================
 // asm: byte __thiscall CellClass_LAT(CellClass *this)   (asm:288560)
 //
-//  给出本格的 LAT（地表平均类型）：地块贴图按"温和/雪地/沙地"等地表组织
-//  成组，同一组内的贴图可以无缝拼接。查询方（寻路、放置判定）拿它判断
-//  两个相邻格的地表是否同组。
+//  LAT 不是"查询"，而是**改写本格 tile 编号**：原版把每类地表切成
+//  1 张基础 tile + 15 张过渡变体（4 个斜向邻格是否同类的 4-bit 掩码），
+//  按邻接情况把本格换成合适的拼接变体，返回"编号是否变了"。
+//
+//  逐组（asm 顺序，一旦 tile 落入某组就处理，之后继续查下一组）：
+//
+//    Rough  : base = tile_RoughTile，区间 [tile_ClearToRoughLat, +0x0F]
+//    Sand   : base = tile_SandTile， 区间 [tile_ClearToSandLat,  +0x0F]
+//    Green  : base = tile_GreenTile，区间 [tile_ClearToGreenLat,+0x0F]
+//             邻居还接受 Shore / WaterBridge
+//    Pave   : base = tile_PaveTile， 区间 [tile_ClearToPaveLat, +0x0F]
+//             邻居还接受 MiscPave / Medians / PavedRoads
+//    Ramp   : 按 +0x11C 的斜坡方向（1..4）查两个特定方向邻居的 +0x11C
+//             是否为 0，得到 2-bit 掩码，选 RampSmooth 的 4 个变体段；
+//             掩码为 0 时落 RampBase + 方向 - 1。
+//
+//  邻格采样方向固定为 0/2/4/6（四个斜角），掩码位序 i → dir = 2i。
+//  组区间为 -1 表示该 theater 没有这套 tile，整组跳过。
+//
+//  ★ 收尾差异：asm 在 tile 改变后还会
+//      `vec_IsometricTileTypes[tile]->vt[0x9C]()` 判空并调 sub_544C80；
+//    本树没有 IsometricTileType 的虚表，也没有那套后处理，故只改编号。
 // ============================================================================
-int32 CellClass::LAT() const
+int32 CellClass::LAT()
 {
-    // 根据游戏行为，可知 LAT 就是地面类型在规则表里的分组编号：直接把地面
-    //  类型编号返回即可，调用方按编号查组表。
-    return static_cast<int32>(this->Get_Land_Type());
+    const int32 oldTile = this->TileType;
+
+    static const int8 kDirs[8][2] = {
+        {  1,  0 }, {  1,  1 }, {  0,  1 }, { -1,  1 },
+        { -1,  0 }, { -1, -1 }, {  0, -1 }, {  1, -1 },
+    };
+
+    const auto neighbour = [this](int32 dir) -> CellClass*
+    {
+        if (MapClass::Instance == nullptr)
+            return nullptr;
+        const CellStruct probe(
+            static_cast<int16>(this->MapCoords.X + kDirs[dir][0]),
+            static_cast<int16>(this->MapCoords.Y + kDirs[dir][1]));
+        return MapClass::Instance->GetCellAt(probe);
+    };
+
+    const auto inRange = [](int32 v, int32 lo, int32 hi) -> bool
+    {
+        return (lo != -1) && (v >= lo) && (v <= hi);
+    };
+
+    const auto span = [](int32 start, int32 count) -> int32
+    {
+        return (start == -1) ? -1 : (start + count);
+    };
+
+    // ── 组区间（asm 288570..288700） ────────────────────────────────────
+    const int32 staRough      = tile_ClearToRoughLat;
+    const int32 staSand       = tile_ClearToSandLat;
+    const int32 staGreen      = tile_ClearToGreenLat;
+    const int32 staPave       = tile_ClearToPaveLat;
+    const int32 staMiscPave   = tile_MiscPaveTile;
+    const int32 staPavedRoads = tile_PavedRoads;
+    const int32 staMedians    = tile_Medians;
+    const int32 staWaterBridge= tile_WaterBridge;
+    const int32 staShore      = tile_ShorePieces;
+    const int32 staRampBase   = tile_RampBase;
+    const int32 staRampSmooth = tile_RampSmooth;
+
+    const int32 endRough      = span(staRough,      0x0F);
+    const int32 endSand       = span(staSand,       0x0F);
+    const int32 endGreen      = span(staGreen,      0x0F);
+    const int32 endPave       = span(staPave,       0x0F);
+    const int32 endMiscPave   = span(staMiscPave,   0x0D);
+    const int32 endPavedRoads = span(staPavedRoads, 0x14);
+    const int32 endMedians    = span(staMedians,    0x0D);
+    const int32 endWaterBridge= span(staWaterBridge,0x01);
+    const int32 endShore      = span(staShore,      0x29);
+    const int32 endRampBase   = span(staRampBase,   0x13);
+    const int32 endRampSmooth = span(staRampSmooth, 0x0B);
+
+    // 通用组：本格落在 base 或组区间内时，用四个斜邻的同类情况选变体。
+    const auto applyGroup =
+        [&](int32 base, int32 sta, int32 end, const auto& accept)
+    {
+        if (sta == -1)
+            return;
+        if (!(this->TileType == base || inRange(this->TileType, sta, end)))
+            return;
+
+        int32 mask = 0;
+        for (int32 i = 0, dir = 0; i < 4; ++i, dir = (dir + 2) & 7)
+        {
+            const CellClass* pN = neighbour(dir);
+            if (pN != nullptr && accept(pN->TileType))
+                mask |= (1 << i);
+        }
+
+        // asm: test ebp,ebp / jz → 写 base；否则写 sta + mask。
+        this->TileType = (mask != 0) ? (sta + mask) : base;
+    };
+
+    // Rough
+    applyGroup(tile_RoughTile, staRough, endRough,
+        [&](int32 t) { return t == tile_RoughTile || inRange(t, staRough, endRough); });
+
+    // Sand
+    applyGroup(tile_SandTile, staSand, endSand,
+        [&](int32 t) { return t == tile_SandTile || inRange(t, staSand, endSand); });
+
+    // Green（邻居还接受 Shore / WaterBridge）
+    applyGroup(tile_GreenTile, staGreen, endGreen,
+        [&](int32 t) {
+            return t == tile_GreenTile
+                || inRange(t, staGreen, endGreen)
+                || inRange(t, staShore, endShore)
+                || inRange(t, staWaterBridge, endWaterBridge);
+        });
+
+    // Pave（邻居还接受 MiscPave / Medians / PavedRoads）
+    applyGroup(tile_PaveTile, staPave, endPave,
+        [&](int32 t) {
+            return t == tile_PaveTile
+                || inRange(t, staPave, endPave)
+                || inRange(t, staMiscPave, endMiscPave)
+                || inRange(t, staMedians, endMedians)
+                || inRange(t, staPavedRoads, endPavedRoads);
+        });
+
+    // ── Ramp（asm 47CF02..47D1CF） ──────────────────────────────────────
+    if (inRange(this->TileType, staRampBase, endRampBase)
+        || inRange(this->TileType, staRampSmooth, endRampSmooth))
+    {
+        // +0x11C：斜坡方向（1..4）。同一字节在矿脉逻辑里是 VeinStage，
+        //   一格不可能同时是斜坡与矿脉，原版共用。
+        const int32 ramp = static_cast<int32>(this->VeinStage);
+
+        const auto flatNeighbour = [&](int32 dir) -> bool
+        {
+            const CellClass* pN = neighbour(dir);
+            return pN != nullptr && pN->VeinStage == 0;
+        };
+
+        int32 flags = 0;
+        switch (ramp)
+        {
+        case 1:   // 邻居 6 / 2
+            if (flatNeighbour(6)) flags |= 1;
+            if (flatNeighbour(2)) flags |= 2;
+            if (flags != 0) this->TileType = staRampSmooth + flags - 1;
+            break;
+
+        case 2:   // 邻居 0 / 4
+            if (flatNeighbour(0)) flags |= 1;
+            if (flatNeighbour(4)) flags |= 2;
+            if (flags != 0) this->TileType = staRampSmooth + flags + 2;
+            break;
+
+        case 3:   // 邻居 2 / 6
+            if (flatNeighbour(2)) flags |= 1;
+            if (flatNeighbour(6)) flags |= 2;
+            if (flags != 0) this->TileType = staRampSmooth + flags + 5;
+            break;
+
+        case 4:   // 邻居 4 / 0
+            if (flatNeighbour(4)) flags |= 1;
+            if (flatNeighbour(0)) flags |= 2;
+            if (flags != 0) this->TileType = staRampSmooth + flags + 8;
+            break;
+
+        default:
+            break;
+        }
+
+        // asm: loc_47D1B8 test edi,edi / jnz 结束；否则 tile = RampBase + ramp - 1
+        if (flags == 0 && ramp >= 1 && ramp <= 4 && staRampBase != -1)
+            this->TileType = staRampBase + ramp - 1;
+    }
+
+    return (this->TileType != oldTile) ? 1 : 0;
 }
 
 // ============================================================================
 // Trigger-action helpers
 // ============================================================================
-
-// ----------------------------------------------------------------------------
-// CellClass::Show_Talk_Bubble
-//
-//   TActionClass::Action_TalkBubble resolves a waypoint cell and asks it to
-//   raise a dialogue balloon.  The balloon belongs to the techno standing on
-//   the cell, so the cell finds that techno (nearest TechnoClass) and forwards
-//   the text, widening it for TechnoClass::DisplayTalkBubble.
-// ----------------------------------------------------------------------------
-void CellClass::Show_Talk_Bubble(const char* pText)
-{
-    if (pText == nullptr)
-        return;
-
-    // The techno that occupies this cell owns the balloon.
-    ObjectClass* pObj = Cell_Techno(nullptr, false, nullptr);
-    if (pObj == nullptr)
-        pObj = Occupier;
-    if (pObj == nullptr)
-        return;
-
-    const AbstractType what = pObj->WhatAmI();
-    const bool isTechno = (what == AbstractType::Infantry || what == AbstractType::Unit
-                        || what == AbstractType::Aircraft || what == AbstractType::Building);
-    if (!isTechno)
-        return;
-
-    wchar_t wideText[0x40];
-    int32 n = 0;
-    for (; pText[n] != '\0' && n < 0x3F; ++n)
-        wideText[n] = static_cast<wchar_t>(static_cast<unsigned char>(pText[n]));
-    wideText[n] = L'\0';
-
-    static_cast<TechnoClass*>(pObj)->DisplayTalkBubble(wideText, -1);
-}
 
 // ----------------------------------------------------------------------------
 // CellClass::Make_Occupiers_Berzerk
